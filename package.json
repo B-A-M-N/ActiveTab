@@ -15,6 +15,9 @@
     "test": "node --test",
     "api": "node src/api/start-server.js",
     "api:test": "node --test test/api-server.test.js",
-    "test:headed": "bash scripts/test-headed.sh"
+    "test:headed": "bash scripts/test-headed.sh",
+    "qualify:staging": "node scripts/qualify-staging.mjs",
+    "qualify:staging:owned": "node scripts/qualify-staging.mjs --mode=owned",
+    "qualify:staging:attached": "node scripts/qualify-staging.mjs --mode=attached"
   }
 }

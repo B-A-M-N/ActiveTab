@@ -492,7 +492,9 @@ export class TestRunner {
       }
     }
 
-    const engine = new NavigationEngine(this.session, { maxActions: step.maxActions ?? 8, maxScrolls: step.maxScrolls ?? 5, signal: this.signal });
+    // Pass the verified environment binding so the engine refuses to
+    // count navigation onto a non-authorized origin as goal progress.
+    const engine = new NavigationEngine(this.session, { maxActions: step.maxActions ?? 8, maxScrolls: step.maxScrolls ?? 5, signal: this.signal, environment: this.environment ?? null });
     const result = await engine.run(step.goal);
     if (result.status === "needs_human") {
       const category = result.interventionRequired?.category ?? "authentication";
@@ -565,7 +567,25 @@ export class TestRunner {
    * evidence before the step is re-executed; a failed verification leaves
    * the run suspended.
    */
-  async resume(receipt, { verify = null, evaluate = null } = {}) {
+  /**
+   * Resume a suspended run from its interrupted step (P0-6). The exact
+   * completion predicate is verified with fresh evidence BEFORE the step
+   * re-executes; a failed verification leaves the run suspended. Resume
+   * acquires continuation ownership through a fencing lease, so only one
+   * worker may resume a given run at a time. When the caller supplies the
+   * original workflow, the remaining steps after the suspended one
+   * continue to execute; already-passed steps are never replayed (a
+   * successful non-idempotent operation must not be duplicated).
+   *
+   * @param {TestReceipt} receipt - The suspended run's receipt.
+   * @param {object} [options]
+   * @param {object} [options.verify] - Context for completion predicates.
+   * @param {Function} [options.evaluate] - Custom completion evaluator.
+   * @param {object} [options.workflow] - The ORIGINAL workflow definition
+   *   (or an immutable versioned reference). When provided, resume
+   *   re-enters at the suspended step and continues the subsequent steps.
+   */
+  async resume(receipt, { verify = null, evaluate = null, workflow = null } = {}) {
     const pending = (receipt.interventions ?? []).filter(i => i.state === INTERVENTION_STATE.WAITING || i.state === INTERVENTION_STATE.ACKNOWLEDGED);
     const suspendedStep = [...receipt.steps].reverse().find(s => s.status === STEP_STATUS_EXTENDED.SUSPENDED);
     if (!suspendedStep) {
@@ -576,25 +596,89 @@ export class TestRunner {
     if (Date.parse(record.expiresAt) <= Date.now()) {
       return { resumed: false, reason: `Intervention expired at ${record.expiresAt}.`, expired: true };
     }
-    // 1. Verify the actual completion condition with fresh evidence.
-    const evaluator = evaluate ?? ((intervention, ctx) => evaluateCompletion(intervention, ctx));
-    const evaluation = await evaluator(record, verify ?? {});
-    if (!evaluation.satisfied) {
-      return { resumed: false, reason: `Completion condition not verified: ${evaluation.reason}`, intervention: record };
+    // 1. Acquire continuation ownership (fencing lease): only one worker
+    //    may resume this run. Without a store, the single in-process
+    //    runner implicitly holds ownership.
+    let lease = null;
+    if (this.interventions) {
+      try {
+        const acquired = await this.interventions.acquireResume(record.intervention_id);
+        lease = acquired.lease;
+      } catch (error) {
+        return { resumed: false, reason: `Could not acquire resume ownership: ${String(error?.message ?? error).slice(0, 200)}` };
+      }
     }
-    // 2. Consume the intervention and re-enter at the suspended step.
-    await this.interventions?.completeResume(record.intervention_id, record.resumeHeldBy ?? record.generation, { evidenceId: evaluation.evidenceId ?? null, note: evaluation.summary });
-    const workflow = { id: receipt.workflowId, name: receipt.workflowName, steps: [{ id: suspendedStep.stepId, type: "goal", goal: suspendedStep.details?.goal ?? "" }] };
-    // Mark the run running again, then execute the remaining original steps
-    // from the caller-supplied workflow; here we re-run just the suspended
-    // step with fresh evidence and return its outcome.
-    const stepResult = await this.#executeGoal(workflow.steps[0], { ...receipt, status: RUN_STATUS.RUNNING, interventions: receipt.interventions }, new Date().toISOString());
-    if (stepResult.status !== STEP_STATUS_EXTENDED.SUSPENDED) {
-      const replacement = receipt.steps.find(s => s.stepId === suspendedStep.stepId);
-      if (replacement) Object.assign(replacement, { status: stepResult.status, reason: stepResult.reason });
-      receipt.status = RUN_STATUS.RUNNING;
+    try {
+      // 2. Evaluate the completion predicate with fresh evidence.
+      const evaluator = evaluate ?? ((intervention, ctx) => evaluateCompletion(intervention, ctx));
+      const evaluation = await evaluator(record, verify ?? {});
+      if (!evaluation.satisfied) {
+        if (lease) await this.interventions.releaseResume(record.intervention_id, lease).catch(() => {});
+        return { resumed: false, reason: `Completion condition not verified: ${evaluation.reason}`, intervention: record };
+      }
+      // 3. Consume the intervention with the held lease.
+      await this.interventions?.completeResume(record.intervention_id, lease ?? record.resumeHeldBy ?? record.generation, { evidenceId: evaluation.evidenceId ?? null, note: evaluation.summary });
+
+      // 4. Re-enter at the suspended step and continue the ORIGINAL
+      //    workflow when supplied. Completed steps are never replayed.
+      if (workflow && Array.isArray(workflow.steps)) {
+        const suspendedIndex = workflow.steps.findIndex(s => s.id === suspendedStep.stepId);
+        if (suspendedIndex >= 0) {
+          receipt.status = RUN_STATUS.RUNNING;
+          const remaining = workflow.steps.slice(suspendedIndex);
+          const failedStepIds = new Set(
+            receipt.steps
+              .filter(s => s.status === STEP_STATUS.FAIL || s.status === STEP_STATUS.BLOCKED || s.status === STEP_STATUS.UNCERTAIN)
+              .map(s => s.stepId)
+          );
+          for (const step of remaining) {
+            if (this.signal?.aborted) {
+              receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.CANCELED, reason: "Run was canceled during resume." });
+              break;
+            }
+            if (receipt.status !== RUN_STATUS.RUNNING) break;
+            if (failedStepIds.size > 0 && !step.recoveryBranch && step.id !== suspendedStep.stepId) {
+              receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason: `Skipped because a prerequisite step failed (${[...failedStepIds].join(", ")}).` });
+              continue;
+            }
+            const result = await this.#executeStep(step, receipt);
+            if (result.status === STEP_STATUS.CANCELED) break;
+            if (result.status === STEP_STATUS_EXTENDED.SUSPENDED) {
+              const EXTERNAL_TO_RUN = {
+                waiting_for_tab_authorization: RUN_STATUS.WAITING_FOR_TAB_AUTHORIZATION,
+                waiting_for_authentication: RUN_STATUS.WAITING_FOR_AUTHENTICATION,
+                waiting_for_mfa: RUN_STATUS.WAITING_FOR_MFA,
+                waiting_for_human_approval: RUN_STATUS.WAITING_FOR_HUMAN_APPROVAL,
+                waiting_for_external_authorization: RUN_STATUS.WAITING_FOR_EXTERNAL_AUTHORIZATION,
+                waiting_for_human_decision: RUN_STATUS.WAITING_FOR_HUMAN_DECISION
+              };
+              receipt.finish(EXTERNAL_TO_RUN[result.externalState] ?? RUN_STATUS.WAITING_FOR_HUMAN_DECISION);
+              break;
+            }
+            if (result.status === STEP_STATUS.FAIL || result.status === STEP_STATUS.BLOCKED || result.status === STEP_STATUS.UNCERTAIN) {
+              failedStepIds.add(step.id);
+            }
+          }
+          if (receipt.status === RUN_STATUS.RUNNING) receipt.finish(deriveRunStatus(receipt.steps));
+          return { resumed: !isWaitingRunStatus(receipt.status), receipt, evaluation };
+        }
+      }
+      // No original workflow available: re-run only the suspended step with
+      // fresh evidence and return its outcome (never the whole run).
+      const suspendedGoal = workflow?.steps?.find(s => s.id === suspendedStep.stepId)?.goal
+        ?? receipt.steps.find(s => s.stepId === suspendedStep.stepId)?.details?.goal
+        ?? "";
+      const stepResult = await this.#executeGoal({ id: suspendedStep.stepId, type: "goal", goal: suspendedGoal }, { ...receipt, status: RUN_STATUS.RUNNING, interventions: receipt.interventions }, new Date().toISOString());
+      if (stepResult.status !== STEP_STATUS_EXTENDED.SUSPENDED) {
+        const replacement = receipt.steps.find(s => s.stepId === suspendedStep.stepId);
+        if (replacement) Object.assign(replacement, { status: stepResult.status, reason: stepResult.reason });
+        receipt.status = RUN_STATUS.RUNNING;
+      }
+      return { resumed: stepResult.status !== STEP_STATUS_EXTENDED.SUSPENDED, stepResult, evaluation };
+    } catch (error) {
+      if (lease) await this.interventions.releaseResume(record.intervention_id, lease).catch(() => {});
+      throw error;
     }
-    return { resumed: stepResult.status !== STEP_STATUS_EXTENDED.SUSPENDED, stepResult, evaluation };
   }
 
   async #executeCleanup(step, receipt, startedAt) {

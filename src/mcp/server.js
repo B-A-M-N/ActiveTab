@@ -1,4 +1,5 @@
 import { createInterface } from "node:readline";
+import { join } from "node:path";
 import { listTargets, resolveAuthorizedTarget } from "../browser/targets.js";
 import { BrowserSession } from "../browser/session.js";
 import { connectChromeAuto, listChromeTargets, resolveChromeTarget } from "../browser/chrome-autoconnect.js";
@@ -18,7 +19,7 @@ import { DiagnosticReport, FINDING_LEVEL, INVESTIGATION_STATUS } from "../diagno
 import { TestRunner } from "../testing/runner.js";
 import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
 import { InvestigationEngine } from "../investigation/engine.js";
-import { InterventionStore } from "../runtime/interventions.js";
+import { InterventionStore, InterventionWatcher } from "../runtime/interventions.js";
 import { createInterventionTools } from "../api/intervention-tools.js";
 
 const endpoint = process.env.ACTIVETAB_CDP_ENDPOINT ?? "http://127.0.0.1:9222";
@@ -30,8 +31,15 @@ let extensionBroker;
 if (extensionMode) extensionBroker = await new ExtensionBroker({ socketPath: brokerSocketPath() }).start();
 const workflowStore = process.env.ACTIVETAB_WORKFLOW_STORE ? new WorkflowStore(process.env.ACTIVETAB_WORKFLOW_STORE) : undefined;
 const taskJournalStore = new McpTaskJournalStore();
+// Run registry is declared BEFORE any service that depends on it (P0-7):
+// constructing the intervention tools with an uninitialized registry was a
+// temporal-dead-zone error that could prevent MCP startup.
+const testRuns = new Map();
+const targetIdOptional = { targetId: { type: "string", description: "Select an attached tab. Required when more than one tab is attached." } };
+let interventionTools = null;
+let interventionWatcher = null;
+
 const interventionStore = new InterventionStore(process.env.ACTIVETAB_INTERVENTION_DIR ?? join(process.cwd(), ".activetab", "interventions"));
-await interventionStore.init().catch(() => {});
 const interventionCtx = {
   // Attachment verification: a caller-provided target ID alone is never proof.
   hasAttachmentGrant: async targetId => sessions.has(targetId)
@@ -45,9 +53,17 @@ const interventionCtx = {
     return session ? await session.observe() : null;
   }
 };
-const interventionTools = createInterventionTools({ store: interventionStore, runs: testRuns, ctx: interventionCtx });
-const targetIdOptional = { targetId: { type: "string", description: "Select an attached tab. Required when more than one tab is attached." } };
-const testRuns = new Map();
+
+// Explicit startup: a failed intervention-store initialization must not
+// leave the server claiming durable resumability.
+await interventionStore.init();
+interventionTools = createInterventionTools({ store: interventionStore, runs: testRuns, ctx: interventionCtx });
+interventionWatcher = new InterventionWatcher({ store: interventionStore, ctx: interventionCtx, pollIntervalMs: 5_000 });
+interventionWatcher.onResume = async (record) => {
+  const run = testRuns.get(record.runId);
+  if (run && typeof run.resume === "function") await run.resume(record);
+};
+interventionWatcher.start();
 
 function createBrowserDiagnosticSources(session, collector) {
   registerBrowserDiagnosticSources(session, collector);
@@ -131,11 +147,31 @@ async function callTool(name, args) {
     const correlator = new DiagnosticCorrelator();
     const controller = new AbortController();
     const runner = new TestRunner({ session, collector, correlator, signal: controller.signal, interventions: interventionStore });
+    // The watcher stays bound to the run's exact session and realm-specific
+    // verification, not to the first available session (P0-5).
+    const runCtx = {
+      ...interventionCtx,
+      hasAttachmentGrant: async targetId => sessions.has(targetId)
+        ? { ok: true }
+        : { ok: false, reason: `No authorized attachment grant for target '${targetId}'.` },
+      observe: async () => await session.observe().catch(() => null)
+    };
     const runPromise = runner.run(args.workflow, { runId });
     testRuns.set(runId, {
       collector, correlator, controller, runPromise, session, runner,
       startedAt: new Date().toISOString(),
-      resume: async () => ({ resume: "re-execute the suspended step via the TestRunner resume path" }),
+      resume: async (record) => {
+        const receipt = await Promise.race([runPromise, Promise.resolve(null)]).catch(() => null);
+        if (!receipt) return { resumed: false, reason: "Run receipt unavailable." };
+        return await runner.resume(receipt, {
+          verify: runCtx,
+          workflow: args.workflow
+        });
+      },
+      getState: async () => {
+        const receipt = await Promise.race([runPromise, Promise.resolve(null)]).catch(() => null);
+        return receipt?.status ?? "RUNNING";
+      },
       cancel: async () => { controller.abort(); }
     });
     return { status: "started", runId };
@@ -245,6 +281,7 @@ for await (const line of rl) {
     if (request.id !== undefined) write({ jsonrpc: "2.0", id: request.id, error: { code: error.code ?? -32000, message: String(error.message).slice(0, 1000) } });
   }
 }
+interventionWatcher?.stop();
 await Promise.all([...sessions.values()].map(session => session.close()));
 await chromeConnection?.close();
 await extensionBroker?.close();

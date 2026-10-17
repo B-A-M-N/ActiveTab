@@ -645,3 +645,66 @@ test("resuming a redacted search journal re-enters the caller phrase instead of 
   assert.equal(JSON.stringify(journal.value).includes("bronze lamp"), false);
   assert.equal(JSON.stringify(resumed).includes("bronze lamp"), false);
 });
+
+test("with an environment binding, a click onto a non-authorized origin is recovered, never success", async () => {
+  const environment = {
+    environmentId: "freeinference-staging",
+    authorizedOrigins: ["https://staging.freeinference.org"],
+    entryOrigin: "https://staging.freeinference.org"
+  };
+  const navigations = [];
+  const session = {
+    target: { id: "env-target", endpoint: "local-cdp" },
+    state: {
+      page: { url: "https://staging.freeinference.org/", title: "FreeInference" },
+      headings: [{ level: 1, text: "FreeInference" }],
+      candidates: [
+        { identity: "ext-link", backendNodeId: 1, documentGeneration: 1, name: "Agents", role: "link", tag: "a", visible: true },
+        { identity: "good-link", backendNodeId: 2, documentGeneration: 1, name: "Documentation", role: "link", tag: "a", visible: true }
+      ]
+    },
+    clicks: 0,
+    async observe() { return { evidenceId: `ev-${this.clicks}`, pageChangeFingerprint: `fp-${this.clicks}`, domMutationCount: this.clicks, lifecycleEventCount: this.clicks, ...structuredClone(this.state) }; },
+    async waitForChange() {},
+    client: {
+      async send(method, params) {
+        if (method === "Page.navigate") {
+          navigations.push(params.url);
+          session.state = {
+            page: { url: "https://staging.freeinference.org/", title: "FreeInference" },
+            headings: [{ level: 1, text: "FreeInference" }],
+            candidates: [
+              { identity: "good-link", backendNodeId: 2, documentGeneration: 1, name: "Agents portal", role: "link", tag: "a", visible: true }
+            ]
+          };
+        }
+      }
+    },
+    async click(candidate) {
+      this.clicks += 1;
+      if (candidate.identity === "ext-link") {
+        // The planner picked an external/unauthorized link.
+        this.state = {
+          page: { url: "https://unrelated.example.net/agents", title: "Agents" },
+          headings: [{ level: 1, text: "Agents" }],
+          candidates: []
+        };
+      } else {
+        this.state = {
+          page: { url: "https://staging.freeinference.org/agents", title: "Agents" },
+          headings: [{ level: 1, text: "Agents portal" }],
+          candidates: []
+        };
+      }
+    }
+  };
+  const result = await new NavigationEngine(session, { environment, maxActions: 3, maxRecoveries: 2 }).run("Open the Agents portal");
+  // The engine never declared success while on the unauthorized origin: it
+  // detected the off-environment navigation, returned to the authorized page,
+  // excluded the offending link, and only then completed on the authorized
+  // /agents route.
+  assert.equal(result.status, "succeeded", `expected recovery to succeed on the authorized origin (got ${result.status}: ${result.reason})`);
+  assert.ok(navigations.includes("https://staging.freeinference.org/"), `engine must navigate back to the authorized page, got ${JSON.stringify(navigations)}`);
+  assert.ok(session.clicks >= 2, "the off-environment link must not be the final state; a fresh authorized action was required");
+  assert.match(result.page?.url ?? "", /^https:\/\/staging\.freeinference\.org\//, `final page must be on the authorized origin, got ${result.page?.url}`);
+});

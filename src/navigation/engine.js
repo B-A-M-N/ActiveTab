@@ -4,6 +4,7 @@ import { searchPhraseFromGoal } from "./search.js";
 import { authorizePlannedAction } from "./actionPolicy.js";
 import { classifyHumanHandoff } from "./handoff.js";
 import { newTaskState, taskGoalFingerprint, updateTaskJournal } from "../state/journal.js";
+import { normalizeOrigin } from "../environments/model.js";
 import { matchesScrollTargetSignature, matchesTargetSignature, observationSemanticFingerprint, observationStateFingerprint, routeFingerprint, scrollPositionFraction, scrollPositionMatches, scrollTargetSignature, targetSignature, visibleCandidatesFingerprint } from "../state/workflows.js";
 
 function pageChangeWaitBaseline(observation, scrollTarget) {
@@ -39,7 +40,7 @@ function labelTerms(value) {
   return new Set(String(value ?? "").normalize("NFKC").toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []);
 }
 
-function hasVerifiedOutcome(observation, goal, initialPageLabelHashes) {
+function hasVerifiedOutcome(observation, goal, initialPageLabelHashes, environment = null) {
   const expected = goalExpectation(goal);
   if (!expected.targetTokens.length) return false;
   const labels = pageLabelEntries(observation);
@@ -58,7 +59,17 @@ function hasVerifiedOutcome(observation, goal, initialPageLabelHashes) {
   }
   // A matching label on the starting page is not proof that navigation happened. A matching route
   // is sufficient when already there; an SPA can instead prove the goal through a changed title/heading.
-  return pathMatches || changedLabelsMatch;
+  if (!(pathMatches || changedLabelsMatch)) return false;
+  // Environment guard: a goal whose label tokens happen to match on an
+  // unrelated origin is NOT a verified outcome. When an environment binding
+  // is supplied, the goal must be satisfied on one of its authorized origins
+  // (or already be there). This prevents a blind navigation step from
+  // "succeeding" after wandering onto an unauthorized site.
+  if (environment?.authorizedOrigins?.length) {
+    const observed = normalizeOrigin(observation.page.url);
+    if (observed && !environment.authorizedOrigins.includes(observed)) return false;
+  }
+  return true;
 }
 
 function handoffResult(goal, reason, authorizationRequired, attempts, recoveries, evidenceId) {
@@ -72,10 +83,13 @@ function unchangedAfterFailedClick(attempt) {
 }
 
 export class NavigationEngine {
-  constructor(session, { planner = configuredPlanner(), journal, workflowStore, maxActions = 8, maxRecoveries = 1, maxScrolls = 5, signal } = {}) {
+  constructor(session, { planner = configuredPlanner(), journal, workflowStore, maxActions = 8, maxRecoveries = 1, maxScrolls = 5, signal, environment = null } = {}) {
     this.signal = signal;
     this.session = session;
     this.planner = planner;
+    // Optional verified environment binding. When present, the engine refuses
+    // to count a navigation onto a non-authorized origin as goal progress.
+    this.environment = environment;
     this.journal = journal;
     this.workflowStore = workflowStore;
     this.maxActions = Math.max(1, Math.min(maxActions, 10));
@@ -109,6 +123,7 @@ export class NavigationEngine {
       throw new Error("Resume state goal fingerprint or target does not match the current authorized session.");
     }
     let latest = await this.session.observe();
+    state.initialUrl ??= latest.page.url;
     state.initialUrlFingerprint ??= routeFingerprint(latest.page.url);
     state.initialPageLabelHashes ??= pageLabelHashes(latest);
     state.status = "running";
@@ -197,7 +212,7 @@ export class NavigationEngine {
       return resultWithWorkflow({ status: state.status, goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: attempt.beforeEvidenceId });
     };
     const outcomeVerified = async () => {
-      if (!hasVerifiedOutcome(latest, goal, state.initialPageLabelHashes)) return false;
+      if (!hasVerifiedOutcome(latest, goal, state.initialPageLabelHashes, this.environment)) return false;
       return !searchPhrase || await this.session.verifySearchOutcome(searchPhrase);
     };
     const handoffIfNeeded = async observation => {
@@ -720,6 +735,30 @@ export class NavigationEngine {
           return resultWithWorkflow({ status: state.status, goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: latest.evidenceId });
         }
         continue;
+      }
+      // Off-environment navigation guard: a click that carries the page onto
+      // an origin not authorized by the environment binding is a misstep,
+      // never goal progress. Record it, navigate back to the authorized
+      // page, exclude the offending candidate, and recover.
+      if (actionType === "click" && !attempt.error && this.environment?.authorizedOrigins?.length && typeof this.session.client?.send === "function") {
+        const observed = normalizeOrigin(latest.page.url);
+        if (observed && !this.environment.authorizedOrigins.includes(observed)) {
+          attempt.error = {
+            name: "OffEnvironmentNavigation",
+            message: `Click navigated to non-authorized origin '${observed}'; returned to the authorized environment page.`
+          };
+          attempt.recoveredOffEnvironment = true;
+          excludedIdentities.add(selectedTarget.identity);
+          if (workflowTraceSafe) workflowTraceSafe = false;
+          try {
+            await this.session.client.send("Page.navigate", { url: state.initialUrl ?? "" });
+            await this.session.waitForChange(2_500, waitBaseline).catch(() => {});
+            latest = await this.session.observe();
+          } catch (error) {
+            if (isAbortError(error)) return await canceledWithPendingAction(attempt);
+            return await stopAfterObservationLoss(attempt, error);
+          }
+        }
       }
       if (attempt.error) {
         if (afterSemanticFingerprint !== beforeSemanticFingerprint) workflowTraceSafe = false;
