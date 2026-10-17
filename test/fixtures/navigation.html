@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Demo shop</title></head>
+<body>
+  <main>
+    <h1>Shop</h1>
+    <label>Test password <input type="password" value="fixture-secret" /></label>
+    <section><h2>Shipping history</h2><button type="button" onclick="document.querySelector('h1').textContent='Shipping history';document.title='Shipping history'">Continue</button></section>
+    <section><h2>Billing history</h2><button type="button" onclick="document.querySelector('h1').textContent='Billing history';document.title='Billing history'">Continue</button></section>
+    <section><h2>Ambiguous route</h2><button type="button" onclick="document.querySelector('h1').textContent='Primary route';document.title='Primary route'">Continue</button><button type="button" onclick="document.querySelector('h1').textContent='Alternate route';document.title='Alternate route'">Continue</button></section>
+    <section><h2>Invoices</h2><div id="invoice-list" role="list" aria-label="Invoice list" style="height:168px;overflow-y:auto;position:relative;border:1px solid #999"><div id="invoice-spacer" style="height:1120px;position:relative"></div></div></section>
+    <button id="account" type="button">Open account</button>
+    <button id="obstructed" type="button" onclick="document.title='Obstructed action ran'">Open obstructed controls</button>
+    <div id="cover" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.2)"></div>
+    <p id="status">Waiting</p>
+    <section id="resource-section">
+      <h2>Test resources</h2>
+      <button id="create-resource" type="button">Create resource</button>
+      <span id="resource-id" data-testid="resource-id"></span>
+      <button id="delete-resource" type="button" disabled>Delete resource</button>
+    </section>
+    <div style="height: 1800px" aria-hidden="true"></div>
+    <button id="archive" type="button" onclick="document.querySelector('h1').textContent='Archive';document.title='Archive'">Open archive</button>
+    <form onsubmit="event.preventDefault();document.querySelector('h1').textContent='Search results';document.title='Search results'">
+      <input type="search" aria-label="Search text" />
+      <button type="submit">Search</button>
+    </form>
+    <iframe title="Embedded profile" src="/same-frame.html" width="360" height="160"></iframe>
+    <iframe title="Cross-origin profile" src="CROSS_ORIGIN_FRAME_URL" width="360" height="160"></iframe>
+    <div id="shadow-host"></div>
+  </main>
+  <script>
+    const invoiceList = document.querySelector("#invoice-list");
+    const invoiceSpacer = document.querySelector("#invoice-spacer");
+    const invoiceRows = Array.from({ length: 6 }, () => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.style.cssText = "position:absolute;left:0;right:0;height:26px";
+      invoiceSpacer.append(button);
+      return button;
+    });
+    function renderInvoices() {
+      const first = Math.max(0, Math.floor(invoiceList.scrollTop / 28));
+      invoiceRows.forEach((button, offset) => {
+        const invoice = first + offset + 1;
+        button.textContent = `Open invoice ${invoice}`;
+        button.style.top = `${(invoice - 1) * 28}px`;
+        button.onclick = () => {
+          document.querySelector("h1").textContent = `Invoice ${invoice}`;
+          document.title = `Invoice ${invoice}`;
+        };
+      });
+    }
+    invoiceList.addEventListener("scroll", renderInvoices, { passive: true });
+    renderInvoices();
+    const shadowRoot = document.querySelector("#shadow-host").attachShadow({ mode: "open" });
+    shadowRoot.innerHTML = '<button type="button">Open shadow preferences</button>';
+    shadowRoot.querySelector("button").addEventListener("click", () => {
+      document.querySelector("h1").textContent = "Shadow preferences";
+      document.title = "Shadow preferences";
+    });
+    window.addEventListener("message", event => {
+      if (event.origin === location.origin && event.data?.kind === "frame-account-open") {
+        document.querySelector("h1").textContent = "Frame controls";
+        document.title = "Frame controls";
+      } else if (event.data?.kind === "cross-frame-open") {
+        document.querySelector("h1").textContent = "Cross-origin controls";
+        document.title = "Cross-origin controls";
+      }
+    });
+    let attempts = 0;
+    document.querySelector("#account").addEventListener("click", () => {
+      attempts += 1;
+      if (attempts === 1) {
+        document.querySelector("#account").replaceWith(Object.assign(document.createElement("button"), {
+          id: "account-retry",
+          textContent: "Continue to account",
+          onclick() {
+            fetch("/api/account?session=network-query-token")
+              .then(response => response.json())
+              .then(() => {
+                document.querySelector("h1").textContent = "Account";
+                document.querySelector("#status").textContent = "Account loaded";
+                document.title = "Account";
+              });
+          }
+        }));
+        document.querySelector("#status").textContent = "Refreshing account controls";
+        return;
+      }
+      fetch("/api/account?session=network-query-token")
+        .then(response => response.json())
+        .then(() => {
+          document.querySelector("h1").textContent = "Account";
+          document.querySelector("#status").textContent = "Account loaded";
+          document.title = "Account";
+        });
+    });
+    let createdResourceId = null;
+    document.querySelector("#create-resource").addEventListener("click", async () => {
+      const response = await fetch("/api/resources", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ label: "test-resource" }) });
+      const data = await response.json();
+      createdResourceId = data.id;
+      document.querySelector("#resource-id").textContent = data.id;
+      document.querySelector("#create-resource").disabled = true;
+      document.querySelector("#delete-resource").disabled = false;
+      document.querySelector("#status").textContent = `Resource created: ${data.id}`;
+    });
+    document.querySelector("#delete-resource").addEventListener("click", async () => {
+      if (!createdResourceId) return;
+      await fetch(`/api/resources/${createdResourceId}`, { method: "DELETE" });
+      document.querySelector("#resource-id").textContent = "";
+      document.querySelector("#create-resource").disabled = false;
+      document.querySelector("#delete-resource").disabled = true;
+      document.querySelector("#status").textContent = "Resource deleted";
+      createdResourceId = null;
+    });
+  </script>
+</body>
+</html>

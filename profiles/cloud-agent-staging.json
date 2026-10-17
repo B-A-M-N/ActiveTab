@@ -1,0 +1,42 @@
+{
+  "$schema": "./profile-schema.json",
+  "profile_id": "cloud-agent-staging",
+  "name": "Cloud Agent Staging",
+  "description": "Cloud Agent staging application. Routes and operations are discovered, not predeclared.",
+  "origin_patterns": ["https://staging.cloudagent.ai", "https://cloud-agent.staging.internal"],
+  "authentication_realms": [
+    {
+      "realm_id": "cloud-agent-app",
+      "description": "Cloud Agent application session",
+      "scope": ["app"],
+      "separate_credentials": true
+    },
+    {
+      "realm_id": "fi-dashboard-admin",
+      "description": "FreeInference dashboard admin session. Does not authorize Cloud Agent internal tools.",
+      "scope": ["fi_dashboard"],
+      "separate_credentials": true
+    }
+  ],
+  "diagnostic_sources": [
+    {
+      "source_id": "cloud-agent-execution-history",
+      "description": "Execution history visible in the Cloud Agent application. Discovery is required.",
+      "authority": "application_session",
+      "operations": ["read"],
+      "scope": "run-scoped",
+      "sensitivity": "metadata_only",
+      "validation_required": true
+    },
+    {
+      "source_id": "cloud-agent-worker-status",
+      "description": "Worker and scheduling diagnostics, if exposed. Discovery is required.",
+      "authority": "admin_session",
+      "operations": ["read_aggregate"],
+      "scope": "aggregate",
+      "sensitivity": "metadata_only",
+      "validation_required": true
+    }
+  ],
+  "test_packs": []
+}

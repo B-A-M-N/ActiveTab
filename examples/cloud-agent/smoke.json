@@ -1,0 +1,32 @@
+{
+  "workflow_id": "cloud-agent-smoke",
+  "name": "Cloud Agent smoke test",
+  "description": "Verify login state, application availability, route navigation, visible controls, and available status endpoints.",
+  "profile_id": "cloud-agent-staging",
+  "mode": "observe",
+  "steps": [
+    {
+      "id": "s1",
+      "type": "navigate",
+      "url": "https://staging.cloudagent.ai/"
+    },
+    {
+      "id": "s2",
+      "type": "assert",
+      "assertion": {
+        "type": "page_title_contains",
+        "value": "cloud"
+      }
+    },
+    {
+      "id": "s3",
+      "type": "diagnostic_snapshot"
+    },
+    {
+      "id": "s4",
+      "type": "cleanup"
+    }
+  ],
+  "template": true,
+  "executable": false
+}

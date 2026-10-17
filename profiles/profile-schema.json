@@ -1,0 +1,41 @@
+{
+  "type": "object",
+  "required": ["profile_id", "name", "origin_patterns", "authentication_realms"],
+  "properties": {
+    "profile_id": { "type": "string" },
+    "name": { "type": "string" },
+    "description": { "type": "string" },
+    "origin_patterns": { "type": "array", "items": { "type": "string" } },
+    "authentication_realms": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["realm_id", "scope"],
+        "properties": {
+          "realm_id": { "type": "string" },
+          "description": { "type": "string" },
+          "scope": { "type": "array", "items": { "type": "string" } },
+          "separate_credentials": { "type": "boolean" }
+        }
+      }
+    },
+    "diagnostic_sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["source_id", "authority", "operations", "scope", "sensitivity", "validation_required"],
+        "properties": {
+          "source_id": { "type": "string" },
+          "description": { "type": "string" },
+          "authority": { "type": "string" },
+          "operations": { "type": "array", "items": { "type": "string" } },
+          "scope": { "type": "string" },
+          "sensitivity": { "type": "string" },
+          "validation_required": { "type": "boolean", "const": true },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "test_packs": { "type": "array", "items": { "type": "object" } }
+  }
+}

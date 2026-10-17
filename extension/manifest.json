@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "ActiveTab",
+  "version": "0.1.0",
+  "description": "Explicitly attach ActiveTab to the current Chrome tab for local native CDP control.",
+  "minimum_chrome_version": "125",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArEYqG1MIw9/4+j0+rU3NWJocoF8qQFaOMFdE3idAmY5gfusiJALlpHody3janda6SUXiHgHj2/l9f4xQjoR/ELMnXUeqBxegkADRP1wpVEw6tCFM4Z09x/9wGuxbua+S5wwUzahn39Ev090iOmMMO76c6OtotqV54vb0Amwf5LbQnvfXmLyuJ84zDUFQfSAAtq/hEarT3L8fVFmxVOfWB1/iwGMNPvtElqzw+QXQ+iSngN7IRWhf7wxlJr+Av4Tb7C+I9SXDcNcw8f7XqJq0SzSP/NlrL5NKYG4HRN298IA5ZGoNv61tNkUI7zaVaZE3FqCefvR36KHRUJr0Rh36twIDAQAB",
+  "permissions": ["activeTab", "debugger", "nativeMessaging", "storage"],
+  "background": { "service_worker": "service-worker.js", "type": "module" },
+  "action": { "default_popup": "popup.html", "default_title": "Attach ActiveTab" }
+}

@@ -1,0 +1,57 @@
+{
+  "workflow_id": "cloud-agent-execution-recovery",
+  "name": "Execution recovery",
+  "description": "Submit a controlled operation, observe execution, and verify result or recovery.",
+  "profile_id": "cloud-agent-staging",
+  "mode": "test",
+  "requires": [
+    "test_owned_resource"
+  ],
+  "steps": [
+    {
+      "id": "s1",
+      "type": "setup"
+    },
+    {
+      "id": "s2",
+      "type": "interact",
+      "action": {
+        "description": "create a test-owned agent/thread",
+        "ownership": "test_owned",
+        "idempotent": false
+      }
+    },
+    {
+      "id": "s3",
+      "type": "interact",
+      "action": {
+        "description": "submit a controlled operation",
+        "ownership": "test_owned",
+        "idempotent": true
+      }
+    },
+    {
+      "id": "s4",
+      "type": "controlled_failure",
+      "description": "inject a supported controlled failure via an approved mechanism"
+    },
+    {
+      "id": "s5",
+      "type": "retry_verification"
+    },
+    {
+      "id": "s6",
+      "type": "postcondition",
+      "assertion": {
+        "type": "diagnostic_source_available",
+        "sourceId": "cloud-agent-execution-history"
+      }
+    },
+    {
+      "id": "s7",
+      "type": "cleanup"
+    }
+  ],
+  "template": true,
+  "executable": false
+}

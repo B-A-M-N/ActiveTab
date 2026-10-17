@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Cross-origin profile</title></head>
+<body>
+  <script>globalThis.__activetabFrameState__ = { frameLabel: "cross-origin runtime fixture" };</script>
+  <main>
+    <h1>Cross-origin profile</h1>
+    <button type="button" onclick="parent.postMessage({kind:'cross-frame-open'}, '*')">Open cross-origin controls</button>
+  </main>
+</body>
+</html>

@@ -1,0 +1,20 @@
+{
+  "name": "active-tab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A local-first native browser navigation runtime built on CDP",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "node src/cli.js",
+    "mcp": "node src/mcp/server.js",
+    "mcp:extension": "node src/extension/start-mcp.js",
+    "native-host:setup": "node scripts/install-native-host.js",
+    "test": "node --test",
+    "api": "node src/api/start-server.js",
+    "api:test": "node --test test/api-server.test.js",
+    "test:headed": "bash scripts/test-headed.sh"
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "workflow_id": "cloud-agent-mcp-lifecycle",
+  "name": "MCP connector lifecycle",
+  "description": "Where supported, test connector registration, association, invocation, revocation, and recovery.",
+  "profile_id": "cloud-agent-staging",
+  "mode": "test",
+  "requires": [
+    "test_owned_resource"
+  ],
+  "steps": [
+    {
+      "id": "s1",
+      "type": "setup"
+    },
+    {
+      "id": "s2",
+      "type": "navigate"
+    },
+    {
+      "id": "s3",
+      "type": "interact",
+      "action": {
+        "description": "register a test-owned MCP connector",
+        "ownership": "test_owned",
+        "idempotent": false
+      }
+    },
+    {
+      "id": "s4",
+      "type": "wait_for",
+      "condition": {
+        "type": "element_visible",
+        "selector": "connector-list"
+      }
+    },
+    {
+      "id": "s5",
+      "type": "interact",
+      "action": {
+        "description": "invoke the connector",
+        "ownership": "test_owned",
+        "idempotent": true
+      }
+    },
+    {
+      "id": "s6",
+      "type": "interact",
+      "action": {
+        "description": "revoke the connector",
+        "ownership": "test_owned",
+        "idempotent": false
+      }
+    },
+    {
+      "id": "s7",
+      "type": "postcondition",
+      "assertion": {
+        "type": "element_visible",
+        "selector": "connector-list"
+      }
+    },
+    {
+      "id": "s8",
+      "type": "cleanup"
+    }
+  ],
+  "template": true,
+  "executable": false
+}

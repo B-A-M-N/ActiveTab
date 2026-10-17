@@ -1,0 +1,52 @@
+{
+  "workflow_id": "cloud-agent-diagnostic-correlation",
+  "name": "Diagnostic correlation",
+  "description": "Execute a controlled workflow that generates identifiable activity, then verify that the diagnostic collector can associate browser events, API records, and authorized backend evidence.",
+  "profile_id": "cloud-agent-staging",
+  "mode": "test",
+  "requires": [
+    "test_owned_resource",
+    "diagnostic_access"
+  ],
+  "steps": [
+    {
+      "id": "s1",
+      "type": "setup"
+    },
+    {
+      "id": "s2",
+      "type": "interact",
+      "action": {
+        "description": "submit a controlled operation with an identifiable trace",
+        "ownership": "test_owned",
+        "idempotent": false
+      }
+    },
+    {
+      "id": "s3",
+      "type": "diagnostic_snapshot"
+    },
+    {
+      "id": "s4",
+      "type": "assert",
+      "assertion": {
+        "type": "network_request_seen",
+        "urlPattern": "execution|trace"
+      }
+    },
+    {
+      "id": "s5",
+      "type": "postcondition",
+      "assertion": {
+        "type": "diagnostic_source_available",
+        "sourceId": "cloud-agent-execution-history"
+      }
+    },
+    {
+      "id": "s6",
+      "type": "cleanup"
+    }
+  ],
+  "template": true,
+  "executable": false
+}

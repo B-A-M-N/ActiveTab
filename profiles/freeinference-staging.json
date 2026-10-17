@@ -1,0 +1,37 @@
+{
+  "$schema": "./profile-schema.json",
+  "profile_id": "freeinference-staging",
+  "name": "FreeInference Staging",
+  "description": "Read-only diagnostic surfaces discovered in the FreeInference staging environment. Profile data is a starting point, not an authority. Validate actual routes before executing test steps.",
+  "origin_patterns": ["https://staging.freeinference.ai"],
+  "authentication_realms": [
+    {
+      "realm_id": "fi-dashboard",
+      "description": "FreeInference dashboard login session",
+      "scope": ["dashboard"],
+      "separate_credentials": true
+    }
+  ],
+  "diagnostic_sources": [
+    {
+      "source_id": "fi-request-history",
+      "description": "Recent request history visible in the dashboard. Starting evidence for diagnostic discovery.",
+      "authority": "application_session",
+      "operations": ["read"],
+      "scope": "run-scoped, metadata-first",
+      "sensitivity": "metadata_only",
+      "validation_required": true,
+      "notes": "Route is not predeclared. Discover via reconnaissance and verify before collection."
+    },
+    {
+      "source_id": "fi-analytics",
+      "description": "Aggregate analytics interface, if accessible.",
+      "authority": "admin_session",
+      "operations": ["read_aggregate"],
+      "scope": "aggregate only",
+      "sensitivity": "aggregate",
+      "validation_required": true
+    }
+  ],
+  "test_packs": []
+}
