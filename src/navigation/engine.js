@@ -5,6 +5,7 @@ import { authorizePlannedAction } from "./actionPolicy.js";
 import { classifyHumanHandoff } from "./handoff.js";
 import { newTaskState, taskGoalFingerprint, updateTaskJournal } from "../state/journal.js";
 import { normalizeOrigin } from "../environments/model.js";
+import { isOperatorProhibitedNavigation } from "../runtime/controlRestrictions.js";
 import { matchesScrollTargetSignature, matchesTargetSignature, observationSemanticFingerprint, observationStateFingerprint, routeFingerprint, scrollPositionFraction, scrollPositionMatches, scrollTargetSignature, targetSignature, visibleCandidatesFingerprint } from "../state/workflows.js";
 
 function pageChangeWaitBaseline(observation, scrollTarget) {
@@ -743,15 +744,32 @@ export class NavigationEngine {
       if (actionType === "click" && !attempt.error && this.environment?.authorizedOrigins?.length && typeof this.session.client?.send === "function") {
         const observed = normalizeOrigin(latest.page.url);
         if (observed && !this.environment.authorizedOrigins.includes(observed)) {
+          const recoveryUrl = state.initialUrl ?? "";
+          if (isOperatorProhibitedNavigation(recoveryUrl)) {
+            attempt.error = {
+              name: "OperatorProhibitedNavigation",
+              message: "Automatic recovery would reopen the operator-prohibited Admin Console Audit Log; execution stopped for an operator."
+            };
+            excludedIdentities.add(selectedTarget.identity);
+            state.status = "needs_human";
+            state.authorizationRequired = true;
+            state.terminationReason = attempt.error.message;
+            attempt.afterRouteFingerprint = routeFingerprint(latest.page.url);
+            attempt.afterEvidenceId = latest.evidenceId;
+            attempt.completedAt = new Date().toISOString();
+            finishAction(attempt);
+            await updateJournal();
+            return resultWithWorkflow(handoffResult(goal, state.terminationReason, true, state.attempts.length, recoveries, latest.evidenceId));
+          }
           attempt.error = {
             name: "OffEnvironmentNavigation",
-            message: `Click navigated to non-authorized origin '${observed}'; returned to the authorized environment page.`
+            message: `Click navigated to non-authorized origin '${observed}'; returning to the authorized environment page.`
           };
           attempt.recoveredOffEnvironment = true;
           excludedIdentities.add(selectedTarget.identity);
           if (workflowTraceSafe) workflowTraceSafe = false;
           try {
-            await this.session.client.send("Page.navigate", { url: state.initialUrl ?? "" });
+            await this.session.client.send("Page.navigate", { url: recoveryUrl });
             await this.session.waitForChange(2_500, waitBaseline).catch(() => {});
             latest = await this.session.observe();
           } catch (error) {

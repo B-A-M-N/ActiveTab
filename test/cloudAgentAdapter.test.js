@@ -37,7 +37,7 @@ test("cloudAgentAdapter healthCheck verifies connectivity and admin authority", 
     res.writeHead(404, { "content-type": "application/json" });
     res.end(JSON.stringify({ detail: "Not Found" }));
   }, async url => {
-    const adapter = new CloudAgentDiagnosticAdapter({ baseUrl: url, adminToken: "test-admin-token" });
+    const adapter = new CloudAgentDiagnosticAdapter({ baseUrl: url, adminToken: "test-admin-token", diagnosticTransport: "ssh_tunnel", remoteTarget: "staging.freeinference.org" });
     const health = await adapter.healthCheck();
     assert.equal(health.healthy, true);
   });
@@ -77,7 +77,7 @@ test("cloudAgentAdapter collects real records from all diagnostic sources", asyn
     }
     res.writeHead(404); res.end();
   }, async url => {
-    const adapter = new CloudAgentDiagnosticAdapter({ baseUrl: url, adminToken: "test-token" });
+    const adapter = new CloudAgentDiagnosticAdapter({ baseUrl: url, adminToken: "test-token", diagnosticTransport: "ssh_tunnel", remoteTarget: "staging.freeinference.org" });
     const collector = new DiagnosticCollector({ runId: "test-run" });
     adapter.registerSources(collector);
     const results = await collector.collectAll(collector.listSources().map(s => ({ sourceId: s.id, operation: "read" })));
@@ -112,7 +112,7 @@ test("cloudAgentAdapter getRunDetail and getRunActivity use the correct paths", 
     }
     res.writeHead(404); res.end();
   }, async url => {
-    const adapter = new CloudAgentDiagnosticAdapter({ baseUrl: url, adminToken: "t" });
+    const adapter = new CloudAgentDiagnosticAdapter({ baseUrl: url, adminToken: "t", diagnosticTransport: "ssh_tunnel", remoteTarget: "staging.freeinference.org" });
     const detail = await adapter.getRunDetail("job-123");
     assert.equal(detail.status, "ok");
     assert.equal(detail.data.run.id, "job-123");
@@ -121,8 +121,20 @@ test("cloudAgentAdapter getRunDetail and getRunActivity use the correct paths", 
   });
 });
 
+test("cloudAgentAdapter rejects loopback without explicit ssh_tunnel transport", () => {
+  assert.throws(
+    () => new CloudAgentDiagnosticAdapter({ baseUrl: "http://127.0.0.1:18000", adminToken: "t" }),
+    /requires diagnosticTransport 'ssh_tunnel'/
+  );
+});
+
 test("cloudAgentAdapterFromEnv returns null without config and adapter with both vars", () => {
   assert.equal(cloudAgentAdapterFromEnv({}), null);
-  const adapter = cloudAgentAdapterFromEnv({ ACTIVETAB_CLOUD_AGENT_URL: "http://127.0.0.1:18000", ACTIVETAB_CLOUD_AGENT_ADMIN_TOKEN: "t" });
+  const adapter = cloudAgentAdapterFromEnv({
+    ACTIVETAB_CLOUD_AGENT_URL: "http://127.0.0.1:18000",
+    ACTIVETAB_CLOUD_AGENT_ADMIN_TOKEN: "t",
+    ACTIVETAB_CLOUD_AGENT_TRANSPORT: "ssh_tunnel",
+    ACTIVETAB_CLOUD_AGENT_REMOTE_TARGET: "staging.freeinference.org"
+  });
   assert.ok(adapter instanceof CloudAgentDiagnosticAdapter);
 });

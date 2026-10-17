@@ -52,19 +52,38 @@ export function createInterventionTools({ store, runs = new Map(), ctx = {} }) {
       };
     },
 
-    async approve_operation({ interventionId, grantedBy = "human_operator", expiresInMs } = {}) {
+    async request_operation_approval({ interventionId } = {}) {
       const record = store.get(interventionId);
       if (!record) throw new Error(`No intervention '${interventionId}'.`);
+      // Agent-callable: creates a pending approval request only. It never
+      // issues authority; resolution requires an independently authenticated
+      // operator channel.
+      return {
+        interventionId,
+        status: "pending_approval",
+        message: "Approval requested. Resolve via an independently authenticated operator channel; this client cannot issue grants."
+      };
+    },
+
+    async resolve_operation_approval({ interventionId, authenticatedOperator, decision = "approve", expectedRevision = null } = {}) {
+      const record = store.get(interventionId);
+      if (!record) throw new Error(`No intervention '${interventionId}'.`);
+      if (!authenticatedOperator || typeof authenticatedOperator !== "string") {
+        throw new Error("Operator authentication is required to resolve an approval.");
+      }
+      if (decision !== "approve") {
+        const canceled = await store.cancel(interventionId);
+        return { interventionId, state: canceled.state, decision: "rejected" };
+      }
       if (typeof ctx.issueGrant !== "function") throw new Error("No approval-grant issuer is configured.");
       const grant = ctx.issueGrant({
-        principal: grantedBy,
+        principal: authenticatedOperator,
         environmentId: record.environmentId,
         authenticationRealm: record.authenticationRealm,
         resource: record.applicationId ?? record.runId,
         operation: record.completionCondition?.operation ?? record.type,
         input: record.completionCondition?.input ?? {},
-        allowedEffects: record.completionCondition?.allowedEffects ?? [`${record.type}:approved`],
-        ...(expiresInMs ? { expiresInMs } : {})
+        allowedEffects: record.completionCondition?.allowedEffects ?? [`${record.type}:approved`]
       });
       return { interventionId, grantId: grant.grantId, expiresAt: grant.expiresAt, state: grant.state };
     },

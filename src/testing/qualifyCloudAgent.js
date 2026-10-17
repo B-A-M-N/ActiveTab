@@ -26,13 +26,12 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID, createHash } from "node:crypto";
 
-import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
 import { TestRunner } from "./runner.js";
 import { InterventionStore, InterventionWatcher } from "../runtime/interventions.js";
 import { loadEnvironmentBinding } from "./profiles.js";
-import { verifyObservedUrl, isLoopbackUrl, normalizeOrigin } from "../environments/model.js";
+import { verifyObservedUrl, isLoopbackUrl } from "../environments/model.js";
 import { classifyHumanHandoff } from "../navigation/handoff.js";
-import { RUN_STATUS } from "./schema.js";
+import { RUN_STATUS, isWaitingRunStatus } from "./schema.js";
 
 const QUALIFICATION_STATES = Object.freeze({
   PASSED: "PASSED",
@@ -53,13 +52,66 @@ const MANDATORY_GATES = Object.freeze([
 ]);
 
 
-/** Resolve a possibly-relative href against the observed page URL. */
-function absolutize(href, baseUrl) {
-  try { return new URL(String(href ?? ""), String(baseUrl ?? "")).href; } catch { return null; }
+const DIAGNOSTIC_SURFACE_HINT = /\b(?:admin|diagnostic|logs?|history|requests?|activity|events?|audit|analytics|usage|metrics?|traces?|monitor(?:ing)?|observability|executions?|runs?|reports?|errors?|failures?|workers?|queues?)\b/i;
+const TASK_HISTORY_HINT = /\b(?:tasks?|jobs?)\b/i;
+const SAFE_SURFACE_TERMS = /\b(?:admin|console|dashboard|diagnostics?|logs?|history|requests?|activity|events?|audit|analytics|usage|metrics?|traces?|monitor(?:ing)?|observability|executions?|runs?|reports?|errors?|failures?|workers?|queues?|tasks?|jobs?|recent|completed|failed|view|page|panel)\b/ig;
+
+function redactPath(pathname) {
+  return pathname.split("/").map(segment => {
+    if (!segment) return segment;
+    if (/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(segment) || /^\d{4,}$/.test(segment) || segment.length > 64) return ":id";
+    return segment;
+  }).join("/");
 }
 
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/**
+ * Inventory only visible, relevant links from the current page. This is a
+ * discovery hint for an operator: it never opens a link or reads its target.
+ */
+export function discoverVisibleDiagnosticSurfaces(observation, environment) {
+  const allowedOrigins = new Set(environment?.authorizedOrigins ?? []);
+  const seen = new Set();
+  const surfaces = [];
+  for (const candidate of observation?.candidates ?? []) {
+    if (candidate.visible !== true || (!candidate.href && String(candidate.role).toLowerCase() !== "link")) continue;
+    const label = String(candidate.name ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
+    let destination = null;
+    let pathname = "";
+    if (candidate.href) {
+      try {
+        const url = new URL(candidate.href, observation?.page?.url);
+        if (url.protocol !== "https:" || !allowedOrigins.has(url.origin)) continue;
+        pathname = url.pathname;
+        destination = `${url.origin}${redactPath(pathname)}`;
+      } catch { continue; }
+    }
+    const taskHistoryLabel = TASK_HISTORY_HINT.test(label) && /\b(?:history|recent|past|completed|failed|runs?)\b/i.test(label);
+    if (!label || (!DIAGNOSTIC_SURFACE_HINT.test(label) && !DIAGNOSTIC_SURFACE_HINT.test(pathname) && !taskHistoryLabel)) continue;
+    const safeTerms = [...label.matchAll(SAFE_SURFACE_TERMS)].map(match => match[0]);
+    const pathTerms = [...pathname.matchAll(SAFE_SURFACE_TERMS)].map(match => match[0]);
+    const reportedLabel = (safeTerms.length ? safeTerms : pathTerms).join(" ").slice(0, 120);
+    const key = `${label.toLowerCase()}|${destination ?? "no-href"}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    let sourceOrigin = null;
+    let sourcePage = null;
+    try {
+      const sourceUrl = new URL(observation?.page?.url);
+      sourceOrigin = sourceUrl.origin;
+      sourcePage = `${sourceUrl.origin}${redactPath(sourceUrl.pathname)}`;
+    } catch { /* keep source unknown */ }
+    surfaces.push({
+      sourceOrigin,
+      sourcePage,
+      label: reportedLabel || "diagnostic candidate",
+      role: String(candidate.role ?? "link").slice(0, 32),
+      destination,
+      category: /\badmin\b/i.test(`${label} ${pathname}`) ? "admin-entry" : "diagnostic-candidate",
+      action: "not opened"
+    });
+    if (surfaces.length >= 20) break;
+  }
+  return surfaces;
 }
 
 /** Bounded wait for the page to finish loading (origin is 'null' mid-load). */
@@ -76,6 +128,83 @@ async function observeLoadedPage(session, { timeoutMs = 20_000 } = {}) {
   return last;
 }
 
+/** Return a profile identity hint. This URL is never used as a navigation target. */
+export function resolveCloudAgentEntry(environment) {
+  const app = (environment?.applications ?? []).find(item => item.applicationId === "fi-agents");
+  if (!app?.candidateEntry) return null;
+  let url;
+  try { url = new URL(app.candidateEntry, environment.applicationEntryUrl); }
+  catch { throw new Error("The profile's Cloud Agent entry is not a valid URL."); }
+  const identity = verifyObservedUrl(environment, url.href);
+  if (!identity.ok) throw new Error(`The profile's Cloud Agent entry is not authorized: ${identity.reason}`);
+  return { url: url.href, origin: url.origin, applicationId: app.applicationId, authenticationRealm: app.authenticationRealm ?? "agents-session" };
+}
+
+/** The actual Agent destination must be reached through the staging UI. */
+export function verifyCloudAgentReady(observation, environment, expectedOrigin) {
+  const url = observation?.page?.url;
+  const identity = verifyObservedUrl(environment, url);
+  if (!identity.ok) return { ok: false, reason: identity.reason ?? "Observed URL is outside the authorized staging environment." };
+  if (expectedOrigin && identity.origin !== expectedOrigin) {
+    return { ok: false, reason: `Observed application origin '${identity.origin}' does not match the profile's Cloud Agent identity hint.` };
+  }
+  if (!/\bagent\b/i.test(String(observation?.page?.title ?? ""))) {
+    return { ok: false, reason: "The observed page title does not identify the Cloud Agent application." };
+  }
+  if (!hasCloudAgentTaskComposer(observation)) {
+    return { ok: false, reason: "The protected Cloud Agent task composer is not visible yet." };
+  }
+  return { ok: true, origin: identity.origin, evidenceId: observation.evidenceId ?? null };
+}
+
+/** Positive UI evidence that the protected task application, not its login page, is ready. */
+export function hasCloudAgentTaskComposer(observation) {
+  const candidates = observation?.candidates ?? [];
+  const hasNewTaskControl = candidates.some(candidate =>
+    candidate.visible !== false && /\bnew task\b/i.test(String(candidate.name ?? ""))
+  );
+  const hasTaskInput = candidates.some(candidate =>
+    candidate.visible !== false && candidate.disabled !== true &&
+    String(candidate.role ?? "").toLowerCase() === "textbox"
+  );
+  return hasNewTaskControl && hasTaskInput;
+}
+
+/** Build a workflow that follows visible UI navigation and never auto-navigates to candidate_entry. */
+export function createCloudAgentEntryWorkflow(environment, observation) {
+  const agentEntry = resolveCloudAgentEntry(environment);
+  if (!agentEntry) return null;
+  const alreadyAtComposer = verifyCloudAgentReady(observation, environment, agentEntry.origin).ok;
+  const steps = [];
+  if (!alreadyAtComposer) {
+    steps.push({
+      type: "goal",
+      id: "follow-visible-agents-route",
+      goal: "Follow the visible Cloud Agents link from the current FreeInference staging page, complete the visible Agent login link if required, and reach the Cloud Agent task composer",
+      intervention: {
+        type: "authentication",
+        realm: agentEntry.authenticationRealm,
+        requiredAction: "In the open browser, finish the current login if needed, return to the staging page, click its visible Cloud Agents link, then click the Agent page's visible login link. Stop when the Cloud Agent task composer is visible.",
+        condition: { type: "authenticated_session_check", realm: agentEntry.authenticationRealm }
+      }
+    });
+  }
+  steps.push({
+    id: "verify-task-composer",
+    type: "assert",
+    assertion: { type: "candidate_name_contains", value: "new task" }
+  });
+  return {
+    agentEntry,
+    alreadyAtComposer,
+    workflow: {
+      id: "cloud-agent-enter-agents",
+      name: "Follow staging navigation and verify the Cloud Agent task composer",
+      steps
+    }
+  };
+}
+
 /**
  * Execute the real Cloud Agent staging qualification.
  *
@@ -86,9 +215,7 @@ async function observeLoadedPage(session, { timeoutMs = 20_000 } = {}) {
  * @param {object} [options.runStore] - Optional RunStateStore (durable mode).
  * @param {object} [options.diagnostics] - Optional DiagnosticCollector.
  * @param {object} [options.mode] - "test" | "owned" | "attached".
- * @param {boolean} [options.waitForHuman] - Allow a bounded in-process
- *   wait for human authentication (only meaningful with a usable display).
- * @param {number} [options.humanWaitMs] - Bound for the human wait.
+ * @param {Function} [options.onHumanIntervention] - Wait for an operator, then verify and resume.
  * @param {AbortSignal} [options.signal] - Cancellation.
  * @param {Function} [options.onEvent] - Progress callback (text) => {}.
  */
@@ -99,8 +226,7 @@ export async function qualifyCloudAgent({
   runStore = null,
   diagnostics = null,
   mode = "test",
-  waitForHuman = false,
-  humanWaitMs = 5 * 60_000,
+  onHumanIntervention = null,
   signal,
   onEvent = null
 }) {
@@ -111,6 +237,7 @@ export async function qualifyCloudAgent({
   const evidence = [];
   const steps = [];
   const limitations = [];
+  const discoveries = { visibleDiagnosticSurfaces: [] };
   const gate = (name, passed, detail = null) => {
     gates[name] = { passed: passed === true, ...(detail ? { detail: String(detail).slice(0, 300) } : {}) };
     emit(`${passed === true ? "PASS" : "FAIL"} gate: ${name}${detail ? ` — ${detail}` : ""}`);
@@ -191,160 +318,94 @@ export async function qualifyCloudAgent({
     // is itself a named gate; it is NOT operational qualification.
     gate("real_staging_site_reached", true, observedUrl);
 
-    // ── 3. Authenticated application access (human-intervention boundary) ──
+    discoveries.visibleDiagnosticSurfaces.push(...discoverVisibleDiagnosticSurfaces(observation, environment));
+
+    // ── 3. Authentication and Agent entry use the real visible UI route ──
     const handoff = classifyHumanHandoff(observation);
     const authRequired = handoff?.category === "authentication" || handoff?.category === "anti_automation";
     if (authRequired) {
-      const type = handoff.category === "anti_automation" ? "human_decision" : "authentication";
-      const record = await interventions.create({
-        runId,
-        stepId: "enter-agents",
-        type,
-        reason: handoff.reason,
-        requiredHumanAction: "Complete sign-in in the attached browser tab. No password or MFA code passes through the agent.",
-        completionCondition: type === "human_decision"
-          ? { type: "challenge_cleared" }
-          : { type: "authenticated_session_check", realm: "agents-session" },
-        environmentId: environment.environmentId,
-        authenticationRealm: "agents-session",
-        targetId: session.target?.id ?? null,
-        applicationId: "fi-agents"
-      });
-      emit(`Authentication required → durable resumable state ${record.state} (${record.intervention_id})`);
-      if (runState) await runStore.update(runState.runId, { status: "waiting_for_authentication", pendingInterventionId: record.intervention_id, suspendedStepId: "enter-agents" });
-
-      if (waitForHuman) {
-        // Bounded in-process wait (only meaningful with a usable display).
-        const deadline = Date.now() + Math.max(5_000, humanWaitMs);
-        let satisfied = false;
-        while (Date.now() < deadline) {
-          if (signal?.aborted) break;
-          const pending = interventions.get(record.intervention_id);
-          if (pending?.state === "satisfied") { satisfied = true; break; }
-          const fresh = await observeLoadedPage(session, { timeoutMs: 5_000 });
-          const freshHandoff = classifyHumanHandoff(fresh);
-          if (fresh && !freshHandoff) {
-            // No authoritative verifier: do not fabricate satisfaction.
-            emit("Authentication state changed, but no authoritative verifier is configured; continuing to observe.");
-          }
-          await new Promise(r => setTimeout(r, 2_000));
-        }
-        if (!satisfied) {
-          finalState = QUALIFICATION_STATES.WAITING_FOR_HUMAN;
-          reason = "Human authentication was not verified within the bounded wait. The run is suspended durably and resumes when the agents-session realm is verifiably authenticated.";
-          emit(reason);
-          return finalize(finalState, { reason, interventionId: record.intervention_id });
-        }
-      } else {
-        finalState = QUALIFICATION_STATES.WAITING_FOR_HUMAN;
-        reason = "Authentication is required on the real staging site. The run is suspended in a durable resumable state; resume after the agents-session realm is verifiably authenticated.";
-        emit(reason);
-        return finalize(finalState, { reason, interventionId: record.intervention_id });
-      }
-    }
-    emit("Authentication state: no login/challenge handoff detected on the entry page.");
-
-    // ── 4. Discover the Agents application through the site's navigation ──
-    const discovery = new ApplicationDiscoveryEngine({
-      session,
-      maxSteps: 8,
-      maxLinksPerStep: 4,
-      environment,
-      onAuthorizationBoundary: boundary => emit(`Authorization boundary: ${boundary.category} at ${boundary.url}`)
-    });
-    const discoveryResult = await discovery.discover();
-    const map = discoveryResult.capabilityMap;
-    emit(`Discovered ${map.pages.length} pages, ${map.controls.length} controls, ${(map.childApplications ?? []).length} child applications`);
-    steps.push({ id: "discover", status: "PASS", detail: `${map.pages.length} pages, ${map.controls.length} controls` });
-    for (const child of map.childApplications ?? []) {
-      emit(`Child application: ${child.applicationId} via ${child.entryFrom} (${child.verified ? "verified" : "unverified"})`);
+      emit(`Authentication handoff detected (${handoff.category}); the same qualification run will wait while the operator completes the staging → visible Agents → Agent login path.`);
+    } else {
+      emit("Entry page observed. Cloud Agent will be reached through a visible staging UI link.");
     }
 
-    // ── 4b. Resolve the Agents entry from the environment binding ──
-    // The entry to the child application is resolved from the verified
-    // environment binding FIRST: (a) an actually verified same-origin
-    // navigation candidate matching the application label, else (b) the
-    // profile's candidate_entry route under the authorized origin. Blind
-    // semantic exploration is only a last resort, and the engine refuses
-    // to count navigation onto a non-authorized origin as progress.
-    const agentsApp = (environment.applications ?? []).find(a => a.applicationId === "fi-agents") ?? environment.applications?.[0] ?? null;
-    const agentsLabel = /agent/i;
-    let entryResolution = null;
-    {
-      const latest = await session.observe().catch(() => null);
-      const sameOrigin = (environment.authorizedOrigins ?? []).includes(normalizeOrigin(latest?.page?.url));
-      if (latest && sameOrigin) {
-        const candidates = latest.candidates ?? [];
-        const verified = candidates.filter(c =>
-          c.visible === true && c.disabled !== true &&
-          agentsLabel.test(String(c.name ?? "")) &&
-          (environment.authorizedOrigins ?? []).includes(normalizeOrigin(absolutize(c.href, latest.page.url)))
-        );
-        if (verified.length >= 1) {
-          entryResolution = { kind: "verified-candidate", href: absolutize(verified[0].href, latest.page.url), label: verified[0].name };
-          emit(`Agents entry resolved from verified same-origin candidate: '${verified[0].name}' → ${entryResolution.href}`);
-        }
-      }
-      if (!entryResolution && agentsApp?.candidateEntry) {
-        try {
-          const candidateUrl = new URL(agentsApp.candidateEntry, environment.applicationEntryUrl).href;
-          if ((environment.authorizedOrigins ?? []).includes(new URL(candidateUrl).origin)) {
-            entryResolution = { kind: "candidate-route", href: candidateUrl };
-            emit(`Agents entry resolved from environment candidate_entry: ${candidateUrl}`);
-          }
-        } catch { /* invalid candidate_entry: fall through to discovery-only */ }
-      }
+    // ── 4. Profile route is an identity hint only; never navigate to it ──
+    const entryFlow = createCloudAgentEntryWorkflow(environment, observation);
+    if (!entryFlow) {
+      finalState = QUALIFICATION_STATES.BLOCKED;
+      reason = "The environment profile has no authorized Cloud Agent identity hint.";
+      gate("agents_application_entered", false, reason);
+      return finalize(finalState, { reason });
     }
+    const { agentEntry, workflow } = entryFlow;
+    emit(`Cloud Agent identity hint loaded (${agentEntry.origin}); browser navigation remains driven by the visible staging UI.`);
+    if (entryFlow.alreadyAtComposer) emit("The task composer is already visible; skipping goal navigation and performing read-only verification.");
 
-    // ── 5. Goal-driven workflow: enter Agents and verify the realm ──
+    // ── 5. Follow the visible route, hand off for login, then verify and resume ──
     const runner = new TestRunner({ session, interventions, environment, signal });
-    const receipt = await runner.run({
-      id: "cloud-agent-enter-agents",
-      name: "Enter the Agents application from FreeInference staging",
-      steps: [
-        // Navigate to the resolved authorized Agents entry via the native
-        // navigate step (URL target from the verified binding, never from
-        // the diagnostic adapter). The target is always on an authorized
-        // origin; a login wall is caught by the assert + handoff below.
-        ...(entryResolution ? [{
-          id: "navigate-agents",
-          type: "navigate",
-          url: entryResolution.href,
-          expectedUrlPattern: "^" + escapeRegExp(entryResolution.href).replace(/\/$/, "") + "(/|$)"
-        }] : []),
-        {
-          id: "enter-agents",
-          type: "goal",
-          goal: entryResolution
-            ? `Open the Agents (Cloud Agent) application at ${entryResolution.href}`
-            : "Find and open the Agents (Cloud Agent) application from the FreeInference staging navigation",
-          intervention: {
-            type: "authentication",
-            realm: "agents-session",
-            requiredAction: "Complete Agents authentication in the attached browser tab.",
-            condition: { type: "authenticated_session_check", realm: "agents-session" }
+    let receipt = await runner.run(workflow, { runId });
+
+    if (isWaitingRunStatus(receipt.status)) {
+      const interventionRef = receipt.interventions?.[0];
+      const record = interventionRef?.interventionId ? interventions.get(interventionRef.interventionId) : null;
+      emit(`Suspended: ${receipt.interventions.map(i => `${i.type}(${i.state})`).join(", ")}`);
+      if (runState) await runStore.update(runState.runId, { status: "waiting_for_authentication", pendingInterventionId: record?.intervention_id ?? null, suspendedStepId: record?.stepId ?? null });
+      if (record && typeof onHumanIntervention === "function") {
+        const verify = {
+          hasAttachmentGrant: async targetId => session.target?.id === targetId && session.attached === true
+            ? { ok: true }
+            : { ok: false, reason: `No authorized attachment grant for target '${targetId}'.` },
+          verifyEnvironment: async url => verifyObservedUrl(environment, url),
+          observe: async () => await session.observe().catch(() => null),
+          verifyAuthentication: async realm => {
+            if (realm !== agentEntry.authenticationRealm) {
+              return { authenticated: false, reason: `Unexpected authentication realm '${realm ?? "unknown"}'.` };
+            }
+            const current = await session.observe().catch(() => null);
+            const handoffNow = classifyHumanHandoff(current);
+            if (handoffNow) return { authenticated: false, reason: handoffNow.reason };
+            const ready = verifyCloudAgentReady(current, environment, agentEntry.origin);
+            return ready.ok
+              ? { authenticated: true, identity: "Cloud Agent task composer", evidenceId: ready.evidenceId }
+              : { authenticated: false, reason: ready.reason };
           }
-        },
-        {
-          id: "verify-agents-realm",
-          type: "assert",
-          assertion: { type: "page_title_contains", value: "agent" }
+        };
+
+        while (!signal?.aborted && isWaitingRunStatus(receipt.status)) {
+          const shouldResume = await onHumanIntervention(record, {
+            session,
+            environment,
+            expectedOrigin: agentEntry.origin,
+            inspectCurrentPage: async () => {
+              const current = await session.observe().catch(() => null);
+              discoveries.visibleDiagnosticSurfaces.push(...discoverVisibleDiagnosticSurfaces(current, environment));
+              const ready = verifyCloudAgentReady(current, environment, agentEntry.origin);
+              return { ...ready, observation: current };
+            },
+            verifyReady: async () => verifyCloudAgentReady(await session.observe().catch(() => null), environment, agentEntry.origin)
+          });
+          if (shouldResume === false) break;
+          const resumed = await runner.resume(receipt, { workflow, verify });
+          if (resumed.resumed && resumed.receipt) {
+            receipt = resumed.receipt;
+            if (runState) await runStore.update(runState.runId, { status: "running", pendingInterventionId: null, suspendedStepId: null });
+            break;
+          }
+          emit(`Authentication is not verified yet: ${resumed.reason ?? "the Agent task composer is still unavailable."}`);
         }
-      ]
-    }, { runId });
+      }
+
+      if (isWaitingRunStatus(receipt.status)) {
+        finalState = signal?.aborted ? QUALIFICATION_STATES.CANCELED : QUALIFICATION_STATES.WAITING_FOR_HUMAN;
+        reason = signal?.aborted
+          ? "Run canceled while waiting for Cloud Agent authentication."
+          : "The run is suspended for authentication; the browser remains available for a verified resume.";
+        return finalize(finalState, { reason, interventionId: record?.intervention_id ?? null, receipt });
+      }
+    }
 
     for (const step of receipt.steps) {
       steps.push({ id: step.stepId, status: step.status, reason: step.reason });
-    }
-
-    if (receipt.interventions?.length > 0) {
-      // Suspended at a human-intervention boundary with durable state.
-      const record = receipt.interventions[0];
-      emit(`Suspended: ${receipt.interventions.map(i => `${i.type}(${i.state})`).join(", ")}`);
-      if (runState) await runStore.update(runState.runId, { status: "waiting_for_authentication", pendingInterventionId: record.interventionId, suspendedStepId: record.stepId });
-      finalState = QUALIFICATION_STATES.WAITING_FOR_HUMAN;
-      reason = "Workflow suspended at a durable human-intervention boundary; it resumes from the suspended step once the completion condition is verified.";
-      return finalize(finalState, { reason, interventionId: record.interventionId, receipt });
     }
 
     if (receipt.status !== RUN_STATUS.PASSED) {
@@ -362,8 +423,23 @@ export async function qualifyCloudAgent({
       return finalize(finalState, { reason, receipt });
     }
 
-    gate("agents_application_entered", true, "Agents realm verified");
-    evidence.push({ kind: "agents-realm", evidenceId: receipt.steps.find(s => s.stepId === "verify-agents-realm")?.evidenceIds?.[0] ?? null });
+    const composerEvidence = receipt.steps.find(s => s.stepId === "verify-task-composer")?.evidenceIds?.[0] ?? null;
+    const finalObservation = await session.observe().catch(() => null);
+    const ready = verifyCloudAgentReady(finalObservation, environment, agentEntry.origin);
+    if (!ready.ok) {
+      finalState = QUALIFICATION_STATES.UNCERTAIN;
+      reason = `The Cloud Agent task composer was not independently re-observed: ${ready.reason}`;
+      gate("agents_application_entered", false, reason);
+      return finalize(finalState, { reason, receipt });
+    }
+    discoveries.visibleDiagnosticSurfaces.push(...discoverVisibleDiagnosticSurfaces(finalObservation, environment));
+    discoveries.visibleDiagnosticSurfaces = [...new Map(discoveries.visibleDiagnosticSurfaces.map(surface => [`${surface.sourcePage ?? ""}|${surface.label.toLowerCase()}|${surface.destination ?? ""}`, surface])).values()].slice(0, 20);
+    gate("agents_application_entered", true, `Task composer visible at observed Agent origin ${ready.origin}`);
+    evidence.push({ kind: "cloud-agent-task-composer", evidenceId: composerEvidence });
+    evidence.push({ kind: "observed-cloud-agent-destination", url: `${ready.origin}/`, evidenceId: ready.evidenceId });
+    emit(discoveries.visibleDiagnosticSurfaces.length
+      ? `Read-only discovery found ${discoveries.visibleDiagnosticSurfaces.length} visible history/logging navigation surface(s); none were opened.`
+      : "No visible history/logging navigation surface found in the current view; no links were opened or guessed.");
 
     // ── 6. Backend diagnostic correlation (optional; exact identifiers) ──
     const diagUrl = process.env.ACTIVETAB_CLOUD_AGENT_URL;
@@ -448,6 +524,7 @@ export async function qualifyCloudAgent({
       receipt: receipt ? receipt.toObject?.() ?? receipt : null,
       verifiedBackendOperations: backendCorrelationRef.value,
       diagnosticEvidence: evidence,
+      discoveries,
       correlation: backendCorrelationRef.value,
       screenshotPath,
       pendingInterventions: interventionId ? [interventionId] : [],

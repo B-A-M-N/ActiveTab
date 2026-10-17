@@ -78,7 +78,7 @@ async function handleBrokerRequest(message) {
   if (message.method === "debugger.detach") {
     const target = attached.get(message.targetId);
     if (!target) return { detached: true };
-    return await detachCurrent(target.tabId, "mcp-session-closed");
+    return await detachCurrent(target.tabId, "activetab-explicit-detach");
   }
   throw new Error("Unknown ActiveTab broker request.");
 }
@@ -118,8 +118,8 @@ function notifyBrokerAttached(target) {
 }
 
 function scheduleBrokerReconnect() {
-  if (attached.size === 0 || nativePort || reconnectTimer || reconnectAttempt >= 8) return;
-  const delay = Math.min(250 * (2 ** reconnectAttempt), 8_000);
+  if (attached.size === 0 || nativePort || reconnectTimer) return;
+  const delay = Math.min(250 * (2 ** Math.min(reconnectAttempt, 5)), 8_000);
   reconnectAttempt++;
   reconnectTimer = setTimeout(() => {
     reconnectTimer = undefined;

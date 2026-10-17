@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { CdpClient } from "../cdp/client.js";
 import { BrowserActivityRecorder } from "./activity.js";
 import { BrowserObserver } from "../observe/observer.js";
+import { isOperatorProhibitedControl, operatorProhibitedControlReason } from "../runtime/controlRestrictions.js";
 
 function createSessionClient(transport, sessionId) {
   return {
@@ -10,6 +11,10 @@ function createSessionClient(transport, sessionId) {
       if ((eventSessionId ?? null) === (sessionId() ?? null)) listener(params);
     })
   };
+}
+
+function assertControlAllowed(candidate, actionType) {
+  if (isOperatorProhibitedControl(candidate, actionType)) throw new Error(operatorProhibitedControlReason());
 }
 
 const IFRAME_TARGET_FILTER = [{ type: "iframe", exclude: false }];
@@ -379,6 +384,7 @@ export class BrowserSession {
 
   async click(candidate) {
     this.#assertTargetAttached();
+    assertControlAllowed(candidate, "click");
     if (candidate.targetId !== this.target.id) throw new Error("Candidate belongs to a different browser target.");
     if (candidate.documentGeneration !== this.documentGeneration) throw new Error("Candidate belongs to a stale document generation; observe again before acting.");
     const frame = candidate.frameTargetId ? this.frameSessions.get(candidate.frameTargetId) : null;
@@ -414,6 +420,13 @@ export class BrowserSession {
 
   async scroll(target) {
     this.#assertTargetAttached();
+    const location = await this.client.send("Runtime.evaluate", {
+      expression: "location.href",
+      returnByValue: true,
+      awaitPromise: false,
+      userGesture: false
+    }).catch(() => null);
+    assertControlAllowed({ ...target, documentUrl: target.documentUrl ?? location?.result?.value }, "scroll");
     if (target.targetId !== this.target.id) throw new Error("Scroll target belongs to a different browser target.");
     if (target.documentGeneration !== this.documentGeneration) throw new Error("Scroll target belongs to a stale document generation; observe again before acting.");
     if (target.visible !== true || target.canScrollDown !== true) throw new Error("The selected region is not currently visible and scrollable downward.");
@@ -471,6 +484,7 @@ export class BrowserSession {
 
   async typeSearchPhrase(candidate, phrase) {
     this.#assertTargetAttached();
+    assertControlAllowed(candidate, "type");
     if (typeof phrase !== "string" || !phrase.trim() || phrase.length > 500) throw new Error("Search text is empty or exceeds the 500-character input limit.");
     if (candidate.targetId !== this.target.id) throw new Error("Candidate belongs to a different browser target.");
     if (candidate.frameTargetId) throw new Error("Search text entry is limited to the main frame.");
@@ -510,6 +524,7 @@ export class BrowserSession {
 
   async fillField(candidate, value) {
     this.#assertTargetAttached();
+    assertControlAllowed(candidate, "fill");
     if (typeof value !== "string" || value.length > 2000) throw new Error("Field value exceeds the 2000-character input limit.");
     if (candidate.targetId !== this.target.id) throw new Error("Candidate belongs to a different browser target.");
     if (candidate.frameTargetId) throw new Error("Field text entry is limited to the main frame.");
@@ -542,6 +557,7 @@ export class BrowserSession {
 
   async selectOption(candidate, value) {
     this.#assertTargetAttached();
+    assertControlAllowed(candidate, "select");
     if (typeof value !== "string" || value.length > 500) throw new Error("Select value exceeds the 500-character limit.");
     if (candidate.targetId !== this.target.id) throw new Error("Candidate belongs to a different browser target.");
     if (candidate.frameTargetId) throw new Error("Select is limited to the main frame.");
@@ -575,6 +591,7 @@ export class BrowserSession {
 
   async uploadFile(candidate, filePaths) {
     this.#assertTargetAttached();
+    assertControlAllowed(candidate, "upload");
     if (!Array.isArray(filePaths) || filePaths.length === 0 || filePaths.length > 10) {
       throw new Error("uploadFile requires a non-empty array of 1-10 file paths.");
     }

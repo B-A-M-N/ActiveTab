@@ -32,9 +32,15 @@ export function canonicalInputHash(input) {
 }
 
 export class AuthorizationGrantStore {
-  constructor({ now = () => Date.now() } = {}) {
+  constructor({ now = () => Date.now(), trustedIssuer = null } = {}) {
     this.grants = new Map();
     this.now = now;
+    // A trusted issuer identity must be configured at construction time.
+    // Callers cannot supply their own `issuedBy` string to forge approval.
+    if (trustedIssuer !== null && (typeof trustedIssuer !== "string" || !trustedIssuer)) {
+      throw new Error("AuthorizationGrantStore trustedIssuer must be a non-empty string or null.");
+    }
+    this.trustedIssuer = trustedIssuer;
   }
 
   /**
@@ -63,7 +69,7 @@ export class AuthorizationGrantStore {
       state: GRANT_STATE.ACTIVE,
       singleUse,
       useCount: 0,
-      issuedBy: String(issuedBy),
+      issuedBy: String(this.trustedIssuer ?? issuedBy ?? "untrusted"),
       issuedAt: new Date(now).toISOString(),
       expiresAt: new Date(now + Math.max(1_000, expiresInMs)).toISOString()
     };
@@ -86,14 +92,26 @@ export class AuthorizationGrantStore {
     }
     if (grant.singleUse && grant.useCount > 0) return { ok: false, reason: "Single-use grant already used." };
     const mismatch = [];
-    if (principal !== undefined && principal !== grant.principal) mismatch.push("principal");
-    if (environmentId !== undefined && environmentId !== grant.environmentId) mismatch.push("environment");
-    if (authenticationRealm !== undefined && grant.authenticationRealm !== null && authenticationRealm !== grant.authenticationRealm) mismatch.push("realm");
-    if (resource !== undefined && resource !== grant.resource) mismatch.push("resource");
-    if (operation !== undefined && operation !== grant.operation) mismatch.push("operation");
-    if (input !== undefined && canonicalInputHash(input) !== grant.inputHash) mismatch.push("input");
+    // Required fields must be present; omissions fail closed rather than skipping checks.
+    for (const [name, value] of Object.entries({ principal, environmentId, resource, operation })) {
+      if (value === undefined || value === null) {
+        return { ok: false, reason: `Grant verification requires '${name}'.` };
+      }
+    }
+    if (principal !== grant.principal) mismatch.push("principal");
+    if (environmentId !== grant.environmentId) mismatch.push("environment");
+    if (grant.authenticationRealm !== null && authenticationRealm !== grant.authenticationRealm) mismatch.push("realm");
+    if (resource !== grant.resource) mismatch.push("resource");
+    if (operation !== grant.operation) mismatch.push("operation");
+    if (input === undefined || input === null) {
+      return { ok: false, reason: "Grant verification requires 'input'." };
+    }
+    if (canonicalInputHash(input) !== grant.inputHash) mismatch.push("input");
     if (mismatch.length > 0) return { ok: false, reason: `Grant scope mismatch: ${mismatch.join(", ")}.` };
-    if (effect !== null && !grant.allowedEffects.includes(effect)) {
+    if (effect === null || effect === undefined) {
+      return { ok: false, reason: "Grant verification requires the exact 'effect'." };
+    }
+    if (!grant.allowedEffects.includes(effect)) {
       return { ok: false, reason: `Effect '${effect}' is not in the grant's allowed effects.` };
     }
     return { ok: true, grant };
@@ -105,7 +123,7 @@ export class AuthorizationGrantStore {
     if (!check.ok) return check;
     const grant = check.grant;
     grant.useCount += 1;
-    if (grant.singleUse || grant.useCount >= 1) grant.state = GRANT_STATE.CONSUMED;
+    if (grant.singleUse) grant.state = GRANT_STATE.CONSUMED;
     return { ok: true, grant };
   }
 

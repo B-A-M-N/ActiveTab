@@ -108,7 +108,7 @@ test("extension broker rejects missing consent, insecure pages, and unexpected e
   assert.deepEqual(await broker.listTabs(), []);
 });
 
-test("extension broker routes two authorized tabs independently and detaches only the selected lease", async t => {
+test("extension transport disposal preserves leases and explicit broker detach releases only one tab", async t => {
   const dir = await mkdtemp(join(tmpdir(), "activetab-extension-multi-"));
   const broker = await new ExtensionBroker({ socketPath: join(dir, "broker.sock"), requestTimeoutMs: 1_000 }).start();
   const extension = await connectExtension(broker.socketPath);
@@ -142,9 +142,13 @@ test("extension broker routes two authorized tabs independently and detaches onl
   extension.write(encodeNativeMessage({ kind: "response", id: command.id, result: { result: { value: "page-two" } } }));
   assert.deepEqual(await commandPromise, { result: { value: "page-two" } });
 
-  const closePromise = second.browserClient.close();
+  await second.browserClient.close();
+  assert.deepEqual((await broker.listTabs()).map(target => target.id), ["page-one", "page-two"], "closing a session transport preserves the extension's operator-authorized lease");
+
+  const closePromise = broker.detach("page-two");
   const detach = await readMessage(extension);
   assert.equal(detach.targetId, "page-two");
+  assert.equal(detach.method, "debugger.detach");
   extension.write(encodeNativeMessage({ kind: "response", id: detach.id, result: { detached: true } }));
   await closePromise;
   assert.deepEqual((await broker.listTabs()).map(target => target.id), ["page-one"]);
@@ -154,9 +158,30 @@ test("extension broker routes two authorized tabs independently and detaches onl
   assert.equal(remaining.targetId, "page-one");
   extension.write(encodeNativeMessage({ kind: "response", id: remaining.id, result: { result: { value: "page-one" } } }));
   assert.deepEqual(await remainingCommand, { result: { value: "page-one" } });
-  const lastClose = first.browserClient.close();
+  await first.browserClient.close();
+  assert.deepEqual((await broker.listTabs()).map(target => target.id), ["page-one"]);
+  const lastClose = broker.detach("page-one");
   const lastDetach = await readMessage(extension);
+  assert.equal(lastDetach.targetId, "page-one");
   extension.write(encodeNativeMessage({ kind: "response", id: lastDetach.id, result: { detached: true } }));
   await lastClose;
   assert.deepEqual(await broker.listTabs(), []);
+});
+
+test("broker shutdown drops only the local connection and preserves extension debugger leases", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "activetab-extension-shutdown-"));
+  const socketPath = join(dir, "broker.sock");
+  const broker = await new ExtensionBroker({ socketPath, requestTimeoutMs: 1_000 }).start();
+  const extension = await connectExtension(socketPath);
+  const attached = new Promise(resolve => broker.once("attached", resolve));
+  extension.write(encodeNativeMessage({ kind: "attached", extensionId: EXTENSION_ID, target: {
+    id: "page-preserved", tabId: 31, title: "Account", url: "https://example.test/", userAuthorized: true
+  } }));
+  await attached;
+  const received = [];
+  extension.on("data", chunk => received.push(chunk));
+  t.after(async () => { extension.destroy(); await broker.close(); await rm(dir, { recursive: true, force: true }); });
+
+  await broker.close();
+  assert.equal(received.length, 0, "broker shutdown must not issue debugger.detach to the extension");
 });

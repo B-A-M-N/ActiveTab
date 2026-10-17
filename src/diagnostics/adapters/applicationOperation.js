@@ -53,7 +53,9 @@ export class ApplicationOperationExecutor {
       contract: effectiveContract, handler,
       // Defaults: destructive always requires a grant; mutating requires one
       // when a grant store is bound or the operation opts in explicitly.
-      requiresGrant: requiresGrant ?? (effect === EFFECT_CLASSIFICATION.DESTRUCTIVE ? true : effect === EFFECT_CLASSIFICATION.MUTATING && this.grantStore !== null)
+      // Fail closed: mutating and destructive operations always require a
+      // grant, regardless of whether a grant store is currently bound.
+      requiresGrant: requiresGrant ?? (effect !== EFFECT_CLASSIFICATION.READ_ONLY)
     });
     return this;
   }
@@ -95,7 +97,7 @@ export class ApplicationOperationExecutor {
       resource: options.resource ?? operation.sourceId,
       operation: operation.operationId,
       input: options.input ?? {},
-      effect: options.effect ?? null
+      effect: options.effect ?? operation.effect
     });
     if (!consumed.ok) return { ok: false, reason: `Grant rejected: ${consumed.reason}` };
     return { ok: true, grant: consumed.grant };

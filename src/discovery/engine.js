@@ -8,6 +8,7 @@ import { KnowledgeStore } from "./knowledgeStore.js";
 import { URL } from "node:url";
 import { authorizePlannedAction } from "../navigation/actionPolicy.js";
 import { verifyObservedUrl } from "../environments/model.js";
+import { isOperatorProhibitedNavigation } from "../runtime/controlRestrictions.js";
 
 const SAFE_CONTROL_ROLES = new Set(["link", "tab", "button", "menuitem", "menuitemradio", "menuitemcheckbox"]);
 const SAFE_SUBMIT_CONTROLS = false;
@@ -91,6 +92,10 @@ export class ApplicationDiscoveryEngine {
         if (this.signal?.aborted) break;
         if (this.#isSideEffectingRoute(target.href)) {
           this.discoveries.push({ type: "navigation_skipped_side_effect", url: target.href, control: target.name.slice(0, 100) });
+          continue;
+        }
+        if (isOperatorProhibitedNavigation(target.href)) {
+          this.discoveries.push({ type: "navigation_skipped_operator_restriction", url: target.href, control: target.name.slice(0, 100) });
           continue;
         }
         try {

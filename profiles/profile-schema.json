@@ -29,7 +29,8 @@
           "description": "Optional authorized backend diagnostic interface. Never a browser navigation target."
         },
         "diagnostic_transport": {
-          "type": ["string", "enum": ["direct", "ssh_tunnel", "verified_service"]],
+          "type": "string",
+          "enum": ["direct", "ssh_tunnel", "verified_service"],
           "description": "How the diagnostic endpoint is reached. A loopback endpoint requires 'ssh_tunnel' plus a verified remote_target."
         },
         "remote_target": { "type": ["string", "null"], "description": "Verified remote staging destination for a tunnel." },
@@ -82,6 +83,115 @@
           "validation_required": { "type": "boolean", "const": true },
           "notes": { "type": "string" }
         }
+      }
+    },
+    "operator_safety_constraints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["surface", "control_label", "prohibited_actions", "source", "status"],
+        "properties": {
+          "surface": { "type": "string" },
+          "context": { "type": "string" },
+          "control_label": { "type": "string" },
+          "prohibited_actions": { "type": "array", "items": { "type": "string" } },
+          "source": { "type": "string", "enum": ["operator_reported", "verified_contract"] },
+          "status": { "type": "string", "enum": ["hard_deny", "authorization_required"] },
+          "authorization_condition": { "type": "string" },
+          "effect_verified": { "type": "boolean" }
+        }
+      }
+    },
+    "recent_requests_discovery": {
+      "type": "object",
+      "required": ["surface", "read_only", "requires_operator_opened_route", "inspect_filter_schema_only", "download_during_discovery"],
+      "properties": {
+        "surface": { "type": "string" },
+        "read_only": { "type": "boolean", "const": true },
+        "requires_operator_opened_route": { "type": "boolean", "const": true },
+        "inspect_filter_schema_only": { "type": "boolean", "const": true },
+        "download_during_discovery": { "type": "boolean", "const": false },
+        "control_kinds": { "type": "array", "items": { "type": "string", "enum": ["text_input", "dropdown"] } },
+        "capture_values": { "type": "boolean", "const": false },
+        "prohibited_control_labels": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "providers_discovery": {
+      "type": "object",
+      "required": ["surface", "read_only", "requires_operator_opened_route", "inspect_filter_schema_only", "capture_values", "change_filters", "dispatch_actions"],
+      "properties": {
+        "surface": { "type": "string" },
+        "route_status": { "type": "string" },
+        "read_only": { "type": "boolean", "const": true },
+        "requires_operator_opened_route": { "type": "boolean", "const": true },
+        "operator_reported_subtabs": { "type": "array", "items": { "type": "string" } },
+        "performance_control_kinds": { "type": "array", "items": { "type": "string", "enum": ["dropdown", "text_input"] } },
+        "inspect_filter_schema_only": { "type": "boolean", "const": true },
+        "capture_values": { "type": "boolean", "const": false },
+        "change_filters": { "type": "boolean", "const": false },
+        "dispatch_actions": { "type": "boolean", "const": false },
+        "prohibited_control_labels": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "admin_log_discovery": {
+      "type": "object",
+      "required": ["operator_reported_labels", "relationship", "purpose", "audit_log_dropdowns_reported", "audit_log_do_not_open_or_interact", "inspect_dropdowns"],
+      "properties": {
+        "operator_reported_labels": { "type": "array", "items": { "type": "string" } },
+        "relationship": { "type": "string", "enum": ["unconfirmed"] },
+        "purpose": { "type": "string", "enum": ["unknown"] },
+        "route_status": { "type": "string" },
+        "audit_log_dropdowns_reported": { "type": "boolean" },
+        "audit_log_do_not_open_or_interact": { "type": "boolean", "const": true },
+        "inspect_dropdowns": { "type": "boolean", "const": false }
+      }
+    },
+    "settings_config_discovery": {
+      "type": "object",
+      "required": ["surface", "read_only_inventory_allowed", "requires_operator_opened_route", "capture_control_labels", "capture_current_non_sensitive_values", "redact_sensitive_values", "allow_mutation", "mutation_requires_explicit_freeinference_authorization"],
+      "properties": {
+        "surface": { "type": "string" },
+        "route_status": { "type": "string" },
+        "accepted_headings": { "type": "array", "items": { "type": "string", "enum": ["Settings", "Config", "Configuration"] } },
+        "navigation_labels": { "type": "array", "items": { "type": "string" } },
+        "configuration_route_status": { "type": "string" },
+        "observed_pages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["surface", "pathname", "source", "section", "visible_controls", "controls_changed"],
+            "properties": {
+              "surface": { "type": "string", "enum": ["Settings", "Config", "Configuration"] },
+              "pathname": { "type": "string" },
+              "source": { "type": "string", "enum": ["operator_screenshot", "operator_reported", "live_read_only_inventory"] },
+              "section": { "type": "string" },
+              "section_description": { "type": "string" },
+              "visible_controls": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["label", "kind", "displayed_state"],
+                  "properties": {
+                    "label": { "type": "string" },
+                    "description": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "displayed_state": { "type": "string", "enum": ["on", "off", "unknown"] },
+                    "visibility": { "type": "string" }
+                  }
+                }
+              },
+              "additional_content": { "type": "string" },
+              "controls_changed": { "type": "boolean", "const": false }
+            }
+          }
+        },
+        "read_only_inventory_allowed": { "type": "boolean", "const": true },
+        "requires_operator_opened_route": { "type": "boolean", "const": true },
+        "capture_control_labels": { "type": "boolean", "const": true },
+        "capture_current_non_sensitive_values": { "type": "boolean", "const": true },
+        "redact_sensitive_values": { "type": "boolean", "const": true },
+        "allow_mutation": { "type": "boolean", "const": false },
+        "mutation_requires_explicit_freeinference_authorization": { "type": "boolean", "const": true }
       }
     },
     "test_packs": { "type": "array", "items": { "type": "object" } }

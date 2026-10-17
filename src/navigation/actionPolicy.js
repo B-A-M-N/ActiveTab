@@ -1,4 +1,5 @@
 import { searchPhraseFromGoal } from "./search.js";
+import { isOperatorProhibitedControl, operatorProhibitedControlReason } from "../runtime/controlRestrictions.js";
 
 const SENSITIVE_ACTIONS = [
   { name: "purchase", pattern: /\b(?:buy|purchase|pay|payment|checkout|place\s+order|complete\s+order|subscribe)\b/i },
@@ -32,6 +33,13 @@ function actionCategory(candidate, categories) {
 }
 
 export function authorizePlannedAction(goal, candidate, actionType = "click") {
+  if (isOperatorProhibitedControl(candidate, actionType)) {
+    return {
+      authorized: false,
+      category: "operator_prohibited_control",
+      reason: operatorProhibitedControlReason()
+    };
+  }
   if (actionType === "scroll") {
     return candidate?.visible === true && ["container", "viewport"].includes(candidate.kind) && candidate.canScrollDown === true
       ? { authorized: true, category: "navigation_scroll" }

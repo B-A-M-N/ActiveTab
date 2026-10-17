@@ -172,7 +172,7 @@ test("E2E vertical: attach → discover → test → collect → investigate →
         };
       });
     const correlator = new DiagnosticCorrelator();
-    const runner = new TestRunner({ session, collector, correlator });
+    const runner = new TestRunner({ session, collector, correlator, localFixture: true });
     const receipt = await runner.run({
       id: "e2e-smoke", name: "E2E smoke",
       steps: [

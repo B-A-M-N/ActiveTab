@@ -18,12 +18,28 @@ export function evaluateAssertion(assertion, context) {
   }
   switch (assertion.type) {
     case "page_title_contains": return pageTitleContains(assertion, context);
+    case "candidate_name_contains": return candidateNameContains(assertion, context);
     case "url_matches": return urlMatches(assertion, context);
     case "element_visible": return elementVisible(assertion, context);
     case "network_request_seen": return networkRequestSeen(assertion, context);
     case "diagnostic_source_available": return diagnosticSourceAvailable(assertion, context);
     default: return { status: STEP_STATUS.UNCERTAIN, reason: `Unknown assertion type '${assertion.type}'.`, evidenceIds: [] };
   }
+}
+
+function candidateNameContains(assertion, context) {
+  const observation = context.observation;
+  const expected = String(assertion.value ?? "").trim().toLocaleLowerCase();
+  if (!observation || !expected) {
+    return { status: STEP_STATUS.UNCERTAIN, reason: "Candidate-name assertion requires fresh observation and a non-empty value.", evidenceIds: [] };
+  }
+  const found = (observation.candidates ?? []).some(candidate =>
+    candidate.visible !== false && String(candidate.name ?? "").toLocaleLowerCase().includes(expected)
+  );
+  const evidenceIds = observation.evidenceId ? [observation.evidenceId] : [];
+  return found
+    ? { status: STEP_STATUS.PASS, reason: `A visible control name contains '${assertion.value}'.`, evidenceIds }
+    : { status: STEP_STATUS.FAIL, reason: `No visible control name contains '${assertion.value}'.`, evidenceIds };
 }
 
 function pageTitleContains(assertion, context) {

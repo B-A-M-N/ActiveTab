@@ -9,7 +9,7 @@
  *
  * Launch contract:
  *   --remote-debugging-port=0   (Chrome assigns a free loopback port)
- *   --user-data-dir=<unique disposable profile>
+ *   --user-data-dir=<caller-selected profile>
  *   --no-first-run --no-default-browser-check
  * No --headless unless explicitly requested. No --no-sandbox unless a
  * documented environment restriction requires it. GPU rendering is not
@@ -24,14 +24,14 @@
  * Cleanup is idempotent: stop admission, cancel in-progress actions,
  * flush receipts/diagnostics, close the CDP session, request graceful
  * termination, wait for the owned process to exit, force-terminate only
- * that owned process if necessary, remove the disposable profile, and
- * record the final shutdown outcome.
+ * that owned process if necessary, and preserve or remove the profile
+ * according to the explicit caller option.
  */
 
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, realpath, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { listTargets, resolveAuthorizedTarget } from "./targets.js";
@@ -94,7 +94,7 @@ async function waitForAssignedPort(profileDir, timeoutMs, chromeProcess, signal)
  *
  * @param {object} options
  * @param {string} options.initialUrl - Startup navigation target. For
- *   runner-owned disposable browsers an HTTP(S) URL is a safe startup
+ *   runner-owned browsers an HTTP(S) URL is a safe startup
  *   target; it is chosen from the validated environment binding by the
  *   caller, never from a diagnostic adapter URL.
  * @param {boolean} [options.headed=true] - Headed is the default;
@@ -103,8 +103,17 @@ async function waitForAssignedPort(profileDir, timeoutMs, chromeProcess, signal)
  *   source recorded for the run. This module never overwrites DISPLAY;
  *   the caller/operator provides a valid display session for headed runs.
  * @param {AbortSignal} [options.signal] - Cancellation during launch.
+ * @param {string|null} [options.userDataDir] - Optional explicit Chrome profile directory.
+ * @param {boolean} [options.preserveProfile=false] - Keep an explicit profile for later runs.
  */
-export async function launchOwnedChrome({ initialUrl, headed = true, displayMode = "current-display", signal } = {}) {
+export async function launchOwnedChrome({
+  initialUrl,
+  headed = true,
+  displayMode = "current-display",
+  signal,
+  userDataDir = null,
+  preserveProfile = false
+} = {}) {
   if (typeof initialUrl !== "string" || !initialUrl) {
     throw new Error("launchOwnedChrome requires an initialUrl (the validated application entry, not a diagnostic endpoint).");
   }
@@ -120,7 +129,28 @@ export async function launchOwnedChrome({ initialUrl, headed = true, displayMode
   const chromePath = findChromeBinary();
   if (!chromePath) throw new Error("Chrome binary not found. Install Chrome or set CHROME_PATH.");
 
-  const profileDir = await mkdtemp(join(tmpdir(), "activetab-owned-chrome-"));
+  if (preserveProfile && !userDataDir) {
+    throw new Error("preserveProfile requires an explicit userDataDir.");
+  }
+  let profileDir;
+  if (userDataDir) {
+    profileDir = resolve(userDataDir);
+    await mkdir(profileDir, { recursive: true, mode: 0o700 });
+    const stat = await lstat(profileDir);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error("Chrome userDataDir must be a real directory, not a symlink or file.");
+    }
+    if (await realpath(profileDir) !== profileDir) {
+      throw new Error("Chrome userDataDir resolves through a symlink; refusing to use it.");
+    }
+    await chmod(profileDir, 0o700);
+  } else {
+    profileDir = await mkdtemp(join(tmpdir(), "activetab-owned-chrome-"));
+  }
+  // Persistent profiles retain files across runs. Remove the previous
+  // instance's CDP handoff before starting Chrome, or startup could read
+  // a stale port and attach to the wrong (or already closed) browser.
+  await rm(join(profileDir, "DevToolsActivePort"), { force: true });
   let chromeProcess = null;
   let session = null;
   let closed = false;
@@ -196,17 +226,30 @@ export async function launchOwnedChrome({ initialUrl, headed = true, displayMode
       } catch { /* not ready yet */ }
       await new Promise(r => setTimeout(r, 100));
     }
-    const ownedTarget = targets?.find(t => t.type === "page");
+    // Select the target that matches the intended startup URL origin.
+    // Chrome may create other page targets (e.g. NTP) during launch; the
+    // first page target is not necessarily the intended one.
+    let expectedOrigin = null;
+    try { expectedOrigin = new URL(startupUrl).origin; } catch { /* validated above */ }
+    const ownedTarget = targets?.find(t => t.type === "page" && (
+      (() => { try { return new URL(t.url).origin === expectedOrigin; } catch { return false; } })()
+    )) ?? targets?.find(t => t.type === "page");
     if (!ownedTarget) {
       await browserClient.close().catch(() => {});
       throw new Error("Chrome did not expose a page target owned by this invocation.");
     }
     targetId = ownedTarget.id;
+    const targetUrlOrigin = (() => { try { return new URL(ownedTarget.url).origin; } catch { return null; } })();
+    if (expectedOrigin && targetUrlOrigin !== expectedOrigin) {
+      // Do not adopt a target that did not load the intended entry origin.
+      await browserClient.close().catch(() => {});
+      throw new Error(`Chrome launched to unexpected origin '${targetUrlOrigin ?? ownedTarget.url}' instead of '${expectedOrigin}'. No target was adopted.`);
+    }
     const target = await resolveAuthorizedTarget(endpoint, targetId, targetId);
     target.browserClient = browserClient;
     target.ownsBrowserClient = true;
     session = await new BrowserSession(target).attach();
-    session.persistent = false;
+    session.persistent = preserveProfile;
     readiness = { phase: "attached", targetId };
 
     // 7. Verify the browser actually loaded the intended URL.
@@ -215,10 +258,20 @@ export async function launchOwnedChrome({ initialUrl, headed = true, displayMode
     while (Date.now() < deadline) {
       observed = await session.observe().catch(() => null);
       const url = observed?.page?.url;
-      if (url && url !== "about:blank" && url !== "chrome-error://chromewebdata/") break;
+      if (url && url !== "about:blank" && url !== "chrome-error://chromewebdata/") {
+        try {
+          const origin = new URL(url).origin;
+          if (expectedOrigin && origin === expectedOrigin) break;
+          if (!expectedOrigin) break;
+        } catch { /* keep waiting */ }
+      }
       await new Promise(r => setTimeout(r, 250));
     }
     const observedUrl = observed?.page?.url ?? null;
+    const observedOrigin = (() => { try { return new URL(observedUrl ?? "").origin; } catch { return null; } })();
+    if (expectedOrigin && observedOrigin !== expectedOrigin) {
+      throw new Error(`Chrome loaded unexpected origin '${observedOrigin ?? observedUrl}' instead of '${expectedOrigin}'.`);
+    }
     readiness = { phase: "loaded", url: observedUrl };
 
     let processExit = null;
@@ -237,7 +290,9 @@ export async function launchOwnedChrome({ initialUrl, headed = true, displayMode
       stderrTail: stderrTail.slice(-800)
     };
     try { chromeProcess?.kill("SIGKILL"); } catch { /* already dead */ }
-    try { await rm(profileDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    if (!preserveProfile) {
+      try { await rm(profileDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
     throw error;
   }
 
@@ -245,12 +300,13 @@ export async function launchOwnedChrome({ initialUrl, headed = true, displayMode
    * Idempotent cleanup (P0-1): stop admission, cancel in-progress owned
    * actions, close the CDP session, request graceful termination, wait for
    * the owned process, force-terminate only that process if necessary,
-   * remove the disposable profile, and record the shutdown outcome.
+   * remove a disposable profile or preserve an explicit reusable profile,
+   * and record the shutdown outcome.
    */
   async function close() {
     if (closed) return closeResult;
     closed = true;
-    const outcome = { graceful: false, forced: false, exitCode: null, profileRemoved: false, error: null };
+    const outcome = { graceful: false, forced: false, exitCode: null, profileRemoved: false, profilePreserved: preserveProfile, error: null };
     try {
       // Close the CDP session first (this also detaches owned targets).
       if (session) await session.close().catch(() => {});
@@ -274,8 +330,10 @@ export async function launchOwnedChrome({ initialUrl, headed = true, displayMode
     } catch (error) {
       outcome.error = String(error?.message ?? error).slice(0, 300);
     } finally {
-      try { await rm(profileDir, { recursive: true, force: true }); outcome.profileRemoved = true; }
-      catch (error) { outcome.error = outcome.error ?? String(error?.message ?? error).slice(0, 300); }
+      if (!preserveProfile) {
+        try { await rm(profileDir, { recursive: true, force: true }); outcome.profileRemoved = true; }
+        catch (error) { outcome.error = outcome.error ?? String(error?.message ?? error).slice(0, 300); }
+      }
       closeResult = outcome;
     }
     return closeResult;

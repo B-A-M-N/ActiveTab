@@ -19,7 +19,7 @@ export const INTERVENTION_TYPES = Object.freeze([
 ]);
 
 export const INTERACTION_TYPES = Object.freeze([
-  "click", "fill", "select", "toggle", "submit", "keyboard", "scroll"
+  "click", "fill", "select", "toggle", "upload"
 ]);
 
 export const EFFECT_CLASSIFICATION = Object.freeze({

@@ -112,8 +112,45 @@ export class CloudAgentDiagnosticAdapter {
         continue;
       }
       this.requestCount++;
+      // Bound the response body by actual bytes while streaming; never buffer
+      // the full body before checking the limit.
+      const reader = response.body?.getReader?.();
+      let chunks = [];
+      let totalBytes = 0;
+      let truncated = false;
+      if (reader) {
+        const decoder = new TextDecoder();
+        let text = "";
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            totalBytes += value.byteLength;
+            if (totalBytes > this.maxBytes) {
+              truncated = true;
+              try { await reader.cancel(); } catch {}
+              break;
+            }
+            text += decoder.decode(value, { stream: true });
+            chunks.push(value);
+          }
+          if (truncated) {
+            return { status: "truncated", httpStatus: response.status, data: null, reason: `Response exceeded ${this.maxBytes} bytes.` };
+          }
+          text += decoder.decode();
+          const bodyText = text;
+          let parsed;
+          try { parsed = JSON.parse(bodyText); }
+          catch { parsed = bodyText; }
+          return { status: response.ok ? "ok" : "error", httpStatus: response.status, data: parsed };
+        } catch (error) {
+          return { status: "error", httpStatus: response.status, data: null, reason: String(error.message ?? error).slice(0, 300) };
+        }
+      }
+      // Fallback for environments without ReadableStream.
       const text = await response.text();
-      if (text.length > this.maxBytes) {
+      const byteLength = new TextEncoder().encode(text).length;
+      if (byteLength > this.maxBytes) {
         return { status: "truncated", httpStatus: response.status, data: null, reason: `Response exceeded ${this.maxBytes} bytes.` };
       }
       let parsed;
@@ -207,8 +244,11 @@ export class CloudAgentDiagnosticAdapter {
     if (Array.isArray(value)) return value.slice(0, 100).map(item => this.#redact(item, depth + 1));
     const out = {};
     for (const [key, item] of Object.entries(value).slice(0, 100)) {
-      if (/token|secret|password|credential|apikey|api_key|authorization/i.test(key)) out[key] = item == null ? item : "[redacted]";
-      else out[key] = this.#redact(item, depth + 1);
+      if (/token|secret|password|credential|apikey|api_key|authorization/i.test(key)) {
+        // Boolean `secret` is a classification flag, not a credential.
+        if (typeof item === "boolean") out[key] = item;
+        else out[key] = item == null ? item : "[redacted]";
+      } else out[key] = this.#redact(item, depth + 1);
     }
     return out;
   }

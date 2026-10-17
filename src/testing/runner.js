@@ -12,9 +12,10 @@ import { classifyHumanHandoff } from "../navigation/handoff.js";
 import { InterventionStore, evaluateCompletion, externalRunState, INTERVENTION_STATE } from "../runtime/interventions.js";
 import { isLoopbackUrl, verifyObservedUrl } from "../environments/model.js";
 import { NavigationEngine } from "../navigation/engine.js";
+import { executeAuthorizedAction } from "../runtime/authorizedExecutor.js";
 
 export class TestRunner {
-  constructor({ session, collector, correlator, journal, maxSteps = 32, signal, interventions = null, environment = null } = {}) {
+  constructor({ session, collector, correlator, journal, maxSteps = 32, signal, interventions = null, environment = null, localFixture = false } = {}) {
     this.session = session;
     this.collector = collector;
     this.correlator = correlator;
@@ -25,6 +26,7 @@ export class TestRunner {
     // persist before control returns and the run suspends instead of ending.
     this.interventions = interventions;
     this.environment = environment;
+    this.localFixture = localFixture;
     this.onIntervention = null; // async (record) => {}
     this.onRunSuspended = null; // async (receipt, record) => {}
   }
@@ -155,11 +157,22 @@ export class TestRunner {
     const preObservation = await this.session.observe();
     this.#emitTraceEvent({ eventId: `step:${step.id}:start`, runId: receipt.runId, stepId: step.id, event: "step_start", actionType: "navigate", targetUrl: step.url });
     try {
-      // Use the authorized session's CDP path. Page.navigate is the
-      // single execution boundary for this target; the session object
-      // owns attachment, lifecycle, and authorization.
       this.#emitTraceEvent({ eventId: `step:${step.id}:dispatch`, runId: receipt.runId, stepId: step.id, event: "action_dispatch", actionType: "navigate", targetUrl: step.url });
-      await this.session.client.send("Page.navigate", { url: step.url });
+      const authResult = await executeAuthorizedAction({
+        session: this.session,
+        environment: this.environment,
+        action: "navigate",
+        url: step.url,
+        expectedUrlPattern: step.expectedUrlPattern ?? null,
+        localFixture: this.localFixture
+      });
+      if (!authResult.dispatched) {
+        const reason = authResult.authorized
+          ? `Navigation dispatch failed: ${authResult.reason}`
+          : `Navigation refused by policy: ${authResult.reason}`;
+        receipt.recordStep({ stepId: step.id, type: step.type, status: authResult.authorized ? STEP_STATUS.FAIL : STEP_STATUS.BLOCKED, reason, startedAt });
+        return { status: authResult.authorized ? STEP_STATUS.FAIL : STEP_STATUS.BLOCKED, reason };
+      }
     } catch (error) {
       const reason = `Navigation dispatch failed: ${String(error.message ?? error).slice(0, 200)}`;
       receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.FAIL, reason, startedAt });
@@ -214,14 +227,25 @@ export class TestRunner {
     this.#emitTraceEvent({ eventId: `step:${step.id}:dispatch`, runId: receipt.runId, stepId: step.id, event: "action_dispatch", actionType: action.type, backendNodeId: candidate.backendNodeId });
     let dispatchResult;
     try {
-      switch (action.type) {
-        case "click": dispatchResult = await this.session.click(candidate); break;
-        case "fill": dispatchResult = await this.session.fillField(candidate, action.value ?? ""); break;
-        case "select": dispatchResult = await this.session.selectOption(candidate, action.value ?? ""); break;
-        case "toggle": dispatchResult = await this.session.click(candidate); break;
-        case "upload": dispatchResult = await this.session.uploadFile(candidate, action.filePaths ?? []); break;
-        default: throw new Error(`Interaction type '${action.type}' is not yet implemented in the native session.`);
+      const authResult = await executeAuthorizedAction({
+        session: this.session,
+        environment: this.environment,
+        goal: step.goal ?? null,
+        action: action.type,
+        candidate,
+        value: action.value ?? null,
+        filePaths: action.filePaths ?? null,
+        localFixture: this.localFixture
+      });
+      if (!authResult.dispatched) {
+        const reason = authResult.authorized
+          ? `Interaction dispatch failed: ${authResult.reason}`
+          : `Interaction refused by policy: ${authResult.reason}`;
+        const status = authResult.authorized ? STEP_STATUS.FAIL : STEP_STATUS.BLOCKED;
+        receipt.recordStep({ stepId: step.id, type: step.type, status, reason, startedAt, evidenceIds: [observation.evidenceId] });
+        return { status, reason };
       }
+      dispatchResult = authResult.dispatchResult;
     } catch (error) {
       const reason = `Interaction dispatch failed: ${String(error.message ?? error).slice(0, 300)}`;
       receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.FAIL, reason, startedAt, evidenceIds: [observation.evidenceId] });

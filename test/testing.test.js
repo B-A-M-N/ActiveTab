@@ -39,6 +39,19 @@ test("assertions: page_title_contains", () => {
   assert.equal(evaluateAssertion({ type: "page_title_contains", value: "x" }, {}).status, "UNCERTAIN");
 });
 
+test("assertions: candidate_name_contains requires a visible fresh UI control", () => {
+  const ctx = { observation: {
+    evidenceId: "agent-composer-1",
+    candidates: [
+      { name: "New task", visible: true },
+      { name: "Hidden New task", visible: false }
+    ]
+  } };
+  assert.equal(evaluateAssertion({ type: "candidate_name_contains", value: "new task" }, ctx).status, "PASS");
+  assert.equal(evaluateAssertion({ type: "candidate_name_contains", value: "run" }, ctx).status, "FAIL");
+  assert.equal(evaluateAssertion({ type: "candidate_name_contains", value: "new task" }, {}).status, "UNCERTAIN");
+});
+
 test("assertions: url_matches", () => {
   const ctx = { observation: { page: { url: "http://127.0.0.1:3000/archive" } } };
   assert.equal(evaluateAssertion({ type: "url_matches", pattern: "/archive" }, ctx).status, "PASS");

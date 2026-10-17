@@ -38,6 +38,7 @@ import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
 import { InvestigationEngine } from "../investigation/engine.js";
 import { InterventionStore } from "../runtime/interventions.js";
 import { createInterventionTools } from "./intervention-tools.js";
+import { AuthorizationGrantStore } from "../runtime/approvals.js";
 import { randomUUID } from "node:crypto";
 
 const DEFAULT_PORT = 9377;
@@ -60,7 +61,15 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
   const testRuns = new Map();
   const interventionStore = new InterventionStore(join(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"), "..", "interventions"));
   interventionStore.init().catch(() => {}); // lazy init; durable records reload on first use
-  const interventionTools = createInterventionTools({ store: interventionStore, runs: testRuns });
+  const grantStore = new AuthorizationGrantStore({ trustedIssuer: process.env.ACTIVETAB_TRUSTED_ISSUER ?? "activetab-api" });
+  const interventionTools = createInterventionTools({
+    store: interventionStore,
+    runs: testRuns,
+    ctx: {
+      grantStore,
+      issueGrant: (...args) => grantStore.issue(...args)
+    }
+  });
 
   function createBrowserDiagnosticSources(session, collector) {
     registerBrowserDiagnosticSources(session, collector);
@@ -235,7 +244,13 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
             const action = interventionMatch[2] ?? "get";
             if (method === "GET" && action === "get") { sendJson(res, 200, await interventionTools.get_pending_intervention({ interventionId })); return; }
             if (method === "POST" && action === "acknowledge") { const body = await readBody(req); sendJson(res, 200, await interventionTools.acknowledge_human_action({ interventionId, ...(body ?? {}) })); return; }
-            if (method === "POST" && action === "approve") { const body = await readBody(req); sendJson(res, 200, await interventionTools.approve_operation({ interventionId, ...(body ?? {}) })); return; }
+            if (method === "POST" && action === "approve") { const body = await readBody(req); sendJson(res, 200, await interventionTools.request_operation_approval({ interventionId, ...(body ?? {}) })); return; }
+            if (method === "POST" && action === "resolve") {
+              const body = await readBody(req) ?? {};
+              const operatorToken = req.headers["x-activetab-operator-token"];
+              if (!operatorToken || operatorToken !== process.env.ACTIVETAB_OPERATOR_TOKEN) { sendError(res, 403, 99403, "Operator authentication required."); return; }
+              sendJson(res, 200, await interventionTools.resolve_operation_approval({ interventionId, authenticatedOperator: body.authenticatedOperator ?? "operator", decision: body.decision ?? "approve", expectedRevision: body.expectedRevision ?? null })); return;
+            }
             if (method === "POST" && action === "reject") { const body = await readBody(req); sendJson(res, 200, await interventionTools.reject_operation({ interventionId, ...(body ?? {}) })); return; }
             if (method === "POST" && action === "resume") { const body = await readBody(req); sendJson(res, 200, await interventionTools.resume_run({ interventionId, ...(body ?? {}) })); return; }
             if (method === "POST" && action === "cancel") { sendJson(res, 200, await interventionTools.cancel_run({ interventionId })); return; }

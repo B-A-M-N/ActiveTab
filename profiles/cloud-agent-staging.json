@@ -2,7 +2,7 @@
   "$schema": "./profile-schema.json",
   "profile_id": "cloud-agent-staging",
   "name": "Cloud Agent on FreeInference Staging",
-  "description": "Cloud Agent as an application realm within the FreeInference staging platform. The browser path enters through the real staging website (https://staging.freeinference.org -> /agents/); the admin diagnostic adapter is an optional backend source, reachable directly or through an explicitly configured, verified SSH tunnel. The tunnel's localhost URL is transport only and must never become the browser entry point.",
+  "description": "Cloud Agent is reached from the authenticated FreeInference staging website by following its visible Cloud Agents link. Its destination may use a different URL; the browser observes that destination instead of guessing it. Backend diagnostics use a separate optional adapter.",
   "environment": {
     "environment_id": "freeinference-staging",
     "platform": "freeinference",
@@ -11,17 +11,17 @@
     "diagnostic_endpoint": null,
     "diagnostic_transport": null,
     "remote_target": null,
-    "authorized_origins": ["https://staging.freeinference.org"],
+    "authorized_origins": ["https://staging.freeinference.org", "https://agents-staging.freeinference.org"],
     "applications": [
       {
         "application_id": "fi-agents",
         "authentication_realm": "agents-session",
-        "candidate_entry": "/agents/",
+        "candidate_entry": "https://agents-staging.freeinference.org/",
         "status": "candidate"
       }
     ]
   },
-  "origin_patterns": ["https://staging.freeinference.org"],
+  "origin_patterns": ["https://staging.freeinference.org", "https://agents-staging.freeinference.org"],
   "authentication_realms": [
     {
       "realm_id": "agents-session",
@@ -37,6 +37,16 @@
     }
   ],
   "diagnostic_sources": [
+    {
+      "source_id": "cloud-agent-admin-ui-inventory",
+      "description": "Bounded, read-only inventory of the authenticated Cloud Agent admin UI and same-origin GET routes it loads.",
+      "authority": "admin_session",
+      "operations": ["read_ui_metadata", "observe_get_routes"],
+      "scope": "profile-declared-surfaces",
+      "sensitivity": "metadata_only",
+      "validation_required": true,
+      "notes": "Uses visible UI links and controls only. Does not read response bodies, submit admin forms, or query database tables."
+    },
     {
       "source_id": "cloud-agent-runs",
       "description": "Recent agent run execution records, scoped to the test operation under investigation.",
@@ -66,5 +76,41 @@
       "validation_required": true
     }
   ],
+  "staging_ui_diagnostics": {
+    "application_origin": "https://agents-staging.freeinference.org",
+    "entry_link_labels": ["Agents", "Cloud Agents"],
+    "login_link_labels": ["Login", "Log in", "Sign in"],
+    "admin_link_labels": ["Admin"],
+    "settings_link_labels": ["Settings"],
+    "admin_path_prefix": "/admin/",
+    "api_path_prefix": "/api/admin/agent/",
+    "surfaces": [
+      { "surface_id": "audit", "pathname": "/admin/audit", "link_labels": ["Audit", "Audit log"], "audit_categories": ["All", "Settings", "Servers", "Measurements", "Content views", "Database"] },
+      { "surface_id": "activity", "pathname": "/admin/activity", "link_labels": ["Activity"], "tabs": ["Sandboxes", "Sessions", "Turns", "Steps"], "known_options": ["Last 7 days", "Last 30 days", "Last 90 days", "All results", "queued", "running", "succeeded", "failed", "cancelled"] },
+      { "surface_id": "measurements", "pathname": "/admin/measurements", "link_labels": ["Measurements"], "expandable_sections": ["Operations", "Timings"], "known_options": ["All Operations", "Sandbox Startup", "Terminal Opening", "File Listing", "File Opening", "All servers"] },
+      { "surface_id": "usage", "pathname": "/admin/usage", "link_labels": ["Usage"], "known_options": ["Last 7 days", "Last 30 days", "Last 90 days"] },
+      { "surface_id": "database", "pathname": "/admin/database", "link_labels": ["Database"], "known_options": ["agent_audit", "agent_jobs", "agent_attempts", "agent_sandboxes", "agent_threads", "agent_tool_resources", "Ascending", "Descending", "25", "50", "100", "200"] },
+      { "surface_id": "settings", "pathname": null, "link_labels": ["Settings"], "route_discovery": "visible-admin-link", "status": "needs-live-inventory" }
+    ],
+    "known_controls": ["Operation", "Run", "Server", "Servers", "Created", "Turn created", "Turn result", "Rows per page", "Sort by", "Sort direction", "Add filter"],
+    "known_options": ["All", "Settings", "Servers", "Measurements", "Content views", "Database", "Sandboxes", "Sessions", "Turns", "Steps", "All operations", "All Operations", "Sandbox Startup", "Terminal Opening", "File Listing", "File Opening", "All servers", "All results", "Last 7 days", "Last 30 days", "Last 90 days", "queued", "running", "succeeded", "failed", "cancelled", "agent_audit", "agent_jobs", "agent_attempts", "agent_sandboxes", "agent_threads", "agent_tool_resources", "Ascending", "Descending", "25", "50", "100", "200"],
+    "recipes": [
+      { "recipe_id": "admin-dashboard-inventory", "areas": ["audit", "activity", "measurements", "usage", "database", "settings"] },
+      { "recipe_id": "admin-settings-review", "areas": ["settings"] },
+      { "recipe_id": "admin-activity-review", "areas": ["activity", "measurements", "usage"] },
+      { "recipe_id": "admin-audit-review", "areas": ["audit"] }
+    ],
+    "policy": {
+      "maximumRowsExpandedPerAuditCategory": 1,
+      "maximumPages": 6,
+      "readOnly": true,
+      "recordPageText": false,
+      "readResponseBodies": false,
+      "submitForms": false,
+      "selectDatabaseTables": false,
+      "recordFreeTextFieldValues": false,
+      "allowOnlyVisibleAdminLinks": true
+    }
+  },
   "test_packs": []
 }

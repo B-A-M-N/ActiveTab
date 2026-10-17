@@ -8,9 +8,8 @@
  * invocations.
  *
  * Modes:
- *   --mode=owned    (default) Launch an owned headed Chrome with a unique
- *                   disposable profile and Chrome-assigned CDP port. For
- *                   disposable, bounded execution inside one invocation.
+ *   --mode=owned    (default) Launch an owned headed Chrome with a private,
+ *                   persistent profile dedicated to this staging profile.
  *   --mode=attached Attach to the operator's existing authorized Chrome
  *                   tab (extension Attach flow or confirmed direct CDP
  *                   target). The browser process and authenticated
@@ -24,11 +23,10 @@
  * desktop). Use the current display (DISPLAY already set) for
  * human-assisted runs.
  *
- * Honest outcomes (P1-3/P1-5): if the owned invocation reaches the real
- * staging site but cannot authenticate, that is a truthful
- * WAITING_FOR_HUMAN result — browser launch, connection, and real-site
- * navigation are established; human authentication remains blocked by
- * the environment. The attached mode then finishes the workflow.
+ * Human handoff: owned mode keeps the same browser and run alive while the
+ * operator follows staging → visible Cloud Agents → Agent login. It resumes
+ * only after fresh evidence shows the Agent task composer. After qualification
+ * it leaves the authenticated page open until Ctrl-C.
  */
 
 import { spawn } from "node:child_process";
@@ -56,8 +54,8 @@ const hasFlag = name => args.includes(`--${name}`);
 
 const mode = arg("mode", "owned");
 const profileId = arg("profile", "cloud-agent-staging");
-const waitForHuman = hasFlag("wait-for-human");
-const humanWaitMinutes = Number(arg("wait-minutes", "5"));
+const openOnly = hasFlag("open-only");
+
 const useXvfb = hasFlag("xvfb");
 const reportDirArg = arg("report-dir", null);
 
@@ -69,6 +67,10 @@ if (mode === "attached" && useXvfb) {
   console.error("--xvfb is only meaningful with --mode=owned.");
   process.exit(2);
 }
+if (mode === "attached" && openOnly) {
+  console.error("--open-only requires --mode=owned.");
+  process.exit(2);
+}
 if (mode === "owned" && process.env.ACTIVETAB_HEADLESS === "1") {
   console.error("Refusing --mode=owned with ACTIVETAB_HEADLESS=1: headless is never a silent fallback for staging qualification. Use --mode=owned with a display, or an explicit operator opt-in workflow.");
   process.exit(2);
@@ -77,7 +79,29 @@ if (mode === "owned" && process.env.ACTIVETAB_HEADLESS === "1") {
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const profilesDir = join(repoRoot, "profiles");
 const stateDir = join(repoRoot, ".activetab", "qualification");
+const browserProfilesDir = join(stateDir, "browser-profiles");
 const reportDir = reportDirArg ?? stateDir;
+
+function delayOrAbort(ms, signal) {
+  return new Promise(resolve => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    if (signal?.aborted) finish();
+    else signal?.addEventListener("abort", finish, { once: true });
+  });
+}
+
+if (!/^[a-z0-9][a-z0-9-]{0,63}$/i.test(profileId)) {
+  console.error("Profile ID must contain only letters, digits, and hyphens.");
+  process.exit(2);
+}
 
 let xvfbProcess = null;
 let displaySource = "current-display";
@@ -108,9 +132,9 @@ function captureScreenshot(session, name) {
     .then(async data => {
       if (!data) return null;
       try {
-        await mkdir(reportDir, { recursive: true });
+        await mkdir(reportDir, { recursive: true, mode: 0o700 });
         const path = join(reportDir, `${name}.jpg`);
-        await writeFile(path, Buffer.from(data, "base64"));
+        await writeFile(path, Buffer.from(data, "base64"), { mode: 0o600 });
         return path;
       } catch { return null; }
     });
@@ -127,19 +151,51 @@ async function main() {
   process.on("SIGINT", onSig);
   process.on("SIGTERM", onSig);
 
-  // Durable state (P0-4). The owned run's intervention store and browser
-  // cannot survive the invocation's end; the attached (host-backed) mode
-  // persists under the configured state directory so a restart can reload
-  // and resume the exact pending run.
+  // Attached mode can resume its exact external target across invocations.
+  // Owned mode retains its dedicated Chrome profile, but each invocation
+  // starts a fresh run against that login; an unfinished auth-only run does
+  // not block a later attempt or delete its record.
   const durable = mode === "attached";
   const interventionDir = durable
     ? join(repoRoot, ".activetab", "interventions")
     : join(stateDir, "interventions-owned");
-  const runStoreDir = durable ? join(repoRoot, ".activetab", "run-state") : null;
+  const runStoreDir = join(repoRoot, ".activetab", "run-state");
   const interventions = new InterventionStore(interventionDir);
   await interventions.init();
-  const runStore = runStoreDir ? new RunStateStore(runStoreDir) : null;
+  const runStore = durable ? new RunStateStore(runStoreDir) : null;
   if (runStore) await runStore.init();
+
+  // P0-4: owned-mode resume must never silently launch a replacement
+  // browser. If a suspended run exists in the durable store, require an
+  // explicit --resume-run-id or --discard-run before launching.
+  if (mode === "owned" && runStore) {
+    const suspended = runStore.listSuspended();
+    if (suspended.length > 0) {
+      console.error(`[owned] ${suspended.length} suspended qualification run(s) exist in the durable state store (${runStoreDir}).`);
+      for (const run of suspended) {
+        console.error(`  runId=${run.runId} status=${run.status} pendingIntervention=${run.pendingInterventionId ?? "none"} suspendedStep=${run.suspendedStepId ?? "none"}`);
+      }
+      const resumeId = process.env.ACTIVETAB_RESUME_RUN_ID ?? null;
+      const discard = process.env.ACTIVETAB_DISCARD_SUSPENDED_RUN === "1";
+      if (discard) {
+        console.error("[owned] ACTIVETAB_DISCARD_SUSPENDED_RUN=1: proceeding with a new owned run; suspended runs are not resumed by this invocation.");
+      } else if (resumeId) {
+        const match = suspended.find(run => run.runId === resumeId);
+        if (!match) {
+          console.error(`[owned] ACTIVETAB_RESUME_RUN_ID='${resumeId}' does not match any suspended run. Refusing to launch a replacement browser.`);
+          process.exit(3);
+        }
+        console.error(`[owned] Suspended run ${resumeId} exists, but owned-mode resume is not implemented in this invocation. Launching a new browser would lose the authenticated session. Use --mode=attached with ACTIVETAB_AUTHORIZED_TARGET_ID to resume, or discard the run explicitly.`);
+        process.exit(3);
+      } else {
+        console.error("[owned] Refusing to launch a replacement browser that would silently discard the suspended run.");
+        console.error("  Options:");
+        console.error("    - Use attached mode with the original authorized tab and ACTIVETAB_RESUME_RUN_ID to resume the suspended run.");
+        console.error("    - Set ACTIVETAB_DISCARD_SUSPENDED_RUN=1 to explicitly abandon the suspended run and launch a fresh owned browser.");
+        process.exit(3);
+      }
+    }
+  }
 
   let owned = null;
   let session = null;
@@ -150,10 +206,15 @@ async function main() {
   try {
     if (mode === "owned") {
       owned = await launchOwnedChrome({
+        // Both the manual browser launcher and qualification begin at the
+        // actual staging application entry. Cloud Agent is reached through
+        // the visible UI route observed by the workflow.
         initialUrl: binding.applicationEntryUrl,
         headed: true,
         displayMode: useXvfb ? "xvfb" : "current-display",
-        signal: controller.signal
+        signal: controller.signal,
+        userDataDir: join(browserProfilesDir, profileId),
+        preserveProfile: true
       });
       session = owned.session;
       evidence.browser = {
@@ -162,10 +223,25 @@ async function main() {
         displaySource,
         browserVersion: owned.browserVersion,
         assignedCdpEndpoint: "ws://127.0.0.1:<assigned>", // sanitized: assigned port only
-        profileDir: "<disposable removed on cleanup>",
+        profileDir: "<private persistent profile>",
         readiness: owned.readiness
       };
       console.log(`[owned] Chrome ${owned.browserVersion} launched (${owned.launchMode}, ${displaySource}), target ${owned.targetId}`);
+      if (openOnly) {
+        const cdpHttp = new URL(owned.endpoint);
+        cdpHttp.protocol = "http:";
+        cdpHttp.pathname = "";
+        cdpHttp.search = "";
+        console.log(`[owned] Staging entry: ${binding.applicationEntryUrl}`);
+        console.log(`[owned] Browser parked for manual login/navigation. Persistent profile: ${owned.profileDir}`);
+        console.log(`[owned] CDP endpoint: ${cdpHttp.href}`);
+        console.log("[owned] Authenticate on staging, follow the visible Cloud Agents link, and leave this process running for attachment.");
+        await new Promise(resolve => {
+          if (controller.signal.aborted) return resolve();
+          controller.signal.addEventListener("abort", resolve, { once: true });
+        });
+        return;
+      }
     } else {
       // Attached mode: adopt only a tab authorized out of band. Never turn
       // an arbitrary existing tab into a runner-owned target.
@@ -183,12 +259,26 @@ async function main() {
         console.error(`[attached] No authorized tab on ${binding.entryOrigin} (observed: ${observed}). Open FreeInference staging and Attach/authorize the tab.`);
         process.exit(3);
       }
-      const target = await resolveAuthorizedTarget(endpoint, stagingTarget.id, stagingTarget.id);
+      const authorizedTargetId = process.env.ACTIVETAB_AUTHORIZED_TARGET_ID;
+      if (!authorizedTargetId) {
+        console.error(`[attached] ACTIVETAB_AUTHORIZED_TARGET_ID is required in attached mode. Set it to the target ID independently authorized via the extension Attach action.`);
+        process.exit(3);
+      }
+      if (authorizedTargetId !== stagingTarget.id) {
+        console.error(`[attached] Independently supplied target ID '${authorizedTargetId}' does not match the discovered staging target '${stagingTarget.id}'. Re-authorize the correct tab.`);
+        process.exit(3);
+      }
+      const target = await resolveAuthorizedTarget(endpoint, stagingTarget.id, authorizedTargetId);
       session = await new BrowserSession(target).attach();
       attachedFromOutside = true;
       evidence.browser = { launchMode: "attached (operator browser preserved)", endpoint: "ws://127.0.0.1:<operator-assigned>" };
       console.log(`[attached] Attached to authorized staging tab ${stagingTarget.id} (${stagingTarget.url})`);
     }
+
+    const waitForAbort = () => new Promise(resolve => {
+      if (controller.signal.aborted) return resolve();
+      controller.signal.addEventListener("abort", resolve, { once: true });
+    });
 
     const report = await qualifyCloudAgent({
       session,
@@ -196,14 +286,33 @@ async function main() {
       interventions,
       runStore,
       mode,
-      waitForHuman,
-      humanWaitMs: Math.max(1, humanWaitMinutes) * 60_000,
+
       signal: controller.signal,
+      onHumanIntervention: async (intervention, { inspectCurrentPage }) => {
+        console.log(`\n[human] ${intervention.requiredHumanAction ?? "Complete the visible staging and Cloud Agent login flow in Chrome."}`);
+        console.log(`[human] Chrome remains open at the staging root. ActiveTab will resume this same run after it observes the authorized Cloud Agent task composer.`);
+        let lastNoticeAt = 0;
+        while (!controller.signal.aborted) {
+          const ready = await inspectCurrentPage().catch(error => ({ ok: false, reason: String(error?.message ?? error) }));
+          if (ready.ok) {
+            console.log(`[human] Verified task composer at ${ready.origin}; resuming the suspended run.`);
+            return true;
+          }
+          if (Date.now() - lastNoticeAt > 15_000) {
+            console.log(`[human] Still waiting for the task composer (${ready.reason ?? "not visible yet"}).`);
+            lastNoticeAt = Date.now();
+          }
+          await delayOrAbort(1_500, controller.signal);
+        }
+        return false;
+      },
       onEvent: text => console.log(`  ${text}`)
     });
 
     // Capture a screenshot where permitted (bounded, local).
-    const shot = await captureScreenshot(session, `qualify-${report.runId}`);
+    const shot = hasFlag("capture-screenshot")
+      ? await captureScreenshot(session, `qualify-${report.runId}`)
+      : null;
     if (shot) { evidence.screenshots.push(shot); report.screenshotPath = shot; }
 
     report.evidence = { ...report.evidence, ...evidence };
@@ -211,9 +320,9 @@ async function main() {
     report.displaySource = displaySource;
 
     // Persist the final report.
-    await mkdir(reportDir, { recursive: true });
+    await mkdir(reportDir, { recursive: true, mode: 0o700 });
     const reportPath = join(reportDir, `${report.runId}.report.json`);
-    await writeFile(reportPath, JSON.stringify(report, null, 2), "utf8");
+    await writeFile(reportPath, JSON.stringify(report, null, 2), { encoding: "utf8", mode: 0o600 });
     report.reportLocation = reportPath;
 
     console.log(`\nQualification state: ${report.qualificationState}`);
@@ -228,10 +337,25 @@ async function main() {
     // Distinct, honest exit codes (P1-3).
     const exitByState = { PASSED: 0, FAILED: 1, WAITING_FOR_HUMAN: 10, BLOCKED: 11, UNCERTAIN: 12, CANCELED: 13 };
     process.exitCode = exitByState[report.qualificationState] ?? 1;
+
+    // Leave the authenticated page available for the operator's next
+    // read-only discovery or explicitly requested PR test. The profile is
+    // persistent, and Ctrl-C is the explicit close boundary.
+    if (mode === "owned" && report.gates?.agents_application_entered?.passed === true && !controller.signal.aborted) {
+      const cdpHttp = new URL(owned.endpoint);
+      cdpHttp.protocol = "http:";
+      cdpHttp.pathname = "";
+      cdpHttp.search = "";
+      console.log(`[owned] Authenticated Cloud Agent remains open at the observed application page. Target: ${owned.targetId}`);
+      console.log(`[owned] CDP endpoint: ${cdpHttp.href}`);
+      console.log(`[owned] Persistent profile retained: ${owned.profileDir}`);
+      console.log("[owned] Press Ctrl-C when you are done using this browser.");
+      await waitForAbort();
+    }
   } finally {
     if (owned) {
       const cleanup = await owned.close();
-      console.log(`[owned] Cleanup: graceful=${cleanup.graceful} forced=${cleanup.forced} exitCode=${cleanup.exitCode} profileRemoved=${cleanup.profileRemoved}${cleanup.error ? ` error=${cleanup.error}` : ""}`);
+      console.log(`[owned] Browser closed: graceful=${cleanup.graceful} forced=${cleanup.forced} exitCode=${cleanup.exitCode} profilePreserved=${cleanup.profilePreserved}${cleanup.error ? ` error=${cleanup.error}` : ""}`);
       if (xvfbProcess) { try { xvfbProcess.kill("SIGTERM"); } catch { /* best-effort */ } }
     } else if (session && attachedFromOutside) {
       // Detach without closing the operator's browser.

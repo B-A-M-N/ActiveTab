@@ -11,7 +11,7 @@
     "diagnostic_endpoint": null,
     "diagnostic_transport": null,
     "remote_target": null,
-    "authorized_origins": ["https://staging.freeinference.org"],
+    "authorized_origins": ["https://staging.freeinference.org", "https://agents-staging.freeinference.org"],
     "applications": [
       {
         "application_id": "fi-dashboard",
@@ -22,13 +22,13 @@
       {
         "application_id": "fi-admin",
         "authentication_realm": "fi-admin",
-        "candidate_entry": "/dashboard/admin",
+        "candidate_entry": "/dashboard/admin/users",
         "status": "candidate"
       },
       {
         "application_id": "fi-agents",
         "authentication_realm": "agents-session",
-        "candidate_entry": "/agents/",
+        "candidate_entry": "https://agents-staging.freeinference.org",
         "status": "candidate"
       },
       {
@@ -69,13 +69,13 @@
   "diagnostic_sources": [
     {
       "source_id": "fi-request-history",
-      "description": "Recent request history visible in the dashboard. Starting evidence for diagnostic discovery.",
+      "description": "Recent Requests history with filtered JSONL downloads for selected time periods (operator-reported; discovery still required).",
       "authority": "application_session",
-      "operations": ["read"],
-      "scope": "run-scoped, metadata-first",
-      "sensitivity": "metadata_only",
+      "operations": ["read", "export_jsonl"],
+      "scope": "incident-scoped account or run and explicit time window; discover filters before export",
+      "sensitivity": "request_level_sensitive",
       "validation_required": true,
-      "notes": "Route is not predeclared. Discover via reconnaissance and verify before collection."
+      "notes": "Route and filter choices are not yet inventoried. Read filter/time-period schemas without exporting. JSONL export requires explicit incident scope and FreeInference authorization."
     },
     {
       "source_id": "fi-analytics",
@@ -87,5 +87,190 @@
       "validation_required": true
     }
   ],
+  "dashboard_discovery": {
+    "origin": "https://staging.freeinference.org",
+    "pathname": "/dashboard",
+    "dashboard_heading": "Dashboard",
+    "models_heading": "Models",
+    "agents_link_labels": ["Agents", "Cloud Agents"],
+    "agents_origin": "https://agents-staging.freeinference.org",
+    "settings_link_labels": ["Settings"],
+    "settings_pathname": "/dashboard/settings",
+    "admin_console_link_labels": ["Admin Console"],
+    "admin_console_pathname": "/dashboard/admin/users",
+    "read_only": true,
+    "model_source": "visible accessible button labels",
+    "admin_console_navigation": "record_exact_visible_link_only; any_walkthrough_is_separate_and_operator_directed"
+  },
+  "admin_console_discovery": {
+    "origin": "https://staging.freeinference.org",
+    "pathname": "/dashboard/admin/users",
+    "heading": "Admin",
+    "read_only": true,
+    "requires_operator_opened_route": true,
+    "capture_user_rows": false,
+    "capture_user_summary_values": false,
+    "capture_field_values": false,
+    "capture_response_bodies": false,
+    "dispatch_actions": false,
+    "safe_button_labels": [
+      "Pending", "Top spenders today", "Anomalies", "Near quota", "Recently active",
+      "+ Save current", "Clear filters", "Columns", "Comfortable", "Compact", "Previous", "Next"
+    ]
+  },
+  "operator_safety_constraints": [
+    {
+      "surface": "Admin Console / Recent Requests",
+      "control_label": "Clear Last Hours",
+      "prohibited_actions": ["click", "submit"],
+      "source": "operator_reported",
+      "status": "hard_deny",
+      "effect_verified": false
+    },
+    {
+      "surface": "Admin Console / Overview / Providers",
+      "context": "Providers",
+      "control_label": "Manage",
+      "prohibited_actions": ["click", "submit"],
+      "source": "operator_reported",
+      "status": "hard_deny",
+      "effect_verified": false
+    },
+    {
+      "surface": "Admin Console / Overview / Providers",
+      "context": "Providers",
+      "control_label": "Edit",
+      "prohibited_actions": ["click", "submit"],
+      "source": "operator_reported",
+      "status": "hard_deny",
+      "effect_verified": false
+    },
+    {
+      "surface": "Admin Console / Overview / Providers",
+      "context": "Providers",
+      "control_label": "Add",
+      "prohibited_actions": ["click", "submit"],
+      "source": "operator_reported",
+      "status": "hard_deny",
+      "effect_verified": false
+    },
+    {
+      "surface": "Admin Console / Overview / Providers",
+      "context": "Providers",
+      "control_label": "Delete Keys",
+      "prohibited_actions": ["click", "submit"],
+      "source": "operator_reported",
+      "status": "hard_deny",
+      "effect_verified": false
+    },
+    {
+      "surface": "Admin Console / Audit Log",
+      "context": "Audit Log",
+      "control_label": "Entire Audit Log surface",
+      "prohibited_actions": ["navigate", "click", "scroll", "type", "select", "expand", "submit"],
+      "source": "operator_reported",
+      "status": "hard_deny",
+      "effect_verified": false
+    },
+    {
+      "surface": "Admin Console / Settings",
+      "context": "Settings",
+      "control_label": "Settings mutation controls",
+      "prohibited_actions": ["click_controls", "type", "select", "upload", "submit", "modify"],
+      "source": "operator_reported",
+      "status": "authorization_required",
+      "authorization_condition": "explicit_freeinference_authorization",
+      "effect_verified": false
+    },
+    {
+      "surface": "Admin Console / Config",
+      "context": "Config",
+      "control_label": "Config mutation controls",
+      "prohibited_actions": ["click_controls", "type", "select", "upload", "submit", "modify"],
+      "source": "operator_reported",
+      "status": "authorization_required",
+      "authorization_condition": "explicit_freeinference_authorization",
+      "effect_verified": false
+    }
+  ],
+  "providers_discovery": {
+    "surface": "Admin Console / Overview / Providers",
+    "route_status": "not_yet_live_inventoried",
+    "read_only": true,
+    "requires_operator_opened_route": true,
+    "operator_reported_subtabs": ["Overview", "Performance"],
+    "performance_control_kinds": ["dropdown", "text_input"],
+    "inspect_filter_schema_only": true,
+    "capture_values": false,
+    "change_filters": false,
+    "dispatch_actions": false,
+    "prohibited_control_labels": ["Manage", "Edit", "Add", "Delete Keys"]
+  },
+  "admin_log_discovery": {
+    "operator_reported_labels": ["Log", "Audit Log"],
+    "relationship": "unconfirmed",
+    "purpose": "unknown",
+    "route_status": "not_yet_live_inventoried",
+    "audit_log_dropdowns_reported": true,
+    "audit_log_do_not_open_or_interact": true,
+    "inspect_dropdowns": false
+  },
+  "settings_config_discovery": {
+    "surface": "Admin Console / Settings and Config",
+    "route_status": "partially_inventoried_from_operator_screenshot",
+    "accepted_headings": ["Settings", "Config", "Configuration"],
+    "navigation_labels": ["Configuration", "Settings"],
+    "observed_pages": [
+      {
+        "surface": "Settings",
+        "pathname": "/dashboard/admin/settings",
+        "source": "operator_screenshot",
+        "section": "Feature Flags",
+        "section_description": "Toggle runtime features without restarting the server. Changes take effect immediately.",
+        "visible_controls": [
+          {
+            "label": "User Auth Enabled",
+            "description": "Require user API keys for inference requests (does not disable account login)",
+            "kind": "toggle",
+            "displayed_state": "on"
+          },
+          {
+            "label": "Signup Enabled",
+            "description": "Allow new user signups",
+            "kind": "toggle",
+            "displayed_state": "on"
+          },
+          {
+            "label": "Signup Require Email Verification",
+            "description": "Require email verification for new signups",
+            "kind": "toggle",
+            "displayed_state": "on",
+            "visibility": "partially_below_viewport"
+          }
+        ],
+        "additional_content": "below_fold_not_observed",
+        "controls_changed": false
+      }
+    ],
+    "configuration_route_status": "tab_visible_not_opened",
+    "read_only_inventory_allowed": true,
+    "requires_operator_opened_route": true,
+    "capture_control_labels": true,
+    "capture_current_non_sensitive_values": true,
+    "redact_sensitive_values": true,
+    "allow_mutation": false,
+    "mutation_requires_explicit_freeinference_authorization": true
+  },
+  "recent_requests_discovery": {
+    "surface": "Admin Console / Recent Requests",
+    "route_status": "not_yet_live_inventoried",
+    "read_only": true,
+    "requires_operator_opened_route": true,
+    "inspect_filter_schema_only": true,
+    "download_during_discovery": false,
+    "control_kinds": ["text_input", "dropdown"],
+    "capture_values": false,
+    "prohibited_control_labels": ["Clear Last Hours"]
+  },
   "test_packs": []
 }

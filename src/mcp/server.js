@@ -21,6 +21,7 @@ import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
 import { InvestigationEngine } from "../investigation/engine.js";
 import { InterventionStore, InterventionWatcher } from "../runtime/interventions.js";
 import { createInterventionTools } from "../api/intervention-tools.js";
+import { AuthorizationGrantStore } from "../runtime/approvals.js";
 
 const endpoint = process.env.ACTIVETAB_CDP_ENDPOINT ?? "http://127.0.0.1:9222";
 const sessions = new Map();
@@ -40,7 +41,10 @@ let interventionTools = null;
 let interventionWatcher = null;
 
 const interventionStore = new InterventionStore(process.env.ACTIVETAB_INTERVENTION_DIR ?? join(process.cwd(), ".activetab", "interventions"));
+const grantStore = new AuthorizationGrantStore({ trustedIssuer: process.env.ACTIVETAB_TRUSTED_ISSUER ?? "activetab-mcp" });
 const interventionCtx = {
+  grantStore,
+  issueGrant: (...args) => grantStore.issue(...args),
   // Attachment verification: a caller-provided target ID alone is never proof.
   hasAttachmentGrant: async targetId => sessions.has(targetId)
     ? { ok: true }
@@ -90,7 +94,7 @@ const tools = [
   { name: "list_pending_interventions", description: "List durable, resumable human interventions (waiting or acknowledged) across runs, with their exact completion conditions.", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
   { name: "get_pending_intervention", description: "Get one intervention record including its verified resume predicate.", inputSchema: { type: "object", properties: { interventionId: { type: "string" } }, required: ["interventionId"], additionalProperties: false } },
   { name: "acknowledge_human_action", description: "Record that the operator believes the requested human action is complete. This does NOT resume execution; resume_run verifies the completion predicate first.", inputSchema: { type: "object", properties: { interventionId: { type: "string" } }, required: ["interventionId"], additionalProperties: false } },
-  { name: "approve_operation", description: "Issue a scoped, single-use authorization grant for an intervention's exact operation. Approval of one operation grants no general autonomy.", inputSchema: { type: "object", properties: { interventionId: { type: "string" }, grantedBy: { type: "string" }, expiresInMs: { type: "integer", minimum: 1000 } }, required: ["interventionId"], additionalProperties: false } },
+  { name: "request_operation_approval", description: "Request (do not grant) approval for an intervention's exact operation. An MCP client cannot approve its own requested effects; resolution requires an independently authenticated operator channel.", inputSchema: { type: "object", properties: { interventionId: { type: "string" } }, required: ["interventionId"], additionalProperties: false } },
   { name: "reject_operation", description: "Reject and cancel a pending intervention.", inputSchema: { type: "object", properties: { interventionId: { type: "string" }, reason: { type: "string" } }, required: ["interventionId"], additionalProperties: false } },
   { name: "resume_run", description: "Resume a suspended run: verifies the exact completion predicate (grant scope/expiry, authenticated session, attachment grant, or outcome reconciliation) with fresh evidence before admitting execution.", inputSchema: { type: "object", properties: { interventionId: { type: "string" } }, required: ["interventionId"], additionalProperties: false } },
   { name: "get_run_state", description: "Get the resumable state of a run (including suspended/waiting states).", inputSchema: { type: "object", properties: { runId: { type: "string" } }, required: ["runId"], additionalProperties: false } },
@@ -135,7 +139,8 @@ async function callTool(name, args) {
     const session = sessions.get(args.targetId);
     if (!session) throw new Error("No explicitly authorized tab is attached for that targetId.");
     sessions.delete(args.targetId);
-    await session.close();
+    try { await session.close(); }
+    finally { if (extensionMode) await extensionBroker.detach(args.targetId); }
     return { status: "detached", targetId: args.targetId };
   }
   if (name === "start_test_run") {

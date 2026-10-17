@@ -18,6 +18,12 @@
     "test:headed": "bash scripts/test-headed.sh",
     "qualify:staging": "node scripts/qualify-staging.mjs",
     "qualify:staging:owned": "node scripts/qualify-staging.mjs --mode=owned",
-    "qualify:staging:attached": "node scripts/qualify-staging.mjs --mode=attached"
+    "browser:staging": "node scripts/qualify-staging.mjs --mode=owned --open-only",
+    "qualify:staging:attached": "node scripts/qualify-staging.mjs --mode=attached",
+    "discover:staging-dashboard": "node scripts/discover-staging-dashboard.mjs",
+    "discover:staging-admin-console": "node scripts/discover-staging-admin-console.mjs",
+    "discover:staging-admin-config": "node scripts/discover-staging-admin-config.mjs",
+    "discover:staging-admin": "node scripts/discover-staging-admin.mjs",
+    "discover:staging-admin:settings": "node scripts/discover-staging-admin.mjs --recipe=admin-settings-review"
   }
 }

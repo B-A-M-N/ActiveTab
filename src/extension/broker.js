@@ -181,7 +181,9 @@ export class ExtensionBroker extends EventEmitter {
   }
 
   async close() {
-    await Promise.all([...this.attachedTargets.keys()].map(targetId => this.detach(targetId).catch(() => {})));
+    // Closing/restarting the local broker is a transport lifecycle event, not
+    // operator revocation. Leave extension-owned debugger leases intact so
+    // the service worker can reconnect and restore the same authorized tabs.
     if (this.socket) this.#drop(new Error("ActiveTab broker is closing."));
     if (this.server) await new Promise(resolve => this.server.close(resolve));
     this.server = null;
@@ -243,6 +245,5 @@ class ExtensionCdpTransport {
     this.broker.off("detached", this.forwardDetached);
     this.broker.off("disconnected", this.forwardDisconnected);
     this.listeners.clear();
-    if (!this.disconnected && !this.detached) await this.broker.detach(this.targetId);
   }
 }

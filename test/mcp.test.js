@@ -38,7 +38,7 @@ test("MCP stdio server initializes and advertises bounded browser tools", async 
   try {
     assert.equal(responses[0].result.serverInfo.name, "activetab");
     const names = responses[1].result.tools.map(tool => tool.name);
-    assert.deepEqual(names, ["list_tabs", "attach_tab", "detach_tab", "observe_page", "get_evidence", "inspect_runtime_state", "click_observed_element", "inspect_network_response", "discover_application", "investigate_failure", "start_test_run", "get_test_run", "cancel_test_run", "collect_diagnostics", "get_test_report", "list_pending_interventions", "get_pending_intervention", "acknowledge_human_action", "approve_operation", "reject_operation", "resume_run", "get_run_state", "cancel_run", "run_goal"]);
+    assert.deepEqual(names, ["list_tabs", "attach_tab", "detach_tab", "observe_page", "get_evidence", "inspect_runtime_state", "click_observed_element", "inspect_network_response", "discover_application", "investigate_failure", "start_test_run", "get_test_run", "cancel_test_run", "collect_diagnostics", "get_test_report", "list_pending_interventions", "get_pending_intervention", "acknowledge_human_action", "request_operation_approval", "reject_operation", "resume_run", "get_run_state", "cancel_run", "run_goal"]);
     assert.deepEqual(responses[1].result.tools.find(tool => tool.name === "attach_tab").inputSchema.required, ["targetId"]);
     assert.deepEqual(responses[1].result.tools.find(tool => tool.name === "detach_tab").inputSchema.required, ["targetId"]);
     assert.match(responses[1].result.tools.find(tool => tool.name === "observe_page").description, /targetId/);
@@ -87,7 +87,7 @@ test("extension MCP exposes no tabs and refuses attach until the popup authorize
   ], { stateDir });
   try {
     assert.equal(responses[0].result.serverInfo.name, "activetab");
-    assert.deepEqual(responses[1].result.tools.map(tool => tool.name), ["list_tabs", "attach_tab", "detach_tab", "observe_page", "get_evidence", "inspect_runtime_state", "click_observed_element", "inspect_network_response", "discover_application", "investigate_failure", "start_test_run", "get_test_run", "cancel_test_run", "collect_diagnostics", "get_test_report", "list_pending_interventions", "get_pending_intervention", "acknowledge_human_action", "approve_operation", "reject_operation", "resume_run", "get_run_state", "cancel_run", "run_goal"]);
+    assert.deepEqual(responses[1].result.tools.map(tool => tool.name), ["list_tabs", "attach_tab", "detach_tab", "observe_page", "get_evidence", "inspect_runtime_state", "click_observed_element", "inspect_network_response", "discover_application", "investigate_failure", "start_test_run", "get_test_run", "cancel_test_run", "collect_diagnostics", "get_test_report", "list_pending_interventions", "get_pending_intervention", "acknowledge_human_action", "request_operation_approval", "reject_operation", "resume_run", "get_run_state", "cancel_run", "run_goal"]);
     assert.deepEqual(responses[2].result.structuredContent, []);
     assert.match(responses[3].error.message, /Attach this exact tab from the ActiveTab extension/);
   } finally {
