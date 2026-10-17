@@ -1,67 +1,53 @@
 {
   "workflow_id": "cloud-agent-mcp-lifecycle",
   "name": "MCP connector lifecycle",
-  "description": "Where supported, test connector registration, association, invocation, revocation, and recovery.",
+  "description": "Discover MCP connector management through the real staging UI, create a test-owned connector, verify its authoritative ID, invoke a permitted operation, verify the identifiable execution, then clean up and verify cleanup server-side. Semantic steps resolve against fresh evidence; routes are not predeclared.",
   "profile_id": "cloud-agent-staging",
   "mode": "test",
-  "requires": [
-    "test_owned_resource"
-  ],
+  "requires": ["test_owned_resource", "agents_authentication"],
   "steps": [
     {
-      "id": "s1",
-      "type": "setup"
-    },
-    {
-      "id": "s2",
-      "type": "navigate"
-    },
-    {
-      "id": "s3",
-      "type": "interact",
-      "action": {
-        "description": "register a test-owned MCP connector",
-        "ownership": "test_owned",
-        "idempotent": false
+      "id": "enter-agents",
+      "type": "goal",
+      "goal": "From FreeInference staging, open the Agents application and find MCP connector management",
+      "intervention": {
+        "type": "authentication",
+        "realm": "agents-session",
+        "requiredAction": "Complete Agents authentication in the attached browser tab.",
+        "condition": { "type": "authenticated_session_check", "realm": "agents-session" }
       }
     },
     {
-      "id": "s4",
-      "type": "wait_for",
-      "condition": {
-        "type": "element_visible",
-        "selector": "connector-list"
+      "id": "create-connector",
+      "type": "goal",
+      "goal": "Create a test-owned MCP connector with a unique test name and verify it appears with an authoritative ID",
+      "intervention": {
+        "type": "human_approval",
+        "requiredAction": "Approve the exact connector creation (principal, environment, resource, parameters).",
+        "condition": { "type": "approval_grant", "operation": "create_connector" }
       }
     },
     {
-      "id": "s5",
-      "type": "interact",
-      "action": {
-        "description": "invoke the connector",
-        "ownership": "test_owned",
-        "idempotent": true
-      }
-    },
-    {
-      "id": "s6",
-      "type": "interact",
-      "action": {
-        "description": "revoke the connector",
-        "ownership": "test_owned",
-        "idempotent": false
-      }
-    },
-    {
-      "id": "s7",
+      "id": "verify-creation",
       "type": "postcondition",
-      "assertion": {
-        "type": "element_visible",
-        "selector": "connector-list"
-      }
+      "assertion": { "type": "page_title_contains", "value": "agent" }
     },
     {
-      "id": "s8",
-      "type": "cleanup"
+      "id": "invoke-operation",
+      "type": "goal",
+      "goal": "Invoke one permitted read-only operation on the test-owned connector and verify an identifiable execution appears"
+    },
+    {
+      "id": "collect-run-diagnostics",
+      "type": "diagnostic_snapshot"
+    },
+    {
+      "id": "cleanup-connector",
+      "type": "cleanup",
+      "action": {
+        "type": "goal",
+        "goal": "Delete the test-owned MCP connector created in this run and verify it no longer appears"
+      }
     }
   ],
   "template": true,

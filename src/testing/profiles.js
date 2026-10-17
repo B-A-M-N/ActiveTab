@@ -6,6 +6,19 @@
 import { readFile, readdir } from "node:fs/promises";
 import { join, dirname, resolve } from "node:path";
 import { validateWorkflow } from "./schema.js";
+import { buildEnvironmentBinding } from "../environments/model.js";
+
+/**
+ * Load the verified environment binding for a profile (P0-1). Throws when
+ * the profile's routing violates the contract (e.g. a loopback application
+ * entry, or a tunnel diagnostic endpoint without a verified remote target).
+ */
+export async function loadEnvironmentBinding(profilesDir, profileId) {
+  const loader = new ProfileLoader(profilesDir);
+  const profile = await loader.loadProfile(profileId);
+  if (!profile) throw new Error(`No profile '${profileId}' found.`);
+  return buildEnvironmentBinding(profile);
+}
 
 export class ProfileLoader {
   constructor(profilesDir) {
@@ -61,11 +74,18 @@ export class ProfileLoader {
         id: step.id,
         type: step.type,
         ...(step.url !== undefined ? { url: step.url } : {}),
+        ...(step.goal !== undefined ? { goal: step.goal } : {}),
+        ...(step.intervention !== undefined ? { intervention: step.intervention } : {}),
+        ...(step.maxActions !== undefined ? { maxActions: step.maxActions } : {}),
+        ...(step.maxScrolls !== undefined ? { maxScrolls: step.maxScrolls } : {}),
         ...(step.action !== undefined ? { action: step.action } : {}),
         ...(step.assertion !== undefined ? { assertion: step.assertion } : {}),
         ...(step.condition !== undefined ? { condition: step.condition } : {}),
         ...(step.operation !== undefined ? { operation: step.operation } : {}),
-        ...(step.preconditions !== undefined ? { preconditions: step.preconditions } : {})
+        ...(step.preconditions !== undefined ? { preconditions: step.preconditions } : {}),
+        ...(step.failure !== undefined ? { failure: step.failure } : {}),
+        ...(step.targetStepId !== undefined ? { targetStepId: step.targetStepId } : {}),
+        ...(step.recoveryBranch !== undefined ? { recoveryBranch: step.recoveryBranch } : {})
       }))
     };
     const result = validateWorkflow(normalized);

@@ -18,6 +18,8 @@ import { DiagnosticReport, FINDING_LEVEL, INVESTIGATION_STATUS } from "../diagno
 import { TestRunner } from "../testing/runner.js";
 import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
 import { InvestigationEngine } from "../investigation/engine.js";
+import { InterventionStore } from "../runtime/interventions.js";
+import { createInterventionTools } from "../api/intervention-tools.js";
 
 const endpoint = process.env.ACTIVETAB_CDP_ENDPOINT ?? "http://127.0.0.1:9222";
 const sessions = new Map();
@@ -28,6 +30,22 @@ let extensionBroker;
 if (extensionMode) extensionBroker = await new ExtensionBroker({ socketPath: brokerSocketPath() }).start();
 const workflowStore = process.env.ACTIVETAB_WORKFLOW_STORE ? new WorkflowStore(process.env.ACTIVETAB_WORKFLOW_STORE) : undefined;
 const taskJournalStore = new McpTaskJournalStore();
+const interventionStore = new InterventionStore(process.env.ACTIVETAB_INTERVENTION_DIR ?? join(process.cwd(), ".activetab", "interventions"));
+await interventionStore.init().catch(() => {});
+const interventionCtx = {
+  // Attachment verification: a caller-provided target ID alone is never proof.
+  hasAttachmentGrant: async targetId => sessions.has(targetId)
+    ? { ok: true }
+    : { ok: false, reason: `No authorized attachment grant for target '${targetId}'. Authorize the tab through the ActiveTab extension.` },
+  // Authentication verification: supplied by the operator/integration; the
+  // default refuses to treat a disappeared login form as proof.
+  verifyAuthentication: async realm => ({ authenticated: false, reason: `No authentication verifier configured for realm '${realm ?? "unknown"}'.` }),
+  observe: async () => {
+    const session = [...sessions.values()][0];
+    return session ? await session.observe() : null;
+  }
+};
+const interventionTools = createInterventionTools({ store: interventionStore, runs: testRuns, ctx: interventionCtx });
 const targetIdOptional = { targetId: { type: "string", description: "Select an attached tab. Required when more than one tab is attached." } };
 const testRuns = new Map();
 
@@ -53,6 +71,14 @@ const tools = [
   { name: "cancel_test_run", description: "Cancel a running test run by runId. Cancellation takes effect at the next step boundary.", inputSchema: { type: "object", properties: { runId: { type: "string" } }, required: ["runId"], additionalProperties: false } },
   { name: "collect_diagnostics", description: "Collect from registered diagnostic sources for a test run. Uses contract-validated, run-scoped, metadata-first retrieval.", inputSchema: { type: "object", properties: { runId: { type: "string" } }, required: ["runId"], additionalProperties: false } },
   { name: "get_test_report", description: "Generate a qualified diagnostic report for a completed test run. Returns findings, correlation summary, source access log, and limitations.", inputSchema: { type: "object", properties: { runId: { type: "string" } }, required: ["runId"], additionalProperties: false } },
+  { name: "list_pending_interventions", description: "List durable, resumable human interventions (waiting or acknowledged) across runs, with their exact completion conditions.", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
+  { name: "get_pending_intervention", description: "Get one intervention record including its verified resume predicate.", inputSchema: { type: "object", properties: { interventionId: { type: "string" } }, required: ["interventionId"], additionalProperties: false } },
+  { name: "acknowledge_human_action", description: "Record that the operator believes the requested human action is complete. This does NOT resume execution; resume_run verifies the completion predicate first.", inputSchema: { type: "object", properties: { interventionId: { type: "string" } }, required: ["interventionId"], additionalProperties: false } },
+  { name: "approve_operation", description: "Issue a scoped, single-use authorization grant for an intervention's exact operation. Approval of one operation grants no general autonomy.", inputSchema: { type: "object", properties: { interventionId: { type: "string" }, grantedBy: { type: "string" }, expiresInMs: { type: "integer", minimum: 1000 } }, required: ["interventionId"], additionalProperties: false } },
+  { name: "reject_operation", description: "Reject and cancel a pending intervention.", inputSchema: { type: "object", properties: { interventionId: { type: "string" }, reason: { type: "string" } }, required: ["interventionId"], additionalProperties: false } },
+  { name: "resume_run", description: "Resume a suspended run: verifies the exact completion predicate (grant scope/expiry, authenticated session, attachment grant, or outcome reconciliation) with fresh evidence before admitting execution.", inputSchema: { type: "object", properties: { interventionId: { type: "string" } }, required: ["interventionId"], additionalProperties: false } },
+  { name: "get_run_state", description: "Get the resumable state of a run (including suspended/waiting states).", inputSchema: { type: "object", properties: { runId: { type: "string" } }, required: ["runId"], additionalProperties: false } },
+  { name: "cancel_run", description: "Cancel a run or intervention. Cancellation is permitted during suspension.", inputSchema: { type: "object", properties: { runId: { type: "string" }, interventionId: { type: "string" } }, additionalProperties: false } },
   { name: "run_goal", description: "Run a natural-language navigation goal with bounded actions and scrolling, outcome verification, one recovery by default, and a policy gate that refuses sensitive actions not explicitly requested by the caller. Task continuation is stored locally using only a goal fingerprint and bounded continuation state; repeating the same goal on the same target resumes an incomplete task. A completed task is returned idempotently; set newTask=true to explicitly start it again. Tied targets stop unresolved and return evidence-linked backend/frame handles for caller inspection; select one with click_observed_element, which revalidates it before dispatch. Set reuseWorkflows=true to replay or record verified workflows; scroll-driven traces are not persisted until they have freshness checks. Configure ACTIVETAB_WORKFLOW_STORE first.", inputSchema: { type: "object", properties: { ...targetIdOptional, goal: { type: "string" }, maxActions: { type: "integer", minimum: 1, maximum: 10 }, maxScrolls: { type: "integer", minimum: 0, maximum: 8 }, reuseWorkflows: { type: "boolean" }, newTask: { type: "boolean" } }, required: ["goal"], additionalProperties: false } }
 ];
 for (const tool of tools) {
@@ -62,6 +88,9 @@ for (const tool of tools) {
 }
 
 async function callTool(name, args) {
+  // Intervention tools (P0-6): long-running and suspended runs never block
+  // these status/acknowledgement/approval/cancellation/resume tools.
+  if (Object.hasOwn(interventionTools, name)) return await interventionTools[name](args);
   if (name === "list_tabs") {
     if (extensionMode) return await extensionBroker.listTabs();
     if (!autoConnect) return await listTargets(endpoint);
@@ -101,9 +130,14 @@ async function callTool(name, args) {
     createBrowserDiagnosticSources(session, collector);
     const correlator = new DiagnosticCorrelator();
     const controller = new AbortController();
-    const runner = new TestRunner({ session, collector, correlator, signal: controller.signal });
+    const runner = new TestRunner({ session, collector, correlator, signal: controller.signal, interventions: interventionStore });
     const runPromise = runner.run(args.workflow, { runId });
-    testRuns.set(runId, { collector, correlator, controller, runPromise, session, startedAt: new Date().toISOString() });
+    testRuns.set(runId, {
+      collector, correlator, controller, runPromise, session, runner,
+      startedAt: new Date().toISOString(),
+      resume: async () => ({ resume: "re-execute the suspended step via the TestRunner resume path" }),
+      cancel: async () => { controller.abort(); }
+    });
     return { status: "started", runId };
   }
   if (name === "get_test_run") {

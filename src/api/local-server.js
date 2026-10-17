@@ -36,6 +36,8 @@ import { DiagnosticReport, FINDING_LEVEL, INVESTIGATION_STATUS } from "../diagno
 import { TestRunner } from "../testing/runner.js";
 import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
 import { InvestigationEngine } from "../investigation/engine.js";
+import { InterventionStore } from "../runtime/interventions.js";
+import { createInterventionTools } from "./intervention-tools.js";
 import { randomUUID } from "node:crypto";
 
 const DEFAULT_PORT = 9377;
@@ -43,7 +45,10 @@ const API_PREFIX = "/v3/bots";
 const MAX_TASK_RECORDS = 1_000;
 const MAX_OUTPUT_FILE_BYTES = 5 * 1024 * 1024;
 const OUTPUT_EXTENSIONS = new Set(["json", "md", "csv", "xml"]);
-const TERMINAL = new Set(["finished", "failed", "canceled", "needs_human"]);
+// Terminal states exclude human-handoff/waiting states: those are
+// resumable suspensions (P0-3), and status reads on them must not report
+// the run as finished.
+const TERMINAL = new Set(["finished", "failed", "canceled"]);
 
 export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationRunner, apiToken, host = "127.0.0.1", maxTasks = MAX_TASK_RECORDS, executorName, reportDir, testSessionResolver = null } = {}) {
   const store = new TaskStore(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"));
@@ -53,6 +58,9 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
   const maxTaskRecords = Number.isInteger(maxTasks) && maxTasks >= 1 ? Math.min(maxTasks, 10_000) : MAX_TASK_RECORDS;
   const diagnostics = createDiagnostics();
   const testRuns = new Map();
+  const interventionStore = new InterventionStore(join(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"), "..", "interventions"));
+  interventionStore.init().catch(() => {}); // lazy init; durable records reload on first use
+  const interventionTools = createInterventionTools({ store: interventionStore, runs: testRuns });
 
   function createBrowserDiagnosticSources(session, collector) {
     registerBrowserDiagnosticSources(session, collector);
@@ -83,9 +91,18 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
     createBrowserDiagnosticSources(session, collector);
     const correlator = new DiagnosticCorrelator();
     const controller = new AbortController();
-    const runner = new TestRunner({ session, collector, correlator, signal: controller.signal });
+    const runner = new TestRunner({ session, collector, correlator, signal: controller.signal, interventions: interventionStore });
     const runPromise = runner.run(workflow, { runId });
-    testRuns.set(runId, { collector, correlator, controller, runPromise, session, startedAt: new Date().toISOString() });
+    testRuns.set(runId, {
+      collector, correlator, controller, runPromise, session, runner,
+      startedAt: new Date().toISOString(),
+      resume: async () => {
+        const receipt = await Promise.race([runPromise, Promise.resolve(null)]);
+        if (!receipt) return { resumed: false, reason: "Run is still executing." };
+        return await runner.resume(receipt);
+      },
+      cancel: async () => { controller.abort(); }
+    });
     sendJson(res, 200, { status: "started", runId });
   }
 
@@ -201,6 +218,36 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
         const engine = new InvestigationEngine({ collector: null, correlator: new DiagnosticCorrelator() });
         const result = await engine.investigate({ subject: body.subject, reason: body.reason, runId: body.runId ?? null });
         sendJson(res, 200, result);
+        return;
+      }
+
+      // ── Intervention lifecycle (P0-6): status/ack/approval/resume/cancel ──
+      if (path === "/v1/interventions" || path.startsWith("/v1/interventions/")) {
+        if (!authorizeMutation(req)) { sendError(res, 401, 99401, "Authentication required."); return; }
+        try {
+          if (method === "GET" && path === "/v1/interventions") {
+            sendJson(res, 200, await interventionTools.list_pending_interventions());
+            return;
+          }
+          const interventionMatch = path.match(/^\/v1\/interventions\/([^/]+)(?:\/(acknowledge|approve|reject|resume|cancel))?$/);
+          if (interventionMatch) {
+            const interventionId = interventionMatch[1];
+            const action = interventionMatch[2] ?? "get";
+            if (method === "GET" && action === "get") { sendJson(res, 200, await interventionTools.get_pending_intervention({ interventionId })); return; }
+            if (method === "POST" && action === "acknowledge") { const body = await readBody(req); sendJson(res, 200, await interventionTools.acknowledge_human_action({ interventionId, ...(body ?? {}) })); return; }
+            if (method === "POST" && action === "approve") { const body = await readBody(req); sendJson(res, 200, await interventionTools.approve_operation({ interventionId, ...(body ?? {}) })); return; }
+            if (method === "POST" && action === "reject") { const body = await readBody(req); sendJson(res, 200, await interventionTools.reject_operation({ interventionId, ...(body ?? {}) })); return; }
+            if (method === "POST" && action === "resume") { const body = await readBody(req); sendJson(res, 200, await interventionTools.resume_run({ interventionId, ...(body ?? {}) })); return; }
+            if (method === "POST" && action === "cancel") { sendJson(res, 200, await interventionTools.cancel_run({ interventionId })); return; }
+          }
+          if (method === "GET" && path === "/v1/interventions/run-state") {
+            sendJson(res, 200, await interventionTools.get_run_state({ runId: query.runId ?? "" }));
+            return;
+          }
+          sendError(res, 404, 99404, "No such intervention resource.");
+        } catch (error) {
+          sendError(res, 400, 99400, String(error?.message ?? error).slice(0, 300));
+        }
         return;
       }
 
@@ -360,6 +407,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
     store,
     async start() {
       await store.init();
+      await interventionStore.init().catch(() => {});
       return new Promise((resolvePromise, reject) => {
         server.listen(port, host, () => {
           const address = server.address();

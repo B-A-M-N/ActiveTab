@@ -28,9 +28,11 @@ export class RunLifecycle {
   }
 
   /**
-   * Translate an executor result into a distinct terminal task state.
-   * verified success → finished; handoff → needs_human; cancellation →
-   * canceled; everything else → failed. Never collapses these.
+   * Translate an executor result into a distinct task state.
+   * verified success → finished; handoff → needs_human (a resumable
+   * suspension, not a terminal failure); explicit waiting states map to
+   * their resumable vocabulary; cancellation → canceled; everything else →
+   * failed. Never collapses these.
    */
   applyResult(taskId, controller, result, reporter) {
     if (!this.isCurrent(taskId, controller) || controller.signal.aborted) return;
@@ -39,8 +41,14 @@ export class RunLifecycle {
       this.store.forceCancel(taskId);
       return;
     }
+    const WAITING_STATES = new Set([
+      "waiting_for_tab_authorization", "waiting_for_authentication", "waiting_for_mfa",
+      "waiting_for_human_approval", "waiting_for_external_authorization",
+      "waiting_for_human_decision", "resume_validation", "reconciling"
+    ]);
     const status = result.status === "succeeded" ? "finished"
       : result.status === "needs_human" ? "needs_human"
+      : WAITING_STATES.has(result.status) ? result.status
       : "failed";
     // The report records the same translated terminal state the store
     // exposes, so readers see one consistent vocabulary.

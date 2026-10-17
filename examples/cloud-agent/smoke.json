@@ -1,29 +1,45 @@
 {
   "workflow_id": "cloud-agent-smoke",
   "name": "Cloud Agent smoke test",
-  "description": "Verify login state, application availability, route navigation, visible controls, and available status endpoints.",
+  "description": "Start at the real FreeInference staging website, verify environment/application identity, enter Agents through live navigation, and pause for authentication when required (resumable). No localhost URL appears anywhere in this workflow.",
   "profile_id": "cloud-agent-staging",
-  "mode": "observe",
+  "mode": "test",
+  "requires": ["authorized_headed_browser"],
   "steps": [
     {
-      "id": "s1",
+      "id": "open-staging",
       "type": "navigate",
-      "url": "https://staging.cloudagent.ai/"
+      "url": "https://staging.freeinference.org"
     },
     {
-      "id": "s2",
-      "type": "assert",
-      "assertion": {
-        "type": "page_title_contains",
-        "value": "cloud"
+      "id": "verify-environment",
+      "type": "setup",
+      "preconditions": [
+        { "type": "url_matches", "pattern": "^https://staging\\.freeinference\\.org" }
+      ]
+    },
+    {
+      "id": "enter-agents",
+      "type": "goal",
+      "goal": "Find and open the Agents (Cloud Agent) application from the FreeInference staging navigation",
+      "intervention": {
+        "type": "authentication",
+        "realm": "agents-session",
+        "requiredAction": "Complete Agents authentication in the attached browser tab.",
+        "condition": { "type": "authenticated_session_check", "realm": "agents-session" }
       }
     },
     {
-      "id": "s3",
+      "id": "verify-agents-realm",
+      "type": "assert",
+      "assertion": { "type": "page_title_contains", "value": "agent" }
+    },
+    {
+      "id": "collect-status",
       "type": "diagnostic_snapshot"
     },
     {
-      "id": "s4",
+      "id": "cleanup",
       "type": "cleanup"
     }
   ],

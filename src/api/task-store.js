@@ -8,14 +8,25 @@
  *   they can never remain falsely successful after a crash or restart.
  * - Terminal-state fencing: update() refuses to overwrite a terminal
  *   state with a different one, so stale workers cannot resurrect or
- *   rewrite finished/canceled/failed/needs_human tasks.
+ *   rewrite finished/canceled/failed tasks.
+ * - Human-handoff states (needs_human and the resumable waiting_* states)
+ *   are SUSPENSIONS, not terminals: a run must automatically continue once
+ *   the required human action has completed and been verified (P0-3).
  * - Capacity bound with a clear error when full.
  */
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile, readFile, readdir, rename, open } from "node:fs/promises";
 import { join, dirname } from "node:path";
 
-export const TERMINAL_STATUSES = new Set(["finished", "failed", "canceled", "needs_human"]);
+export const TERMINAL_STATUSES = new Set(["finished", "failed", "canceled"]);
+
+/** Resumable suspension states (P0-3); these are never terminal. */
+export const SUSPENDED_STATUSES = new Set([
+  "needs_human",
+  "waiting_for_tab_authorization", "waiting_for_authentication", "waiting_for_mfa",
+  "waiting_for_human_approval", "waiting_for_external_authorization",
+  "waiting_for_human_decision", "resume_validation", "reconciling"
+]);
 
 export class TaskStore {
   constructor(baseDir) {
@@ -43,6 +54,8 @@ export class TaskStore {
           task.updated_at = task.finished_at;
           await this.#writeAtomic(entry.name, task);
         }
+        // Suspended (human-blocked) runs survive restarts: they are reloaded
+        // for intervention re-evaluation, never auto-failed (P0-3/P1-4).
         if (task && typeof task.task_id === "string") this.tasks.set(task.task_id, task);
       } catch { /* Unreadable records are left for explicit local inspection. */ }
     }
@@ -110,7 +123,7 @@ export class TaskStore {
     const task = this.tasks.get(taskId);
     if (!task) return null;
     if (TERMINAL_STATUSES.has(task.status)) return task;
-    task.status = "canceled";
+    task.status = "canceled"; // Cancellation is permitted during suspension.
     task.finished_at = new Date().toISOString();
     task.updated_at = task.finished_at;
     return task;

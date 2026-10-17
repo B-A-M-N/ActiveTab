@@ -1,27 +1,55 @@
 {
   "$schema": "./profile-schema.json",
   "profile_id": "cloud-agent-staging",
-  "name": "Cloud Agent Staging",
-  "description": "Cloud Agent staging application. Routes and operations are discovered, not predeclared.",
-  "origin_patterns": ["https://staging.cloudagent.ai", "https://cloud-agent.staging.internal"],
+  "name": "Cloud Agent on FreeInference Staging",
+  "description": "Cloud Agent as an application realm within the FreeInference staging platform. The browser path enters through the real staging website (https://staging.freeinference.org -> /agents/); the admin diagnostic adapter is an optional backend source, reachable directly or through an explicitly configured, verified SSH tunnel. The tunnel's localhost URL is transport only and must never become the browser entry point.",
+  "environment": {
+    "environment_id": "freeinference-staging",
+    "platform": "freeinference",
+    "application_entry_url": "https://staging.freeinference.org",
+    "browser_control_endpoint": null,
+    "diagnostic_endpoint": null,
+    "diagnostic_transport": null,
+    "remote_target": null,
+    "authorized_origins": ["https://staging.freeinference.org"],
+    "applications": [
+      {
+        "application_id": "fi-agents",
+        "authentication_realm": "agents-session",
+        "candidate_entry": "/agents/",
+        "status": "candidate"
+      }
+    ]
+  },
+  "origin_patterns": ["https://staging.freeinference.org"],
   "authentication_realms": [
     {
-      "realm_id": "cloud-agent-app",
-      "description": "Cloud Agent application session",
-      "scope": ["app"],
+      "realm_id": "agents-session",
+      "description": "Agents/Cloud Agent application session. Distinct from the FreeInference dashboard session: verify it independently and never copy dashboard credentials or tokens into this realm.",
+      "scope": ["agents_app"],
       "separate_credentials": true
     },
     {
-      "realm_id": "fi-dashboard-admin",
-      "description": "FreeInference dashboard admin session. Does not authorize Cloud Agent internal tools.",
-      "scope": ["fi_dashboard"],
+      "realm_id": "fi-admin",
+      "description": "FreeInference dashboard admin session. Authorizes admin diagnostic surfaces only; it does not authorize Cloud Agent internal tools or the Agents application realm.",
+      "scope": ["fi_dashboard_admin"],
       "separate_credentials": true
     }
   ],
   "diagnostic_sources": [
     {
+      "source_id": "cloud-agent-runs",
+      "description": "Recent agent run execution records, scoped to the test operation under investigation.",
+      "authority": "admin_session",
+      "operations": ["read"],
+      "scope": "run-scoped",
+      "sensitivity": "metadata_only",
+      "validation_required": true,
+      "notes": "Retrieved via the Cloud Agent admin diagnostic adapter (optional backend source), never via the browser entry URL."
+    },
+    {
       "source_id": "cloud-agent-execution-history",
-      "description": "Execution history visible in the Cloud Agent application. Discovery is required.",
+      "description": "Execution history visible in the Agents application UI. Discovery is required.",
       "authority": "application_session",
       "operations": ["read"],
       "scope": "run-scoped",
@@ -30,7 +58,7 @@
     },
     {
       "source_id": "cloud-agent-worker-status",
-      "description": "Worker and scheduling diagnostics, if exposed. Discovery is required.",
+      "description": "Worker and scheduling diagnostics, if exposed. Aggregate only.",
       "authority": "admin_session",
       "operations": ["read_aggregate"],
       "scope": "aggregate",

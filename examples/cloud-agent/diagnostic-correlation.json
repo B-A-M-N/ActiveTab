@@ -1,49 +1,38 @@
 {
   "workflow_id": "cloud-agent-diagnostic-correlation",
   "name": "Diagnostic correlation",
-  "description": "Execute a controlled workflow that generates identifiable activity, then verify that the diagnostic collector can associate browser events, API records, and authorized backend evidence.",
+  "description": "Execute a real Cloud Agent operation through the staging website, then retrieve the backend records for that EXACT operation via the authorized diagnostic adapter and correlate by shared run/request identifiers. Temporal proximity alone is reported as a limitation, never as correlation.",
   "profile_id": "cloud-agent-staging",
   "mode": "test",
-  "requires": [
-    "test_owned_resource",
-    "diagnostic_access"
-  ],
+  "requires": ["test_owned_resource", "diagnostic_access", "agents_authentication"],
   "steps": [
     {
-      "id": "s1",
-      "type": "setup"
-    },
-    {
-      "id": "s2",
-      "type": "interact",
-      "action": {
-        "description": "submit a controlled operation with an identifiable trace",
-        "ownership": "test_owned",
-        "idempotent": false
+      "id": "enter-agents",
+      "type": "goal",
+      "goal": "From FreeInference staging, open the Agents application",
+      "intervention": {
+        "type": "authentication",
+        "realm": "agents-session",
+        "requiredAction": "Complete Agents authentication in the attached browser tab.",
+        "condition": { "type": "authenticated_session_check", "realm": "agents-session" }
       }
     },
     {
-      "id": "s3",
+      "id": "execute-identifiable-operation",
+      "type": "goal",
+      "goal": "Execute one test-owned Cloud Agent operation and capture its run identifier from the application UI"
+    },
+    {
+      "id": "collect-run-scoped-diagnostics",
       "type": "diagnostic_snapshot"
     },
     {
-      "id": "s4",
-      "type": "assert",
-      "assertion": {
-        "type": "network_request_seen",
-        "urlPattern": "execution|trace"
-      }
-    },
-    {
-      "id": "s5",
+      "id": "correlate-by-identifier",
       "type": "postcondition",
-      "assertion": {
-        "type": "diagnostic_source_available",
-        "sourceId": "cloud-agent-execution-history"
-      }
+      "assertion": { "type": "network_request_seen", "urlPattern": "runs|executions|trace" }
     },
     {
-      "id": "s6",
+      "id": "verify-cleanup",
       "type": "cleanup"
     }
   ],

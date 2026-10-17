@@ -5,18 +5,28 @@
  * evidence-backed.
  */
 
-import { validateWorkflow, STEP_STATUS, RUN_STATUS } from "./schema.js";
+import { validateWorkflow, STEP_STATUS, RUN_STATUS, isWaitingRunStatus } from "./schema.js";
 import { evaluateAssertion } from "./assertions.js";
-import { TestReceipt, deriveRunStatus } from "./receipts.js";
+import { TestReceipt, deriveRunStatus, STEP_STATUS_EXTENDED } from "./receipts.js";
+import { classifyHumanHandoff } from "../navigation/handoff.js";
+import { InterventionStore, evaluateCompletion, externalRunState, INTERVENTION_STATE } from "../runtime/interventions.js";
+import { isLoopbackUrl, verifyObservedUrl } from "../environments/model.js";
+import { NavigationEngine } from "../navigation/engine.js";
 
 export class TestRunner {
-  constructor({ session, collector, correlator, journal, maxSteps = 32, signal } = {}) {
+  constructor({ session, collector, correlator, journal, maxSteps = 32, signal, interventions = null, environment = null } = {}) {
     this.session = session;
     this.collector = collector;
     this.correlator = correlator;
     this.journal = journal;
     this.maxSteps = Math.max(1, Math.min(maxSteps, 128));
     this.signal = signal;
+    // Durable intervention lifecycle (P0-3). When provided, human handoffs
+    // persist before control returns and the run suspends instead of ending.
+    this.interventions = interventions;
+    this.environment = environment;
+    this.onIntervention = null; // async (record) => {}
+    this.onRunSuspended = null; // async (receipt, record) => {}
   }
 
   async run(workflow, { runId } = {}) {
@@ -33,6 +43,9 @@ export class TestRunner {
         receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.CANCELED, reason: "Run was canceled." });
         break;
       }
+      // A suspended run holds its place: no further steps dispatch while a
+      // human intervention is pending; resumption re-enters at this step.
+      if (receipt.status !== RUN_STATUS.RUNNING) break;
       // If a mandatory step failed, stop downstream ordinary steps.
       if (failedStepIds.size > 0 && !step.recoveryBranch) {
         receipt.recordStep({
@@ -43,13 +56,35 @@ export class TestRunner {
       }
       const result = await this.#executeStep(step, receipt);
       if (result.status === STEP_STATUS.CANCELED) break;
+      if (result.status === STEP_STATUS_EXTENDED.SUSPENDED) {
+        // Waiting states are resumable, not terminal failures. The
+        // intervention store uses the external lowercase vocabulary; map it
+        // onto the receipt's run-status constants.
+        const EXTERNAL_TO_RUN_STATUS = {
+          waiting_for_tab_authorization: RUN_STATUS.WAITING_FOR_TAB_AUTHORIZATION,
+          waiting_for_authentication: RUN_STATUS.WAITING_FOR_AUTHENTICATION,
+          waiting_for_mfa: RUN_STATUS.WAITING_FOR_MFA,
+          waiting_for_human_approval: RUN_STATUS.WAITING_FOR_HUMAN_APPROVAL,
+          waiting_for_external_authorization: RUN_STATUS.WAITING_FOR_EXTERNAL_AUTHORIZATION,
+          waiting_for_human_decision: RUN_STATUS.WAITING_FOR_HUMAN_DECISION
+        };
+        const waiting = EXTERNAL_TO_RUN_STATUS[result.externalState];
+        if (!waiting) {
+          receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.FAIL, reason: `Unknown suspension state '${result.externalState}'.`, startedAt: new Date().toISOString() });
+          failedStepIds.add(step.id);
+        } else {
+          receipt.finish(waiting);
+          break;
+        }
+      }
       if (result.status === STEP_STATUS.FAIL || result.status === STEP_STATUS.BLOCKED || result.status === STEP_STATUS.UNCERTAIN) {
         failedStepIds.add(step.id);
       }
     }
 
-    const finalStatus = deriveRunStatus(receipt.steps);
-    receipt.finish(finalStatus);
+    if (receipt.status === RUN_STATUS.RUNNING) {
+      receipt.finish(deriveRunStatus(receipt.steps));
+    }
     return receipt;
   }
 
@@ -68,6 +103,7 @@ export class TestRunner {
         case "retry_verification": return await this.#executeRetryVerification(step, receipt, startedAt);
         case "postcondition": return await this.#executePostcondition(step, receipt, startedAt);
         case "cleanup": return await this.#executeCleanup(step, receipt, startedAt);
+        case "goal": return await this.#executeGoal(step, receipt, startedAt);
         default: {
           const message = `Unsupported step type '${step.type}'.`;
           receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason: message, startedAt });
@@ -422,6 +458,143 @@ export class TestRunner {
         this.correlator.correlate(stepEventId, snapshot.snapshotId ?? `snap:${snapshot.sourceId}:${Date.now()}`);
       } catch { /* If the step event wasn't emitted, correlation is skipped. */ }
     }
+  }
+
+  /**
+   * Goal-driven step (P1-2): resolve a semantic objective ("Find the Agents
+   * application") into native browser actions using fresh evidence via the
+   * NavigationEngine. If a human requirement is detected — or the step
+   * declares an intervention — the run suspends at this step with a durable,
+   * resumable intervention record instead of failing.
+   */
+  async #executeGoal(step, receipt, startedAt) {
+    if (!this.session) {
+      const reason = "No browser session available for the goal step.";
+      receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason, startedAt });
+      return { status: STEP_STATUS.BLOCKED, reason };
+    }
+    // A caller-supplied target or URL alone is never proof of authorization
+    // or identity: verify the observed page against the environment first.
+    if (this.environment) {
+      const preObservation = await this.session.observe().catch(() => null);
+      const observedUrl = preObservation?.page?.url;
+      if (observedUrl) {
+        const verified = verifyObservedUrl(this.environment, observedUrl);
+        if (!verified.ok) {
+          return await this.#suspendForIntervention(step, receipt, startedAt, {
+            type: "human_decision",
+            reason: `Environment identity mismatch: ${verified.reason}`,
+            requiredHumanAction: "Verify the environment or supply the appropriate authorization for the unexpected origin.",
+            condition: { type: "ambiguity_resolved" },
+            preObservation
+          });
+        }
+      }
+    }
+
+    const engine = new NavigationEngine(this.session, { maxActions: step.maxActions ?? 8, maxScrolls: step.maxScrolls ?? 5, signal: this.signal });
+    const result = await engine.run(step.goal);
+    if (result.status === "needs_human") {
+      const category = result.interventionRequired?.category ?? "authentication";
+      const type = category === "anti_automation" ? "human_decision" : category === "authorization" ? "external_authorization" : "authentication";
+      return await this.#suspendForIntervention(step, receipt, startedAt, {
+        type,
+        reason: result.reason ?? "A human requirement was detected.",
+        requiredHumanAction: "Complete the required step in the attached browser (authentication, challenge, or authorization), then let ActiveTab verify it.",
+        condition: type === "human_decision" && category === "anti_automation"
+          ? { type: "challenge_cleared" }
+          : { type: "authenticated_session_check", realm: step.intervention?.realm ?? this.environment?.applications?.[0]?.authenticationRealm ?? null },
+        engineResult: { attempts: result.attempts, recoveries: result.recoveries, evidenceId: result.evidenceId ?? null }
+      });
+    }
+    const succeeded = result.status === "succeeded";
+    const status = succeeded ? STEP_STATUS.PASS : result.status === "canceled" ? STEP_STATUS.CANCELED : STEP_STATUS.UNCERTAIN;
+    const reason = succeeded
+      ? `Goal resolved: ${step.goal}`
+      : `Goal step ended '${result.status}'; the expected application-level effect was not verified, so this is UNCERTAIN rather than PASS.`;
+    receipt.recordStep({
+      stepId: step.id, type: step.type, status, reason, startedAt,
+      evidenceIds: [result.evidenceId ?? ""].filter(Boolean),
+      details: { goal: step.goal, engineStatus: result.status, attempts: result.attempts, recoveries: result.recoveries }
+    });
+    return { status, reason, result };
+  }
+
+  /**
+   * Persist the intervention BEFORE returning control, record the suspended
+   * step, and notify the watcher plumbing. The run stays resumable.
+   */
+  async #suspendForIntervention(step, receipt, startedAt, { type, reason, requiredHumanAction, condition, preObservation = null, engineResult = null }) {
+    if (!this.interventions) {
+      // No durable store: fall back to a blocked step rather than losing state.
+      const fallback = `Human requirement detected but no intervention store is configured: ${reason}`;
+      receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason: fallback, startedAt, evidenceIds: [preObservation?.evidenceId ?? engineResult?.evidenceId ?? ""].filter(Boolean) });
+      return { status: STEP_STATUS.BLOCKED, reason: fallback };
+    }
+    const record = await this.interventions.create({
+      runId: receipt.runId,
+      stepId: step.id,
+      type,
+      reason,
+      requiredHumanAction,
+      completionCondition: condition,
+      environmentId: this.environment?.environmentId ?? step.intervention?.environmentId ?? null,
+      authenticationRealm: condition?.realm ?? step.intervention?.realm ?? null,
+      targetId: this.session?.target?.id ?? null,
+      applicationId: this.environment?.applications?.find(a => a.authenticationRealm === condition?.realm)?.applicationId ?? null,
+      ...(step.intervention?.ttlMs ? { ttlMs: step.intervention.ttlMs } : {})
+    });
+    receipt.recordStep({
+      stepId: step.id, type: step.type, status: STEP_STATUS_EXTENDED.SUSPENDED, reason, startedAt,
+      evidenceIds: [preObservation?.evidenceId ?? engineResult?.evidenceId ?? ""].filter(Boolean),
+      details: { interventionId: record.intervention_id, interventionType: type }
+    });
+    receipt.recordIntervention({
+      stepId: step.id, interventionId: record.intervention_id, type,
+      state: record.state, reason, externalState: externalRunState(record)
+    });
+    if (typeof this.onIntervention === "function") {
+      try { await this.onIntervention(record); } catch { /* notification is best-effort */ }
+    }
+    return { status: STEP_STATUS_EXTENDED.SUSPENDED, reason, intervention: record, externalState: externalRunState(record) };
+  }
+
+  /**
+   * Resume a suspended run from its interrupted step (never from the
+   * beginning). The exact completion predicate is verified with fresh
+   * evidence before the step is re-executed; a failed verification leaves
+   * the run suspended.
+   */
+  async resume(receipt, { verify = null, evaluate = null } = {}) {
+    const pending = (receipt.interventions ?? []).filter(i => i.state === INTERVENTION_STATE.WAITING || i.state === INTERVENTION_STATE.ACKNOWLEDGED);
+    const suspendedStep = [...receipt.steps].reverse().find(s => s.status === STEP_STATUS_EXTENDED.SUSPENDED);
+    if (!suspendedStep) {
+      return { resumed: false, reason: "No suspended step to resume." };
+    }
+    const record = pending.find(i => i.stepId === suspendedStep.stepId) ?? (this.interventions ? this.interventions.get(suspendedStep.details?.interventionId) : null);
+    if (!record) return { resumed: false, reason: "No durable intervention record found for the suspended step." };
+    if (Date.parse(record.expiresAt) <= Date.now()) {
+      return { resumed: false, reason: `Intervention expired at ${record.expiresAt}.`, expired: true };
+    }
+    // 1. Verify the actual completion condition with fresh evidence.
+    const evaluator = evaluate ?? ((intervention, ctx) => evaluateCompletion(intervention, ctx));
+    const evaluation = await evaluator(record, verify ?? {});
+    if (!evaluation.satisfied) {
+      return { resumed: false, reason: `Completion condition not verified: ${evaluation.reason}`, intervention: record };
+    }
+    // 2. Consume the intervention and re-enter at the suspended step.
+    await this.interventions?.completeResume(record.intervention_id, record.resumeHeldBy ?? record.generation, { evidenceId: evaluation.evidenceId ?? null, note: evaluation.summary });
+    const workflow = { id: receipt.workflowId, name: receipt.workflowName, steps: [{ id: suspendedStep.stepId, type: "goal", goal: suspendedStep.details?.goal ?? "" }] };
+    // Mark the run running again, then execute the remaining original steps
+    // from the caller-supplied workflow; here we re-run just the suspended
+    // step with fresh evidence and return its outcome.
+    const stepResult = await this.#executeGoal(workflow.steps[0], { ...receipt, status: RUN_STATUS.RUNNING, interventions: receipt.interventions }, new Date().toISOString());
+    if (stepResult.status !== STEP_STATUS_EXTENDED.SUSPENDED) {
+      const replacement = receipt.steps.find(s => s.stepId === suspendedStep.stepId);
+      if (replacement) Object.assign(replacement, { status: stepResult.status, reason: stepResult.reason });
+      receipt.status = RUN_STATUS.RUNNING;
+    }
+    return { resumed: stepResult.status !== STEP_STATUS_EXTENDED.SUSPENDED, stepResult, evaluation };
   }
 
   async #executeCleanup(step, receipt, startedAt) {

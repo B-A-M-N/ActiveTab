@@ -1,54 +1,50 @@
 {
   "workflow_id": "cloud-agent-execution-recovery",
   "name": "Execution recovery",
-  "description": "Submit a controlled operation, observe execution, and verify result or recovery.",
+  "description": "Submit a controlled test-owned operation through the real Agents UI, observe its execution, recover from a controlled failure, and verify the terminal state with backend evidence.",
   "profile_id": "cloud-agent-staging",
   "mode": "test",
-  "requires": [
-    "test_owned_resource"
-  ],
+  "requires": ["test_owned_resource", "agents_authentication"],
   "steps": [
     {
-      "id": "s1",
-      "type": "setup"
-    },
-    {
-      "id": "s2",
-      "type": "interact",
-      "action": {
-        "description": "create a test-owned agent/thread",
-        "ownership": "test_owned",
-        "idempotent": false
+      "id": "enter-agents",
+      "type": "goal",
+      "goal": "From FreeInference staging, open the Agents application and find test agent execution",
+      "intervention": {
+        "type": "authentication",
+        "realm": "agents-session",
+        "requiredAction": "Complete Agents authentication in the attached browser tab.",
+        "condition": { "type": "authenticated_session_check", "realm": "agents-session" }
       }
     },
     {
-      "id": "s3",
-      "type": "interact",
-      "action": {
-        "description": "submit a controlled operation",
-        "ownership": "test_owned",
-        "idempotent": true
-      }
+      "id": "create-test-agent",
+      "type": "goal",
+      "goal": "Create a test-owned agent with a unique test name and verify it appears in the correct application state"
     },
     {
-      "id": "s4",
+      "id": "submit-operation",
+      "type": "goal",
+      "goal": "Submit a controlled operation to the test-owned agent and capture the identifiable execution ID"
+    },
+    {
+      "id": "inject-failure",
       "type": "controlled_failure",
-      "description": "inject a supported controlled failure via an approved mechanism"
+      "failure": { "mechanism": "approved_fault_source" }
     },
     {
-      "id": "s5",
-      "type": "retry_verification"
+      "id": "verify-recovery",
+      "type": "retry_verification",
+      "targetStepId": "submit-operation",
+      "assertion": { "type": "page_title_contains", "value": "agent" }
     },
     {
-      "id": "s6",
+      "id": "terminal-state",
       "type": "postcondition",
-      "assertion": {
-        "type": "diagnostic_source_available",
-        "sourceId": "cloud-agent-execution-history"
-      }
+      "assertion": { "type": "diagnostic_source_available", "sourceId": "cloud-agent-runs" }
     },
     {
-      "id": "s7",
+      "id": "cleanup",
       "type": "cleanup"
     }
   ],

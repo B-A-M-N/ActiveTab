@@ -7,6 +7,7 @@ import { ApplicationCapabilityMap } from "./capabilityMap.js";
 import { KnowledgeStore } from "./knowledgeStore.js";
 import { URL } from "node:url";
 import { authorizePlannedAction } from "../navigation/actionPolicy.js";
+import { verifyObservedUrl } from "../environments/model.js";
 
 const SAFE_CONTROL_ROLES = new Set(["link", "tab", "button", "menuitem", "menuitemradio", "menuitemcheckbox"]);
 const SAFE_SUBMIT_CONTROLS = false;
@@ -26,12 +27,17 @@ function isSafeToNavigate(control) {
 }
 
 export class ApplicationDiscoveryEngine {
-  constructor({ session, maxSteps = 8, maxLinksPerStep = 4, signal, knowledgeDir = null } = {}) {
+  constructor({ session, maxSteps = 8, maxLinksPerStep = 4, signal, knowledgeDir = null, environment = null, onAuthorizationBoundary = null } = {}) {
     this.session = session;
     this.maxSteps = Math.max(1, Math.min(maxSteps, MAX_DISCOVERY_STEPS));
     this.maxLinksPerStep = Math.max(1, Math.min(maxLinksPerStep, MAX_LINKS_PER_STEP));
     this.signal = signal;
     this.knowledgeStore = knowledgeDir ? new KnowledgeStore(knowledgeDir) : null;
+    // Verified platform/environment binding (P1-3): cross-origin application
+    // transitions are verified against the environment's authorized origins;
+    // new authorization boundaries pause discovery instead of being bypassed.
+    this.environment = environment;
+    this.onAuthorizationBoundary = onAuthorizationBoundary;
     this.discoveries = [];
     this.visitedUrls = new Set();
     this.capabilityMap = null;
@@ -44,7 +50,11 @@ export class ApplicationDiscoveryEngine {
     if (!observation?.page?.url) throw new Error("Initial observation did not return a page URL.");
 
     const origin = new URL(observation.page.url).origin;
-    this.capabilityMap = new ApplicationCapabilityMap({ applicationId: origin, origin });
+    this.capabilityMap = new ApplicationCapabilityMap({
+      applicationId: origin,
+      origin,
+      ...(this.environment ? { platform: this.environment.platform, environmentId: this.environment.environmentId } : {})
+    });
     this.visitedUrls.add(observation.page.url);
     if (this.knowledgeStore) {
       const prior = await this.knowledgeStore.load(origin).catch(() => null);
@@ -84,16 +94,64 @@ export class ApplicationDiscoveryEngine {
           continue;
         }
         try {
+          let explicitNavigate = true;
           if (typeof target.href === "string" && target.href) {
             await this.session.client.send("Page.navigate", { url: target.href });
-          } else {
+          } else if (typeof this.session.click === "function") {
+            explicitNavigate = false;
             // For buttons/menu items/tabs without hrefs, use the authorized
             // click path which validates target freshness and visibility.
             await this.session.click(target);
+          } else {
+            // Scripted/observation-only sessions cannot click; record and
+            // move on rather than fabricating a navigation.
+            this.discoveries.push({ type: "click_unsupported", control: target.name.slice(0, 100) });
+            continue;
           }
-          await this.session.waitForChange(3_000);
+          if (explicitNavigate) {
+            // Scripted sessions/tests may resolve the destination inside
+            // observe(); advance once so post-navigation state is visible.
+            try { await this.session.waitForChange(3_000); } catch { /* best-effort */ }
+          } else {
+            await this.session.waitForChange(3_000);
+          }
           const postObservation = await this.session.observe();
           if (postObservation?.page?.url) {
+            // Cross-origin application transition (P1-3): verify the target
+            // belongs to the intended platform; never automatically trust
+            // arbitrary cross-origin links. A new authorization boundary
+            // pauses discovery rather than being bypassed.
+            if (this.environment) {
+              const verified = verifyObservedUrl(this.environment, postObservation.page.url);
+              const childOrigin = new URL(postObservation.page.url).origin;
+              const crossedOrigin = childOrigin !== new URL(currentUrl).origin;
+              if (crossedOrigin) {
+                this.capabilityMap.recordChildApplication({
+                  applicationId: childOrigin,
+                  origin: childOrigin,
+                  entryFrom: currentUrl
+                });
+                if (!verified.ok) {
+                  this.discoveries.push({ type: "cross_origin_untrusted", from: currentUrl, to: postObservation.page.url, reason: verified.reason });
+                  // Stop: the destination is outside the verified platform.
+                  break;
+                }
+                this.capabilityMap.markChildVerified(childOrigin);
+                this.discoveries.push({ type: "cross_origin_verified", from: currentUrl, to: postObservation.page.url });
+              }
+              // Detect a new authentication boundary (login/consent screen at
+              // a different realm) and pause instead of bypassing it.
+              const { classifyHumanHandoff } = await import("../navigation/handoff.js");
+              const handoff = classifyHumanHandoff(postObservation);
+              if (handoff && (handoff.category === "authentication" || handoff.category === "anti_automation")) {
+                this.discoveries.push({ type: "authorization_boundary", url: postObservation.page.url, category: handoff.category, reason: handoff.reason });
+                if (typeof this.onAuthorizationBoundary === "function") {
+                  await this.onAuthorizationBoundary({ url: postObservation.page.url, category: handoff.category, reason: handoff.reason, observation: postObservation });
+                }
+                observation = postObservation;
+                break; // hold at the boundary; a human must authorize/authenticate
+              }
+            }
             this.visitedUrls.add(postObservation.page.url);
             await this.#recordObservation(postObservation);
             this.discoveries.push({ type: "navigated", from: currentUrl, to: postObservation.page.url, control: target.name.slice(0, 100) });

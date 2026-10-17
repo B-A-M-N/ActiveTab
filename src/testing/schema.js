@@ -9,7 +9,13 @@
 export const STEP_TYPES = Object.freeze([
   "setup", "navigate", "interact", "api_call", "wait_for", "assert",
   "diagnostic_snapshot", "controlled_failure", "retry_verification",
-  "postcondition", "cleanup"
+  "postcondition", "cleanup", "goal"
+]);
+
+/** Human-intervention declaration for goal steps (P0-4). */
+export const INTERVENTION_TYPES = Object.freeze([
+  "tab_authorization", "authentication", "mfa", "human_approval",
+  "external_authorization", "human_decision"
 ]);
 
 export const INTERACTION_TYPES = Object.freeze([
@@ -28,9 +34,40 @@ export const STEP_STATUS = Object.freeze({
 });
 
 export const RUN_STATUS = Object.freeze({
-  PENDING: "PENDING", RUNNING: "RUNNING", PASSED: "PASSED",
-  FAILED: "FAILED", BLOCKED: "BLOCKED", CANCELED: "CANCELED"
+  PENDING: "PENDING",
+  RUNNING: "RUNNING",
+  // Resumable waiting states (P0-3): NOT terminal failures.
+  WAITING_FOR_TAB_AUTHORIZATION: "WAITING_FOR_TAB_AUTHORIZATION",
+  WAITING_FOR_AUTHENTICATION: "WAITING_FOR_AUTHENTICATION",
+  WAITING_FOR_MFA: "WAITING_FOR_MFA",
+  WAITING_FOR_HUMAN_APPROVAL: "WAITING_FOR_HUMAN_APPROVAL",
+  WAITING_FOR_EXTERNAL_AUTHORIZATION: "WAITING_FOR_EXTERNAL_AUTHORIZATION",
+  WAITING_FOR_HUMAN_DECISION: "WAITING_FOR_HUMAN_DECISION",
+  RESUME_VALIDATION: "RESUME_VALIDATION",
+  RECONCILING: "RECONCILING",
+  // Terminal states.
+  PASSED: "PASSED", FAILED: "FAILED", BLOCKED: "BLOCKED", CANCELED: "CANCELED",
+  EXPIRED: "EXPIRED"
 });
+
+export const TERMINAL_RUN_STATUSES = Object.freeze([
+  RUN_STATUS.PASSED, RUN_STATUS.FAILED, RUN_STATUS.BLOCKED,
+  RUN_STATUS.CANCELED, RUN_STATUS.EXPIRED
+]);
+
+export const WAITING_RUN_STATUSES = Object.freeze([
+  RUN_STATUS.WAITING_FOR_TAB_AUTHORIZATION, RUN_STATUS.WAITING_FOR_AUTHENTICATION,
+  RUN_STATUS.WAITING_FOR_MFA, RUN_STATUS.WAITING_FOR_HUMAN_APPROVAL,
+  RUN_STATUS.WAITING_FOR_EXTERNAL_AUTHORIZATION, RUN_STATUS.WAITING_FOR_HUMAN_DECISION
+]);
+
+export function isTerminalRunStatus(status) {
+  return TERMINAL_RUN_STATUSES.includes(status);
+}
+
+export function isWaitingRunStatus(status) {
+  return WAITING_RUN_STATUSES.includes(status);
+}
 
 /**
  * Validate a test workflow object.
@@ -70,6 +107,27 @@ export function validateWorkflow(workflow, { maxSteps = 128 } = {}) {
     }
     if (step.type === "setup" && Array.isArray(step.preconditions) && step.preconditions.length === 0) {
       errors.push(`${prefix}.preconditions must not be empty for setup steps.`);
+    }
+    if (step.type === "goal") {
+      if (typeof step.goal !== "string" || !step.goal.trim()) {
+        errors.push(`${prefix}.goal is required for goal steps.`);
+      }
+      if (step.intervention !== undefined) {
+        const intervention = step.intervention;
+        if (!intervention || typeof intervention !== "object") {
+          errors.push(`${prefix}.intervention must be an object.`);
+        } else {
+          if (!INTERVENTION_TYPES.includes(intervention.type)) {
+            errors.push(`${prefix}.intervention.type must be one of: ${INTERVENTION_TYPES.join(", ")}.`);
+          }
+          if (typeof intervention.condition?.type !== "string" || !intervention.condition.type) {
+            errors.push(`${prefix}.intervention.condition.type is required (the verified resume predicate).`);
+          }
+          if (typeof intervention.requiredAction !== "string" || !intervention.requiredAction) {
+            errors.push(`${prefix}.intervention.requiredAction is required.`);
+          }
+        }
+      }
     }
   }
   return { valid: errors.length === 0, errors };

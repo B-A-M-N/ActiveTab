@@ -1,11 +1,59 @@
 {
   "type": "object",
-  "required": ["profile_id", "name", "origin_patterns", "authentication_realms"],
+  "required": ["profile_id", "name", "environment"],
   "properties": {
     "profile_id": { "type": "string" },
     "name": { "type": "string" },
     "description": { "type": "string" },
-    "origin_patterns": { "type": "array", "items": { "type": "string" } },
+    "origin_patterns": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Compatibility field: derived from environment.application_entry_url and environment.authorized_origins. Kept for existing tooling; new code should read the environment block."
+    },
+    "environment": {
+      "type": "object",
+      "required": ["environment_id", "application_entry_url"],
+      "properties": {
+        "environment_id": { "type": "string" },
+        "platform": { "type": "string" },
+        "application_entry_url": {
+          "type": "string",
+          "description": "The real application entry point the browser navigates. Never a loopback URL."
+        },
+        "browser_control_endpoint": {
+          "type": ["string", "null"],
+          "description": "CDP endpoint or extension broker path used to control the browser. Transport infrastructure only."
+        },
+        "diagnostic_endpoint": {
+          "type": ["string", "null"],
+          "description": "Optional authorized backend diagnostic interface. Never a browser navigation target."
+        },
+        "diagnostic_transport": {
+          "type": ["string", "enum": ["direct", "ssh_tunnel", "verified_service"]],
+          "description": "How the diagnostic endpoint is reached. A loopback endpoint requires 'ssh_tunnel' plus a verified remote_target."
+        },
+        "remote_target": { "type": ["string", "null"], "description": "Verified remote staging destination for a tunnel." },
+        "authorized_origins": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Origins that may host this environment's applications. Cross-origin application transitions are verified against this set."
+        },
+        "applications": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["application_id", "authentication_realm"],
+            "properties": {
+              "application_id": { "type": "string" },
+              "authentication_realm": { "type": "string" },
+              "candidate_entry": { "type": ["string", "null"] },
+              "status": { "type": "string", "enum": ["candidate", "verified"] },
+              "final_origin": { "type": ["string", "null"], "description": "Observed final origin; set only from live navigation evidence." }
+            }
+          }
+        }
+      }
+    },
     "authentication_realms": {
       "type": "array",
       "items": {
