@@ -41,13 +41,38 @@ For headed Chrome with a visible desktop display, use:
 ACTIVETAB_VISIBLE_CHROME=1 npm test -- --test-concurrency=1
 ```
 
-## Cloud Agent Diagnostics
+## FreeInference Staging and Cloud Agent
 
-ActiveTab can collect privileged backend diagnostics from a Cloud Agent instance (local or remote). Set both environment variables to enable it:
+Cloud Agent is an application realm **within the FreeInference staging platform** (`https://staging.freeinference.org` → `/agents/`), not a localhost application. ActiveTab operates the real staging website in an authorized headed browser; backend diagnostics are a separate, optional path. The three paths are distinct:
+
+| Path | Endpoint | Role |
+|------|----------|------|
+| Browser | `https://staging.freeinference.org` | The actual application under test |
+| Control | CDP / extension broker | Transport only — never the application |
+| Diagnostic | `ACTIVETAB_CLOUD_AGENT_URL` | Optional authorized backend records |
+
+Loopback is **transport infrastructure only**. A locally forwarded address (SSH tunnel) is never the browser entry point and never counts as staging qualification.
+
+### Browser qualification (application path)
+
+Attach to an authorized headed Chrome tab on the real staging origin and run:
+
+```sh
+node --test test/cloud-agent-e2e.test.js
+```
+
+The test verifies environment/application identity from the observed URL, discovers the Agents application through live navigation, and — when authentication is required — enters a **durable resumable waiting state** instead of skipping the browser workflow. No step restarts from the beginning once the human action is verified. See `examples/cloud-agent/*.json` for goal-driven test packs.
+
+### Backend diagnostics (optional diagnostic path)
+
+ActiveTab can collect privileged backend diagnostics from a Cloud Agent control plane (direct or via a verified SSH tunnel). Set both environment variables to enable it:
 
 ```sh
 ACTIVETAB_CLOUD_AGENT_URL=http://127.0.0.1:18000
 ACTIVETAB_CLOUD_AGENT_ADMIN_TOKEN=<the Cloud Agent ADMIN_TOKEN>
+# A loopback URL additionally requires the tunnel transport and verified remote target:
+ACTIVETAB_CLOUD_AGENT_TRANSPORT=ssh_tunnel
+ACTIVETAB_CLOUD_AGENT_REMOTE_TARGET=<staging-host>:18000
 ```
 
 When configured, the MCP server and local API server automatically register the following diagnostic sources alongside browser CDP evidence:
