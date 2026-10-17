@@ -1,12 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   resolveCloudAgentEntry,
   hasCloudAgentTaskComposer,
   verifyCloudAgentReady,
   discoverVisibleDiagnosticSurfaces,
-  createCloudAgentEntryWorkflow
+  createCloudAgentEntryWorkflow,
+  qualifyCloudAgent
 } from "../src/testing/qualifyCloudAgent.js";
+import { InterventionStore } from "../src/runtime/interventions.js";
+import { RunStateStore } from "../src/testing/runState.js";
 
 const environment = {
   applicationEntryUrl: "https://staging.freeinference.org",
@@ -121,4 +127,94 @@ test("entry workflow follows the visible UI from staging and skips navigation wh
   const alreadyReady = createCloudAgentEntryWorkflow(environment, agentPage);
   assert.equal(alreadyReady.alreadyAtComposer, true);
   assert.deepEqual(alreadyReady.workflow.steps.map(step => step.type), ["assert"]);
+});
+
+test("owned qualification resumes the same durable run after process restart and verified composer reattachment", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "activetab-staging-resume-"));
+  const runDir = join(dir, "run-state");
+  const interventionDir = join(dir, "interventions");
+  const reportDir = join(dir, "reports");
+  try {
+    const makeSession = page => ({
+      attached: true,
+      persistent: true,
+      target: { id: "owned-target-fixture" },
+      async observe() {
+        return {
+          page: { url: page.url, title: page.title },
+          candidates: page.candidates,
+          evidenceId: page.evidenceId,
+          pageChangeFingerprint: page.url
+        };
+      },
+      async waitForChange() {},
+      async close() {},
+      client: { async send() { throw new Error("No browser dispatch is expected in this resume fixture."); } }
+    });
+    const initialSession = makeSession({
+      url: "https://staging.freeinference.org/login",
+      title: "Sign in to continue",
+      evidenceId: "ev-login",
+      candidates: [
+        { name: "Sign in", role: "button", visible: true },
+        { name: "Password", role: "textbox", type: "password", visible: true }
+      ]
+    });
+    const firstRunStore = new RunStateStore(runDir);
+    await firstRunStore.init();
+    const firstInterventions = new InterventionStore(interventionDir);
+    await firstInterventions.init();
+    const firstReport = await qualifyCloudAgent({
+      session: initialSession,
+      environment,
+      interventions: firstInterventions,
+      runStore: firstRunStore,
+      mode: "owned",
+      profileId: "cloud-agent-staging",
+      reportDir,
+      onHumanIntervention: async () => false
+    });
+
+    assert.equal(firstReport.qualificationState, "WAITING_FOR_HUMAN");
+    const persisted = new RunStateStore(runDir);
+    await persisted.init();
+    const suspended = persisted.get(firstReport.runId);
+    assert.equal(suspended.status, "waiting_for_authentication");
+    assert.equal(suspended.resumeCursor.suspendedStepId, "follow-visible-agents-route");
+    assert.equal(suspended.profileId, "cloud-agent-staging");
+    assert.equal(suspended.mode, "owned");
+    assert.equal(JSON.stringify(suspended.resumeCursor).includes("Follow the visible Cloud Agents link"), false);
+
+    const resumedInterventions = new InterventionStore(interventionDir);
+    await resumedInterventions.init();
+    const composerSession = makeSession({
+      url: "https://agents-staging.freeinference.org/runs",
+      title: "Cloud Agent",
+      evidenceId: "ev-composer",
+      candidates: [
+        { name: "New task", role: "link", visible: true },
+        { name: "Describe the task", role: "textbox", visible: true, disabled: false }
+      ]
+    });
+    const resumedReport = await qualifyCloudAgent({
+      session: composerSession,
+      environment,
+      interventions: resumedInterventions,
+      runStore: persisted,
+      resumeRunState: suspended,
+      mode: "owned",
+      profileId: "cloud-agent-staging",
+      reportDir,
+      onHumanIntervention: async (_record, { inspectCurrentPage }) => (await inspectCurrentPage()).ok
+    });
+
+    assert.equal(resumedReport.runId, firstReport.runId);
+    assert.equal(resumedReport.gates.agents_application_entered.passed, true);
+    assert.equal(resumedReport.qualificationState, "UNCERTAIN", "reaching the composer still does not claim an Agent operation ran");
+    const completedState = persisted.get(firstReport.runId);
+    assert.equal(completedState.status, "uncertain");
+    assert.equal(completedState.resumeCursor, null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

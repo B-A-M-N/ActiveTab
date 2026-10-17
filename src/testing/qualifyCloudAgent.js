@@ -27,6 +27,7 @@ import { fileURLToPath } from "node:url";
 import { randomUUID, createHash } from "node:crypto";
 
 import { TestRunner } from "./runner.js";
+import { TestReceipt } from "./receipts.js";
 import { InterventionStore, InterventionWatcher } from "../runtime/interventions.js";
 import { loadEnvironmentBinding } from "./profiles.js";
 import { verifyObservedUrl, isLoopbackUrl } from "../environments/model.js";
@@ -62,6 +63,42 @@ function redactPath(pathname) {
     if (/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(segment) || /^\d{4,}$/.test(segment) || segment.length > 64) return ":id";
     return segment;
   }).join("/");
+}
+
+function resumeCursorFor(receipt, statusOverride = null) {
+  if (!receipt) return null;
+  const suspended = [...receipt.steps].reverse().find(step => step.status === "SUSPENDED");
+  if (!suspended) return null;
+  const object = receipt.toObject();
+  return {
+    schemaVersion: 1,
+    suspendedStepId: suspended.stepId,
+    receipt: {
+      runId: object.runId,
+      workflowId: object.workflowId,
+      workflowName: object.workflowName,
+      startedAt: object.startedAt,
+      finishedAt: null,
+      status: statusOverride ?? object.status,
+      steps: object.steps.map(step => ({
+        stepId: step.stepId,
+        type: step.type,
+        status: step.status,
+        evidenceIds: (step.evidenceIds ?? []).slice(0, 20),
+        startedAt: step.startedAt,
+        finishedAt: step.finishedAt
+      })),
+      cleanup: [],
+      interventions: object.interventions.map(item => ({
+        stepId: item.stepId,
+        interventionId: item.interventionId,
+        type: item.type,
+        state: item.state,
+        externalState: item.externalState
+      })),
+      limitations: []
+    }
+  };
 }
 
 /**
@@ -224,6 +261,9 @@ export async function qualifyCloudAgent({
   environment,
   interventions,
   runStore = null,
+  resumeRunState = null,
+  profileId = null,
+  reportDir: reportDirOption = null,
   diagnostics = null,
   mode = "test",
   onHumanIntervention = null,
@@ -231,7 +271,24 @@ export async function qualifyCloudAgent({
   onEvent = null
 }) {
   const emit = text => { if (typeof onEvent === "function") { try { onEvent(text); } catch { /* best-effort */ } } };
-  const runId = `cloud-agent-staging-${randomUUID()}`;
+  let runState = resumeRunState;
+  let runId = runState?.runId ?? `cloud-agent-staging-${randomUUID()}`;
+  let resumeReceipt = null;
+  let resumeError = null;
+  if (resumeRunState) {
+    try {
+      if (resumeRunState.resumeCursor?.schemaVersion !== 1
+        || resumeRunState.resumeCursor.suspendedStepId !== resumeRunState.suspendedStepId) {
+        throw new Error("Suspended qualification has no valid resume cursor.");
+      }
+      resumeReceipt = TestReceipt.fromObject(resumeRunState.resumeCursor.receipt);
+      if (resumeReceipt.runId !== resumeRunState.runId || !isWaitingRunStatus(resumeReceipt.status)) {
+        throw new Error("Suspended qualification receipt identity or status is invalid.");
+      }
+    } catch (error) {
+      resumeError = String(error?.message ?? error);
+    }
+  }
   const backendCorrelationRef = { value: null };
   const gates = {};
   const evidence = [];
@@ -244,25 +301,45 @@ export async function qualifyCloudAgent({
     return passed === true;
   };
 
+  if (resumeError) return finalize(QUALIFICATION_STATES.BLOCKED, { reason: resumeError });
+
   if (!session || session.attached !== true) {
     return finalize(QUALIFICATION_STATES.BLOCKED, { reason: "No authorized attached browser session." });
   }
   if (!environment) {
     return finalize(QUALIFICATION_STATES.BLOCKED, { reason: "No verified environment binding." });
   }
+  if (resumeRunState && !runStore) {
+    return finalize(QUALIFICATION_STATES.BLOCKED, { reason: "Restart resume requires a durable RunStateStore." });
+  }
 
-  // Optional durable run-state cursor (P0-4 durable mode).
-  let runState = null;
+  // Durable run-state cursor is independent of browser-profile persistence.
   if (runStore) {
-    runState = await runStore.create({
-      workflowId: "cloud-agent-staging-qualification",
-      workflowName: "Cloud Agent staging qualification",
-      environmentId: environment.environmentId,
-      authenticationRealm: "agents-session",
-      targetId: session.target?.id ?? null,
-      goalFingerprint: createHash("sha256").update(String(environment.applicationEntryUrl)).digest("hex").slice(0, 32)
+    if (!runState) {
+      runState = await runStore.create({
+        workflowId: "cloud-agent-staging-qualification",
+        workflowName: "Cloud Agent staging qualification",
+        environmentId: environment.environmentId,
+        authenticationRealm: "agents-session",
+        targetId: session.target?.id ?? null,
+        goalFingerprint: createHash("sha256").update(String(environment.applicationEntryUrl)).digest("hex").slice(0, 32),
+        mode,
+        profileId
+      });
+      runId = runState.runId;
+    } else if (runState.workflowId !== "cloud-agent-staging-qualification"
+      || runState.environmentId !== environment.environmentId
+      || (profileId && runState.profileId !== profileId)
+      || (runState.mode && runState.mode !== mode)) {
+      return finalize(QUALIFICATION_STATES.BLOCKED, { reason: "Suspended run does not match the selected workflow, profile, mode, or environment." });
+    }
+    await runStore.update(runState.runId, {
+      status: resumeRunState ? runState.status : "running",
+      profileId: profileId ?? runState.profileId ?? null,
+      mode,
+      target: session.target?.id ? { targetId: session.target.id, attached: true } : runState.target,
+      resumeCursor: resumeRunState ? runState.resumeCursor : null
     });
-    await runStore.update(runState.runId, { status: "running" });
   }
 
   // Wire the intervention watcher (P0-5): bound to this run's exact
@@ -310,7 +387,10 @@ export async function qualifyCloudAgent({
     }
     gate("environment_identity_verified", true, `${observedUrl} (${observation.page.title ?? "untitled"})`);
     evidence.push({ kind: "identity", url: observedUrl, title: observation.page.title ?? null, evidenceId: observation.evidenceId ?? null });
-    if (runState) await runStore.update(runState.runId, { latestVerifiedEvidenceId: observation.evidenceId ?? null });
+    if (runState) await runStore.update(runState.runId, {
+      latestVerifiedEvidenceId: observation.evidenceId ?? null,
+      target: session.target?.id ? { targetId: session.target.id, attached: true } : runState.target
+    });
     emit(`Environment: ${environment.environmentId} → ${observedUrl}`);
 
     // ── 2. Real staging site reached (mandatory) ──
@@ -343,13 +423,57 @@ export async function qualifyCloudAgent({
 
     // ── 5. Follow the visible route, hand off for login, then verify and resume ──
     const runner = new TestRunner({ session, interventions, environment, signal });
-    let receipt = await runner.run(workflow, { runId });
+    runner.onRunSuspended = async (suspendedReceipt, record) => {
+      if (!runState) return;
+      const suspendedStatus = {
+        tab_authorization: RUN_STATUS.WAITING_FOR_TAB_AUTHORIZATION,
+        authentication: RUN_STATUS.WAITING_FOR_AUTHENTICATION,
+        mfa: RUN_STATUS.WAITING_FOR_MFA,
+        human_approval: RUN_STATUS.WAITING_FOR_HUMAN_APPROVAL,
+        external_authorization: RUN_STATUS.WAITING_FOR_EXTERNAL_AUTHORIZATION,
+        human_decision: RUN_STATUS.WAITING_FOR_HUMAN_DECISION
+      }[record.type] ?? RUN_STATUS.WAITING_FOR_HUMAN_DECISION;
+      const cursor = resumeCursorFor(suspendedReceipt, suspendedStatus);
+      await runStore.update(runState.runId, {
+        status: suspendedStatus.toLowerCase(),
+        pendingInterventionId: record.intervention_id,
+        suspendedStepId: record.stepId,
+        resumeCursor: cursor,
+        target: session.target?.id ? { targetId: session.target.id, attached: true } : runState.target
+      });
+    };
+    let activeWorkflow = workflow;
+    if (resumeReceipt) {
+      const suspendedStepId = resumeRunState.suspendedStepId;
+      if (suspendedStepId !== "follow-visible-agents-route") {
+        return finalize(QUALIFICATION_STATES.BLOCKED, { reason: "The persisted Cloud Agent suspension is not at the supported visible-entry step.", receipt: resumeReceipt });
+      }
+      activeWorkflow = {
+        ...workflow,
+        steps: [
+          { id: suspendedStepId, type: "goal", goal: "Resume after the verified Cloud Agent task composer predicate." },
+          ...workflow.steps.filter(step => step.id !== suspendedStepId)
+        ]
+      };
+    }
+    let receipt = resumeReceipt ?? await runner.run(workflow, { runId });
 
     if (isWaitingRunStatus(receipt.status)) {
-      const interventionRef = receipt.interventions?.[0];
-      const record = interventionRef?.interventionId ? interventions.get(interventionRef.interventionId) : null;
+      const interventionRef = [...(receipt.interventions ?? [])].reverse().find(item => item.state === "waiting_for_human" || item.state === "acknowledged");
+      const pendingId = resumeRunState?.pendingInterventionId ?? interventionRef?.interventionId;
+      const record = pendingId ? interventions.get(pendingId) : null;
+      if (resumeReceipt && (!record || record.runId !== runId || record.stepId !== resumeRunState.suspendedStepId
+        || record.intervention_id !== resumeRunState.pendingInterventionId)) {
+        return finalize(QUALIFICATION_STATES.BLOCKED, { reason: "The durable human intervention does not match the suspended run and step.", receipt });
+      }
       emit(`Suspended: ${receipt.interventions.map(i => `${i.type}(${i.state})`).join(", ")}`);
-      if (runState) await runStore.update(runState.runId, { status: "waiting_for_authentication", pendingInterventionId: record?.intervention_id ?? null, suspendedStepId: record?.stepId ?? null });
+      if (runState) await runStore.update(runState.runId, {
+        status: receipt.status.toLowerCase(),
+        pendingInterventionId: record?.intervention_id ?? null,
+        suspendedStepId: record?.stepId ?? null,
+        resumeCursor: resumeCursorFor(receipt),
+        target: session.target?.id ? { targetId: session.target.id, attached: true } : runState.target
+      });
       if (record && typeof onHumanIntervention === "function") {
         const verify = {
           hasAttachmentGrant: async targetId => session.target?.id === targetId && session.attached === true
@@ -385,10 +509,14 @@ export async function qualifyCloudAgent({
             verifyReady: async () => verifyCloudAgentReady(await session.observe().catch(() => null), environment, agentEntry.origin)
           });
           if (shouldResume === false) break;
-          const resumed = await runner.resume(receipt, { workflow, verify });
+          const resumed = await runner.resume(receipt, {
+            workflow: activeWorkflow,
+            verify,
+            completedStepIds: record.stepId === "follow-visible-agents-route" ? [record.stepId] : []
+          });
           if (resumed.resumed && resumed.receipt) {
             receipt = resumed.receipt;
-            if (runState) await runStore.update(runState.runId, { status: "running", pendingInterventionId: null, suspendedStepId: null });
+            if (runState) await runStore.update(runState.runId, { status: "running" });
             break;
           }
           emit(`Authentication is not verified yet: ${resumed.reason ?? "the Agent task composer is still unavailable."}`);
@@ -510,6 +638,21 @@ export async function qualifyCloudAgent({
   }
 
   async function finalize(state, { reason: r, error = null, receipt = null, interventionId = null } = {}) {
+    if (runStore && runState) {
+      const isSuspended = state === QUALIFICATION_STATES.WAITING_FOR_HUMAN
+        && receipt && isWaitingRunStatus(receipt.status) && resumeCursorFor(receipt);
+      const pending = isSuspended
+        ? [...(receipt.interventions ?? [])].reverse().find(item => item.state === "waiting_for_human" || item.state === "acknowledged")
+        : null;
+      await runStore.update(runState.runId, {
+        status: isSuspended ? receipt.status.toLowerCase() : state.toLowerCase(),
+        pendingInterventionId: pending?.interventionId ?? (isSuspended ? interventionId : null),
+        suspendedStepId: isSuspended ? resumeCursorFor(receipt).suspendedStepId : null,
+        resumeCursor: isSuspended ? resumeCursorFor(receipt) : null,
+        target: session?.target?.id ? { targetId: session.target.id, attached: session.attached === true } : runState.target,
+        latestVerifiedEvidenceId: evidence.at(-1)?.evidenceId ?? runState.latestVerifiedEvidenceId ?? null
+      });
+    }
     const passedGates = MANDATORY_GATES.filter(name => gates[name]?.passed === true);
     const failedGates = MANDATORY_GATES.filter(name => gates[name] && gates[name].passed !== true);
     const report = {
@@ -541,10 +684,10 @@ export async function qualifyCloudAgent({
     // Save the final report under the repo's local output directory.
     let reportLocation = null;
     try {
-      const reportDir = join(dirname(fileURLToPath(import.meta.url)), "..", "..", ".activetab", "qualification");
-      await mkdir(reportDir, { recursive: true });
+      const reportDir = reportDirOption ?? join(dirname(fileURLToPath(import.meta.url)), "..", "..", ".activetab", "qualification");
+      await mkdir(reportDir, { recursive: true, mode: 0o700 });
       reportLocation = join(reportDir, `${runId}.json`);
-      await writeFile(reportLocation, JSON.stringify(report, null, 2), "utf8");
+      await writeFile(reportLocation, JSON.stringify(report, null, 2), { encoding: "utf8", mode: 0o600 });
     } catch { /* report location is best-effort */ }
     report.reportLocation = reportLocation;
     return report;

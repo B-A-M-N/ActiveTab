@@ -18,7 +18,7 @@ const environment = buildEnvironmentBinding({
     environment_id: "freeinference-staging",
     platform: "freeinference",
     application_entry_url: "https://staging.freeinference.org",
-    authorized_origins: ["https://staging.freeinference.org"],
+    authorized_origins: ["https://staging.freeinference.org", "https://agents-staging.freeinference.org"],
     applications: [{ application_id: "fi-agents", authentication_realm: "agents-session", candidate_entry: "/agents/" }]
   }
 });
@@ -42,6 +42,7 @@ function makeSession({ pages, onMutating }) {
       };
     },
     async waitForChange() { index = Math.min(index + 1, pages.length - 1); },
+    setPageIndex(value) { index = Math.max(0, Math.min(value, pages.length - 1)); },
     async client() {},
     click: async () => { session.mutations++; if (onMutating) onMutating("click"); },
     async close() {}
@@ -106,6 +107,62 @@ test("an unverified environment origin suspends with a human-decision interventi
     assert.equal(pending[0].type, "human_decision");
     assert.match(pending[0].reason, /not authorized/);
     assert.equal(session.mutations, 0);
+  }));
+
+test("verified authentication resumes the same run, continues after its completed goal, and reconciles the receipt", () =>
+  withInterventions(async interventions => {
+    const session = makeSession({
+      pages: [
+        { url: "https://staging.freeinference.org/login", title: "Sign in to continue", candidates: [{ name: "Sign in", role: "button" }, { name: "Password", type: "password", role: "textbox" }] },
+        { url: "https://agents-staging.freeinference.org/runs", title: "Cloud Agent", candidates: [
+          { name: "New task", role: "link", visible: true },
+          { name: "Describe the task", role: "textbox", visible: true, disabled: false }
+        ] }
+      ]
+    });
+    const runner = new TestRunner({ session, interventions, environment });
+    const workflow = {
+      id: "cloud-agent-enter-agents", name: "Enter Cloud Agent",
+      steps: [
+        { id: "follow-visible-agents-route", type: "goal", goal: "Reach the Cloud Agent task composer", intervention: {
+          type: "authentication", realm: "agents-session", requiredAction: "Complete the visible login flow.",
+          condition: { type: "authenticated_session_check", realm: "agents-session" }
+        } },
+        { id: "verify-task-composer", type: "assert", assertion: { type: "candidate_name_contains", value: "new task" } }
+      ]
+    };
+    const receipt = await runner.run(workflow, { runId: "same-logical-run" });
+    assert.equal(receipt.status, RUN_STATUS.WAITING_FOR_AUTHENTICATION);
+    const intervention = interventions.listPending()[0];
+    session.setPageIndex(1);
+
+    const resumed = await runner.resume(receipt, {
+      workflow,
+      completedStepIds: ["follow-visible-agents-route"],
+      verify: {
+        hasAttachmentGrant: async targetId => ({ ok: targetId === "tab-1" }),
+        verifyEnvironment: async url => ({ ok: url.startsWith("https://agents-staging.freeinference.org/") }),
+        observe: () => session.observe(),
+        verifyAuthentication: async realm => {
+          const observation = await session.observe();
+          const ready = realm === "agents-session"
+            && observation.page.url.startsWith("https://agents-staging.freeinference.org/")
+            && observation.candidates.some(candidate => candidate.name === "New task")
+            && observation.candidates.some(candidate => candidate.role === "textbox" && candidate.disabled === false);
+          return ready ? { authenticated: true, identity: "Cloud Agent task composer", evidenceId: observation.evidenceId } : { authenticated: false };
+        }
+      }
+    });
+
+    assert.equal(resumed.resumed, true, JSON.stringify({ reason: resumed.reason, status: resumed.receipt?.status, steps: resumed.receipt?.steps }));
+    assert.equal(resumed.receipt.runId, "same-logical-run");
+    assert.equal(resumed.receipt.status, RUN_STATUS.PASSED);
+    assert.deepEqual(resumed.receipt.steps.map(step => [step.stepId, step.status]), [
+      ["follow-visible-agents-route", "PASS"],
+      ["verify-task-composer", "PASS"]
+    ]);
+    assert.equal(resumed.receipt.interventions.find(item => item.interventionId === intervention.intervention_id).state, "satisfied");
+    assert.equal(session.mutations, 0, "verified auth continuation must not replay browser navigation or actions");
   }));
 
 test("goal workflow validation requires intervention declarations to name a verified predicate", async () => {

@@ -294,6 +294,25 @@ Reports are written under .activetab/qualification/admin-discovery with
 owner-only directory and file permissions. Discovery closes only its CDP
 attachment; it leaves the operator's browser process and tab open.
 
+## Resuming staging qualification
+
+The persistent Chrome profile and the qualification run journal are separate.
+If an owned run is interrupted during login, resume its exact run with:
+
+    npm run qualify:staging -- --mode=owned --resume-run-id=<runId>
+
+The command launches the same profile-specific Chrome directory, then verifies
+the observed staging environment and the Cloud Agent task composer before it
+continues the saved run. It does not repeat the suspended navigation step. For
+attached mode, the independently authorized target ID must still match the
+target recorded by the run. An unfinished run blocks a fresh run; explicitly
+mark one abandoned with `--discard-run=<runId>` if it should not resume. The
+report and intervention records remain available after abandonment.
+
+Reaching the task composer is still only entry qualification. The profile has
+no executable Cloud Agent test pack, so this workflow does not create an Agent
+task or claim an operational PASS.
+
 ## Current limitation
 
 The profile includes a partial Settings inventory from the operator-provided

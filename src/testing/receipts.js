@@ -22,6 +22,48 @@ export class TestReceipt {
     this.limitations = [];
   }
 
+  static fromObject(value) {
+    if (!value || typeof value !== "object" || typeof value.runId !== "string"
+      || typeof value.workflowId !== "string" || !Array.isArray(value.steps)
+      || !Array.isArray(value.interventions) || !Object.values(RUN_STATUS).includes(value.status)) {
+      throw new Error("Cannot restore an invalid durable test receipt.");
+    }
+    const receipt = new TestReceipt({ runId: value.runId, workflowId: value.workflowId, workflowName: value.workflowName ?? value.workflowId });
+    receipt.startedAt = typeof value.startedAt === "string" ? value.startedAt : receipt.startedAt;
+    receipt.finishedAt = typeof value.finishedAt === "string" ? value.finishedAt : null;
+    receipt.status = value.status;
+    receipt.steps = value.steps.map(step => {
+      if (!step || typeof step.stepId !== "string" || typeof step.type !== "string"
+        || ![...Object.values(STEP_STATUS), STEP_SUSPENDED].includes(step.status)) {
+        throw new Error("Cannot restore a durable receipt with an invalid step.");
+      }
+      return {
+        stepId: step.stepId,
+        type: step.type,
+        status: step.status,
+        reason: String(step.reason ?? "Restored from durable run state."),
+        evidenceIds: Array.isArray(step.evidenceIds) ? step.evidenceIds.filter(id => typeof id === "string").slice(0, 20) : [],
+        startedAt: typeof step.startedAt === "string" ? step.startedAt : receipt.startedAt,
+        finishedAt: typeof step.finishedAt === "string" ? step.finishedAt : receipt.startedAt
+      };
+    });
+    receipt.interventions = value.interventions.map(item => {
+      if (!item || typeof item.stepId !== "string" || typeof item.interventionId !== "string") {
+        throw new Error("Cannot restore a durable receipt with an invalid intervention reference.");
+      }
+      return {
+        stepId: item.stepId,
+        interventionId: item.interventionId,
+        type: String(item.type ?? "human_decision"),
+        state: String(item.state ?? "waiting_for_human"),
+        reason: String(item.reason ?? "Restored from durable run state."),
+        ...(typeof item.externalState === "string" ? { externalState: item.externalState } : {}),
+        ...(typeof item.resumedAt === "string" ? { resumedAt: item.resumedAt } : {})
+      };
+    });
+    return receipt;
+  }
+
   recordStep({ stepId, type, status, reason, evidenceIds = [], startedAt, finishedAt, details = null }) {
     if (!Object.values(STEP_STATUS).includes(status) && status !== STEP_SUSPENDED) {
       throw new Error(`Unknown step status '${status}' for step '${stepId}'.`);
@@ -49,6 +91,31 @@ export class TestReceipt {
       recordedAt: new Date().toISOString()
     });
     return this;
+  }
+
+  /** Reconcile the suspended step with its verified continuation result. */
+  replaceSuspendedStep(stepId) {
+    const suspendedIndex = this.steps.findIndex(step => step.stepId === stepId && step.status === STEP_SUSPENDED);
+    if (suspendedIndex < 0) return false;
+    const suspended = this.steps[suspendedIndex];
+    const resumedIndex = this.steps.findLastIndex(step => step.stepId === stepId);
+    if (resumedIndex <= suspendedIndex) return false;
+    const resumed = this.steps[resumedIndex];
+    this.steps[suspendedIndex] = { ...resumed, startedAt: suspended.startedAt };
+    this.steps.splice(resumedIndex, 1);
+    return true;
+  }
+
+  /** Complete a suspended step when its exact resume predicate proves its postcondition. */
+  completeSuspendedStep(stepId, { reason, evidenceId = null } = {}) {
+    const step = this.steps.findLast(item => item.stepId === stepId && item.status === STEP_SUSPENDED);
+    if (!step) return false;
+    step.status = STEP_STATUS.PASS;
+    step.reason = String(reason ?? "The suspended step's completion predicate was verified.");
+    step.finishedAt = new Date().toISOString();
+    step.evidenceIds = evidenceId ? [evidenceId] : [];
+    delete step.details;
+    return true;
   }
 
   addLimitation(text) {

@@ -81,7 +81,7 @@ export async function discoverStagingAdminConfig({ session, environment, profile
   }
 
   const identityPage = await session.client.send("Runtime.evaluate", {
-    expression: "(()=>{const visible=element=>{const rect=element.getBoundingClientRect(),style=getComputedStyle(element);return rect.width>0&&rect.height>0&&style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)>0};return JSON.stringify([...document.querySelectorAll('h1,h2,h3')].filter(visible).map(element=>String(element.innerText??'').replace(/\\s+/g,' ').trim().slice(0,180))})()",
+    expression: "(()=>{const visible=element=>{const rect=element.getBoundingClientRect(),style=getComputedStyle(element);return rect.width>0&&rect.height>0&&style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)>0};return JSON.stringify([...document.querySelectorAll('h1,h2,h3')].filter(visible).map(element=>String(element.innerText??'').replace(/\\s+/g,' ').trim().slice(0,180)))})()",
     returnByValue: true,
     awaitPromise: false,
     userGesture: false

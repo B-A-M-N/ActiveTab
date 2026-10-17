@@ -26,6 +26,8 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 - A test-owned resource must be created and identified durably before cleanup verification is meaningful.
 - Staging qualification begins at the profile's real application entry and follows visible navigation to Cloud Agent; a profile candidate URL is an identity hint and never an automatic destination.
 - Authentication handoff keeps the same run and browser alive until fresh evidence verifies the Cloud Agent task composer.
+- Owned browser profiles and qualification run state persist independently. Restart resume requires the explicit run ID, matching profile/mode/environment, the same owned profile or exact attached target, and fresh Cloud Agent task-composer evidence. A verified authentication predicate completes the suspended visible-entry step without replaying it.
+- Qualification run-state cursors contain bounded step/intervention references only; they omit raw goals and browser evidence. Unfinished runs block replacement runs until explicitly resumed or marked abandoned.
 - Ordinary qualification only inventories visible diagnostic links. The separate Admin discovery entrypoint is profile-driven and may follow an exact visible same-origin Admin link, inspect one row disclosure, and restore its state. It remains separate from Cloud Agent task execution and never creates a task.
 - Main account-dashboard discovery requires the exact profile-declared `/dashboard` route and inventories visible model labels plus exact Agents, Settings, and Admin Console link destinations. This recipe does not follow those links or read form values, response bodies, or infer Cloud Agent task-selector choices from the account catalog. Admin Console content is handled only through a separate operator-directed walkthrough.
 - The main account Admin Console inventory runs only after the operator has opened the exact profile-declared Users route. It records allowlisted view-control labels, filter option labels, and spend/request/token table column labels only; it excludes summary-card values, user rows, field values, and response bodies, and never changes filters or submits actions. A separate incident-scoped flow may collect a specific user's spending evidence after the target and time window are explicit.
@@ -41,7 +43,7 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 ## Verification
 
 ```bash
-node --test test/testing.test.js test/goal-steps.test.js test/e2e-vertical.test.js
+node --test test/testing.test.js test/goal-steps.test.js test/qualifyCloudAgent.test.js test/qualifyTarget.test.js test/staging-admin-discovery.test.js test/e2e-vertical.test.js
 ```
 
 E2E vertical tests require a real Chrome environment and fixture server.

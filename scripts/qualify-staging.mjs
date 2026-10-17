@@ -42,7 +42,7 @@ import { loadEnvironmentBinding } from "../src/testing/profiles.js";
 import { qualifyCloudAgent } from "../src/testing/qualifyCloudAgent.js";
 import { listTargets, resolveAuthorizedTarget } from "../src/browser/targets.js";
 import { BrowserSession } from "../src/browser/session.js";
-import { verifyObservedUrl } from "../src/environments/model.js";
+import { selectAuthorizedStagingTarget } from "../src/testing/qualifyTarget.js";
 
 const args = process.argv.slice(2);
 function arg(name, fallback = null) {
@@ -55,6 +55,8 @@ const hasFlag = name => args.includes(`--${name}`);
 const mode = arg("mode", "owned");
 const profileId = arg("profile", "cloud-agent-staging");
 const openOnly = hasFlag("open-only");
+const resumeRunId = arg("resume-run-id", process.env.ACTIVETAB_RESUME_RUN_ID ?? null);
+const discardRunId = arg("discard-run", null);
 
 const useXvfb = hasFlag("xvfb");
 const reportDirArg = arg("report-dir", null);
@@ -73,6 +75,10 @@ if (mode === "attached" && openOnly) {
 }
 if (mode === "owned" && process.env.ACTIVETAB_HEADLESS === "1") {
   console.error("Refusing --mode=owned with ACTIVETAB_HEADLESS=1: headless is never a silent fallback for staging qualification. Use --mode=owned with a display, or an explicit operator opt-in workflow.");
+  process.exit(2);
+}
+if (resumeRunId && (discardRunId || process.env.ACTIVETAB_DISCARD_SUSPENDED_RUN === "1")) {
+  console.error("Choose either --resume-run-id or an explicit discard, not both.");
   process.exit(2);
 }
 
@@ -151,49 +157,64 @@ async function main() {
   process.on("SIGINT", onSig);
   process.on("SIGTERM", onSig);
 
-  // Attached mode can resume its exact external target across invocations.
-  // Owned mode retains its dedicated Chrome profile, but each invocation
-  // starts a fresh run against that login; an unfinished auth-only run does
-  // not block a later attempt or delete its record.
-  const durable = mode === "attached";
-  const interventionDir = durable
+  // Browser-profile persistence and run-state persistence are independent:
+  // either mode can resume a durable run, but each must revalidate its target.
+  const interventionDir = mode === "attached"
     ? join(repoRoot, ".activetab", "interventions")
     : join(stateDir, "interventions-owned");
   const runStoreDir = join(repoRoot, ".activetab", "run-state");
   const interventions = new InterventionStore(interventionDir);
   await interventions.init();
-  const runStore = durable ? new RunStateStore(runStoreDir) : null;
-  if (runStore) await runStore.init();
+  const runStore = new RunStateStore(runStoreDir);
+  await runStore.init();
+  const relevantRun = run => run.workflowId === "cloud-agent-staging-qualification"
+    && run.environmentId === binding.environmentId
+    && (!run.profileId || run.profileId === profileId);
+  const pendingRuns = [...new Map([...runStore.listSuspended(), ...runStore.listActive()]
+    .filter(relevantRun).map(run => [run.runId, run])).values()];
+  let resumeRunState = null;
 
-  // P0-4: owned-mode resume must never silently launch a replacement
-  // browser. If a suspended run exists in the durable store, require an
-  // explicit --resume-run-id or --discard-run before launching.
-  if (mode === "owned" && runStore) {
-    const suspended = runStore.listSuspended();
-    if (suspended.length > 0) {
-      console.error(`[owned] ${suspended.length} suspended qualification run(s) exist in the durable state store (${runStoreDir}).`);
-      for (const run of suspended) {
-        console.error(`  runId=${run.runId} status=${run.status} pendingIntervention=${run.pendingInterventionId ?? "none"} suspendedStep=${run.suspendedStepId ?? "none"}`);
-      }
-      const resumeId = process.env.ACTIVETAB_RESUME_RUN_ID ?? null;
-      const discard = process.env.ACTIVETAB_DISCARD_SUSPENDED_RUN === "1";
-      if (discard) {
-        console.error("[owned] ACTIVETAB_DISCARD_SUSPENDED_RUN=1: proceeding with a new owned run; suspended runs are not resumed by this invocation.");
-      } else if (resumeId) {
-        const match = suspended.find(run => run.runId === resumeId);
-        if (!match) {
-          console.error(`[owned] ACTIVETAB_RESUME_RUN_ID='${resumeId}' does not match any suspended run. Refusing to launch a replacement browser.`);
-          process.exit(3);
-        }
-        console.error(`[owned] Suspended run ${resumeId} exists, but owned-mode resume is not implemented in this invocation. Launching a new browser would lose the authenticated session. Use --mode=attached with ACTIVETAB_AUTHORIZED_TARGET_ID to resume, or discard the run explicitly.`);
-        process.exit(3);
-      } else {
-        console.error("[owned] Refusing to launch a replacement browser that would silently discard the suspended run.");
-        console.error("  Options:");
-        console.error("    - Use attached mode with the original authorized tab and ACTIVETAB_RESUME_RUN_ID to resume the suspended run.");
-        console.error("    - Set ACTIVETAB_DISCARD_SUSPENDED_RUN=1 to explicitly abandon the suspended run and launch a fresh owned browser.");
-        process.exit(3);
-      }
+  let selectedDiscardId = discardRunId;
+  if (!selectedDiscardId && process.env.ACTIVETAB_DISCARD_SUSPENDED_RUN === "1" && pendingRuns.length === 1) {
+    selectedDiscardId = pendingRuns[0].runId;
+  }
+  if (selectedDiscardId) {
+    const abandoned = pendingRuns.find(run => run.runId === selectedDiscardId);
+    if (!abandoned) {
+      console.error(`[qualification] --discard-run '${selectedDiscardId}' does not identify a pending run for profile '${profileId}'.`);
+      process.exit(3);
+    }
+    await runStore.update(abandoned.runId, {
+      status: "abandoned",
+      pendingInterventionId: null,
+      suspendedStepId: null,
+      resumeCursor: null
+    });
+    console.error(`[qualification] Explicitly abandoned suspended run ${abandoned.runId}; its report and intervention records remain available.`);
+  }
+
+  if (resumeRunId) {
+    const candidate = pendingRuns.find(run => run.runId === resumeRunId);
+    if (!candidate || !candidate.resumeCursor || !candidate.pendingInterventionId) {
+      console.error(`[qualification] Run '${resumeRunId}' has no resumable human-authentication cursor for profile '${profileId}'.`);
+      process.exit(3);
+    }
+    if (candidate.mode && candidate.mode !== mode) {
+      console.error(`[qualification] Run '${resumeRunId}' was created in ${candidate.mode} mode; refusing to resume it in ${mode} mode.`);
+      process.exit(3);
+    }
+    if (candidate.profileId && candidate.profileId !== profileId) {
+      console.error(`[qualification] Run '${resumeRunId}' belongs to profile '${candidate.profileId}', not '${profileId}'.`);
+      process.exit(3);
+    }
+    resumeRunState = candidate;
+  } else {
+    const remaining = pendingRuns.filter(run => run.runId !== selectedDiscardId);
+    if (remaining.length) {
+      console.error(`[qualification] ${remaining.length} unfinished run(s) exist in ${runStoreDir}; refusing to start a replacement run.`);
+      for (const run of remaining) console.error(`  runId=${run.runId} status=${run.status} pendingIntervention=${run.pendingInterventionId ?? "none"} suspendedStep=${run.suspendedStepId ?? "none"}`);
+      console.error("  Resume with --resume-run-id=<runId>, or explicitly abandon one with --discard-run=<runId>.");
+      process.exit(3);
     }
   }
 
@@ -253,19 +274,20 @@ async function main() {
         console.error("[attached] Start the operator's headed Chrome with remote debugging (or use the extension Attach flow) and authorize the staging tab out of band.");
         process.exit(3);
       }
-      const stagingTarget = targets.find(t => verifyObservedUrl(binding, t.url).ok);
-      if (!stagingTarget) {
-        const observed = targets.map(t => t.url).join(", ") || "none";
-        console.error(`[attached] No authorized tab on ${binding.entryOrigin} (observed: ${observed}). Open FreeInference staging and Attach/authorize the tab.`);
-        process.exit(3);
-      }
       const authorizedTargetId = process.env.ACTIVETAB_AUTHORIZED_TARGET_ID;
       if (!authorizedTargetId) {
         console.error(`[attached] ACTIVETAB_AUTHORIZED_TARGET_ID is required in attached mode. Set it to the target ID independently authorized via the extension Attach action.`);
         process.exit(3);
       }
-      if (authorizedTargetId !== stagingTarget.id) {
-        console.error(`[attached] Independently supplied target ID '${authorizedTargetId}' does not match the discovered staging target '${stagingTarget.id}'. Re-authorize the correct tab.`);
+      const selected = selectAuthorizedStagingTarget(targets, authorizedTargetId, binding);
+      if (!selected.ok) {
+        const observed = selected.target?.url ?? (targets.map(target => `${target.id}:${target.url}`).join(", ") || "none");
+        console.error(`[attached] The exact independently authorized target '${authorizedTargetId}' is unavailable or outside ${binding.entryOrigin} (observed: ${observed}). ${selected.reason} Re-authorize the intended staging tab.`);
+        process.exit(3);
+      }
+      const stagingTarget = selected.target;
+      if (resumeRunState && resumeRunState.target?.targetId !== authorizedTargetId) {
+        console.error(`[attached] Resume target '${authorizedTargetId}' does not match the suspended run's original target '${resumeRunState.target?.targetId ?? "unknown"}'.`);
         process.exit(3);
       }
       const target = await resolveAuthorizedTarget(endpoint, stagingTarget.id, authorizedTargetId);
@@ -285,6 +307,8 @@ async function main() {
       environment: binding,
       interventions,
       runStore,
+      resumeRunState,
+      profileId,
       mode,
 
       signal: controller.signal,

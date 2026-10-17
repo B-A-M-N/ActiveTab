@@ -63,18 +63,21 @@ export class RunStateStore {
     await rename(temp, path);
   }
 
-  async create({ workflowId, workflowName, environmentId = null, authenticationRealm = null, targetId = null, goalFingerprint = null, budget = {} }) {
+  async create({ workflowId, workflowName, environmentId = null, authenticationRealm = null, targetId = null, goalFingerprint = null, budget = {}, mode = null, profileId = null }) {
     const run = {
       schemaVersion: 1,
       runId: randomUUID(),
       workflowId: String(workflowId),
       workflowName: String(workflowName),
+      mode: mode ? String(mode) : null,
+      profileId: profileId ? String(profileId) : null,
       status: "created",
       environmentId,
       authenticationRealm,
       target: targetId ? { targetId, attached: false } : null,
       latestVerifiedEvidenceId: null,
       pendingInterventionId: null,
+      resumeCursor: null,
       authorizationState: { grants: [], realm: authenticationRealm },
       testOwnedResources: [],
       expectedPostconditions: [],

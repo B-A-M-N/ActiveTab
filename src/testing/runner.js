@@ -579,6 +579,9 @@ export class TestRunner {
       stepId: step.id, interventionId: record.intervention_id, type,
       state: record.state, reason, externalState: externalRunState(record)
     });
+    if (typeof this.onRunSuspended === "function") {
+      await this.onRunSuspended(receipt, record);
+    }
     if (typeof this.onIntervention === "function") {
       try { await this.onIntervention(record); } catch { /* notification is best-effort */ }
     }
@@ -586,17 +589,13 @@ export class TestRunner {
   }
 
   /**
-   * Resume a suspended run from its interrupted step (never from the
-   * beginning). The exact completion predicate is verified with fresh
-   * evidence before the step is re-executed; a failed verification leaves
-   * the run suspended.
-   */
-  /**
    * Resume a suspended run from its interrupted step (P0-6). The exact
-   * completion predicate is verified with fresh evidence BEFORE the step
-   * re-executes; a failed verification leaves the run suspended. Resume
-   * acquires continuation ownership through a fencing lease, so only one
-   * worker may resume a given run at a time. When the caller supplies the
+   * completion predicate is verified with fresh evidence before any
+   * continuation; a failed verification leaves the run suspended. Callers
+   * may identify steps whose full postcondition is exactly the verified
+   * predicate, so those steps are completed from evidence without replay.
+   * Resume acquires continuation ownership through a fencing lease, so only
+   * one worker may resume a given run at a time. When the caller supplies the
    * original workflow, the remaining steps after the suspended one
    * continue to execute; already-passed steps are never replayed (a
    * successful non-idempotent operation must not be duplicated).
@@ -608,14 +607,20 @@ export class TestRunner {
    * @param {object} [options.workflow] - The ORIGINAL workflow definition
    *   (or an immutable versioned reference). When provided, resume
    *   re-enters at the suspended step and continues the subsequent steps.
+   * @param {string[]} [options.completedStepIds] - Suspended steps fully
+   *   covered by the verified completion predicate; these are never replayed.
    */
-  async resume(receipt, { verify = null, evaluate = null, workflow = null } = {}) {
+  async resume(receipt, { verify = null, evaluate = null, workflow = null, completedStepIds = [] } = {}) {
     const pending = (receipt.interventions ?? []).filter(i => i.state === INTERVENTION_STATE.WAITING || i.state === INTERVENTION_STATE.ACKNOWLEDGED);
     const suspendedStep = [...receipt.steps].reverse().find(s => s.status === STEP_STATUS_EXTENDED.SUSPENDED);
     if (!suspendedStep) {
       return { resumed: false, reason: "No suspended step to resume." };
     }
-    const record = pending.find(i => i.stepId === suspendedStep.stepId) ?? (this.interventions ? this.interventions.get(suspendedStep.details?.interventionId) : null);
+    const interventionRef = pending.find(i => i.stepId === suspendedStep.stepId);
+    const record = (interventionRef?.interventionId && this.interventions
+      ? this.interventions.get(interventionRef.interventionId)
+      : null)
+      ?? (this.interventions ? this.interventions.get(suspendedStep.details?.interventionId) : null);
     if (!record) return { resumed: false, reason: "No durable intervention record found for the suspended step." };
     if (Date.parse(record.expiresAt) <= Date.now()) {
       return { resumed: false, reason: `Intervention expired at ${record.expiresAt}.`, expired: true };
@@ -624,7 +629,8 @@ export class TestRunner {
     //    may resume this run. Without a store, the single in-process
     //    runner implicitly holds ownership.
     let lease = null;
-    if (this.interventions) {
+    const alreadySatisfied = record.state === INTERVENTION_STATE.SATISFIED;
+    if (this.interventions && !alreadySatisfied) {
       try {
         const acquired = await this.interventions.acquireResume(record.intervention_id);
         lease = acquired.lease;
@@ -641,7 +647,14 @@ export class TestRunner {
         return { resumed: false, reason: `Completion condition not verified: ${evaluation.reason}`, intervention: record };
       }
       // 3. Consume the intervention with the held lease.
-      await this.interventions?.completeResume(record.intervention_id, lease ?? record.resumeHeldBy ?? record.generation, { evidenceId: evaluation.evidenceId ?? null, note: evaluation.summary });
+      if (!alreadySatisfied) {
+        await this.interventions?.completeResume(record.intervention_id, lease ?? record.resumeHeldBy ?? record.generation, { evidenceId: evaluation.evidenceId ?? null, note: evaluation.summary });
+      }
+      const receiptIntervention = receipt.interventions?.find(item => item.interventionId === record.intervention_id);
+      if (receiptIntervention) {
+        receiptIntervention.state = "satisfied";
+        receiptIntervention.resumedAt = new Date().toISOString();
+      }
 
       // 4. Re-enter at the suspended step and continue the ORIGINAL
       //    workflow when supplied. Completed steps are never replayed.
@@ -649,7 +662,14 @@ export class TestRunner {
         const suspendedIndex = workflow.steps.findIndex(s => s.id === suspendedStep.stepId);
         if (suspendedIndex >= 0) {
           receipt.status = RUN_STATUS.RUNNING;
-          const remaining = workflow.steps.slice(suspendedIndex);
+          const completedByPredicate = new Set(completedStepIds).has(suspendedStep.stepId);
+          if (completedByPredicate && !receipt.completeSuspendedStep(suspendedStep.stepId, {
+            reason: evaluation.summary ?? "The suspended step's exact completion predicate was verified.",
+            evidenceId: evaluation.evidenceId ?? null
+          })) {
+            return { resumed: false, reason: "The verified suspended step is missing from the receipt.", intervention: record };
+          }
+          const remaining = workflow.steps.slice(suspendedIndex + (completedByPredicate ? 1 : 0));
           const failedStepIds = new Set(
             receipt.steps
               .filter(s => s.status === STEP_STATUS.FAIL || s.status === STEP_STATUS.BLOCKED || s.status === STEP_STATUS.UNCERTAIN)
@@ -665,7 +685,11 @@ export class TestRunner {
               receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason: `Skipped because a prerequisite step failed (${[...failedStepIds].join(", ")}).` });
               continue;
             }
+            const stepCountBefore = receipt.steps.length;
             const result = await this.#executeStep(step, receipt);
+            if (step.id === suspendedStep.stepId && !completedByPredicate && receipt.steps.length > stepCountBefore) {
+              receipt.replaceSuspendedStep(step.id);
+            }
             if (result.status === STEP_STATUS.CANCELED) break;
             if (result.status === STEP_STATUS_EXTENDED.SUSPENDED) {
               const EXTERNAL_TO_RUN = {
@@ -693,12 +717,21 @@ export class TestRunner {
         ?? receipt.steps.find(s => s.stepId === suspendedStep.stepId)?.details?.goal
         ?? "";
       const stepResult = await this.#executeGoal({ id: suspendedStep.stepId, type: "goal", goal: suspendedGoal }, { ...receipt, status: RUN_STATUS.RUNNING, interventions: receipt.interventions }, new Date().toISOString());
-      if (stepResult.status !== STEP_STATUS_EXTENDED.SUSPENDED) {
-        const replacement = receipt.steps.find(s => s.stepId === suspendedStep.stepId);
-        if (replacement) Object.assign(replacement, { status: stepResult.status, reason: stepResult.reason });
-        receipt.status = RUN_STATUS.RUNNING;
+      receipt.replaceSuspendedStep(suspendedStep.stepId);
+      if (stepResult.status === STEP_STATUS_EXTENDED.SUSPENDED) {
+        const EXTERNAL_TO_RUN = {
+          waiting_for_tab_authorization: RUN_STATUS.WAITING_FOR_TAB_AUTHORIZATION,
+          waiting_for_authentication: RUN_STATUS.WAITING_FOR_AUTHENTICATION,
+          waiting_for_mfa: RUN_STATUS.WAITING_FOR_MFA,
+          waiting_for_human_approval: RUN_STATUS.WAITING_FOR_HUMAN_APPROVAL,
+          waiting_for_external_authorization: RUN_STATUS.WAITING_FOR_EXTERNAL_AUTHORIZATION,
+          waiting_for_human_decision: RUN_STATUS.WAITING_FOR_HUMAN_DECISION
+        };
+        receipt.finish(EXTERNAL_TO_RUN[stepResult.externalState] ?? RUN_STATUS.WAITING_FOR_HUMAN_DECISION);
+      } else {
+        receipt.finish(deriveRunStatus(receipt.steps));
       }
-      return { resumed: stepResult.status !== STEP_STATUS_EXTENDED.SUSPENDED, stepResult, evaluation };
+      return { resumed: !isWaitingRunStatus(receipt.status), stepResult, receipt, evaluation };
     } catch (error) {
       if (lease) await this.interventions.releaseResume(record.intervention_id, lease).catch(() => {});
       throw error;
