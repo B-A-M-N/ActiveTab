@@ -18,6 +18,7 @@ import { RunDecisionRecorder } from "./telemetry/runDecisionRecorder.js";
 import { RunStateCoordinator } from "./lifecycle/runStateCoordinator.js";
 import { ControlFlowStepHandler } from "./steps/controlFlowStepHandler.js";
 import { VerificationStepHandler } from "./steps/verificationStepHandler.js";
+import { QualificationStepHandler } from "./steps/qualificationStepHandler.js";
 import {
   deriveWorkflowRunStatus,
   estimateWorkflowExecutionCost,
@@ -140,6 +141,12 @@ export class TestRunner {
       correlateStepDiagnostics: (...args) => this.#correlateStepDiagnostics(...args),
       executeApiCall: (...args) => this.#executeApiCall(...args),
       executeInteract: (...args) => this.#executeInteract(...args)
+    });
+    this.qualificationStepHandler = new QualificationStepHandler({
+      qualificationService,
+      getEpisodeId: () => this.decisionRecorder.episodeId,
+      principalId,
+      signal
     });
     this.existingRunStateId = existingRunStateId;
     this.principalId = principalId;
@@ -415,7 +422,13 @@ export class TestRunner {
         case "postcondition": return await this.verificationStepHandler.executePostcondition(step, receipt, startedAt);
         case "cleanup": return await this.verificationStepHandler.executeCleanup(step, receipt, startedAt, context);
         case "goal": return await this.#executeGoal(step, receipt, startedAt);
-        case "qualify": return await this.#executeQualification(step, receipt, startedAt, context);
+        case "qualify": return await this.qualificationStepHandler.execute(
+          step,
+          receipt,
+          startedAt,
+          context,
+          this.currentTelemetryStepId ?? telemetryStepId(step.id)
+        );
         case "set_variable": return this.controlFlowStepHandler.executeSetVariable(step, receipt, startedAt, context, stepStatuses);
         case "repeat": return await this.controlFlowStepHandler.executeRepeat(step, receipt, startedAt, context);
         case "subworkflow": return await this.controlFlowStepHandler.executeSubworkflow(step, receipt, startedAt, context);
@@ -430,61 +443,6 @@ export class TestRunner {
       receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.FAIL, reason, startedAt });
       return { status: STEP_STATUS.FAIL, reason };
     }
-  }
-
-  async #executeQualification(step, receipt, startedAt, context) {
-    const unavailable = reasonCode => ({
-      status: "unavailable",
-      qualificationId: null,
-      reasonCode,
-      evidenceRefs: []
-    });
-    let result;
-    if (!this.qualificationService || !this.decisionRecorder.episodeId) {
-      result = unavailable("qualification_service_unavailable");
-    } else {
-      try {
-        result = await this.qualificationService.qualify({
-          runId: receipt.runId,
-          episodeId: this.decisionRecorder.episodeId,
-          stepId: this.currentTelemetryStepId ?? telemetryStepId(step.id),
-          scenarioId: step.scenarioId,
-          providerId: step.providerId,
-          trigger: step.trigger,
-          principalId: this.principalId ?? "unknown",
-          strategyFingerprint: context?.workflowHash ?? createHash("sha256").update(step.id).digest("hex"),
-          sourceEventIds: step.sourceEventIds ?? [],
-          evidenceRefs: step.evidenceRefs ?? [],
-          signal: this.signal
-        });
-      } catch {
-        result = unavailable("qualification_invocation_unavailable");
-      }
-    }
-    const qualificationStatus = result?.status ?? "unavailable";
-    const required = step.required === true;
-    const stepStatus = required && qualificationStatus !== "qualified" ? STEP_STATUS.FAIL : STEP_STATUS.PASS;
-    const reason = qualificationStatus === "qualified" ? "Candidate strategy qualified against the independent fixture oracle."
-      : qualificationStatus === "not_qualified" ? "Candidate strategy did not satisfy the independent fixture oracle."
-        : qualificationStatus === "inconclusive" ? "Fixture qualification was inconclusive; actual task execution remains governed by its own policy and evidence."
-          : "Fixture qualification was unavailable; actual task execution remains governed by its own policy and evidence.";
-    const details = {
-      qualificationStatus,
-      required,
-      ...(typeof result?.qualificationId === "string" ? { qualificationId: result.qualificationId } : {}),
-      ...(typeof result?.reasonCode === "string" ? { reasonCode: result.reasonCode } : {}),
-      evidenceRefs: (result?.evidenceRefs ?? []).filter(ref => typeof ref === "string").slice(0, 32)
-    };
-    receipt.recordStep({
-      stepId: step.id,
-      type: step.type,
-      status: stepStatus,
-      reason,
-      evidenceIds: details.evidenceRefs,
-      startedAt,
-      details
-    });
-    return { status: stepStatus, reason, qualificationStatus };
   }
 
   async #observe() {

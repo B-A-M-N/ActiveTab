@@ -25,6 +25,7 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 - `lifecycle/RunStateCoordinator` owns durable run bindings, leases, checkpoints, and durable status; it cannot authorize or dispatch effects.
 - `steps/ControlFlowStepHandler` owns scalar variable assignment, bounded repetition, and trusted subworkflow composition. Nested work re-enters the same `TestRunner` callback and shared budget.
 - `steps/VerificationStepHandler` owns assertions, diagnostic snapshots, bounded waiting, controlled fixture failures, retry verification, postconditions, and cleanup verification. Cleanup dispatch is injected from `TestRunner` and must pass through the same authorized interaction path.
+- `steps/QualificationStepHandler` invokes the registered qualification service and records its advisory result. Fixture outcomes never authorize parent-run effects or verify live-site success.
 - `telemetry/RunDecisionRecorder` owns the testing layer's mapping from workflow operations to decision events and durable operation receipts. It records but never authorizes or dispatches effects.
 - Unsupported actions fail validation before the test starts.
 - Workflow input is untrusted; it cannot elevate permissions or redefine the environment.
