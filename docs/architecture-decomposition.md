@@ -7,7 +7,7 @@ ActiveTab is being decomposed through behavior-preserving extractions. One appli
 | Area | Current entrypoint | Current responsibility pressure |
 | --- | --- | --- |
 | Declarative workflows | `src/testing/runner.js` (620 lines after lifecycle, telemetry, handler, dispatcher, and intervention extractions) | Workflow scheduling and collaborator coordination |
-| Navigation | `src/navigation/engine.js` (1,219 lines) | Planning, browser coordination, recovery, replay, and outcome checks |
+| Navigation | `src/navigation/engine.js` (1,164 lines after outcome-verifier extraction) | Planning, browser coordination, recovery, and replay |
 | MCP transport | `src/mcp/server.js` (766 lines) | Protocol handling mixed with application orchestration |
 | HTTP transport | `src/api/local-server.js` (825 lines) | Routes mixed with run lifecycle and process-local service state |
 | Staging qualification | `src/testing/qualifyCloudAgent.js` (763 lines) | Browser entry, handoff, qualification, diagnostics, reporting, and persistence |
@@ -45,7 +45,7 @@ Extract handlers by responsibility while preserving the receipt shape, state tra
 
 ## Stage 3 — Navigation coordination
 
-Keep `TestRunner` as the top-level declarative workflow owner. `NavigationEngine` remains a subordinate navigation capability. Extract planning, fresh target binding, replay, recovery, scroll convergence, and outcome verification behind internal interfaces. The existing authorized executor remains the only browser effect boundary. Preserve workflow synthesis and the same per-run inference budget.
+Keep `TestRunner` as the top-level declarative workflow owner. `NavigationEngine` remains a subordinate navigation capability. `src/navigation/outcomeVerifier.js` now owns pure visible-destination checks and privacy-preserving initial page-label hashes; it does not verify application-side effects. Continue extracting planning, fresh target binding, replay, recovery, and scroll convergence behind internal interfaces. The existing authorized executor remains the only browser effect boundary. Preserve workflow synthesis and the same per-run inference budget.
 
 ## Stage 4 — Shared application services for transports
 

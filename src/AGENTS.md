@@ -20,6 +20,7 @@ ActiveTab's core execution layer. Contains the browser control plane, runtime po
 - The decision runtime is wired into CLI navigation, MCP goals and observed-element actions, API navigation/discovery/test runs, and the staging qualification workflow. Jev reviews selected decision boundaries; ordinary field entry/selection records an explicit skipped-review event. Missing Jev credentials or refusal is logged as advisory and does not stop deterministic local execution.
 - MCP test-run status reads reflect the settled receipt, and resume reuses the exact workflow and browser session bound to that run.
 - Application adapters translate caller-authored typed requests into generic workflows. Their process-local operation authorizers are injected by trusted composition code and cannot be supplied through workflow JSON.
+- `navigation/outcomeVerifier.js` checks fresh visible destination evidence only; it cannot authorize actions or verify application-level effects.
 - The MCP `enter_cloud_agent` primitive starts from an explicitly attached, currently observed staging tab, follows visible Agents/Cloud Agents navigation, and verifies the task composer on the same target. It may suspend for human authentication; it never creates a Cloud Agent task. `start_cloud_agent_task` still requires exact caller-supplied inputs.
 - CLI navigation loads trusted local environment bindings with `--profile ID`; the task journal binds resume to the same environment fingerprint. Supplying no profile never grants cross-origin navigation.
 
@@ -42,6 +43,7 @@ node --test test/targets.test.js test/approvals.test.js test/authorized-executor
 | `src/browser/` | CDP transport, target authorization, and session lifecycle |
 | `src/extension/` | Native Messaging broker and extension-backed CDP transport |
 | `src/runtime/` | Policy, approvals, and execution boundary contracts |
+| `src/navigation/` | Navigation planning, authorized execution coordination, recovery, and destination verification |
 | `src/testing/` | Declarative workflows, receipts, and verification semantics |
 | `src/diagnostics/` | Diagnostic contracts, evidence collection, and correlation |
 | `src/navigation/semanticAnalyzer.js` | OpenAI-compatible, bounded page and control annotations |
