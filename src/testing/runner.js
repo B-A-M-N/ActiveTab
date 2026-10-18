@@ -19,6 +19,7 @@ import { ControlFlowStepHandler } from "./steps/controlFlowStepHandler.js";
 import { VerificationStepHandler } from "./steps/verificationStepHandler.js";
 import { QualificationStepHandler } from "./steps/qualificationStepHandler.js";
 import { BrowserStepHandler } from "./steps/browserStepHandler.js";
+import { ApiStepHandler } from "./steps/apiStepHandler.js";
 import {
   deriveWorkflowRunStatus,
   estimateWorkflowExecutionCost,
@@ -53,32 +54,6 @@ function executionWorkflowFingerprint(workflow, registry) {
   };
   visit(workflow);
   return createHash("sha256").update(canonicalWorkflow({ workflow, referencedSubworkflows: referenced })).digest("hex");
-}
-
-function classifyDiagnosticResult(snapshot) {
-  const statuses = [snapshot?.data?.result?.status, snapshot?.data?.status, snapshot?.status]
-    .filter(status => typeof status === "string");
-  const refusal = statuses.find(status => ["refused", "denied"].includes(status));
-  if (refusal) {
-    return { status: STEP_STATUS.BLOCKED, effectStatus: refusal, resultStatus: refusal };
-  }
-  const failure = statuses.find(status => ["error", "failed"].includes(status));
-  if (failure) {
-    return { status: STEP_STATUS.FAIL, effectStatus: failure, resultStatus: failure };
-  }
-  const uncertain = statuses.find(status => ["uncertain", "unavailable", "unknown"].includes(status));
-  if (uncertain) {
-    return { status: STEP_STATUS.UNCERTAIN, effectStatus: uncertain, resultStatus: uncertain };
-  }
-  const unexpected = statuses.find(status => !["ok", "available", "empty"].includes(status));
-  if (unexpected) {
-    return { status: STEP_STATUS.UNCERTAIN, effectStatus: "unrecognized_status", resultStatus: unexpected };
-  }
-  const resultStatus = statuses[0] ?? null;
-  if (!snapshot || typeof snapshot !== "object" || !snapshot.data || typeof snapshot.data !== "object") {
-    return { status: STEP_STATUS.UNCERTAIN, effectStatus: "missing_snapshot_data", resultStatus };
-  }
-  return { status: STEP_STATUS.PASS, effectStatus: resultStatus ?? "collected", resultStatus };
 }
 
 function canRestoreStepWithoutExecution(step, status) {
@@ -139,7 +114,7 @@ export class TestRunner {
       signal,
       observe: () => this.#observe(),
       correlateStepDiagnostics: (...args) => this.#correlateStepDiagnostics(...args),
-      executeApiCall: (...args) => this.#executeApiCall(...args),
+      executeApiCall: (...args) => this.apiStepHandler.execute(...args),
       executeInteract: (...args) => this.#executeInteract(...args)
     });
     this.qualificationStepHandler = new QualificationStepHandler({
@@ -160,6 +135,7 @@ export class TestRunner {
       emitTraceEvent: event => this.#emitTraceEvent(event),
       getExecutionLeaseAssertion: () => this.targetLease ? () => this.#assertTargetLeaseCurrent() : null
     });
+    this.apiStepHandler = new ApiStepHandler({ collector });
     this.existingRunStateId = existingRunStateId;
     this.principalId = principalId;
     this.profileId = profileId;
@@ -425,7 +401,7 @@ export class TestRunner {
         case "setup": return await this.#executeSetup(step, receipt, startedAt);
         case "navigate": return await this.#executeNavigate(step, receipt, startedAt, context);
         case "interact": return await this.#executeInteract(step, receipt, startedAt, context);
-        case "api_call": return await this.#executeApiCall(step, receipt, startedAt);
+        case "api_call": return await this.apiStepHandler.execute(step, receipt, startedAt);
         case "wait_for": return await this.verificationStepHandler.executeWaitFor(step, receipt, startedAt);
         case "assert": return await this.verificationStepHandler.executeAssert(step, receipt, startedAt);
         case "diagnostic_snapshot": return await this.verificationStepHandler.executeDiagnosticSnapshot(step, receipt, startedAt);
@@ -492,56 +468,6 @@ export class TestRunner {
 
   async #executeInteract(step, receipt, startedAt, context = null) {
     return this.browserStepHandler.executeInteract(step, receipt, startedAt, context);
-  }
-
-  async #executeApiCall(step, receipt, startedAt) {
-    if (!this.collector) {
-      const reason = "No diagnostic collector configured for API operations.";
-      receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason, startedAt });
-      return { status: STEP_STATUS.BLOCKED, reason };
-    }
-    const operation = step.operation;
-    if (typeof operation?.operationId !== "string" || !operation.operationId) {
-      const reason = "API operation requires a typed operationId.";
-      receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.UNCERTAIN, reason, startedAt });
-      return { status: STEP_STATUS.UNCERTAIN, reason };
-    }
-    const sourceId = operation.sourceId;
-    if (typeof sourceId !== "string" || !this.collector.hasSource(sourceId)) {
-      const reason = `Diagnostic source '${sourceId}' for operation '${operation.operationId}' is not registered.`;
-      receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason, startedAt });
-      return { status: STEP_STATUS.BLOCKED, reason };
-    }
-    const declaredOp = operation.type ?? "read";
-    try {
-      const snapshot = await this.collector.collect(sourceId, declaredOp, { operationId: operation.operationId, ...operation.options });
-      const classified = classifyDiagnosticResult(snapshot);
-      const status = classified.status;
-      const reason = status === STEP_STATUS.PASS
-        ? `Diagnostic snapshot collected from source '${sourceId}'; this does not verify an application outcome.`
-        : status === STEP_STATUS.BLOCKED
-          ? `Diagnostic operation '${operation.operationId}' was refused by source '${sourceId}'.`
-          : status === STEP_STATUS.FAIL
-            ? `Diagnostic operation '${operation.operationId}' returned an error from source '${sourceId}'.`
-            : `Diagnostic operation '${operation.operationId}' returned an unavailable or unrecognized result; outcome remains uncertain.`;
-      receipt.recordStep({
-        stepId: step.id, type: step.type, status, reason, startedAt,
-        evidenceIds: [snapshot?.evidenceId ?? snapshot?.sourceId ?? ""].filter(Boolean),
-        details: {
-          operationId: operation.operationId,
-          sourceId,
-          dispatchStatus: "dispatched",
-          effectStatus: classified.effectStatus,
-          verificationStatus: "not_verified",
-          ...(classified.resultStatus ? { resultStatus: classified.resultStatus } : {})
-        }
-      });
-      return { status, reason, snapshot };
-    } catch (error) {
-      const reason = `API operation failed: ${String(error.message ?? error).slice(0, 300)}`;
-      receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.FAIL, reason, startedAt });
-      return { status: STEP_STATUS.FAIL, reason };
-    }
   }
 
   #emitTraceEvent(event) {

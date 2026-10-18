@@ -27,6 +27,7 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 - `steps/VerificationStepHandler` owns assertions, diagnostic snapshots, bounded waiting, controlled fixture failures, retry verification, postconditions, and cleanup verification. Cleanup dispatch is injected from `TestRunner` and must pass through the same authorized interaction path.
 - `steps/QualificationStepHandler` invokes the registered qualification service and records its advisory result. Fixture outcomes never authorize parent-run effects or verify live-site success.
 - `steps/BrowserStepHandler` owns declarative navigation and interaction behavior but sends every effect through `executeAuthorizedAction`; it records no alternate CDP dispatch path.
+- `steps/ApiStepHandler` dispatches only registered typed diagnostic operations through the configured collector and records refusal, failure, and uncertain statuses without treating collection as outcome verification.
 - `telemetry/RunDecisionRecorder` owns the testing layer's mapping from workflow operations to decision events and durable operation receipts. It records but never authorizes or dispatches effects.
 - Unsupported actions fail validation before the test starts.
 - Workflow input is untrusted; it cannot elevate permissions or redefine the environment.
