@@ -18,6 +18,7 @@ import { DiagnosticCorrelator } from "../diagnostics/correlator.js";
 import { DiagnosticReport, FINDING_LEVEL, deriveRunInvestigationStatus } from "../diagnostics/report.js";
 import { TestRunner } from "../testing/runner.js";
 import { receiptFromRunState } from "../testing/receipts.js";
+import { buildDurableRunReport } from "../testing/durableRunReport.js";
 import { RunStateStore, requestRunCancellation } from "../testing/runState.js";
 import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
 import { InvestigationEngine } from "../investigation/engine.js";
@@ -541,7 +542,11 @@ async function callTool(name, args) {
   }
   if (name === "get_test_report") {
     const run = testRuns.get(args.runId);
-    if (!run) throw new Error(`No test run found for runId '${args.runId}'.`);
+    if (!run) {
+      const durableState = await runStateStore.getFresh(args.runId);
+      if (!durableState) throw new Error(`No test run found for runId '${args.runId}'.`);
+      return buildDurableRunReport(durableState);
+    }
     const receipt = await run.runPromise;
     const durableState = await runStateStore.getFresh(args.runId).catch(() => null);
     const report = new DiagnosticReport({ runId: args.runId, title: `Test run: ${receipt.workflowName}` });

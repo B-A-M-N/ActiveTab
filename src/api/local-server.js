@@ -34,6 +34,7 @@ import { DiagnosticCorrelator } from "../diagnostics/correlator.js";
 import { DiagnosticReport, FINDING_LEVEL, deriveRunInvestigationStatus } from "../diagnostics/report.js";
 import { TestRunner } from "../testing/runner.js";
 import { receiptFromRunState } from "../testing/receipts.js";
+import { buildDurableRunReport } from "../testing/durableRunReport.js";
 import { RunStateStore, requestRunCancellation } from "../testing/runState.js";
 import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
 import { InvestigationEngine } from "../investigation/engine.js";
@@ -345,7 +346,17 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
 
   async function handleGetTestReport(req, res, runId) {
     const run = testRuns.get(runId);
-    if (!run) { sendError(res, 404, 99404, `No test run found for runId '${runId}'.`); return; }
+    if (!run) {
+      try {
+        await ensureRunStateStore();
+        const durableState = await runStateStore.getFresh(runId);
+        if (!durableState) { sendError(res, 404, 99404, `No test run found for runId '${runId}'.`); return; }
+        sendJson(res, 200, buildDurableRunReport(durableState));
+      } catch (error) {
+        sendError(res, 503, 99503, `Durable report reconstruction failed: ${String(error?.message ?? error).slice(0, 200)}`);
+      }
+      return;
+    }
     if (!run.runState.settled) { sendError(res, 409, 99409, "The test run has not settled; a report is not available yet."); return; }
     const receipt = run.runState.receipt;
     if (!receipt) { sendError(res, 409, 99409, "The test run failed without a receipt; a report is unavailable."); return; }

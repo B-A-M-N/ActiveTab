@@ -5,10 +5,11 @@ import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { RunStateStore } from "../src/testing/runState.js";
 
 const MCP_SERVER_PATH = fileURLToPath(new URL("../src/mcp/server.js", import.meta.url));
 
-async function runMcpShell(requests) {
+async function runMcpShell(requests, env = process.env) {
   const tempDir = await mkdtemp(join(tmpdir(), "activetab-mcp-"));
   const inputPath = join(tempDir, "requests.jsonl");
   const outputPath = join(tempDir, "responses.jsonl");
@@ -17,7 +18,7 @@ async function runMcpShell(requests) {
   try {
     await new Promise((resolve, reject) => {
       execFile("/bin/sh", ["-c", `node "${MCP_SERVER_PATH}" < "${inputPath}" > "${outputPath}" 2>&1`], {
-        timeout: 15_000, maxBuffer: 4 * 1024 * 1024
+        timeout: 15_000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, ...env }
       }, (error) => {
         if (error && ![">", "1"].includes(error.code)) return reject(new Error(`MCP shell failed: ${error.message}`));
         resolve();
@@ -63,6 +64,25 @@ test("MCP get_test_report rejects unknown runId", async () => {
   const callRes = responses.find(response => response.id === 2);
   const text = callRes?.error?.message ?? callRes?.result?.content?.[0]?.text ?? "";
   assert.ok(String(text).includes("No test run found"), `Expected 'No test run found', got: ${text}`);
+});
+
+test("MCP test report is recoverable after worker cache loss and remains inconclusive", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "activetab-mcp-durable-report-"));
+  try {
+    const store = new RunStateStore(join(tempDir, "runs"));
+    await store.init();
+    const run = await store.create({ runId: "mcp-restart-report", workflowId: "wf", workflowName: "Restart report" });
+    await store.updateCheckpoint(run.runId, { stepId: "verify", type: "verify", status: "PASS", evidenceIds: ["ev-1"] });
+    await store.update(run.runId, { status: "passed" });
+    const responses = await runMcpShell([
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "get_test_report", arguments: { runId: run.runId } } }
+    ], { ACTIVETAB_RUN_STATE_DIR: join(tempDir, "runs") });
+    const response = responses.find(item => item.id === 2);
+    assert.equal(response?.result?.structuredContent?.investigationStatus, "inconclusive");
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 });
 
 test("MCP cancel_test_run rejects unknown runId", async () => {
