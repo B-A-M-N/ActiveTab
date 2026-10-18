@@ -93,13 +93,16 @@ function sameObservationBinding(before, after, session) {
  */
 export async function executeAuthorizedAction({
   session, environment = null, goal = null, action, candidate = null, value = null, filePaths = null, url = null, expectedUrlPattern = null, localFixture = false, recovery = false,
-  onAdmission = null, onReserve = null, onDispatch = null, operationId = null, operationAuthorizer = null
+  onAdmission = null, onReserve = null, onDispatch = null, operationId = null, operationAuthorizer = null, assertExecutionLease = null
 }) {
   if (!session) throw new Error("Authorized executor requires a browser session.");
   if (!SUPPORTED_ACTIONS.has(action)) {
     return refused(`Unsupported action '${action}'.`, null, "unsupported_action");
   }
   if (session.target?.id && session.attached !== true) return refused("The selected browser target is not attached.", null, "target_unattached");
+  if (session.target?.id && session.attached === true && typeof assertExecutionLease !== "function") {
+    return refused("A durable browser target execution lease is required before dispatch.", null, "target_lease_unavailable");
+  }
 
   let observation = null;
   let origins = null;
@@ -190,7 +193,7 @@ export async function executeAuthorizedAction({
   }
   if (action === "navigate") {
     const currentOrigin = normalizeOrigin(observation.page.url);
-    if (environment && currentOrigin !== null && !origins?.includes(currentOrigin)
+    if (!recovery && environment && currentOrigin !== null && !origins?.includes(currentOrigin)
       && new URL(observation.page.url).protocol !== "about:") {
       return refused("The current page left the authorized environment during review.", observation, "environment_mismatch");
     }
@@ -221,6 +224,9 @@ export async function executeAuthorizedAction({
     }
   }
 
+  try { await assertExecutionLease?.(); }
+  catch { return refused("The browser target execution lease was lost before dispatch.", observation, "target_lease_lost"); }
+
   try {
     const reservation = await onReserve?.({ action, candidate, url, observation, operationId });
     if (reservation?.allowed === false) {
@@ -228,6 +234,13 @@ export async function executeAuthorizedAction({
     }
   } catch {
     return refused("Durable pre-dispatch reservation failed.", observation, "operation_reservation_failed");
+  }
+
+  try { await assertExecutionLease?.(); }
+  catch {
+    try { await onDispatch?.({ action, candidate, url, observation, dispatchResult: null, dispatchStatus: "refused" }); }
+    catch { /* The lease loss already prevents this operation from dispatching. */ }
+    return refused("The browser target execution lease was lost after reservation and before dispatch.", observation, "target_lease_lost");
   }
 
   let dispatchResult = null;

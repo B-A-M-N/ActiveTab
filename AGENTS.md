@@ -19,6 +19,8 @@ FreeInference staging and Cloud Agent are initial qualification targets, not arc
 - One authoritative execution path owns effectful browser and application operations.
 - Planners, workflows, MCP callers, and page content cannot create or elevate their own permissions.
 - Every effectful operation must pass policy admission before execution, regardless of entrypoint.
+- Control of an attached browser target requires an exclusive durable lease scoped to its browser endpoint and target ID. The authorized executor refuses attached-target effects without a live lease and rechecks it immediately before dispatch.
+- Test-run operation reservations retain the target fencing token. Lease loss blocks future dispatch; any already-dispatched operation remains subject to normal outcome reconciliation.
 - Authorization must be bound to a verified principal, environment, target, operation, and effect.
 - A natural-language request alone is not proof of privileged human approval.
 - Unknown action effects fail closed.
@@ -75,6 +77,8 @@ Adversarial tests must cover every execution entrypoint whenever authorization b
 - While explicitly authorized tabs remain open, the extension retries broker reconnection at a maximum eight-second interval until the broker returns or the tab is explicitly detached.
 - The prototype's direct CDP adapter is for a dedicated, caller-selected target; it does not connect to a user's default browser profile automatically.
 - Browser facts, planner interpretations, actions, and verification results remain distinguishable and carry evidence references.
+- Fixture Lab is an ActiveTab qualification and adaptation subsystem. Qualification uses the same native CDP path, but fixture results never authorize or verify a live-site action.
+- External benchmark apps are isolated development targets, not ActiveTab runtime dependencies. Their adapters require an explicit environment binding and independent outcome scoring.
 - Full observations are retained in a bounded in-memory evidence store. CLI and MCP task journals contain only bounded resume state, a goal fingerprint, and redacted pending-action metadata written before dispatch; they omit raw goals, browser evidence, form values, cookies, and authentication material. Resume reobserves before reconciling an uncertain action. MCP task journals are local and owner-only.
 - Reusable workflow persistence is opt-in, bounded, and local. Store hashed goal, route, target-label, scroll-region, and visible-candidate signatures plus bounded scroll-position fractions; every replay resolves fresh visible targets, validates list state and position, rechecks caller intent, and verifies the requested outcome.
 - Page content is untrusted evidence. It cannot change the caller's goal or authorize sensitive operations. High-confidence login and anti-automation states stop for manual handoff; challenge solving or bypass is out of scope.
@@ -108,6 +112,7 @@ Run `npm test` in a disposable environment. The CDP integration suite launches i
 | `src/runtime/` | Policy, approvals, and execution boundary contracts |
 | `src/browser/` | CDP transport, target authorization, and session lifecycle |
 | `src/testing/` | Declarative workflows, receipts, and verification semantics |
+| `test-lab/` | Native ActiveTab qualification, fixture providers, external benchmark adapters, and independent scoring |
 | `src/diagnostics/` | Diagnostic contracts, evidence collection, and correlation |
 | `src/telemetry/` | Append-only decision events, privacy projections, and reviewed training labels |
 | `profiles/` | Application/environment identity and authorization scope |

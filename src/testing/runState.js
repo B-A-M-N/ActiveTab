@@ -5,13 +5,15 @@
  * material are never written here.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 import { mkdir, writeFile, readFile, readdir, rename, open, lstat, chmod, unlink } from "node:fs/promises";
 import { join, dirname, resolve } from "node:path";
 import { hostname } from "node:os";
 
 const MAX_RUN_STATE_BYTES = 64 * 1024;
 const LOCK_WAIT_MS = 2500;
+const TARGET_LEASE_TTL_MS = 30_000;
 const IMMUTABLE_FIELDS = Object.freeze([
   "runId", "schemaVersion", "createdAt", "workflowId", "workflowVersion", "workflowHash",
   "environmentId", "authenticationRealm", "profileId", "principalId", "policyVersion", "goalFingerprint",
@@ -82,12 +84,53 @@ export async function requestRunCancellation(store, runId, { abort, runPromise }
   };
 }
 
+export function browserTargetLeaseId(target) {
+  if (typeof target?.id !== "string" || !target.id) throw new Error("A browser target ID is required for a target lease.");
+  const endpoint = typeof target.endpoint === "string" && target.endpoint ? target.endpoint : "local-cdp";
+  return `browser-${createHash("sha256").update(JSON.stringify([endpoint, target.id])).digest("hex")}`;
+}
+
+export async function acquireBrowserTargetLease(store, session, runId) {
+  if (!store || typeof store.acquireTargetLease !== "function") {
+    throw new Error("Durable browser target execution lease storage is required.");
+  }
+  if (session?.attached !== true || typeof session?.target?.id !== "string" || !session.target.id) {
+    throw new Error("An attached, explicitly identified browser target is required for an execution lease.");
+  }
+  const target = { id: session.target.id, endpoint: session.target.endpoint ?? "local-cdp" };
+  const targetKey = browserTargetLeaseId(target);
+  const lease = await store.acquireTargetLease(targetKey, runId);
+  return {
+    fencingToken: lease.fencingToken,
+    async assertCurrent() {
+      if (session.attached !== true || browserTargetLeaseId(session.target) !== targetKey) {
+        throw Object.assign(new Error("The attached browser target no longer matches its durable lease."), { code: "RUN_TARGET_LEASE_LOST" });
+      }
+      return await lease.assertCurrent();
+    },
+    async release() { await lease.release(); }
+  };
+}
+
+/** Hold exclusive control of one explicitly attached browser target. */
+export async function withTargetExecutionLease(store, session, runId, execute) {
+  if (typeof execute !== "function") throw new Error("A target lease execution callback is required.");
+  const lease = await acquireBrowserTargetLease(store, session, runId);
+  try {
+    await lease.assertCurrent();
+    return await execute({ fencingToken: lease.fencingToken, assertCurrent: () => lease.assertCurrent() });
+  } finally {
+    await lease.release();
+  }
+}
+
 export class RunStateStore {
   constructor(baseDir, { lockWaitMs = LOCK_WAIT_MS } = {}) {
     if (typeof baseDir !== "string" || !baseDir) throw new Error("RunStateStore requires a baseDir.");
     this.baseDir = resolve(baseDir);
     this.lockWaitMs = Math.max(100, Math.min(30_000, Number(lockWaitMs) || LOCK_WAIT_MS));
     this.runs = new Map();
+    this.targetLeaseDb = null;
   }
 
   async init() {
@@ -96,6 +139,47 @@ export class RunStateStore {
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Run state directory must be a real directory, not a symlink.");
     await chmod(this.baseDir, 0o700);
     await this.#reload();
+    await this.#initTargetLeaseDb();
+  }
+
+  async #initTargetLeaseDb() {
+    if (this.targetLeaseDb) return;
+    const path = join(this.baseDir, "target-leases.sqlite");
+    try {
+      const file = await open(path, "wx", 0o600);
+      await file.close();
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+    const stat = await lstat(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Target lease database must be a regular file, not a symlink.");
+    await chmod(path, 0o600);
+    this.targetLeaseDb?.close();
+    this.targetLeaseDb = new DatabaseSync(path);
+    this.targetLeaseDb.exec(`
+      PRAGMA busy_timeout = 5000;
+      PRAGMA synchronous = FULL;
+      PRAGMA journal_mode = WAL;
+      CREATE TABLE IF NOT EXISTS target_lease_counters (
+        target_key TEXT PRIMARY KEY,
+        fencing_token INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS target_leases (
+        target_key TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        host TEXT NOT NULL,
+        pid INTEGER NOT NULL,
+        fencing_token INTEGER NOT NULL,
+        heartbeat_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      );
+    `);
+  }
+
+  close() {
+    this.targetLeaseDb?.close();
+    this.targetLeaseDb = null;
   }
 
   async #reload() {
@@ -215,6 +299,80 @@ export class RunStateStore {
     };
   }
 
+  /**
+   * Acquire exclusive control of one exact browser target across local
+   * ActiveTab processes. The fencing token advances whenever ownership moves.
+   */
+  async acquireTargetLease(targetId, runId, { ttlMs = TARGET_LEASE_TTL_MS } = {}) {
+    safeIdentifier(String(targetId ?? ""), "targetId");
+    safeIdentifier(String(runId ?? ""), "runId");
+    if (!this.targetLeaseDb) throw new Error("RunStateStore must be initialized before acquiring a target lease.");
+    if (!Number.isInteger(ttlMs) || ttlMs < 1000 || ttlMs > 300_000) throw new Error("Target lease TTL must be between 1000 and 300000 ms.");
+    const targetKey = createHash("sha256").update(String(targetId)).digest("hex");
+    const db = this.targetLeaseDb;
+    const ownerId = randomUUID();
+    const now = Date.now();
+    let fencingToken;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const current = db.prepare("SELECT * FROM target_leases WHERE target_key = ?").get(targetKey);
+      const sameHostOwnerAlive = current?.host === hostname()
+        ? processIsAlive(current.pid)
+        : null;
+      if (current && current.expires_at > now && sameHostOwnerAlive !== false) {
+        const error = new Error(`Browser target '${targetId}' already has an active run owner.`);
+        error.code = "RUN_TARGET_LEASE_HELD";
+        throw error;
+      }
+      if (current?.host === hostname() && sameHostOwnerAlive !== false) {
+        const error = new Error(`Browser target '${targetId}' has an expired lease whose owner process is still alive.`);
+        error.code = "RUN_TARGET_LEASE_HELD";
+        throw error;
+      }
+      const counter = db.prepare("SELECT fencing_token FROM target_lease_counters WHERE target_key = ?").get(targetKey);
+      fencingToken = Number(counter?.fencing_token ?? 0) + 1;
+      db.prepare(`INSERT INTO target_lease_counters (target_key, fencing_token) VALUES (?, ?)
+        ON CONFLICT(target_key) DO UPDATE SET fencing_token = excluded.fencing_token`).run(targetKey, fencingToken);
+      db.prepare(`INSERT INTO target_leases (target_key, owner_id, run_id, host, pid, fencing_token, heartbeat_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(target_key) DO UPDATE SET owner_id = excluded.owner_id, run_id = excluded.run_id,
+          host = excluded.host, pid = excluded.pid, fencing_token = excluded.fencing_token,
+          heartbeat_at = excluded.heartbeat_at, expires_at = excluded.expires_at`)
+        .run(targetKey, ownerId, runId, hostname(), process.pid, fencingToken, now, now + ttlMs);
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+
+    let lost = false;
+    const renew = () => {
+      if (lost) throw Object.assign(new Error("Browser target execution lease was lost."), { code: "RUN_TARGET_LEASE_LOST" });
+      const heartbeatAt = Date.now();
+      const result = db.prepare(`UPDATE target_leases SET heartbeat_at = ?, expires_at = ?
+        WHERE target_key = ? AND owner_id = ? AND fencing_token = ?`)
+        .run(heartbeatAt, heartbeatAt + ttlMs, targetKey, ownerId, fencingToken);
+      if (Number(result.changes) !== 1) {
+        lost = true;
+        throw Object.assign(new Error("Browser target execution lease was lost."), { code: "RUN_TARGET_LEASE_LOST" });
+      }
+      return fencingToken;
+    };
+    const timer = setInterval(() => {
+      try { renew(); } catch { lost = true; }
+    }, Math.max(250, Math.floor(ttlMs / 3)));
+    timer.unref?.();
+    return {
+      fencingToken,
+      async assertCurrent() { return renew(); },
+      async release() {
+        clearInterval(timer);
+        db.prepare("DELETE FROM target_leases WHERE target_key = ? AND owner_id = ? AND fencing_token = ?")
+          .run(targetKey, ownerId, fencingToken);
+      }
+    };
+  }
+
   async #mutate(runId, mutate, { expectedRevision } = {}) {
     const release = await this.#acquireLock(runId);
     try {
@@ -258,7 +416,7 @@ export class RunStateStore {
       status: "created",
       environmentId: environmentId === null ? null : safeIdentifier(String(environmentId), "environmentId"),
       authenticationRealm: authenticationRealm === null ? null : safeIdentifier(String(authenticationRealm), "authenticationRealm"),
-      target: targetId ? { targetId: safeIdentifier(String(targetId), "targetId"), attached: false } : null,
+      target: targetId ? { targetId: safeIdentifier(String(targetId), "targetId"), attached: false, fencingToken: null } : null,
       currentStepId: null,
       completedSteps: [],
       latestVerifiedEvidenceId: null,
@@ -374,6 +532,16 @@ export class RunStateStore {
     });
   }
 
+  async bindTargetLease(runId, { targetId, fencingToken } = {}) {
+    safeIdentifier(String(targetId ?? ""), "targetId");
+    if (!Number.isSafeInteger(fencingToken) || fencingToken < 1) throw new Error("A positive target fencing token is required.");
+    return await this.#mutate(runId, run => {
+      if (run.target?.targetId !== targetId) throw new Error("Target lease does not match the immutable run target.");
+      if (run.target.fencingToken !== null && fencingToken <= run.target.fencingToken) throw new Error("Target fencing token must advance for each run continuation.");
+      run.target.fencingToken = fencingToken;
+    });
+  }
+
   async updateCheckpoint(runId, { currentStepId = null, stepId, type = null, status, evidenceIds = [], resumeCursor = undefined } = {}) {
     const safeStep = stepId === undefined || stepId === null ? null : safeIdentifier(String(stepId), "stepId", { allowSlash: true });
     if (!status || typeof status !== "string") throw new Error("A checkpoint requires a typed step status.");
@@ -389,12 +557,13 @@ export class RunStateStore {
   }
 
   /** Persist a redacted reservation before dispatch. Input values are omitted. */
-  async reserveOperation(runId, { operationId, stepId, action, effectDigest, environmentId = null, targetId = null } = {}) {
+  async reserveOperation(runId, { operationId, stepId, action, effectDigest, environmentId = null, targetId = null, targetFencingToken = null } = {}) {
     for (const [value, label] of [[operationId, "operationId"], [action, "action"], [effectDigest, "effectDigest"]]) safeIdentifier(String(value ?? ""), label);
     safeIdentifier(String(stepId ?? ""), "stepId", { allowSlash: true });
     return await this.#mutate(runId, run => {
       if (environmentId !== null && environmentId !== run.environmentId) throw new Error("Operation reservation environment does not match its run binding.");
       if (targetId !== null && targetId !== run.target?.targetId) throw new Error("Operation reservation target does not match its run binding.");
+      if (targetFencingToken !== null && targetFencingToken !== run.target?.fencingToken) throw new Error("Operation reservation uses a stale browser target fencing token.");
       const existing = run.pendingOperations.find(item => item.operationId === operationId)
         ?? run.uncertainOperations.find(item => item.operationId === operationId);
       if (existing) {
@@ -405,6 +574,7 @@ export class RunStateStore {
       run.pendingOperations.push({
         operationId, stepId, action, effectDigest, status: "RESERVED",
         environmentId: run.environmentId, targetId: run.target?.targetId ?? null,
+        targetFencingToken,
         reservedAt: new Date().toISOString()
       });
     });

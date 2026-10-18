@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "scenario_id": "webarena-infinity-gmail-task-001",
+  "site_family": "webarena-infinity-gmail",
+  "seed": 41001,
+  "application": {
+    "build": "webarena-infinity-1ca77813bf8d8e4011aa3fb1f740f70d78bd522d"
+  },
+  "faults": [],
+  "task": {
+    "operation": "mark_email_read",
+    "goal": "Mark the email 'Q1 Product Roadmap Review' from Sarah Chen as read.",
+    "subject": "Q1 Product Roadmap Review",
+    "sender": "Sarah Chen",
+    "initialIsRead": false,
+    "expectedIsRead": true
+  },
+  "oracle": {
+    "kind": "email_read_state"
+  }
+}

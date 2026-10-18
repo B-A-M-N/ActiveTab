@@ -16,6 +16,9 @@ const EVENT_FIELDS = Object.freeze({
   "decision.skipped": ["reasonCode", "inputEventIds"],
   "decision.predicted": ["provider", "model", "rubricId", "rubricVersion", "rubricHash", "questionType", "answer", "inputFingerprint", "inputEventIds", "usage"],
   "decision.failed": ["provider", "model", "rubricId", "rubricVersion", "rubricHash", "questionType", "failureCode", "inputFingerprint", "inputEventIds"],
+  "workflow.plan_synthesized": ["provider", "model", "planVersion", "planHash", "inputFingerprint", "stepCount", "planProjection", "usage"],
+  "workflow.plan_failed": ["provider", "model", "planVersion", "inputFingerprint", "failureCode"],
+  "inference.attempted": ["taskCode", "attemptNumber", "maxAttempts"],
   "policy.adjudicated": ["disposition", "reasonCode", "policyVersion"],
   "execution.reserved": ["operation", "targetRole", "operationId"],
   "execution.dispatched": ["operation", "targetRole", "dispatchStatus", "operationId"],
@@ -24,6 +27,8 @@ const EVENT_FIELDS = Object.freeze({
   "correction.recorded": ["correctionType", "sourceClass", "supersedesDecisionId", "correctedCode", "evidenceRefs"],
   "label.proposed": ["rubricId", "labelCode", "sourceClass", "evidenceRefs"],
   "label.approved": ["labelEventId", "rubricId", "labelCode", "sourceClass", "evidenceRefs", "reviewerId", "approvalDigest"],
+  "qualification.started": ["qualificationId", "automationRunId", "scenarioId", "providerId", "trigger", "principalId", "strategyFingerprint", "sourceEventIds", "evidenceRefs"],
+  "qualification.completed": ["qualificationId", "automationRunId", "scenarioId", "providerId", "trigger", "principalId", "strategyFingerprint", "qualificationStatus", "reasonCode", "evidenceRefs"],
   "episode.completed": ["status", "cleanupStatus"]
 });
 
@@ -39,10 +44,70 @@ const ENUMS = {
   sourceClass: new Set(["deterministic_assertion", "correlated_backend", "independent_human", "coding_agent", "secondary_model", "jev_self"]),
   correctionType: new Set(["target_mapping", "risk_classification", "outcome_label", "recovery", "other"]),
   verificationStatus: new Set(["verified_pass", "verified_fail", "uncertain", "not_run"]),
+  qualificationStatus: new Set(["qualified", "not_qualified", "inconclusive", "unavailable"]),
   annotationKind: new Set(["page_classification", "control_mapping", "ambiguity_resolution", "change_analysis", "form_discovery"]),
-  failureCode: new Set(["configuration", "privacy", "timeout", "transport", "http", "schema", "response_too_large", "refusal", "unknown"]),
-  inputKind: new Set(["pre_action_review", "outcome_review"])
+  failureCode: new Set(["configuration", "privacy", "timeout", "transport", "http", "schema", "response_too_large", "refusal", "budget_exhausted", "missing_intent", "unknown"]),
+  inputKind: new Set(["pre_action_review", "outcome_review", "workflow_plan_review"])
 };
+
+function normalizeWorkflowPlanProjection(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 24) throw new Error("Workflow plan telemetry must contain a bounded non-empty step projection.");
+  const ids = new Set();
+  return value.map(step => {
+    const fields = ["stepId", "capabilityId", "effectClass", "targetRole", "verificationCode", "requiresApproval"];
+    if (!step || typeof step !== "object" || Array.isArray(step)
+      || Object.keys(step).some(key => !fields.includes(key))
+      || fields.some(key => !Object.hasOwn(step, key))) {
+      throw new Error("Workflow plan telemetry step contains unsupported fields.");
+    }
+    const stepId = safeCode(step.stepId, "planProjection.stepId", 64);
+    if (ids.has(stepId)) throw new Error("Workflow plan telemetry step IDs must be unique.");
+    ids.add(stepId);
+    if (typeof step.requiresApproval !== "boolean") throw new Error("Workflow plan approval requirement must be boolean.");
+    return {
+      stepId,
+      capabilityId: safeCode(step.capabilityId, "planProjection.capabilityId", 96),
+      effectClass: validateEnum(step.effectClass, "operationClass"),
+      targetRole: safeCode(step.targetRole, "planProjection.targetRole", 64),
+      verificationCode: safeCode(step.verificationCode, "planProjection.verificationCode", 64),
+      requiresApproval: step.requiresApproval
+    };
+  });
+}
+
+function normalizeWorkflowReviewProjection(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).some(key => !["state", "questions"].includes(key))) {
+    throw new Error("Workflow review projection must contain only state and question identifiers.");
+  }
+  const state = value.state;
+  const fields = ["plan_version", "step_count", "steps"];
+  if (!state || typeof state !== "object" || Array.isArray(state)
+    || Object.keys(state).length !== fields.length || Object.keys(state).some(key => !fields.includes(key))) {
+    throw new Error("Workflow review state contains unsupported fields.");
+  }
+  if (state.plan_version !== 1 || !Number.isInteger(state.step_count) || state.step_count < 1 || state.step_count > 24
+    || !Array.isArray(state.steps) || state.steps.length !== state.step_count) {
+    throw new Error("Workflow review state is outside its supported bounds.");
+  }
+  const steps = state.steps.map(step => {
+    const allowed = ["step_id", "capability_id", "effect_class", "target_role", "verification_code", "requires_approval"];
+    if (!step || typeof step !== "object" || Array.isArray(step)
+      || Object.keys(step).length !== allowed.length || Object.keys(step).some(key => !allowed.includes(key))) {
+      throw new Error("Workflow review step contains unsupported fields.");
+    }
+    if (typeof step.requires_approval !== "boolean") throw new Error("Workflow review approval requirement must be boolean.");
+    return {
+      step_id: safeCode(step.step_id, "inputProjection.step_id", 64),
+      capability_id: safeCode(step.capability_id, "inputProjection.capability_id", 96),
+      effect_class: validateEnum(step.effect_class, "operationClass"),
+      target_role: safeCode(step.target_role, "inputProjection.target_role", 64),
+      verification_code: safeCode(step.verification_code, "inputProjection.verification_code", 64),
+      requires_approval: step.requires_approval
+    };
+  });
+  return { state: { plan_version: state.plan_version, step_count: state.step_count, steps }, questions: normalizeQuestionProjection(value.questions) };
+}
 
 function normalizeJevInputProjection(value, inputKind) {
   if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some(key => !["state", "questions"].includes(key))) {
@@ -62,6 +127,7 @@ function normalizeJevInputProjection(value, inputKind) {
       questions
     };
   }
+  if (inputKind === "workflow_plan_review") return normalizeWorkflowReviewProjection(value);
   if (inputKind !== "pre_action_review") throw new Error("Jev input projection requires a supported review kind.");
   const stateFields = ["operation_code", "operation_class", "requested_target_role", "proposed_control", "page_surface", "alternative_count", "semantic_annotation"];
   if (!state || typeof state !== "object" || Array.isArray(state) || Object.keys(state).some(key => !stateFields.includes(key))) {
@@ -247,9 +313,14 @@ function normalizePayload(eventType, payload) {
     else if (field === "inputProjection") out[field] = eventType === "semantic.input_captured"
       ? normalizeSemanticInputProjection(value)
       : normalizeJevInputProjection(value, payload.inputKind);
+    else if (field === "planProjection") out[field] = normalizeWorkflowPlanProjection(value);
     else if (field === "inputKind") out[field] = validateEnum(value, field);
-    else if (["candidateCount", "visibleCount"].includes(field)) {
+    else if (["candidateCount", "visibleCount", "stepCount", "attemptNumber", "maxAttempts"].includes(field)) {
       if (!Number.isInteger(value) || value < 0 || value > 10_000) throw new Error(`Telemetry field '${field}' must be a bounded non-negative integer.`);
+      out[field] = value;
+      if (["attemptNumber", "maxAttempts"].includes(field) && (value < 1 || value > 4)) throw new Error(`Telemetry field '${field}' must be between 1 and 4.`);
+    } else if (field === "planVersion") {
+      if (value !== 1) throw new Error("Workflow plan telemetry supports only version 1.");
       out[field] = value;
     } else if (field === "changed") {
       if (typeof value !== "boolean") throw new Error("Telemetry field 'changed' must be boolean.");
@@ -260,14 +331,23 @@ function normalizePayload(eventType, payload) {
     } else if (field === "inputFingerprint") {
       if (!isSha256Digest(value)) throw new Error("Telemetry inputFingerprint must be a SHA-256 digest.");
       out[field] = value.toLowerCase();
+    } else if (field === "planHash") {
+      if (!isSha256Digest(value)) throw new Error("Workflow planHash must be a SHA-256 digest.");
+      out[field] = value.toLowerCase();
     } else if (field === "rubricHash") {
       if (!isSha256Digest(value)) throw new Error("Telemetry rubricHash must be a SHA-256 digest.");
       out[field] = value.toLowerCase();
     } else if (field === "approvalDigest") {
       if (!isSha256Digest(value)) throw new Error("Telemetry approvalDigest must be a SHA-256 digest.");
       out[field] = value.toLowerCase();
+    } else if (field === "strategyFingerprint") {
+      if (!isSha256Digest(value)) throw new Error("Telemetry strategyFingerprint must be a SHA-256 digest.");
+      out[field] = value.toLowerCase();
     } else if (field === "inputEventIds") {
       if (!Array.isArray(value) || value.length > 64) throw new Error("Telemetry inputEventIds must be a bounded event reference list.");
+      out[field] = [...new Set(value.map(item => safeCode(item, field, 96)))];
+    } else if (field === "sourceEventIds") {
+      if (!Array.isArray(value) || value.length > 32) throw new Error("Telemetry sourceEventIds must be a bounded event reference list.");
       out[field] = [...new Set(value.map(item => safeCode(item, field, 96)))];
     } else if (field === "roleMappings") {
       if (!Array.isArray(value) || value.length < 1 || value.length > 32) throw new Error("Telemetry roleMappings must contain a bounded non-empty mapping.");
@@ -312,7 +392,7 @@ function normalizePayload(eventType, payload) {
     else if (field === "model" || field === "analyzerModel") out[field] = safeModelId(value, field);
     else if (field === "status" && eventType === "verification.completed") out[field] = validateEnum(value, "verificationStatus");
     else if (field === "annotationKind") out[field] = validateEnum(value, field);
-    else if (field === "workflowKind" || field === "applicationId" || field === "environmentClass" || field === "executionMode" || field === "operationClass" || field === "disposition" || field === "dispatchStatus" || field === "status" || field === "cleanupStatus" || field === "questionType" || field === "sourceClass" || field === "correctionType" || field === "failureCode") {
+    else if (field === "workflowKind" || field === "applicationId" || field === "environmentClass" || field === "executionMode" || field === "operationClass" || field === "disposition" || field === "dispatchStatus" || field === "status" || field === "cleanupStatus" || field === "questionType" || field === "sourceClass" || field === "correctionType" || field === "failureCode" || field === "qualificationStatus") {
       out[field] = validateEnum(value, field) ?? safeCode(value, field);
       if (!ENUMS[field]) out[field] = safeCode(value, field);
     } else {
@@ -339,6 +419,11 @@ function normalizePayload(eventType, payload) {
     "correction.recorded": ["correctionType", "sourceClass", "correctedCode"],
     "label.proposed": ["rubricId", "labelCode", "sourceClass", "evidenceRefs"],
     "label.approved": ["labelEventId", "rubricId", "labelCode", "sourceClass", "evidenceRefs", "reviewerId", "approvalDigest"],
+    "qualification.started": ["qualificationId", "automationRunId", "scenarioId", "providerId", "trigger", "principalId", "strategyFingerprint", "sourceEventIds", "evidenceRefs"],
+    "qualification.completed": ["qualificationId", "automationRunId", "scenarioId", "providerId", "trigger", "principalId", "strategyFingerprint", "qualificationStatus", "reasonCode", "evidenceRefs"],
+    "workflow.plan_synthesized": ["provider", "model", "planVersion", "planHash", "inputFingerprint", "stepCount", "planProjection"],
+    "workflow.plan_failed": ["provider", "model", "planVersion", "inputFingerprint", "failureCode"],
+    "inference.attempted": ["taskCode", "attemptNumber", "maxAttempts"],
     "episode.completed": ["status", "cleanupStatus"]
   }[eventType];
   for (const field of required) if (out[field] === undefined) throw new Error(`Telemetry event '${eventType}' requires '${field}'.`);
@@ -353,7 +438,7 @@ export function createDecisionEvent(input) {
   const trainingEligibility = input.trainingEligibility ?? TRAINING_ELIGIBILITY.PENDING;
   if (!Object.values(TRAINING_ELIGIBILITY).includes(trainingEligibility)) throw new Error("Unsupported training eligibility.");
   if (trainingEligibility === TRAINING_ELIGIBILITY.ELIGIBLE && eventType !== "label.approved") throw new Error("Only independently approved labels may be training eligible.");
-  if (["semantic.input_captured", "semantic.annotated", "semantic.failed", "target.resolved", "decision.input_captured", "decision.skipped", "decision.predicted", "decision.failed", "policy.adjudicated", "execution.reserved", "execution.dispatched", "execution.observed", "verification.completed", "correction.recorded", "label.proposed", "label.approved"].includes(eventType) && !input.decisionId) {
+  if (["semantic.input_captured", "semantic.annotated", "semantic.failed", "target.resolved", "decision.input_captured", "decision.skipped", "decision.predicted", "decision.failed", "policy.adjudicated", "execution.reserved", "execution.dispatched", "execution.observed", "verification.completed", "correction.recorded", "label.proposed", "label.approved", "qualification.started", "qualification.completed", "workflow.plan_synthesized", "workflow.plan_failed", "inference.attempted"].includes(eventType) && !input.decisionId) {
     throw new Error(`Telemetry event '${eventType}' requires a stable decisionId.`);
   }
   const occurredAt = input.occurredAt ?? new Date().toISOString();

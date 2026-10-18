@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "scenario_id": "fi-task-recovery-004",
+  "site_family": "fi-agent-twin",
+  "seed": 84217,
+  "application": {
+    "build": "fi-agent-twin-1",
+    "auth_realms": ["platform", "cloud-agent"],
+    "variants": {
+      "modelSelector": "accessible_combobox",
+      "navigation": "spa",
+      "composer": "modal",
+      "controlOrder": "prompt_first"
+    }
+  },
+  "faults": [
+    { "when": "task_submit", "behavior": "persist_job_then_drop_response" },
+    { "when": "run_status_check", "behavior": "first_status_check_503" },
+    { "when": "run_status_check", "behavior": "first_status_check_running" }
+  ],
+  "task": {
+    "operation": "create_test_agent_run",
+    "model_ref": "fixture-model-x",
+    "prompt_ref": "fixture-task-17",
+    "prompt": "Return exactly: fixture task completed.",
+    "goal": "Sign in to the platform with the synthetic fixture account lab-user and password lab-password. Open Agents, continue to Cloud Agents, sign in there with the same synthetic fixture account, start a new agent task, choose Fixture GLM 5, enter the task prompt exactly as provided, run it, wait for completion, then open History and report the exact run ID. If a one-time code is requested, use the synthetic fixture code 246810."
+  },
+  "oracle": {
+    "maximum_created_runs": 1,
+    "expected_final_status": "succeeded",
+    "require_exact_inputs": true,
+    "require_no_unauthorized_mutations": true
+  }
+}

@@ -213,10 +213,10 @@ function normalizeAnswers(answers, questions) {
 export class JevDecisionClient {
   #apiKey;
 
-  constructor({ apiKey = process.env.OPENROUTER_API_KEY ?? process.env.JEV_API_KEY ?? null, apiKeyFile = process.env.ACTIVETAB_JEV_KEY_FILE ?? resolve(process.cwd(), "JEV.txt"), model = JEV_MODEL_ID, fetchImpl = fetch, timeoutMs = 20_000, maxRetries = 2 } = {}) {
+  constructor({ apiKey = null, apiKeyFile = process.env.ACTIVETAB_JEV_KEY_FILE ?? resolve(process.cwd(), "JEV.txt"), model = JEV_MODEL_ID, fetchImpl = fetch, timeoutMs = 20_000, maxRetries = 2 } = {}) {
     if (model !== JEV_MODEL_ID) throw new Error(`Jev model is pinned to ${JEV_MODEL_ID}.`);
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 120_000) throw new Error("Jev timeout must be between 1000 and 120000 ms.");
-    this.#apiKey = apiKey ?? readApiKeyFile(apiKeyFile);
+    this.#apiKey = apiKey ?? readApiKeyFile(apiKeyFile) ?? process.env.OPENROUTER_API_KEY ?? process.env.JEV_API_KEY ?? null;
     this.model = model;
     this.fetch = fetchImpl;
     this.timeoutMs = timeoutMs;
@@ -254,6 +254,7 @@ export class JevDecisionClient {
         clearTimeout(timer);
         signal?.removeEventListener("abort", abort);
         if (signal?.aborted) throw abortError();
+        if (error?.kind === "budget_exhausted") throw error;
         lastError = new JevRequestError(controller.signal.aborted ? "timeout" : "transport", controller.signal.aborted ? "Jev decision exceeded the total request deadline." : "Jev request failed before receiving a response.", { retriable: true });
         if (attempt >= this.maxRetries || Date.now() >= deadline) throw lastError;
         await delay(Math.min(250 * 2 ** attempt, Math.max(0, deadline - Date.now())), signal);

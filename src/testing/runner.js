@@ -15,6 +15,13 @@ import { NavigationEngine } from "../navigation/engine.js";
 import { executeAuthorizedAction } from "../runtime/authorizedExecutor.js";
 import { createHash, randomUUID } from "node:crypto";
 import { adjudicatePreActionReview } from "../decisions/adjudication.js";
+import { acquireBrowserTargetLease } from "./runState.js";
+import {
+  deriveWorkflowRunStatus,
+  estimateWorkflowExecutionCost,
+  evaluateWorkflowStepAdmission,
+  validateSubworkflowReferences
+} from "./execution/workflowScheduler.js";
 
 function telemetryStepId(stepId) {
   return `step_${createHash("sha256").update(String(stepId)).digest("hex").slice(0, 16)}`;
@@ -71,42 +78,6 @@ function classifyDiagnosticResult(snapshot) {
   return { status: STEP_STATUS.PASS, effectStatus: resultStatus ?? "collected", resultStatus };
 }
 
-function workflowConditions(when) {
-  if (Array.isArray(when?.all)) return { mode: "all", conditions: when.all };
-  if (Array.isArray(when?.any)) return { mode: "any", conditions: when.any };
-  return { mode: "all", conditions: [when] };
-}
-
-function workflowConditionMatches(when, stepStatuses) {
-  const { mode, conditions } = workflowConditions(when);
-  const matches = conditions.map(condition => condition.statuses.includes(stepStatuses.get(condition.stepId)));
-  return mode === "any" ? matches.some(Boolean) : matches.every(Boolean);
-}
-
-function workflowConditionReferencesStatus(when, stepId, status) {
-  const { conditions } = workflowConditions(when);
-  return conditions.some(condition => condition.stepId === stepId && condition.statuses.includes(status));
-}
-
-function deriveWorkflowRunStatus(workflow, stepStatuses) {
-  if (workflow.execution !== "dag") {
-    return deriveRunStatus([...stepStatuses.values()].map(status => ({ status })));
-  }
-  const dependedOn = new Set((workflow.steps ?? []).flatMap(step => step.dependsOn ?? []));
-  const terminalStatuses = (workflow.steps ?? [])
-    .filter(step => !dependedOn.has(step.id))
-    .map(step => stepStatuses.get(step.id));
-  if (!terminalStatuses.length || terminalStatuses.some(status => status === undefined)) return RUN_STATUS.BLOCKED;
-  const allStatuses = [...stepStatuses.values()];
-  if (allStatuses.includes(STEP_STATUS.UNCERTAIN)) return RUN_STATUS.UNCERTAIN;
-  if (allStatuses.includes(STEP_STATUS.CANCELED)) return RUN_STATUS.CANCELED;
-  if (terminalStatuses.includes(STEP_STATUS.FAIL)) return RUN_STATUS.FAILED;
-  if (terminalStatuses.includes(STEP_STATUS.BLOCKED)) return RUN_STATUS.BLOCKED;
-  if (terminalStatuses.some(status => status === STEP_STATUS.PASS)
-    && terminalStatuses.every(status => status === STEP_STATUS.PASS || status === STEP_STATUS.SKIPPED)) return RUN_STATUS.PASSED;
-  return RUN_STATUS.BLOCKED;
-}
-
 function canRestoreStepWithoutExecution(step, status) {
   if (status === STEP_STATUS.PASS) return true;
   const effectfulStepTypes = new Set(["navigate", "interact", "api_call", "cleanup", "goal", "controlled_failure"]);
@@ -114,7 +85,7 @@ function canRestoreStepWithoutExecution(step, status) {
 }
 
 export class TestRunner {
-  constructor({ session, collector, correlator, journal, maxSteps = 32, signal, interventions = null, environment = null, localFixture = false, decisionRuntime = null, operationAuthorizer = null, workflowRegistry = null, runStateStore = null, existingRunStateId = null, principalId = null, profileId = null, policyVersion = "active_policy_v1" } = {}) {
+  constructor({ session, collector, correlator, journal, maxSteps = 32, signal, interventions = null, environment = null, localFixture = false, decisionRuntime = null, qualificationService = null, operationAuthorizer = null, workflowRegistry = null, runStateStore = null, existingRunStateId = null, principalId = null, profileId = null, policyVersion = "active_policy_v1" } = {}) {
     this.session = session;
     this.collector = collector;
     this.correlator = correlator;
@@ -127,11 +98,13 @@ export class TestRunner {
     this.environment = environment;
     this.localFixture = localFixture;
     this.decisionRuntime = decisionRuntime;
+    this.qualificationService = qualificationService;
     // Supplied only by trusted profile/integration composition code. Workflow
     // JSON can name an operation, but cannot provide or replace this authority.
     this.operationAuthorizer = operationAuthorizer;
     this.workflowRegistry = workflowRegistry;
     this.runStateStore = runStateStore;
+    this.targetLease = null;
     this.existingRunStateId = existingRunStateId;
     this.principalId = principalId;
     this.profileId = profileId;
@@ -145,11 +118,32 @@ export class TestRunner {
 
   async run(workflow, { runId } = {}) {
     const effectiveRunId = runId ?? this.existingRunStateId ?? this.collector?.runId ?? crypto.randomUUID();
-    const releaseLease = this.runStateStore
-      ? await this.runStateStore.acquireExecutionLease(effectiveRunId)
-      : null;
+    const releaseLease = await this.#acquireExecutionLeases(effectiveRunId);
     try { return await this.#runWorkflow(workflow, { runId: effectiveRunId }); }
     finally { await releaseLease?.(); }
+  }
+
+  async #acquireExecutionLeases(runId) {
+    if (!this.runStateStore) return null;
+    const releaseRunLease = await this.runStateStore.acquireExecutionLease(runId);
+    let targetLease = null;
+    try {
+      const targetId = this.session?.target?.id;
+      if (targetId) targetLease = await acquireBrowserTargetLease(this.runStateStore, this.session, runId);
+      this.targetLease = targetLease;
+    } catch (error) {
+      await releaseRunLease();
+      throw error;
+    }
+    return async () => {
+      if (this.targetLease === targetLease) this.targetLease = null;
+      await targetLease?.release();
+      await releaseRunLease();
+    };
+  }
+
+  async #assertTargetLeaseCurrent() {
+    if (this.targetLease) await this.targetLease.assertCurrent();
   }
 
   async #runWorkflow(workflow, { runId } = {}) {
@@ -157,9 +151,18 @@ export class TestRunner {
     if (!validation.valid) {
       throw new Error(`Invalid workflow: ${validation.errors.join(" ")}`);
     }
-    const referenceErrors = this.#validateSubworkflowReferences(workflow, new Set([workflow.id]), 0);
+    const referenceErrors = validateSubworkflowReferences({
+      workflow,
+      activeWorkflowIds: new Set([workflow.id]),
+      maxSteps: this.maxSteps,
+      getWorkflow: workflowRef => this.#registeredWorkflow(workflowRef)
+    });
     if (referenceErrors.length) throw new Error(`Invalid workflow references: ${referenceErrors.join(" ")}`);
-    const executionCost = this.#workflowExecutionCost(workflow, new Set());
+    const executionCost = estimateWorkflowExecutionCost({
+      workflow,
+      maxSteps: this.maxSteps,
+      getWorkflow: workflowRef => this.#registeredWorkflow(workflowRef)
+    });
     if (executionCost > this.maxSteps) throw new Error(`Expanded workflow exceeds the total execution budget of ${this.maxSteps} steps.`);
     const declaredInputs = new Set(workflow.inputNames ?? []);
     if ([...declaredInputs].some(name => !Object.hasOwn(workflow.inputs ?? {}, name))) {
@@ -175,6 +178,7 @@ export class TestRunner {
     const context = {
       variables: new Map(Object.entries(workflow.inputs ?? {})),
       workflowStack: new Set([workflow.id]),
+      workflowHash: executionWorkflowFingerprint(workflow, this.workflowRegistry),
       depth: 0,
       stepStatuses: new Map(),
       completedStatuses: new Map(),
@@ -277,57 +281,12 @@ export class TestRunner {
       // A suspended run holds its place: no further steps dispatch while a
       // human intervention is pending; resumption re-enters at this step.
       if (receipt.status !== RUN_STATUS.RUNNING) break;
-      if (workflow.execution === "dag") {
-        const dependencyStatuses = new Map((step.dependsOn ?? []).map(id => [id, stepStatuses.get(id)]));
-        if (step.compensates) {
-          const sourceStatus = stepStatuses.get(step.compensates.stepId);
-          if (sourceStatus === STEP_STATUS.UNCERTAIN) {
-            const reason = "Compensation is suspended because the source effect is uncertain and its resource state must be reconciled first.";
-            receipt.recordStep({ stepId: runtimeStepId, type: step.type, status: STEP_STATUS.BLOCKED, reason });
-            await this.#checkpointRecordedStep(receipt, runtimeStepId);
-            stepStatuses.set(step.id, receipt.steps.findLast(item => item.stepId === runtimeStepId)?.status ?? STEP_STATUS.BLOCKED);
-            continue;
-          }
-          if (!step.compensates.statuses.includes(sourceStatus)) {
-            receipt.recordStep({ stepId: runtimeStepId, type: step.type, status: STEP_STATUS.SKIPPED, reason: "Compensation condition did not match the source operation outcome." });
-            await this.#checkpointRecordedStep(receipt, runtimeStepId);
-            stepStatuses.set(step.id, receipt.steps.findLast(item => item.stepId === runtimeStepId)?.status ?? STEP_STATUS.SKIPPED);
-            continue;
-          }
-        }
-        if (step.when && !workflowConditionMatches(step.when, stepStatuses)) {
-          receipt.recordStep({ stepId: runtimeStepId, type: step.type, status: STEP_STATUS.SKIPPED, reason: "Skipped because its declared workflow status condition was not met." });
-          await this.#checkpointRecordedStep(receipt, runtimeStepId);
-          stepStatuses.set(step.id, receipt.steps.findLast(item => item.stepId === runtimeStepId)?.status ?? STEP_STATUS.SKIPPED);
-          continue;
-        }
-        const unresolvedDependencies = [...dependencyStatuses]
-          .filter(([, status]) => status !== STEP_STATUS.PASS);
-        if (unresolvedDependencies.length > 0) {
-          const conditionCoversAll = unresolvedDependencies.every(([id, status]) =>
-            (step.when && workflowConditionReferencesStatus(step.when, id, status))
-            || (step.compensates?.stepId === id && step.compensates.statuses.includes(status)));
-          const uncertainDependency = unresolvedDependencies.some(([, status]) => status === STEP_STATUS.UNCERTAIN);
-          const reconciliationStep = ["assert", "wait_for", "diagnostic_snapshot", "api_call"].includes(step.type);
-          if (!conditionCoversAll || (uncertainDependency && !reconciliationStep)) {
-            const reason = uncertainDependency
-              ? "Blocked because a dependency has an unresolved effect; reconcile it before another effectful step."
-              : `Blocked because dependency outcomes are not all PASS (${unresolvedDependencies.map(([id, status]) => `${id}:${status}`).join(", ")}).`;
-            receipt.recordStep({ stepId: runtimeStepId, type: step.type, status: STEP_STATUS.BLOCKED, reason });
-            await this.#checkpointRecordedStep(receipt, runtimeStepId);
-            stepStatuses.set(step.id, receipt.steps.findLast(item => item.stepId === runtimeStepId)?.status ?? STEP_STATUS.BLOCKED);
-            continue;
-          }
-        }
-      }
-      // If a mandatory step failed, stop downstream ordinary steps.
-      if (workflow.execution !== "dag" && failedStepIds.size > 0 && !step.recoveryBranch) {
-        receipt.recordStep({
-          stepId: runtimeStepId, type: step.type, status: STEP_STATUS.BLOCKED,
-          reason: `Skipped because a prerequisite step failed (${[...failedStepIds].join(", ")}).`
-        });
+      const admission = evaluateWorkflowStepAdmission({ workflow, step, stepStatuses, failedStepIds });
+      if (admission.action !== "execute") {
+        const status = admission.action === "skip" ? STEP_STATUS.SKIPPED : STEP_STATUS.BLOCKED;
+        receipt.recordStep({ stepId: runtimeStepId, type: step.type, status, reason: admission.reason });
         await this.#checkpointRecordedStep(receipt, runtimeStepId);
-        stepStatuses.set(step.id, receipt.steps.findLast(item => item.stepId === runtimeStepId)?.status ?? STEP_STATUS.BLOCKED);
+        stepStatuses.set(step.id, receipt.steps.findLast(item => item.stepId === runtimeStepId)?.status ?? status);
         continue;
       }
       this.currentTelemetryStepId = telemetryStepId(runtimeStepId);
@@ -374,55 +333,6 @@ export class TestRunner {
     return this.workflowRegistry instanceof Map
       ? this.workflowRegistry.get(workflowRef)
       : this.workflowRegistry?.[workflowRef];
-  }
-
-  #validateSubworkflowReferences(workflow, activeWorkflowIds, depth) {
-    const errors = [];
-    if (depth > 8) return ["Subworkflow nesting exceeds the maximum depth of 8."];
-    for (const step of workflow.steps ?? []) {
-      if (step?.type !== "subworkflow") continue;
-      const child = this.#registeredWorkflow(step.workflowRef);
-      if (!child) {
-        errors.push(`No trusted registered subworkflow '${step.workflowRef}' exists.`);
-        continue;
-      }
-      if (activeWorkflowIds.has(child.id)) {
-        errors.push(`Subworkflow reference '${step.workflowRef}' forms a recursive workflow cycle.`);
-        continue;
-      }
-      const validation = validateWorkflow(child, { maxSteps: this.maxSteps });
-      if (!validation.valid) {
-        errors.push(`Registered subworkflow '${step.workflowRef}' is invalid.`);
-        continue;
-      }
-      const requiredInputs = new Set(child.inputNames ?? []);
-      const providedInputs = new Set(Object.keys(step.inputs ?? {}));
-      if ([...providedInputs].some(name => !requiredInputs.has(name))
-        || [...requiredInputs].some(name => !providedInputs.has(name) && !Object.hasOwn(child.inputs ?? {}, name))) {
-        errors.push(`Subworkflow '${step.workflowRef}' inputs do not match its registered interface.`);
-      }
-      const nextStack = new Set(activeWorkflowIds);
-      nextStack.add(child.id);
-      errors.push(...this.#validateSubworkflowReferences(child, nextStack, depth + 1));
-    }
-    return errors;
-  }
-
-  #workflowExecutionCost(workflow, activeWorkflowIds) {
-    if (activeWorkflowIds.has(workflow.id)) return this.maxSteps + 1;
-    const nextActive = new Set(activeWorkflowIds);
-    nextActive.add(workflow.id);
-    let cost = 0;
-    for (const step of workflow.steps ?? []) {
-      cost++;
-      if (step?.type === "repeat") cost += (step.body?.length ?? 0) * (step.maxIterations ?? 0);
-      if (step?.type === "subworkflow") {
-        const child = this.#registeredWorkflow(step.workflowRef);
-        if (child) cost += this.#workflowExecutionCost(child, nextActive);
-      }
-      if (cost > this.maxSteps) return cost;
-    }
-    return cost;
   }
 
   async #initializeRunState(workflow, receipt) {
@@ -477,7 +387,11 @@ export class TestRunner {
     }
     if (run?.pendingOperations?.some(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status))) return run;
     if (["passed", "failed", "blocked", "canceled", "expired", "reconciling"].includes(run?.status)) return run;
-    if (targetId) await this.runStateStore.update(receipt.runId, { target: { targetId, attached: true } });
+    if (targetId) {
+      const current = await this.runStateStore.getFresh(receipt.runId);
+      await this.runStateStore.update(receipt.runId, { target: { ...current.target, targetId, attached: true } });
+      if (this.targetLease) await this.runStateStore.bindTargetLease(receipt.runId, { targetId, fencingToken: this.targetLease.fencingToken });
+    }
     await this.runStateStore.update(receipt.runId, { status: "running", currentStepId: null });
     return this.runStateStore.getFresh(receipt.runId);
   }
@@ -654,7 +568,8 @@ export class TestRunner {
             action,
             effectDigest,
             environmentId: thisRunner.environment?.environmentId ?? null,
-            targetId: thisRunner.session?.target?.id ?? null
+            targetId: thisRunner.session?.target?.id ?? null,
+            targetFencingToken: thisRunner.targetLease?.fencingToken ?? null
           });
           await thisRunner.runStateStore.update(receipt.runId, { status: "dispatching", currentStepId: stateStepId });
         }
@@ -673,7 +588,8 @@ export class TestRunner {
           try {
             await thisRunner.runStateStore.recordOperationDispatch(receipt.runId, {
               operationId,
-              status: dispatchStatus === "uncertain" ? "UNCERTAIN" : "DISPATCHED",
+              status: dispatchStatus === "uncertain" ? "UNCERTAIN"
+                : dispatchStatus === "refused" ? "REFUSED" : "DISPATCHED",
               receiptId: observation?.evidenceId ?? null
             });
           } catch (error) { errors.push(error); }
@@ -733,6 +649,7 @@ export class TestRunner {
         case "postcondition": return await this.#executePostcondition(step, receipt, startedAt);
         case "cleanup": return await this.#executeCleanup(step, receipt, startedAt, context);
         case "goal": return await this.#executeGoal(step, receipt, startedAt);
+        case "qualify": return await this.#executeQualification(step, receipt, startedAt, context);
         case "set_variable": return this.#executeSetVariable(step, receipt, startedAt, context, stepStatuses);
         case "repeat": return await this.#executeRepeat(step, receipt, startedAt, context);
         case "subworkflow": return await this.#executeSubworkflow(step, receipt, startedAt, context);
@@ -747,6 +664,61 @@ export class TestRunner {
       receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.FAIL, reason, startedAt });
       return { status: STEP_STATUS.FAIL, reason };
     }
+  }
+
+  async #executeQualification(step, receipt, startedAt, context) {
+    const unavailable = reasonCode => ({
+      status: "unavailable",
+      qualificationId: null,
+      reasonCode,
+      evidenceRefs: []
+    });
+    let result;
+    if (!this.qualificationService || !this.decisionEpisodeId) {
+      result = unavailable("qualification_service_unavailable");
+    } else {
+      try {
+        result = await this.qualificationService.qualify({
+          runId: receipt.runId,
+          episodeId: this.decisionEpisodeId,
+          stepId: this.currentTelemetryStepId ?? telemetryStepId(step.id),
+          scenarioId: step.scenarioId,
+          providerId: step.providerId,
+          trigger: step.trigger,
+          principalId: this.principalId ?? "unknown",
+          strategyFingerprint: context?.workflowHash ?? createHash("sha256").update(step.id).digest("hex"),
+          sourceEventIds: step.sourceEventIds ?? [],
+          evidenceRefs: step.evidenceRefs ?? [],
+          signal: this.signal
+        });
+      } catch {
+        result = unavailable("qualification_invocation_unavailable");
+      }
+    }
+    const qualificationStatus = result?.status ?? "unavailable";
+    const required = step.required === true;
+    const stepStatus = required && qualificationStatus !== "qualified" ? STEP_STATUS.FAIL : STEP_STATUS.PASS;
+    const reason = qualificationStatus === "qualified" ? "Candidate strategy qualified against the independent fixture oracle."
+      : qualificationStatus === "not_qualified" ? "Candidate strategy did not satisfy the independent fixture oracle."
+        : qualificationStatus === "inconclusive" ? "Fixture qualification was inconclusive; actual task execution remains governed by its own policy and evidence."
+          : "Fixture qualification was unavailable; actual task execution remains governed by its own policy and evidence.";
+    const details = {
+      qualificationStatus,
+      required,
+      ...(typeof result?.qualificationId === "string" ? { qualificationId: result.qualificationId } : {}),
+      ...(typeof result?.reasonCode === "string" ? { reasonCode: result.reasonCode } : {}),
+      evidenceRefs: (result?.evidenceRefs ?? []).filter(ref => typeof ref === "string").slice(0, 32)
+    };
+    receipt.recordStep({
+      stepId: step.id,
+      type: step.type,
+      status: stepStatus,
+      reason,
+      evidenceIds: details.evidenceRefs,
+      startedAt,
+      details
+    });
+    return { status: stepStatus, reason, qualificationStatus };
   }
 
   async #observe() {
@@ -967,6 +939,7 @@ export class TestRunner {
         url,
         expectedUrlPattern: step.expectedUrlPattern ?? null,
         localFixture: this.localFixture,
+        assertExecutionLease: this.targetLease ? () => this.#assertTargetLeaseCurrent() : null,
         ...(telemetry ? { onAdmission: telemetry.onAdmission, onReserve: telemetry.onReserve, onDispatch: telemetry.onDispatch } : {})
       });
       if (!authResult.dispatched) {
@@ -1070,6 +1043,7 @@ export class TestRunner {
         localFixture: this.localFixture,
         operationId: action.operationId ?? null,
         operationAuthorizer: this.operationAuthorizer,
+        assertExecutionLease: this.targetLease ? () => this.#assertTargetLeaseCurrent() : null,
         ...(telemetry ? { onAdmission: telemetry.onAdmission, onReserve: telemetry.onReserve, onDispatch: telemetry.onDispatch } : {})
       });
       if (!authResult.dispatched) {
@@ -1434,6 +1408,7 @@ export class TestRunner {
       localFixture: this.localFixture,
       decisionRuntime: this.decisionRuntime,
       operationAuthorizer: this.operationAuthorizer,
+      assertExecutionLease: this.targetLease ? () => this.#assertTargetLeaseCurrent() : null,
       ...(this.decisionRuntime ? {
         decisionContext: {
           runId: receipt.runId,
@@ -1537,9 +1512,7 @@ export class TestRunner {
    *   covered by the verified completion predicate; these are never replayed.
    */
   async resume(receipt, options = {}) {
-    const releaseLease = this.runStateStore
-      ? await this.runStateStore.acquireExecutionLease(receipt.runId)
-      : null;
+    const releaseLease = await this.#acquireExecutionLeases(receipt.runId);
     try { return await this.#resumeWorkflow(receipt, options); }
     finally { await releaseLease?.(); }
   }
@@ -1608,6 +1581,9 @@ export class TestRunner {
             || state.policyVersion !== this.policyVersion) {
             return { resumed: false, reason: "Durable continuation bindings do not match the current workflow, environment, target, principal, or policy." };
           }
+          if (targetId && this.targetLease) {
+            await this.runStateStore.bindTargetLease(receipt.runId, { targetId, fencingToken: this.targetLease.fencingToken });
+          }
           await this.runStateStore.bindExecutionContract(receipt.runId, {
             workflowId: workflow.id,
             workflowVersion: workflow.version ?? null,
@@ -1648,6 +1624,16 @@ export class TestRunner {
       }
       // No original workflow available: re-run only the suspended step with
       // fresh evidence and return its outcome (never the whole run).
+      if (this.runStateStore && this.session?.target?.id && this.targetLease) {
+        const state = await this.runStateStore.getFresh(receipt.runId);
+        if (state?.target?.targetId !== this.session.target.id) {
+          return { resumed: false, reason: "Durable continuation target does not match the attached browser target." };
+        }
+        await this.runStateStore.bindTargetLease(receipt.runId, {
+          targetId: this.session.target.id,
+          fencingToken: this.targetLease.fencingToken
+        });
+      }
       const suspendedGoal = workflow?.steps?.find(s => s.id === suspendedStep.stepId)?.goal
         ?? receipt.steps.find(s => s.stepId === suspendedStep.stepId)?.details?.goal
         ?? "";

@@ -10,6 +10,7 @@ import { connectChromeAuto, listChromeTargets, resolveChromeTarget } from "../sr
 import { BrowserSession } from "../src/browser/session.js";
 import { ProfileLoader, loadEnvironmentBinding } from "../src/testing/profiles.js";
 import { discoverStagingAdminConfig } from "../src/testing/stagingAdminConfigDiscovery.js";
+import { RunStateStore, withTargetExecutionLease } from "../src/testing/runState.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
@@ -36,12 +37,15 @@ async function main() {
   const userDataDir = join(root, ".activetab", "qualification", "browser-profiles", browserProfileId);
   let connection;
   let session;
+  const runStateStore = new RunStateStore(join(root, ".activetab", "runs"));
   try {
+    await runStateStore.init();
     connection = await connectChromeAuto({ userDataDir });
     const selected = (await listChromeTargets(connection)).find(value => value.id === targetId);
     if (!selected) throw new Error("The explicitly authorized target is unavailable in the selected ActiveTab-owned browser profile.");
     session = await new BrowserSession(await resolveChromeTarget(connection, selected.id, targetId)).attach();
-    const report = await discoverStagingAdminConfig({ session, environment, profile, evidenceSource: "live_browser" });
+    const report = await withTargetExecutionLease(runStateStore, session, `admin-config-${randomUUID()}`, () =>
+      discoverStagingAdminConfig({ session, environment, profile, evidenceSource: "live_browser" }));
     report.generatedAt = new Date().toISOString();
     report.target = { targetId: selected.id };
     const reportDir = join(root, ".activetab", "qualification", "staging-admin-config");
@@ -63,6 +67,7 @@ async function main() {
     if (report.reason) console.log(`Reason: ${report.reason}`);
     process.exitCode = report.status === "COMPLETE" ? 0 : report.status === "BLOCKED" ? 2 : 1;
   } finally {
+    runStateStore.close();
     await session?.close().catch(() => {});
     await connection?.close().catch(() => {});
   }

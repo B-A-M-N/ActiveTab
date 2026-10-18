@@ -35,7 +35,7 @@ import { DiagnosticReport, FINDING_LEVEL, deriveRunInvestigationStatus } from ".
 import { TestRunner } from "../testing/runner.js";
 import { receiptFromRunState } from "../testing/receipts.js";
 import { buildDurableRunReport } from "../testing/durableRunReport.js";
-import { RunStateStore, requestRunCancellation } from "../testing/runState.js";
+import { RunStateStore, requestRunCancellation, withTargetExecutionLease } from "../testing/runState.js";
 import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
 import { InvestigationEngine } from "../investigation/engine.js";
 import { InterventionStore } from "../runtime/interventions.js";
@@ -43,6 +43,7 @@ import { createInterventionTools } from "./intervention-tools.js";
 import { AuthorizationGrantStore } from "../runtime/approvals.js";
 import { trackRunResult } from "../runtime/runTracker.js";
 import { randomUUID } from "node:crypto";
+import { createQualificationRuntime } from "../testing/qualificationRuntime.js";
 
 const DEFAULT_PORT = 9377;
 const API_PREFIX = "/v3/bots";
@@ -54,7 +55,7 @@ const OUTPUT_EXTENSIONS = new Set(["json", "md", "csv", "xml"]);
 // the run as finished.
 const TERMINAL = new Set(["finished", "failed", "canceled"]);
 
-export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationRunner, decisionRuntime = null, apiToken, operatorToken = process.env.ACTIVETAB_OPERATOR_TOKEN ?? null, operatorId = process.env.ACTIVETAB_OPERATOR_ID ?? null, operatorAuthenticator = null, host = "127.0.0.1", maxTasks = MAX_TASK_RECORDS, executorName, reportDir, testSessionResolver = null, testEnvironmentResolver = null, testProfileIdResolver = null, testPrincipalResolver = null, runStateStore: suppliedRunStateStore = null } = {}) {
+export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationRunner, decisionRuntime = null, qualificationService = null, apiToken, operatorToken = process.env.ACTIVETAB_OPERATOR_TOKEN ?? null, operatorId = process.env.ACTIVETAB_OPERATOR_ID ?? null, operatorAuthenticator = null, host = "127.0.0.1", maxTasks = MAX_TASK_RECORDS, executorName, reportDir, testSessionResolver = null, testEnvironmentResolver = null, testProfileIdResolver = null, testPrincipalResolver = null, runStateStore: suppliedRunStateStore = null } = {}) {
   const store = new TaskStore(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"));
   const lifecycle = new RunLifecycle({ store, navigationRunner, executorName, reportDir });
   const token = apiToken ?? process.env.ACTIVETAB_API_TOKEN ?? null;
@@ -62,6 +63,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
   const authenticateOperator = operatorAuthenticator ?? createOperatorAuthenticator(operatorToken, operatorId);
   const maxTaskRecords = Number.isInteger(maxTasks) && maxTasks >= 1 ? Math.min(maxTasks, 10_000) : MAX_TASK_RECORDS;
   const diagnostics = createDiagnostics();
+  const runQualificationService = qualificationService ?? createQualificationRuntime({ decisionRuntime });
   const testRuns = new Map();
   const runStateStore = suppliedRunStateStore ?? new RunStateStore(
     process.env.ACTIVETAB_RUN_STATE_DIR ?? join(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"), "..", "runs")
@@ -210,7 +212,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
     const controller = new AbortController();
     const runner = new TestRunner({
       session, collector, correlator, signal: controller.signal, interventions: interventionStore,
-      decisionRuntime, runStateStore, ...binding
+      decisionRuntime, qualificationService: runQualificationService, runStateStore, ...binding
     });
     const runCtx = createTestVerificationContext(session);
     const runPromise = runner.run(workflow, { runId });
@@ -281,7 +283,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
     const controller = new AbortController();
     const runner = new TestRunner({
       session, collector, correlator, signal: controller.signal, interventions: interventionStore,
-      decisionRuntime, runStateStore, existingRunStateId: runId, ...binding
+      decisionRuntime, qualificationService: runQualificationService, runStateStore, existingRunStateId: runId, ...binding
     });
     const runCtx = createTestVerificationContext(session);
     const runPromise = intervention
@@ -438,14 +440,18 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
           try { session = await testSessionResolver({ input: body ?? {} }); } catch { session = null; }
         }
         if (!session) { sendError(res, 400, 99002, "A browser session is required for discovery."); return; }
-        const engine = new ApplicationDiscoveryEngine({
-          session,
-          maxSteps: body?.maxSteps ?? 8,
-          maxLinksPerStep: body?.maxLinksPerStep ?? 4,
-          decisionRuntime,
-          ...(body?.knowledgeDir ? { knowledgeDir: body.knowledgeDir } : {})
+        await ensureRunStateStore();
+        const result = await withTargetExecutionLease(runStateStore, session, `api-discovery-${randomUUID()}`, async lease => {
+          const engine = new ApplicationDiscoveryEngine({
+            session,
+            maxSteps: body?.maxSteps ?? 8,
+            maxLinksPerStep: body?.maxLinksPerStep ?? 4,
+            decisionRuntime,
+            assertExecutionLease: lease.assertCurrent,
+            ...(body?.knowledgeDir ? { knowledgeDir: body.knowledgeDir } : {})
+          });
+          return await engine.discover();
         });
-        const result = await engine.discover();
         sendJson(res, 200, result);
         return;
       }
@@ -574,7 +580,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
 
         // ── POST /v3/bots/remote/runs (peer execution; must precede :bot_id) ──
         if (method === "POST" && path === `${API_PREFIX}/remote/runs`) {
-          await handlePeerRun(req, res, { store, lifecycle, executorReady, diagnostics });
+          await handlePeerRun(req, res, { store, lifecycle, executorReady, diagnostics, runStateStore });
           return;
         }
 
@@ -582,7 +588,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
         const templateRun = method === "POST" && path.match(/^\/v3\/bots\/templates\/[^/]+\/runs$/);
         const botRun = method === "POST" && path.match(/^\/v3\/bots\/[^/]+\/runs$/);
         if (templateRun || botRun) {
-          await handleCreateRun(req, res, { templateRun, botRun, path, executorReady, store, lifecycle, maxTaskRecords, diagnostics });
+          await handleCreateRun(req, res, { templateRun, botRun, path, executorReady, store, lifecycle, maxTaskRecords, diagnostics, runStateStore });
           return;
         }
 
@@ -667,6 +673,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
     store,
     async start() {
       await store.init();
+      await ensureRunStateStore();
       await interventionStore.init().catch(() => {});
       return new Promise((resolvePromise, reject) => {
         server.listen(port, host, () => {
@@ -692,7 +699,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
 
 // ── Route handlers ───────────────────────────────────────────────────────
 
-async function handleCreateRun(req, res, { templateRun, botRun, path, executorReady, store, lifecycle, maxTaskRecords, diagnostics }) {
+async function handleCreateRun(req, res, { templateRun, botRun, path, executorReady, store, lifecycle, maxTaskRecords, diagnostics, runStateStore }) {
   if (!executorReady) {
     // Fail closed: no executor, no acknowledged executable task.
     sendError(res, 503, 99503, "Navigation execution is unavailable on this server.");
@@ -727,13 +734,14 @@ async function handleCreateRun(req, res, { templateRun, botRun, path, executorRe
     input: body.input,
     templateId: id,
     taskId: task.task_id,
-    inputSchema: template.input_schema
+    inputSchema: template.input_schema,
+    runStateStore
   }));
 
   sendJson(res, 200, { status: "created", task_id: task.task_id });
 }
 
-async function handlePeerRun(req, res, { store, lifecycle, executorReady, diagnostics }) {
+async function handlePeerRun(req, res, { store, lifecycle, executorReady, diagnostics, runStateStore }) {
   if (!executorReady) { sendError(res, 503, 99503, "Navigation execution is unavailable on this server."); return; }
   const peerAuth = req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : null;
   const { loadPeerTokenRing, tokenMatches } = await import("../runtime/tokens.js");
@@ -757,7 +765,9 @@ async function handlePeerRun(req, res, { store, lifecycle, executorReady, diagno
     input: (body.input && typeof body.input === "object" && !Array.isArray(body.input)) ? body.input : {},
     templateId: "remote-peer-run",
     taskId: task.task_id,
-    plannerMode: body.plannerMode
+    plannerMode: body.plannerMode,
+    workflowIntent: body.workflowIntent,
+    runStateStore
   }));
 
   // Await-style peer response: heartbeats keep the socket responsive on

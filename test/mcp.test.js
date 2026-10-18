@@ -72,8 +72,9 @@ test("MCP stdio server initializes and advertises bounded browser tools", async 
     const runGoalSchema = responses[1].result.tools.find(tool => tool.name === "run_goal").inputSchema;
     assert.deepEqual(runGoalSchema.properties.maxScrolls, { type: "integer", minimum: 0, maximum: 8 });
     assert.equal(runGoalSchema.properties.newTask.type, "boolean");
-    assert.match(responses[1].result.tools.find(tool => tool.name === "run_goal").description, /repeating the same goal on the same target and environment resumes an incomplete task/i);
-    assert.match(responses[1].result.tools.find(tool => tool.name === "run_goal").description, /Tied targets stop unresolved and return evidence-linked backend\/frame handles/);
+    assert.match(responses[1].result.tools.find(tool => tool.name === "run_goal").description, /Task continuation uses a goal fingerprint and bounded state/i);
+    assert.match(responses[1].result.tools.find(tool => tool.name === "run_goal").description, /Set newTask=true to start a completed task again/i);
+    assert.match(responses[1].result.tools.find(tool => tool.name === "run_goal").description, /`targetId` selects the browser session/i);
     assert.deepEqual(responses[1].result.tools.find(tool => tool.name === "collect_cloud_agent_run_evidence").inputSchema.required, ["runId", "cloudAgentRunId", "browserEvidenceId"]);
   } finally {
     rm(tempDir, { recursive: true, force: true }).catch(() => {});

@@ -342,7 +342,8 @@ export class OpenAICompatiblePlanner {
 
 export function configuredPlanner({ executionMode = "agent_directed", plannerMode = "deterministic" } = {}) {
   if (!["agent_directed", "agent_assisted", "standalone"].includes(executionMode)) throw new Error("Execution mode must be agent_directed, agent_assisted, or standalone.");
-  if (!["deterministic", "model"].includes(plannerMode)) throw new Error("Planner mode must be deterministic or model.");
+  if (!["deterministic", "model", "workflow"].includes(plannerMode)) throw new Error("Planner mode must be deterministic, model, or workflow.");
+  if (plannerMode === "workflow") return new DeterministicPlanner();
   if (executionMode !== "standalone" || plannerMode !== "model") return new DeterministicPlanner();
   if (!process.env.ACTIVETAB_MODEL_ENDPOINT || !process.env.ACTIVETAB_MODEL) throw new Error("Standalone model planning requires ACTIVETAB_MODEL_ENDPOINT and ACTIVETAB_MODEL.");
   if (process.env.ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT !== "1") throw new Error("Standalone model planning requires ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT=1.");

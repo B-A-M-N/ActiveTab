@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import { ApplicationDiscoveryEngine } from "../src/discovery/engine.js";
 import { buildEnvironmentBinding } from "../src/environments/model.js";
 
+const fixtureLease = async () => {};
+
 const environment = buildEnvironmentBinding({
   profile_id: "freeinference-staging",
   environment: {
@@ -53,7 +55,7 @@ test("cross-origin navigation inside the platform is recorded and verified", asy
     { name: "New connector", role: "button", visible: true }
   ]);
   const session = scriptedSession([main, agents]);
-  const engine = new ApplicationDiscoveryEngine({ session, environment, maxSteps: 3 });
+  const engine = new ApplicationDiscoveryEngine({ session, environment, maxSteps: 3, assertExecutionLease: fixtureLease });
   const result = await engine.discover();
   // Same-origin navigation within the platform: pages accumulate, no child
   // application boundary is crossed, and platform identity is preserved.
@@ -67,7 +69,7 @@ test("arbitrary cross-origin links are never trusted: discovery stops at the bou
     { name: "External promo", role: "link", href: "https://evil.example.net/promo", visible: true }
   ]);
   const session = scriptedSession([main]);
-  const engine = new ApplicationDiscoveryEngine({ session, environment, maxSteps: 3 });
+  const engine = new ApplicationDiscoveryEngine({ session, environment, maxSteps: 3, assertExecutionLease: fixtureLease });
   const result = await engine.discover();
   const refused = result.discoveries.find(d => d.type === "cross_origin_untrusted");
   assert.ok(refused,
@@ -91,6 +93,7 @@ test("an authentication boundary pauses discovery instead of bypassing it", asyn
   const boundaries = [];
   const engine = new ApplicationDiscoveryEngine({
     session, environment, maxSteps: 3,
+    assertExecutionLease: fixtureLease,
     onAuthorizationBoundary: boundary => boundaries.push(boundary)
   });
   await engine.discover();

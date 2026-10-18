@@ -10,6 +10,7 @@ import { listTargets, resolveAuthorizedTarget } from "../src/browser/targets.js"
 import { BrowserSession } from "../src/browser/session.js";
 import { ProfileLoader, loadEnvironmentBinding } from "../src/testing/profiles.js";
 import { discoverStagingAdminConsole } from "../src/testing/stagingAdminConsoleDiscovery.js";
+import { RunStateStore, withTargetExecutionLease } from "../src/testing/runState.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const profileId = process.argv.slice(2).find(value => value.startsWith("--profile="))?.slice(10) ?? "freeinference-staging";
@@ -27,9 +28,13 @@ async function main() {
   const selected = (await listTargets(endpoint)).find(target => target.id === targetId);
   if (!selected) throw new Error("The explicitly authorized browser target is unavailable at the configured CDP endpoint.");
 
-  const session = await new BrowserSession(await resolveAuthorizedTarget(endpoint, selected.id, targetId)).attach();
+  const runStateStore = new RunStateStore(join(root, ".activetab", "runs"));
+  await runStateStore.init();
+  let session;
   try {
-    const report = await discoverStagingAdminConsole({ session, environment, profile });
+    session = await new BrowserSession(await resolveAuthorizedTarget(endpoint, selected.id, targetId)).attach();
+    const report = await withTargetExecutionLease(runStateStore, session, `admin-console-${randomUUID()}`, () =>
+      discoverStagingAdminConsole({ session, environment, profile }));
     report.generatedAt = new Date().toISOString();
     report.target = { targetId: selected.id };
     const reportDir = join(root, ".activetab", "qualification", "staging-admin-console");
@@ -45,7 +50,8 @@ async function main() {
     if (report.reason) console.log(`Reason: ${report.reason}`);
     process.exitCode = report.status === "COMPLETE" ? 0 : report.status === "BLOCKED" ? 2 : 1;
   } finally {
-    await session.close().catch(() => {});
+    runStateStore.close();
+    await session?.close().catch(() => {});
   }
 }
 

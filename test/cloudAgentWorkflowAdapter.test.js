@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createCloudAgentTaskPlan, CLOUD_AGENT_TASK_ROLES, verifyCloudAgentRunOutcome } from "../src/integrations/freeinference/cloudAgentWorkflow.js";
 import { buildEnvironmentBinding } from "../src/environments/model.js";
 import { TestRunner } from "../src/testing/runner.js";
+import { createRunStateFixture } from "./runStateFixture.js";
 
 const profile = {
   profile_id: "cloud-agent-staging",
@@ -148,7 +149,9 @@ test("the compiled operation capability is exact, ordered, staging-bound, and in
   })).allowed, false);
 });
 
-test("Jev service refusal falls back to policy and the workflow uses exact model and prompt without false PASS", async () => {
+test("Jev service refusal falls back to policy and the workflow uses exact model and prompt without false PASS", async t => {
+  const runState = await createRunStateFixture("activetab-cloud-agent-workflow-");
+  t.after(() => runState.cleanup());
   const page = observedPage();
   const plan = createCloudAgentTaskPlan({ profile, request: taskRequest(), observation: page, mapping: page.mapping });
   const dispatched = [];
@@ -187,10 +190,11 @@ test("Jev service refusal falls back to policy and the workflow uses exact model
     session,
     environment: buildEnvironmentBinding(profile),
     operationAuthorizer: plan.operationAuthorizer,
-    decisionRuntime
+    decisionRuntime,
+    runStateStore: runState.store
   }).run(plan.workflow, { runId: "cloud-agent-adapter-test" });
 
-  assert.deepEqual(dispatched.map(item => item[0]), ["select", "fill", "click"]);
+  assert.deepEqual(dispatched.map(item => item[0]), ["select", "fill", "click"], JSON.stringify(receipt.toObject(), null, 2));
   assert.deepEqual(reviews.map(item => item.targetRole), [CLOUD_AGENT_TASK_ROLES.SUBMIT_TASK]);
   assert.equal(skippedReviews.length, 2);
   assert.deepEqual(skippedReviews.map(item => item.operation), ["select", "fill"]);

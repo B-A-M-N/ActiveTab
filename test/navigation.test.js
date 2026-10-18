@@ -9,9 +9,12 @@ const authorizedFixtureSessions = new WeakSet();
 async function authorizeFixtureSession(session) {
   if (!session || typeof session.observe !== "function") return session;
   if (authorizedFixtureSessions.has(session)) return session;
+  session.attached = true;
+  session.target ??= { id: "navigation-test-target", endpoint: "fixture" };
   const originalObserve = session.observe.bind(session);
   const asNavigationFixture = observation => ({
     ...observation,
+    targetId: observation?.targetId ?? session.target.id,
     candidates: (observation?.candidates ?? []).map(candidate => {
       // These synthetic UI fixtures model route controls as explicit
       // same-origin links. Production observations must carry real hrefs.
@@ -39,14 +42,19 @@ async function authorizeFixtureSession(session) {
     }
     return asNavigationFixture(await originalObserve(...args));
   };
-  session.attached = true;
-  session.target ??= { id: "navigation-test-target", endpoint: "fixture" };
   session.target.url ??= cachedObservation?.page?.url ?? null;
   authorizedFixtureSessions.add(session);
   return session;
 }
 
 class NavigationEngine extends RuntimeNavigationEngine {
+  constructor(session, options = {}) {
+    super(session, {
+      ...options,
+      assertExecutionLease: options.assertExecutionLease ?? (async () => {})
+    });
+  }
+
   async run(goal, options) {
     await authorizeFixtureSession(this.session);
     if (!this.environment) {
@@ -822,12 +830,13 @@ test("with an environment binding, a click onto a non-authorized origin is recov
       }
     }
   };
-  const result = await new NavigationEngine(session, { environment, maxActions: 3, maxRecoveries: 2 }).run("Open the Agents portal");
+  const diagnosticJournal = { value: null, async write(value) { this.value = structuredClone(value); } };
+  const result = await new NavigationEngine(session, { environment, journal: diagnosticJournal, maxActions: 3, maxRecoveries: 2 }).run("Open the Agents portal");
   // The engine never declared success while on the unauthorized origin: it
   // detected the off-environment navigation, returned to the authorized page,
   // excluded the offending link, and only then completed on the authorized
   // /agents route.
-  assert.equal(result.status, "succeeded", `expected recovery to succeed on the authorized origin (got ${result.status}: ${result.reason})`);
+  assert.equal(result.status, "succeeded", `expected recovery to succeed on the authorized origin (got ${result.status}: ${result.reason}; action=${JSON.stringify(diagnosticJournal.value?.attempts?.at(-1))})`);
   assert.ok(navigations.includes("https://staging.freeinference.org/"), `engine must navigate back to the authorized page, got ${JSON.stringify(navigations)}`);
   assert.ok(session.clicks >= 2, "the off-environment link must not be the final state; a fresh authorized action was required");
   assert.match(result.page?.url ?? "", /^https:\/\/staging\.freeinference\.org\//, `final page must be on the authorized origin, got ${result.page?.url}`);

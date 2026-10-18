@@ -19,7 +19,7 @@ import { DiagnosticReport, FINDING_LEVEL, deriveRunInvestigationStatus } from ".
 import { TestRunner } from "../testing/runner.js";
 import { receiptFromRunState } from "../testing/receipts.js";
 import { buildDurableRunReport } from "../testing/durableRunReport.js";
-import { RunStateStore, requestRunCancellation } from "../testing/runState.js";
+import { RunStateStore, requestRunCancellation, withTargetExecutionLease } from "../testing/runState.js";
 import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
 import { InvestigationEngine } from "../investigation/engine.js";
 import { InterventionStore, InterventionWatcher } from "../runtime/interventions.js";
@@ -35,10 +35,12 @@ import { verifyCloudAgentRunOutcome } from "../integrations/freeinference/cloudA
 import { eventIdsForEvidence } from "../telemetry/evidenceRefs.js";
 import { randomUUID } from "node:crypto";
 import { assertRedactedEvidenceOnly } from "../diagnostics/evidenceReleasePolicy.js";
+import { createQualificationRuntime } from "../testing/qualificationRuntime.js";
 
 const endpoint = process.env.ACTIVETAB_CDP_ENDPOINT ?? "http://127.0.0.1:9222";
 const sessions = new Map();
 const decisionRuntime = createDecisionRuntime();
+const qualificationService = createQualificationRuntime({ decisionRuntime });
 let chromeConnection;
 const autoConnect = process.env.ACTIVETAB_AUTO_CONNECT === "1";
 const extensionMode = process.env.ACTIVETAB_EXTENSION === "1";
@@ -124,7 +126,7 @@ function startWorkflowRun({ session, workflow, environment = null, operationAuth
   const correlator = new DiagnosticCorrelator();
   const runner = new TestRunner({
     session, collector, correlator, signal: controller.signal, interventions: interventionStore,
-    decisionRuntime, environment, operationAuthorizer, runStateStore, existingRunStateId,
+    decisionRuntime, qualificationService, environment, operationAuthorizer, runStateStore, existingRunStateId,
     profileId,
     principalId: principalId ?? session?.principalId ?? session?.authorizationPrincipalId ?? "local_mcp_automation"
   });
@@ -204,7 +206,7 @@ const tools = [
   { name: "resume_run", description: "Resume a suspended run: verifies the exact completion predicate (grant scope/expiry, authenticated session, attachment grant, or outcome reconciliation) with fresh evidence before admitting execution.", inputSchema: { type: "object", properties: { interventionId: { type: "string" } }, required: ["interventionId"], additionalProperties: false } },
   { name: "get_run_state", description: "Get the resumable state of a run (including suspended/waiting states).", inputSchema: { type: "object", properties: { runId: { type: "string" } }, required: ["runId"], additionalProperties: false } },
   { name: "cancel_run", description: "Cancel a run or intervention. Cancellation is permitted during suspension.", inputSchema: { type: "object", properties: { runId: { type: "string" }, interventionId: { type: "string" } }, additionalProperties: false } },
-  { name: "run_goal", description: "Run a bounded standalone natural-language task. Select profileId from ActiveTab's local profiles directory whenever navigation or link following is needed; the selected environment is bound to resumable state. Without a profile, only non-navigation interactions within the attached tab's observed origin are eligible. The deterministic planner is the default. A configured model endpoint never selects the action planner automatically; set plannerMode=model to explicitly choose it, and separately enable ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT=1 before page evidence can be sent. Task continuation is stored locally using only a goal fingerprint and bounded continuation state. Repeating the same goal on the same target and environment resumes an incomplete task; completed tasks are returned idempotently. Set newTask=true to explicitly start it again. Tied targets stop unresolved and return evidence-linked backend/frame handles for caller inspection; select one with click_observed_element, which revalidates it before dispatch. Set reuseWorkflows=true to replay or record verified workflows; configure ACTIVETAB_WORKFLOW_STORE first.", inputSchema: { type: "object", properties: { ...targetIdOptional, profileId: { type: "string", minLength: 1, maxLength: 128 }, goal: { type: "string" }, maxActions: { type: "integer", minimum: 1, maximum: 10 }, maxScrolls: { type: "integer", minimum: 0, maximum: 8 }, plannerMode: { type: "string", enum: ["deterministic", "model"] }, reuseWorkflows: { type: "boolean" }, newTask: { type: "boolean" } }, required: ["goal"], additionalProperties: false } }
+  { name: "run_goal", description: "Run a bounded standalone browser task. Select profileId from ActiveTab's local profiles directory whenever navigation is needed; the environment is bound to resumable state. plannerMode=workflow synthesizes one guarded workflow from a typed workflowIntent and fresh application evidence, then executes it locally through the authorized executor. Supply workflowIntent purposeCode and outcomeCode as lowercase structural identifiers (never as free-form task text); optional targetRoles and constraints are bounded identifiers. The built-in workflow capability follows a unique visible link; application profiles may register additional trusted capabilities and fresh-page target resolvers. FreeInference Production GLM5.3-flash is the default model ID for an explicitly configured OpenAI-compatible endpoint. Jev 1.14 is the system's independent, advisory batch reviewer; its unavailability never grants or changes authority. Model retries count toward the durable per-run inference-attempt budget. Task continuation uses a goal fingerprint and bounded state. Set newTask=true to start a completed task again. Set reuseWorkflows=true to replay or record verified workflows; configure ACTIVETAB_WORKFLOW_STORE first.", inputSchema: { type: "object", properties: { ...targetIdOptional, profileId: { type: "string", minLength: 1, maxLength: 128 }, goal: { type: "string" }, maxActions: { type: "integer", minimum: 1, maximum: 10 }, maxScrolls: { type: "integer", minimum: 0, maximum: 8 }, plannerMode: { type: "string", enum: ["deterministic", "model", "workflow"] }, workflowIntent: { type: "object", properties: { purposeCode: { type: "string", minLength: 1, maxLength: 64 }, outcomeCode: { type: "string", minLength: 1, maxLength: 64 }, targetRoles: { type: "array", maxItems: 24, items: { type: "string", minLength: 1, maxLength: 64 } }, constraints: { type: "array", maxItems: 24, items: { type: "string", minLength: 1, maxLength: 64 } } }, required: ["purposeCode", "outcomeCode"], additionalProperties: false }, reuseWorkflows: { type: "boolean" }, newTask: { type: "boolean" } }, required: ["goal"], additionalProperties: false } }
 ];
 for (const tool of tools) {
   if (Object.hasOwn(tool.inputSchema.properties, "targetId") && tool.name !== "attach_tab" && tool.name !== "detach_tab") {
@@ -524,13 +526,16 @@ async function callTool(name, args) {
   }
   if (name === "discover_application") {
     const session = selectBrowserSession(sessions, args.targetId);
-    const engine = new ApplicationDiscoveryEngine({
-      session,
-      maxSteps: args.maxSteps ?? 8,
-      maxLinksPerStep: args.maxLinksPerStep ?? 4,
-      decisionRuntime
+    return await withTargetExecutionLease(runStateStore, session, `mcp-discovery-${randomUUID()}`, async lease => {
+      const engine = new ApplicationDiscoveryEngine({
+        session,
+        maxSteps: args.maxSteps ?? 8,
+        maxLinksPerStep: args.maxLinksPerStep ?? 4,
+        decisionRuntime,
+        assertExecutionLease: lease.assertCurrent
+      });
+      return await engine.discover();
     });
-    return await engine.discover();
   }
   if (name === "investigate_failure") {
     const session = selectBrowserSession(sessions, args.targetId);
@@ -602,14 +607,30 @@ async function callTool(name, args) {
     assertRedactedEvidenceOnly(args, ["includeSensitiveValues"]);
     return await session.observer.inspectRuntimeState(args.evidenceId, { path: args.path, frameTargetId: args.frameTargetId ?? null, includeSensitiveValues: false });
   }
-  if (name === "click_observed_element") return await clickObservedElement(session, { goal: args.goal, evidenceId: args.evidenceId, backendNodeId: args.backendNodeId, frameTargetId: args.frameTargetId ?? null, decisionRuntime });
+  if (name === "click_observed_element") {
+    return await withTargetExecutionLease(runStateStore, session, `mcp-observed-click-${randomUUID()}`, async lease =>
+      await clickObservedElement(session, {
+        goal: args.goal,
+        evidenceId: args.evidenceId,
+        backendNodeId: args.backendNodeId,
+        frameTargetId: args.frameTargetId ?? null,
+        decisionRuntime,
+        assertExecutionLease: lease.assertCurrent
+      }));
+  }
   if (name === "inspect_network_response") {
     assertRedactedEvidenceOnly(args, ["includeSensitive", "includeSensitiveUrlData"]);
     return await session.observer.inspectNetworkResponse(args.evidenceId, { requestId: args.requestId, includeSensitive: false, includeSensitiveUrlData: false, maxBytes: args.maxBytes });
   }
   if (name === "run_goal") {
     const selectedProfile = await loadEnvironmentProfile(args.profileId);
-    return await runMcpGoal(session, args, { journalStore: taskJournalStore, workflowStore, decisionRuntime, environment: selectedProfile?.environment ?? null });
+    return await runMcpGoal(session, args, {
+      journalStore: taskJournalStore,
+      workflowStore,
+      decisionRuntime,
+      environment: selectedProfile?.environment ?? null,
+      runStateStore
+    });
   }
   throw new Error(`Unknown tool: ${name}`);
 }

@@ -7,6 +7,9 @@ import { JEV_MODEL_ID } from "../src/decisions/jevClient.js";
 import { TestRunner } from "../src/testing/runner.js";
 import { ApplicationDiscoveryEngine } from "../src/discovery/engine.js";
 import { clickObservedElement } from "../src/navigation/observedAction.js";
+import { createRunStateFixture } from "./runStateFixture.js";
+
+const fixtureLease = async () => {};
 
 function fixtureSession() {
   const candidate = { identity: "open-account", targetId: "telemetry-test-target", documentGeneration: 1, backendNodeId: 1, name: "Open account", role: "link", tag: "a", href: "/account", visible: true };
@@ -78,7 +81,7 @@ test("live navigation records Jev, policy, dispatch and observed events on one d
   const runtime = createDecisionRuntime({ eventStore: store, jevClient: successfulJev(), semanticAnalyzer: null });
   const session = fixtureSession();
   try {
-    await new NavigationEngine(session, { planner: planner(), maxActions: 1, decisionRuntime: runtime }).run("Open the account page");
+    await new NavigationEngine(session, { planner: planner(), maxActions: 1, decisionRuntime: runtime, assertExecutionLease: fixtureLease }).run("Open the account page");
     assert.equal(session.clicks, 1);
     const episode = store.getLatestEpisodeForRun(store.listEpisodes()[0].run_id);
     const events = store.getEvents(episode.episode_id);
@@ -103,12 +106,12 @@ test("navigation remains usable without Jev credentials and records reviewer una
   const store = new DecisionEventStore({ databasePath: ":memory:" });
   const runtime = createDecisionRuntime({
     eventStore: store,
-    jevOptions: { apiKey: null, apiKeyFile: "/__activetab_test_missing_jev_key__" },
+    jevOptions: { apiKey: "", apiKeyFile: "/__activetab_test_missing_jev_key__" },
     semanticAnalyzer: null
   });
   const session = fixtureSession();
   try {
-    await new NavigationEngine(session, { planner: planner(), maxActions: 1, decisionRuntime: runtime }).run("Open the account page");
+    await new NavigationEngine(session, { planner: planner(), maxActions: 1, decisionRuntime: runtime, assertExecutionLease: fixtureLease }).run("Open the account page");
     assert.equal(session.clicks, 1);
     const episodeId = store.listEpisodes()[0].episode_id;
     const events = store.getEvents(episodeId);
@@ -129,7 +132,7 @@ test("a Jev refusal is recorded and does not block deterministic local navigatio
   });
   const session = fixtureSession();
   try {
-    await new NavigationEngine(session, { planner: planner(), maxActions: 1, decisionRuntime: runtime }).run("Open the account page");
+    await new NavigationEngine(session, { planner: planner(), maxActions: 1, decisionRuntime: runtime, assertExecutionLease: fixtureLease }).run("Open the account page");
     assert.equal(session.clicks, 1);
     const episodeId = store.listEpisodes()[0].episode_id;
     const events = store.getEvents(episodeId);
@@ -146,7 +149,7 @@ test("Jev disagreement suspends navigation before dispatch and cannot authorize 
   const runtime = createDecisionRuntime({ eventStore: store, jevClient: reviewRequiredJev(), semanticAnalyzer: null });
   const session = fixtureSession();
   try {
-    const result = await new NavigationEngine(session, { planner: planner(), maxActions: 1, decisionRuntime: runtime }).run("Open the account page");
+    const result = await new NavigationEngine(session, { planner: planner(), maxActions: 1, decisionRuntime: runtime, assertExecutionLease: fixtureLease }).run("Open the account page");
     assert.equal(result.status, "needs_human");
     assert.equal(result.authorizationRequired.category, "independent_review_required");
     assert.equal(session.clicks, 0);
@@ -160,12 +163,14 @@ test("Jev disagreement suspends navigation before dispatch and cannot authorize 
   }
 });
 
-test("declarative test actions record the full lifecycle in the run episode", async () => {
+test("declarative test actions record the full lifecycle in the run episode", async t => {
+  const runState = await createRunStateFixture();
+  t.after(() => runState.cleanup());
   const store = new DecisionEventStore({ databasePath: ":memory:" });
   const runtime = createDecisionRuntime({ eventStore: store, jevClient: successfulJev(), semanticAnalyzer: null });
   const session = fixtureSession();
   try {
-    const receipt = await new TestRunner({ session, decisionRuntime: runtime }).run({
+    const receipt = await new TestRunner({ session, decisionRuntime: runtime, runStateStore: runState.store }).run({
       id: "workflow_telemetry",
       name: "Telemetry interaction",
       steps: [{ id: "open_account", type: "interact", goal: "Open the account page", action: { type: "click", target: { backendNodeId: 1 }, postcondition: { type: "page_title_contains", value: "Error" } } }]
@@ -263,7 +268,8 @@ test("direct observed-element action stops on Jev disagreement", async () => {
       goal: "Open the account page",
       evidenceId: "observed_action_old",
       backendNodeId: 1,
-      decisionRuntime: runtime
+      decisionRuntime: runtime,
+      assertExecutionLease: fixtureLease
     });
     assert.equal(result.status, "needs_human");
     assert.equal(result.category, "independent_review_required");

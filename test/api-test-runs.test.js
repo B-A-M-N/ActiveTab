@@ -321,6 +321,7 @@ test("local API discovery endpoint runs with a session resolver", async () => {
     },
     client: { async send() { return {}; } },
     target: { id: "t" },
+    attached: true,
     async close() {}
   };
   const api = createApiServer({ port: 0, taskStoreDir: undefined, navigationRunner: { run: async () => ({}) }, testSessionResolver: async () => mockSession, apiToken: "test-token" });

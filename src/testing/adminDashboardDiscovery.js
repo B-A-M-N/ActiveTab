@@ -7,6 +7,8 @@
 
 import { executeAuthorizedAction } from "../runtime/authorizedExecutor.js";
 import { verifyObservedUrl } from "../environments/model.js";
+import { randomUUID } from "node:crypto";
+import { withTargetExecutionLease } from "./runState.js";
 
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const READ_GOAL = "Inspect the visible staging Admin dashboard for read-only diagnostics.";
@@ -90,13 +92,13 @@ async function findSelectedCandidate(session, candidates, allowedLabels, roles =
   return null;
 }
 
-async function activateVisibleReadOnlyControl({ session, environment, origin, label, purpose }) {
+async function activateVisibleReadOnlyControl({ session, environment, origin, label, purpose, assertExecutionLease = null }) {
   const beforePage = await observeAuthorized(session, environment, origin);
   const candidate = exactButton(beforePage, label);
   if (!candidate) return { dispatched: false, verified: false, reason: "No exact visible non-submitting control was found." };
   const before = await selectionState(session, candidate.backendNodeId);
   const result = await executeAuthorizedAction({
-    session, environment, goal: READ_GOAL + " " + purpose, action: "click", candidate
+    session, environment, goal: READ_GOAL + " " + purpose, action: "click", candidate, assertExecutionLease
   });
   if (!result.dispatched) return { dispatched: false, verified: false, reason: result.reason ?? "Authorized executor refused the control." };
   await pause(200);
@@ -136,7 +138,7 @@ async function observedLocation(session) {
 }
 
 /** Primitive: follow one exact visible link through the authorized executor. */
-export async function followVisibleAdminLink({ session, environment, candidate, purpose = "open a read-only Admin view" }) {
+export async function followVisibleAdminLink({ session, environment, candidate, purpose = "open a read-only Admin view", assertExecutionLease = null }) {
   if (!candidate || candidate.role !== "link" || candidate.visible !== true || !candidate.href) {
     return { opened: false, reason: "A visible link candidate is required." };
   }
@@ -145,7 +147,7 @@ export async function followVisibleAdminLink({ session, environment, candidate, 
     return { opened: false, reason: "The link destination is outside the authorized environment." };
   }
   const dispatched = await executeAuthorizedAction({
-    session, environment, goal: READ_GOAL + " " + purpose, action: "click", candidate
+    session, environment, goal: READ_GOAL + " " + purpose, action: "click", candidate, assertExecutionLease
   });
   return dispatched.dispatched
     ? { opened: true, destination }
@@ -300,7 +302,7 @@ async function waitForDisclosureState(session, backendNodeId, expected, timeoutM
 }
 
 /** Primitive: inspect a visible disclosure and restore its original state. */
-export async function inspectAndRestoreDisclosure({ session, environment, candidate, onExpanded = null }) {
+export async function inspectAndRestoreDisclosure({ session, environment, candidate, onExpanded = null, assertExecutionLease = null }) {
   const initial = await disclosureState(session, candidate?.backendNodeId);
   if (!candidate || candidate.visible !== true || candidate.role !== "button" || candidate.submitsForm === true || !["true", "false"].includes(initial)) {
     return { inspected: false, restored: false, reason: "Requires a fresh, visible, non-submitting disclosure button." };
@@ -317,7 +319,7 @@ export async function inspectAndRestoreDisclosure({ session, environment, candid
     const finalState = await disclosureState(session, candidate.backendNodeId);
     return { inspected: true, restored: finalState === initial, initialState: initial, finalState, uiActions: 0, ...(detail ? { detail } : {}) };
   }
-  const opened = await executeAuthorizedAction({ session, environment, goal: DISCLOSURE_GOAL, action: "click", candidate });
+  const opened = await executeAuthorizedAction({ session, environment, goal: DISCLOSURE_GOAL, action: "click", candidate, assertExecutionLease });
   if (!opened.dispatched) return { inspected: false, restored: false, uiActions: 0, reason: opened.reason ?? "Disclosure click refused." };
   if (await waitForDisclosureState(session, candidate.backendNodeId, "true") !== "true") {
     return { inspected: false, restored: false, uiActions: 1, reason: "Open state was not independently observed; no second click was sent." };
@@ -333,7 +335,7 @@ export async function inspectAndRestoreDisclosure({ session, environment, candid
     && item.submitsForm !== true
   );
   if (!sameControl) return { inspected: true, restored: false, uiActions: 1, reason: "Opened disclosure could not be safely re-resolved." };
-  const closed = await executeAuthorizedAction({ session, environment, goal: DISCLOSURE_GOAL, action: "click", candidate: sameControl });
+  const closed = await executeAuthorizedAction({ session, environment, goal: DISCLOSURE_GOAL, action: "click", candidate: sameControl, assertExecutionLease });
   if (!closed.dispatched) return { inspected: true, restored: false, uiActions: 1, reason: closed.reason ?? "Could not restore the disclosure." };
   const finalState = await waitForDisclosureState(session, candidate.backendNodeId, "false");
   return { inspected: true, restored: finalState === "false", initialState: initial, finalState, uiActions: 2, ...(detail ? { detail } : {}) };
@@ -379,13 +381,13 @@ async function waitForPath(session, environment, origin, path, timeoutMs = 10000
   return observation;
 }
 
-async function openArea({ session, environment, area, target, origin, adminPrefix }) {
+async function openArea({ session, environment, area, target, origin, adminPrefix, assertExecutionLease }) {
   const observation = await observeAuthorized(session, environment, origin);
   const current = locationOf(observation.page?.url);
   if (current?.pathname === target.pathname) return { opened: true, observation, navigated: false };
   const link = exactLink(observation, { labels: target.labels, origin, pathname: target.pathname });
   if (!link) return { opened: false, reason: "No exact visible profile-approved link for " + area + "." };
-  const followed = await followVisibleAdminLink({ session, environment, candidate: link, purpose: "open Admin area " + area });
+  const followed = await followVisibleAdminLink({ session, environment, candidate: link, purpose: "open Admin area " + area, assertExecutionLease });
   if (!followed.opened) return { opened: false, reason: followed.reason };
   const arrived = await waitForPath(session, environment, origin, target.pathname);
   const final = locationOf(arrived?.page?.url);
@@ -404,7 +406,13 @@ function selectAreas(value, available) {
 }
 
 /** Admin-only recipe. Cloud Agent execution/history qualification does not call this function. */
-export async function discoverAdminDashboard({ session, environment, profile, areas = "all", onEvent = null, signal = null }) {
+export async function discoverAdminDashboard(options = {}) {
+  const { session, runStateStore } = options;
+  return await withTargetExecutionLease(runStateStore, session, `admin-discovery-${randomUUID()}`, async lease =>
+    await discoverAdminDashboardWithLease({ ...options, assertExecutionLease: lease.assertCurrent }));
+}
+
+async function discoverAdminDashboardWithLease({ session, environment, profile, areas = "all", onEvent = null, signal = null, assertExecutionLease }) {
   const config = profile?.staging_ui_diagnostics;
   if (!session?.attached || !config || !Array.isArray(config.surfaces)) {
     return { status: "BLOCKED", reason: "A profile and an attached authorized browser session are required." };
@@ -447,7 +455,7 @@ export async function discoverAdminDashboard({ session, environment, profile, ar
   if (!start?.pathname.startsWith(adminPrefix)) {
     const adminLink = exactLink(first, { labels: config.admin_link_labels, origin, pathPrefix: adminPrefix });
     if (!adminLink) return { ...report, status: "BLOCKED", reason: "No exact visible Admin link; no Admin URL was guessed." };
-    const opened = await followVisibleAdminLink({ session, environment, candidate: adminLink, purpose: "enter the Admin dashboard" });
+    const opened = await followVisibleAdminLink({ session, environment, candidate: adminLink, purpose: "enter the Admin dashboard", assertExecutionLease });
     if (!opened.opened) return { ...report, status: "BLOCKED", reason: opened.reason };
     actions++;
     const destination = locationOf(adminLink.href, first.page?.url);
@@ -476,7 +484,7 @@ export async function discoverAdminDashboard({ session, environment, profile, ar
         report.surfaces.push({ area, status: "UNAVAILABLE", reason: "No visible profile-approved route." });
         continue;
       }
-      const route = await openArea({ session, environment, area, target, origin, adminPrefix });
+      const route = await openArea({ session, environment, area, target, origin, adminPrefix, assertExecutionLease });
       if (!route.opened) {
         report.surfaces.push({ area, pathname: target.pathname, status: "UNAVAILABLE", reason: route.reason });
         continue;
@@ -496,7 +504,7 @@ export async function discoverAdminDashboard({ session, environment, profile, ar
         for (const category of surface.audit_categories) {
           if (signal?.aborted) throw new Error("Admin discovery canceled.");
           const selectedFilter = await activateVisibleReadOnlyControl({
-            session, environment, origin, label: category, purpose: "inspect the " + category + " audit filter"
+            session, environment, origin, label: category, purpose: "inspect the " + category + " audit filter", assertExecutionLease
           });
           if (!selectedFilter.dispatched || !selectedFilter.verified) {
             report.auditCategories.push({
@@ -513,7 +521,7 @@ export async function discoverAdminDashboard({ session, environment, profile, ar
           const disclosureCandidate = await firstTableDisclosure(session, categoryObservation);
           const disclosure = disclosureCandidate
             ? await inspectAndRestoreDisclosure({
-              session, environment, candidate: disclosureCandidate,
+              session, environment, candidate: disclosureCandidate, assertExecutionLease,
               onExpanded: async () => {
                 const detail = await inspectAdminSurface({ session, profile, apiCursor: requestCursor });
                 requestCursor = session.activity?.snapshot?.().networkRequests?.length ?? requestCursor;
@@ -551,7 +559,7 @@ export async function discoverAdminDashboard({ session, environment, profile, ar
           else {
             const restored = await activateVisibleReadOnlyControl({
               session, environment, origin, label: initialAuditFilter,
-              purpose: "restore the original Audit category filter"
+              purpose: "restore the original Audit category filter", assertExecutionLease
             });
             record.auditFilterRestored = restored.dispatched && restored.verified;
           }
@@ -571,7 +579,7 @@ export async function discoverAdminDashboard({ session, environment, profile, ar
         for (const label of surface.tabs) {
           if (signal?.aborted) throw new Error("Admin discovery canceled.");
           const clicked = await activateVisibleReadOnlyControl({
-            session, environment, origin, label, purpose: "inspect the " + label + " view"
+            session, environment, origin, label, purpose: "inspect the " + label + " view", assertExecutionLease
           });
           if (!clicked.dispatched || !clicked.verified) {
             record.tabs.push({ label, observed: false, interactionDispatched: clicked.dispatched, selectionState: clicked.after ?? null, reason: clicked.reason ?? "Tab selection was not independently identified." });
@@ -589,7 +597,7 @@ export async function discoverAdminDashboard({ session, environment, profile, ar
           else {
             const restored = await activateVisibleReadOnlyControl({
               session, environment, origin, label: initialTab,
-              purpose: "restore the original Activity view"
+              purpose: "restore the original Activity view", assertExecutionLease
             });
             record.activeTabRestored = restored.dispatched && restored.verified;
           }
@@ -609,7 +617,7 @@ export async function discoverAdminDashboard({ session, environment, profile, ar
             && candidate.name === label
           );
           if (!disclosure) { record.expandableSections.push({ label, inspected: false, reason: "No exact reversible disclosure found." }); continue; }
-          const result = await inspectAndRestoreDisclosure({ session, environment, candidate: disclosure });
+          const result = await inspectAndRestoreDisclosure({ session, environment, candidate: disclosure, assertExecutionLease });
           record.expandableSections.push({ label, ...result });
           actions += result.uiActions ?? 0;
           if (result.inspected && !result.restored) report.limitations.push(label + " section did not return to its original state.");
@@ -619,7 +627,7 @@ export async function discoverAdminDashboard({ session, environment, profile, ar
     report.safety.readOnlyUiActions = actions;
     const current = await observedLocation(session);
     if (start?.origin === origin && current?.pathname !== start.pathname) {
-      const restored = await executeAuthorizedAction({ session, environment, goal: READ_GOAL, action: "navigate", url: origin + start.pathname });
+      const restored = await executeAuthorizedAction({ session, environment, goal: READ_GOAL, action: "navigate", url: origin + start.pathname, assertExecutionLease });
       const restoredPage = restored.dispatched ? await waitForPath(session, environment, origin, start.pathname) : null;
       restorationVerified = locationOf(restoredPage?.page?.url)?.pathname === start.pathname;
       if (!restorationVerified) report.limitations.push("Could not verify restoration to the exact initially observed path.");

@@ -27,6 +27,7 @@ import { fileURLToPath } from "node:url";
 import { randomUUID, createHash } from "node:crypto";
 
 import { TestRunner } from "./runner.js";
+import { createQualificationRuntime } from "./qualificationRuntime.js";
 import { TestReceipt } from "./receipts.js";
 import { InterventionStore, InterventionWatcher } from "../runtime/interventions.js";
 import { loadEnvironmentBinding } from "./profiles.js";
@@ -504,6 +505,7 @@ export async function qualifyCloudAgent({
     // ── 5. Follow the visible route, hand off for login, then verify and resume ──
     const runner = new TestRunner({
       session, interventions, environment, signal, decisionRuntime,
+      qualificationService: createQualificationRuntime({ decisionRuntime }),
       ...(runStore && runState ? {
         runStateStore: runStore,
         existingRunStateId: runState.runId,

@@ -28,13 +28,14 @@ import { createDiagnosticContract, AUTHORITY, OPERATION, SENSITIVITY } from "../
 import { DiagnosticCorrelator } from "../src/diagnostics/correlator.js";
 import { InvestigationEngine } from "../src/investigation/engine.js";
 import { FINDING_LEVEL, INVESTIGATION_STATUS } from "../src/diagnostics/report.js";
+import { RunStateStore, withTargetExecutionLease } from "../src/testing/runState.js";
 
 const chromePath = process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
 const fixture = await readFile(new URL("./fixtures/navigation.html", import.meta.url));
 const sameFrameFixture = await readFile(new URL("./fixtures/same-frame.html", import.meta.url));
 
 test("E2E vertical: attach → discover → test → collect → investigate → report", { timeout: 120_000 }, async t => {
-  let server, crossOriginServer, chrome, profileDir, session;
+  let server, crossOriginServer, chrome, profileDir, runStateDir, session, runStateStore;
   try {
     // ── Fixture servers ──
     crossOriginServer = createServer((_req, res) => {
@@ -88,6 +89,9 @@ test("E2E vertical: attach → discover → test → collect → investigate →
 
     // ── Disposable Chrome (headed by default) ──
     profileDir = await mkdtemp(join(tmpdir(), "activetab-e2e-"));
+    runStateDir = await mkdtemp(join(tmpdir(), "activetab-e2e-runstate-"));
+    runStateStore = new RunStateStore(runStateDir);
+    await runStateStore.init();
     chrome = spawn(chromePath, [
       "--no-sandbox", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check",
       "--remote-debugging-port=0", `--user-data-dir=${profileDir}`, siteUrl
@@ -134,8 +138,8 @@ test("E2E vertical: attach → discover → test → collect → investigate →
     assert.ok(initialObservation.candidates.length > 0, "Observation captured interactable candidates");
 
     // ── 3. Bounded autonomous discovery ──
-    const discovery = new ApplicationDiscoveryEngine({ session, maxSteps: 4, maxLinksPerStep: 4 });
-    const discoveryResult = await discovery.discover();
+    const discoveryResult = await withTargetExecutionLease(runStateStore, session, "e2e-discovery", lease =>
+      new ApplicationDiscoveryEngine({ session, maxSteps: 4, maxLinksPerStep: 4, assertExecutionLease: lease.assertCurrent }).discover());
     assert.ok(discoveryResult.capabilityMap);
     assert.ok(discoveryResult.discoveries.some(d => d.type === "initial_observation"));
     t.diagnostic(`Discovery: ${discoveryResult.visitedCount} pages, ${discoveryResult.capabilityMap.controls.length} controls`);
@@ -172,7 +176,7 @@ test("E2E vertical: attach → discover → test → collect → investigate →
         };
       });
     const correlator = new DiagnosticCorrelator();
-    const runner = new TestRunner({ session, collector, correlator, localFixture: true });
+    const runner = new TestRunner({ session, collector, correlator, localFixture: true, runStateStore });
     const receipt = await runner.run({
       id: "e2e-smoke", name: "E2E smoke",
       steps: [
@@ -255,8 +259,10 @@ test("E2E vertical: attach → discover → test → collect → investigate →
     t.diagnostic("✅ E2E vertical verified: attach → observe → discover → test → collect → investigate → report");
   } finally {
     if (session) await session.close().catch(() => {});
+    runStateStore?.close();
     if (chrome) { try { chrome.kill("SIGKILL"); } catch {} }
     if (profileDir) await rm(profileDir, { recursive: true, force: true }).catch(() => {});
+    if (runStateDir) await rm(runStateDir, { recursive: true, force: true }).catch(() => {});
     if (server) server.close();
     if (crossOriginServer) crossOriginServer.close();
   }

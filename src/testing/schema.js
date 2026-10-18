@@ -9,7 +9,7 @@
 export const STEP_TYPES = Object.freeze([
   "setup", "navigate", "interact", "api_call", "wait_for", "assert",
   "diagnostic_snapshot", "controlled_failure", "retry_verification",
-  "postcondition", "cleanup", "goal", "set_variable", "repeat", "subworkflow"
+  "postcondition", "cleanup", "goal", "qualify", "set_variable", "repeat", "subworkflow"
 ]);
 
 /** Human-intervention declaration for goal steps (P0-4). */
@@ -196,6 +196,14 @@ export function validateWorkflow(workflow, { maxSteps = 128 } = {}) {
     if (step.type === "wait_for" && !step.condition) errors.push(`${prefix}.condition is required for wait_for steps.`);
     if (step.type === "api_call" && !step.operation) errors.push(`${prefix}.operation is required for api_call steps.`);
     if (step.type === "api_call" && step.operation && !step.operation.operationId) errors.push(`${prefix}.operation.operationId is required for api_call steps.`);
+    if (step.type === "qualify") {
+      if (typeof step.scenarioId !== "string" || !step.scenarioId.trim() || step.scenarioId.length > 96) errors.push(`${prefix}.scenarioId must be a bounded scenario identifier.`);
+      if (typeof step.providerId !== "string" || !step.providerId.trim() || step.providerId.length > 96) errors.push(`${prefix}.providerId must be a bounded provider identifier.`);
+      if (!new Set(["ambiguous_target", "observed_failure", "workflow_reuse", "ui_drift", "uncertain_operation"]).has(step.trigger)) errors.push(`${prefix}.trigger is unsupported for qualification.`);
+      if (step.required !== undefined && typeof step.required !== "boolean") errors.push(`${prefix}.required must be a boolean.`);
+      if (step.sourceEventIds !== undefined && (!Array.isArray(step.sourceEventIds) || step.sourceEventIds.length > 32 || step.sourceEventIds.some(id => typeof id !== "string" || !id))) errors.push(`${prefix}.sourceEventIds must be a bounded list of event identifiers.`);
+      if (step.evidenceRefs !== undefined && (!Array.isArray(step.evidenceRefs) || step.evidenceRefs.length > 32 || step.evidenceRefs.some(ref => typeof ref !== "string" || !ref))) errors.push(`${prefix}.evidenceRefs must be a bounded list of evidence references.`);
+    }
     if (step.type === "cleanup" && step.action && (!step.verify || typeof step.verify.type !== "string")) {
       errors.push(`${prefix}.verify requires an independent assertion for any effectful cleanup action.`);
     }

@@ -14,6 +14,7 @@ import { listTargets, resolveAuthorizedTarget } from "../src/browser/targets.js"
 import { BrowserSession } from "../src/browser/session.js";
 import { ProfileLoader, loadEnvironmentBinding } from "../src/testing/profiles.js";
 import { discoverAdminDashboard } from "../src/testing/adminDashboardDiscovery.js";
+import { RunStateStore } from "../src/testing/runState.js";
 import { verifyObservedUrl } from "../src/environments/model.js";
 
 const args = process.argv.slice(2);
@@ -60,14 +61,18 @@ async function main() {
   }
 
   const target = await resolveAuthorizedTarget(endpoint, selected.id, targetId);
-  const session = await new BrowserSession(target).attach();
+  const runStateStore = new RunStateStore(join(root, ".activetab", "runs"));
+  await runStateStore.init();
+  let session;
   const controller = new AbortController();
   const onSignal = () => controller.abort();
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
   try {
+    session = await new BrowserSession(target).attach();
     const report = await discoverAdminDashboard({
       session,
+      runStateStore,
       environment,
       profile,
       areas,
@@ -87,9 +92,10 @@ async function main() {
     for (const limitation of report.limitations ?? []) console.log("Limitation: " + limitation);
     process.exitCode = report.status === "COMPLETE" ? 0 : report.status === "BLOCKED" ? 2 : 1;
   } finally {
+    runStateStore.close();
     process.removeListener("SIGINT", onSignal);
     process.removeListener("SIGTERM", onSignal);
-    await session.close().catch(() => {});
+    await session?.close().catch(() => {});
   }
 }
 

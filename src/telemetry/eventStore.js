@@ -129,6 +129,38 @@ export class DecisionEventStore {
     }
   }
 
+  reserveInferenceAttempt({ runId, taskCode, maxAttempts = 4 } = {}) {
+    if (!isSafeTelemetryCode(runId, { maxLength: 96 }) || !isSafeTelemetryCode(taskCode, { maxLength: 64 })) {
+      throw new Error("Inference reservation requires bounded run and task identifiers.");
+    }
+    if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 4) throw new Error("Inference attempt budget must be between 1 and 4.");
+    const episode = this.getLatestEpisodeForRun(runId);
+    if (!episode) throw new Error("Inference attempts require a durable decision episode for this run.");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const count = this.db.prepare("SELECT COUNT(*) AS count FROM decision_events WHERE episode_id = ? AND event_type = 'inference.attempted'").get(episode.episode_id).count;
+      if (count >= maxAttempts) {
+        this.db.exec("ROLLBACK");
+        return Object.freeze({ allowed: false, attempts: count, maxAttempts });
+      }
+      const event = createDecisionEvent({
+        episodeId: episode.episode_id,
+        runId,
+        stepId: "inference_budget",
+        decisionId: randomUUID(),
+        eventType: "inference.attempted",
+        trainingEligibility: TRAINING_ELIGIBILITY.PENDING,
+        payload: { taskCode, attemptNumber: count + 1, maxAttempts }
+      });
+      const stored = this.#appendInTransaction(event);
+      this.db.exec("COMMIT");
+      return Object.freeze({ allowed: true, attempts: count + 1, maxAttempts, eventId: stored.eventId });
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   async approveTrainingLabel({ episodeId, runId, labelEventId }) {
     if (typeof this.#authenticateTrainingApprover !== "function") throw new Error("Training-label export requires an independently authenticated reviewer.");
     const events = this.getEvents(episodeId);
@@ -213,6 +245,53 @@ export class DecisionEventStore {
   listEpisodes({ limit = 1000 } = {}) {
     const bounded = Math.max(1, Math.min(10_000, Number.isInteger(limit) ? limit : 1000));
     return this.db.prepare("SELECT * FROM episodes ORDER BY created_at, episode_id LIMIT ?").all(bounded);
+  }
+
+  listQualificationCandidates({ applicationId, environmentClass, principalId, providerId, limit = 100 } = {}) {
+    for (const [field, value] of Object.entries({ applicationId, environmentClass, principalId, providerId })) {
+      if (!isSafeTelemetryCode(value, { maxLength: 96 })) throw new Error(`Qualification candidate lookup requires a bounded ${field} scope.`);
+    }
+    const bounded = Math.max(1, Math.min(500, Number.isInteger(limit) ? limit : 100));
+    const rows = this.db.prepare(`
+      SELECT completed.*, episodes.application_id, episodes.environment_class,
+        started.payload_json AS started_payload, started.event_id AS started_event_id
+      FROM decision_events AS completed
+      JOIN episodes ON episodes.episode_id = completed.episode_id AND episodes.run_id = completed.run_id
+      JOIN decision_events AS started ON started.event_id = completed.parent_event_id
+        AND started.episode_id = completed.episode_id AND started.event_type = 'qualification.started'
+      WHERE completed.event_type = 'qualification.completed'
+        AND episodes.application_id = ? AND episodes.environment_class = ?
+        AND json_extract(started.payload_json, '$.principalId') = ?
+        AND json_extract(started.payload_json, '$.providerId') = ?
+      ORDER BY completed.occurred_at DESC, completed.episode_id DESC LIMIT ?
+    `).all(applicationId, environmentClass, principalId, providerId, bounded);
+    const candidates = [];
+    for (const row of rows) {
+      const outcome = JSON.parse(row.payload_json);
+      const proposal = JSON.parse(row.started_payload);
+      if (outcome.qualificationStatus !== "qualified" || proposal.principalId !== principalId
+        || proposal.providerId !== providerId || outcome.principalId !== principalId
+        || outcome.providerId !== providerId || outcome.qualificationId !== proposal.qualificationId
+        || outcome.strategyFingerprint !== proposal.strategyFingerprint || outcome.scenarioId !== proposal.scenarioId) continue;
+      candidates.push(Object.freeze({
+        state: "candidate",
+        qualificationId: outcome.qualificationId,
+        strategyFingerprint: outcome.strategyFingerprint,
+        applicationId: row.application_id,
+        environmentClass: row.environment_class,
+        principalId,
+        providerId,
+        scenarioId: outcome.scenarioId,
+        episodeId: row.episode_id,
+        runId: row.run_id,
+        sourceEventIds: proposal.sourceEventIds,
+        evidenceRefs: outcome.evidenceRefs,
+        qualifiedAt: row.occurred_at,
+        trainingEligibility: TRAINING_ELIGIBILITY.PENDING
+      }));
+      if (candidates.length >= bounded) break;
+    }
+    return candidates;
   }
 
   getEvents(episodeId) {

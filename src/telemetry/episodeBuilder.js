@@ -6,6 +6,27 @@ export function buildEpisode(store, episodeId) {
   if (!episode) return null;
   const events = store.getEvents(episodeId);
   const eventById = new Map(events.map(event => [event.eventId, event]));
+  const qualifications = events.filter(event => event.eventType === "qualification.completed").map(completed => {
+    const started = eventById.get(completed.parentEventId);
+    if (!started || started.eventType !== "qualification.started"
+      || started.payload.qualificationId !== completed.payload.qualificationId
+      || started.decisionId !== completed.decisionId) return null;
+    return {
+      qualificationId: completed.payload.qualificationId,
+      automationRunId: completed.payload.automationRunId,
+      scenarioId: completed.payload.scenarioId,
+      providerId: completed.payload.providerId,
+      trigger: completed.payload.trigger,
+      strategyFingerprint: completed.payload.strategyFingerprint,
+      status: completed.payload.qualificationStatus,
+      reasonCode: completed.payload.reasonCode,
+      sourceEventIds: started.payload.sourceEventIds,
+      evidenceRefs: completed.payload.evidenceRefs,
+      eventIds: [started.eventId, completed.eventId],
+      knowledgeState: completed.payload.qualificationStatus === "qualified" ? "candidate" : "not_reusable",
+      trainingEligibility: "pending"
+    };
+  }).filter(Boolean);
   const decisionPredictions = events.filter(event => ["decision.predicted", "semantic.annotated"].includes(event.eventType) && event.decisionId);
   const decisions = decisionPredictions.map(prediction => {
     // Use only explicit model-input references. The surrounding event prefix
@@ -73,7 +94,8 @@ export function buildEpisode(store, episodeId) {
     eventCount: events.length,
     integrity: store.verifyEpisodeChain(episodeId),
     events: events.map(projectTrainingEvent),
-    decisions
+    decisions,
+    qualifications
   };
 }
 

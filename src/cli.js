@@ -12,6 +12,8 @@ import { ProfileLoader } from "./testing/profiles.js";
 import { buildEnvironmentBinding } from "./environments/model.js";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
+import { RunStateStore, withTargetExecutionLease } from "./testing/runState.js";
 
 const args = process.argv.slice(2);
 const command = args[0] ?? "help";
@@ -57,6 +59,9 @@ if (!targetId) throw new Error("--target is required.");
 let connection;
 let session;
 let decisionRuntime;
+const runStateStore = command === "run" || command === "resume"
+  ? new RunStateStore(resolve(process.env.ACTIVETAB_RUN_STATE_DIR ?? ".activetab/runs"))
+  : null;
 try {
   if (autoConnect) connection = await connectChromeAuto({ ...(userDataDir ? { userDataDir } : {}) });
   const targets = connection ? await listChromeTargets(connection) : await listTargets(endpoint);
@@ -75,17 +80,22 @@ try {
     : await resolveAuthorizedTarget(endpoint, targetId, targetId);
   if (resumeState && resumeState.endpoint !== "local-cdp" && resumeState.endpoint !== resolved.endpoint) throw new Error("The task journal belongs to a different CDP endpoint.");
   session = await new BrowserSession(resolved).attach();
-  if (command === "run" || command === "resume") decisionRuntime = createDecisionRuntime();
+  if (runStateStore) {
+    await runStateStore.init();
+    decisionRuntime = createDecisionRuntime();
+  }
   if (command === "observe") print(await session.observe({ includeRawInResponse: true }));
   else if (command === "run") {
     const goal = arg("--goal");
     if (!goal) throw new Error("--goal is required.");
     const taskJournal = journal ?? new TaskJournal(`.activetab/${targetId}.json`);
-    const result = await new NavigationEngine(session, { journal: taskJournal, workflowStore, decisionRuntime, environment, executionMode: "standalone", plannerMode: arg("--planner-mode") ?? "deterministic" }).run(goal);
+    const result = await withTargetExecutionLease(runStateStore, session, `cli-run-${randomUUID()}`, lease =>
+      new NavigationEngine(session, { journal: taskJournal, workflowStore, decisionRuntime, environment, executionMode: "standalone", plannerMode: arg("--planner-mode") ?? "deterministic", assertExecutionLease: lease.assertCurrent }).run(goal));
     print(result);
     if (result.status !== "succeeded") process.exitCode = 2;
   } else if (command === "resume") {
-    const result = await new NavigationEngine(session, { journal, workflowStore, decisionRuntime, environment, executionMode: "standalone", plannerMode: arg("--planner-mode") ?? "deterministic" }).run(resumedGoal, { resumeState });
+    const result = await withTargetExecutionLease(runStateStore, session, `cli-resume-${randomUUID()}`, lease =>
+      new NavigationEngine(session, { journal, workflowStore, decisionRuntime, environment, executionMode: "standalone", plannerMode: arg("--planner-mode") ?? "deterministic", assertExecutionLease: lease.assertCurrent }).run(resumedGoal, { resumeState }));
     print(result);
     if (result.status !== "succeeded") process.exitCode = 2;
   } else throw new Error(`Unknown command: ${command}`);

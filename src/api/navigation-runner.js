@@ -21,6 +21,7 @@ import { generateOutputFiles } from "./output-files.js";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { withTargetExecutionLease } from "../testing/runState.js";
 
 function abortedMarker(signal) {
   if (!signal?.aborted) return null;
@@ -68,7 +69,7 @@ export function createNavigationRunner({
      * @param {object} [context.inputSchema] - Template input schema (for redacted exports)
      * @param {boolean} [context.ownerAuthorizedExport] - Run owner explicitly authorized a full export
      */
-    async run(goal, { signal, input, templateId, taskId: providedTaskId, inputSchema, ownerAuthorizedExport, plannerMode } = {}) {
+    async run(goal, { signal, input, templateId, taskId: providedTaskId, inputSchema, ownerAuthorizedExport, plannerMode, workflowIntent, runStateStore = null } = {}) {
       let abortError = abortedMarker(signal);
 
       let session;
@@ -88,18 +89,20 @@ export function createNavigationRunner({
         const journalPath = join(journalDir, `${taskId}.json`);
         const journal = new TaskJournal(journalPath);
 
-        const engine = new NavigationEngine(session, {
-          executionMode: engineOptions.executionMode ?? "standalone",
-          plannerMode: plannerMode ?? engineOptions.plannerMode ?? "deterministic",
-          journal,
-          maxActions: engineOptions.maxActions ?? 8,
-          maxRecoveries: engineOptions.maxRecoveries ?? 1,
-          maxScrolls: engineOptions.maxScrolls ?? 5,
-          signal,
-          ...engineOptions
+        const result = await withTargetExecutionLease(runStateStore, session, `api-navigation-${taskId}`, async lease => {
+          const engine = new NavigationEngine(session, {
+            executionMode: engineOptions.executionMode ?? "standalone",
+            plannerMode: plannerMode ?? engineOptions.plannerMode ?? "deterministic",
+            journal,
+            maxActions: engineOptions.maxActions ?? 8,
+            maxRecoveries: engineOptions.maxRecoveries ?? 1,
+            maxScrolls: engineOptions.maxScrolls ?? 5,
+            signal,
+            ...engineOptions,
+            assertExecutionLease: lease.assertCurrent
+          });
+          return await engine.run(goal, { workflowIntent });
         });
-
-        const result = await engine.run(goal);
         abortError ??= abortedMarker(signal);
         if (abortError) throw abortError;
 

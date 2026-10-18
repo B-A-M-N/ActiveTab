@@ -20,6 +20,7 @@ import { NavigationEngine } from "../src/navigation/engine.js";
 import { TaskJournal } from "../src/state/journal.js";
 import { createApiServer } from "../src/api/local-server.js";
 import { generateOutputFiles } from "../src/api/output-files.js";
+import { acquireBrowserTargetLease } from "../src/testing/runState.js";
 
 const chromePath = process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
 const fixture = await readFile(new URL("./fixtures/navigation.html", import.meta.url));
@@ -27,7 +28,7 @@ const sameFrameFixture = await readFile(new URL("./fixtures/same-frame.html", im
 
 function createRealRunner({ journalDir, outputDir }) {
   return {
-    async run(goal, { signal, input, templateId, taskId } = {}) {
+    async run(goal, { signal, input, templateId, taskId, runStateStore } = {}) {
       if (signal?.aborted) return { status: "canceled" };
       const startedAtMs = Date.now();
 
@@ -145,8 +146,19 @@ function createRealRunner({ journalDir, outputDir }) {
                 : { allowed: false, reason: "The test capability is limited to the fresh Open archive button on its own fixture." };
             }
           };
-          const engine = new NavigationEngine(session, { journal, maxActions: 3, operationAuthorizer: fixtureButtonAuthorizer });
-          const navResult = await engine.run(goal);
+          const targetLease = await acquireBrowserTargetLease(runStateStore, session, taskId);
+          let navResult;
+          try {
+            const engine = new NavigationEngine(session, {
+              journal,
+              maxActions: 3,
+              operationAuthorizer: fixtureButtonAuthorizer,
+              assertExecutionLease: targetLease.assertCurrent
+            });
+            navResult = await engine.run(goal);
+          } finally {
+            await targetLease.release();
+          }
           console.log(`[CDP Test] Result: ${navResult.status} attempts=${navResult.attempts}`);
 
           if (signal?.aborted) return { status: "canceled" };

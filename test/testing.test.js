@@ -9,6 +9,7 @@ import { TestReceipt, deriveRunStatus } from "../src/testing/receipts.js";
 import { RUN_STATUS } from "../src/testing/schema.js";
 import { TestRunner } from "../src/testing/runner.js";
 import { RunStateStore } from "../src/testing/runState.js";
+import { createRunStateFixture } from "./runStateFixture.js";
 
 test("schema validates workflow structure", () => {
   assert.equal(validateWorkflow(null).valid, false);
@@ -140,6 +141,8 @@ test("uncertain dispatched step stays uncertain until independent evidence recon
 });
 
 test("runner executes navigate + assert + cleanup", async t => {
+  const runState = await createRunStateFixture();
+  t.after(() => runState.cleanup());
   let navigateCalled = false;
   const mockSession = {
     target: { id: "fixture-target", url: "http://fixture.local/" },
@@ -157,6 +160,7 @@ test("runner executes navigate + assert + cleanup", async t => {
   };
   const runner = new TestRunner({
     session: mockSession,
+    runStateStore: runState.store,
     environment: { environmentId: "fixture-local", authorizedOrigins: ["http://fixture.local"] }
   });
   const receipt = await runner.run({
@@ -186,7 +190,9 @@ test("runner blocks unsupported step types and records reason", async () => {
   assert.equal(receipt.steps[0].status, "BLOCKED");
 });
 
-test("runner preserves a possibly dispatched browser error as UNCERTAIN", async () => {
+test("runner preserves a possibly dispatched browser error as UNCERTAIN", async t => {
+  const runState = await createRunStateFixture();
+  t.after(() => runState.cleanup());
   const candidate = { identity: "tab-settings", targetId: "fixture-target", documentGeneration: 1, backendNodeId: 22, name: "Settings", role: "tab", tag: "button", visible: true, disabled: false };
   const session = {
     target: { id: "fixture-target", url: "http://fixture.local/" },
@@ -198,6 +204,7 @@ test("runner preserves a possibly dispatched browser error as UNCERTAIN", async 
   };
   const receipt = await new TestRunner({
     session,
+    runStateStore: runState.store,
     environment: { environmentId: "fixture-local", authorizedOrigins: ["http://fixture.local"] }
   }).run({
     id: "wf-uncertain-dispatch",
@@ -297,6 +304,71 @@ test("durable DAG resume reconciles an uncertain dispatch, preserves workflow bi
   }
 });
 
+test("a competing run is refused before it can control an already leased browser target", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "activetab-target-lease-runner-"));
+  try {
+    const store = new RunStateStore(dir);
+    await store.init();
+    const otherStore = new RunStateStore(dir);
+    await otherStore.init();
+    let enteredObservation;
+    let releaseObservation;
+    const observationEntered = new Promise(resolve => { enteredObservation = resolve; });
+    const observationGate = new Promise(resolve => { releaseObservation = resolve; });
+    let dispatchCount = 0;
+    let firstObservation = true;
+    let currentUrl = "http://fixture.local/";
+    const session = {
+      target: { id: "one-shared-target", url: "http://fixture.local/" },
+      attached: true,
+      async observe() {
+        if (firstObservation) {
+          firstObservation = false;
+          enteredObservation();
+          await observationGate;
+        }
+        return {
+          targetId: "one-shared-target",
+          documentGeneration: 1,
+          page: { url: currentUrl, title: "Fixture" },
+          candidates: [],
+          evidenceId: `target-lease-${dispatchCount}`,
+          pageChangeFingerprint: `state-${dispatchCount}`
+        };
+      },
+      client: { async send(_method, params) { dispatchCount++; currentUrl = params.url; } },
+      async waitForChange() {}
+    };
+    const workflow = { id: "target-lease-flow", name: "Target lease flow", steps: [{ id: "navigate", type: "navigate", url: "http://fixture.local/next" }] };
+    const firstRun = new TestRunner({
+      session,
+      environment: { environmentId: "fixture-local", authorizedOrigins: ["http://fixture.local"] },
+      runStateStore: store
+    }).run(workflow, { runId: "target-lease-run-one" });
+    await observationEntered;
+
+    await assert.rejects(
+      () => new TestRunner({
+        session,
+        environment: { environmentId: "fixture-local", authorizedOrigins: ["http://fixture.local"] },
+        runStateStore: otherStore
+      }).run(workflow, { runId: "target-lease-run-two" }),
+      error => error.code === "RUN_TARGET_LEASE_HELD"
+    );
+    assert.equal(dispatchCount, 0, "The competing run must not dispatch while the target is leased.");
+
+    releaseObservation();
+    const receipt = await firstRun;
+    assert.equal(receipt.status, RUN_STATUS.PASSED);
+    assert.equal(dispatchCount, 1);
+    const durable = await store.getFresh(receipt.runId);
+    assert.ok(durable.target.fencingToken > 0);
+    assert.equal(durable.pendingOperations[0].targetFencingToken, durable.target.fencingToken);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("a durable cancellation from another store stops the DAG before its next dispatch", async () => {
   const dir = await mkdtemp(join(tmpdir(), "activetab-dag-cancel-"));
   try {
@@ -344,7 +416,9 @@ test("a durable cancellation from another store stops the DAG before its next di
   }
 });
 
-test("scoped variables feed exact operation inputs without appearing in receipts", async () => {
+test("scoped variables feed exact operation inputs without appearing in receipts", async t => {
+  const runState = await createRunStateFixture();
+  t.after(() => runState.cleanup());
   const candidate = { identity: "task-input", targetId: "fixture-target", documentGeneration: 1, backendNodeId: 31, name: "Task", role: "textbox", tag: "textarea", visible: true, disabled: false };
   let enteredValue = null;
   const session = {
@@ -356,6 +430,7 @@ test("scoped variables feed exact operation inputs without appearing in receipts
   };
   const runner = new TestRunner({
     session,
+    runStateStore: runState.store,
     environment: { environmentId: "fixture-local", authorizedOrigins: ["http://fixture.local"] },
     operationAuthorizer: { async authorize() { return { allowed: true }; } }
   });
@@ -386,7 +461,9 @@ test("bounded repeat stops at the first verified condition and records iteration
   assert.ok(receipt.steps.some(step => step.status === STEP_STATUS.PASS));
 });
 
-test("trusted reusable subworkflows receive explicit inputs and return allowlisted variables", async () => {
+test("trusted reusable subworkflows receive explicit inputs and return allowlisted variables", async t => {
+  const runState = await createRunStateFixture();
+  t.after(() => runState.cleanup());
   const candidate = { identity: "task-input", targetId: "fixture-target", documentGeneration: 1, backendNodeId: 32, name: "Task", role: "textbox", tag: "textarea", visible: true, disabled: false };
   let enteredValue = null;
   const session = {
@@ -402,6 +479,7 @@ test("trusted reusable subworkflows receive explicit inputs and return allowlist
   };
   const runner = new TestRunner({
     session,
+    runStateStore: runState.store,
     environment: { environmentId: "fixture-local", authorizedOrigins: ["http://fixture.local"] },
     workflowRegistry: new Map([[child.id, child]]),
     operationAuthorizer: { async authorize() { return { allowed: true }; } }

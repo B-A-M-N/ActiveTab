@@ -32,7 +32,7 @@ function isSafeToNavigate(control) {
 }
 
 export class ApplicationDiscoveryEngine {
-  constructor({ session, maxSteps = 8, maxLinksPerStep = 4, signal, knowledgeDir = null, environment = null, decisionRuntime = null, onAuthorizationBoundary = null } = {}) {
+  constructor({ session, maxSteps = 8, maxLinksPerStep = 4, signal, knowledgeDir = null, environment = null, decisionRuntime = null, onAuthorizationBoundary = null, assertExecutionLease = null } = {}) {
     this.session = session;
     this.maxSteps = Math.max(1, Math.min(maxSteps, MAX_DISCOVERY_STEPS));
     this.maxLinksPerStep = Math.max(1, Math.min(maxLinksPerStep, MAX_LINKS_PER_STEP));
@@ -44,6 +44,7 @@ export class ApplicationDiscoveryEngine {
     this.environment = environment;
     this.decisionRuntime = decisionRuntime;
     this.onAuthorizationBoundary = onAuthorizationBoundary;
+    this.assertExecutionLease = assertExecutionLease;
     this.discoveries = [];
     this.visitedUrls = new Set();
     this.capabilityMap = null;
@@ -52,6 +53,9 @@ export class ApplicationDiscoveryEngine {
 
   async discover() {
     if (!this.session) throw new Error("ApplicationDiscoveryEngine requires a browser session.");
+    if (this.session.attached === true && this.session.target?.id && typeof this.assertExecutionLease !== "function") {
+      throw new Error("Application discovery requires a durable browser target execution lease.");
+    }
     let observation = await this.session.observe();
     if (!observation?.page?.url) throw new Error("Initial observation did not return a page URL.");
 
@@ -214,6 +218,7 @@ export class ApplicationDiscoveryEngine {
           const dispatch = await executeAuthorizedAction({
             session: this.session,
             environment: this.environment,
+            assertExecutionLease: this.assertExecutionLease,
             // Follow the observed link through the exact candidate and the
             // central executor. Page.navigate would discard link identity
             // and could turn untrusted page content into a URL command.

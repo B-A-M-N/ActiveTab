@@ -13,6 +13,7 @@ import { listTargets, resolveAuthorizedTarget } from "../src/browser/targets.js"
 import { BrowserSession } from "../src/browser/session.js";
 import { ProfileLoader, loadEnvironmentBinding } from "../src/testing/profiles.js";
 import { discoverStagingDashboard } from "../src/testing/stagingDashboardDiscovery.js";
+import { RunStateStore, withTargetExecutionLease } from "../src/testing/runState.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const profileId = process.argv.slice(2).find(value => value.startsWith("--profile="))?.slice(10) ?? "freeinference-staging";
@@ -34,9 +35,13 @@ async function main() {
   if (!selected) throw new Error("The explicitly authorized browser target is unavailable at the configured CDP endpoint.");
 
   const target = await resolveAuthorizedTarget(endpoint, selected.id, targetId);
-  const session = await new BrowserSession(target).attach();
+  const runStateStore = new RunStateStore(join(root, ".activetab", "runs"));
+  await runStateStore.init();
+  let session;
   try {
-    const report = await discoverStagingDashboard({ session, environment, profile });
+    session = await new BrowserSession(target).attach();
+    const report = await withTargetExecutionLease(runStateStore, session, `dashboard-discovery-${randomUUID()}`, () =>
+      discoverStagingDashboard({ session, environment, profile }));
     report.generatedAt = new Date().toISOString();
     report.target = { targetId: selected.id };
 
@@ -54,7 +59,8 @@ async function main() {
     for (const limitation of report.limitations ?? []) console.log(`Limitation: ${limitation}`);
     process.exitCode = report.status === "COMPLETE" ? 0 : report.status === "BLOCKED" ? 2 : 1;
   } finally {
-    await session.close().catch(() => {});
+    runStateStore.close();
+    await session?.close().catch(() => {});
   }
 }
 

@@ -31,3 +31,18 @@ export const OUTCOME_ANOMALY_QUESTION = Object.freeze({
     unexpected_state: "The observed state does not fit the other categories."
   })
 });
+
+export const WORKFLOW_PLAN_QUESTIONS = Object.freeze({
+  plan_coherence: Object.freeze({
+    type: "noul",
+    instructions: "Does the supplied bounded workflow have a coherent dependency order for its declared operation roles? Judge only the structural projection; do not infer missing steps from page content."
+  }),
+  plan_verifiability: Object.freeze({
+    type: "noul",
+    instructions: "Does each declared operation include an explicit verification contract before later dependent operations proceed? A dispatch acknowledgment is not verification."
+  }),
+  plan_boundary_alignment: Object.freeze({
+    type: "noul",
+    instructions: "Are effects that require approval explicitly marked, with no unknown-effect operation presented as routine? This is an advisory review and never grants authority."
+  })
+});

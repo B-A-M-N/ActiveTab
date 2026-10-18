@@ -4,14 +4,16 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { RunStateStore, requestRunCancellation } from "../src/testing/runState.js";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { RunStateStore, requestRunCancellation, acquireBrowserTargetLease, browserTargetLeaseId } from "../src/testing/runState.js";
 import { TaskStore, TERMINAL_STATUSES, SUSPENDED_STATUSES } from "../src/api/task-store.js";
 
 async function withRunState(fn) {
   const dir = await mkdtemp(join(tmpdir(), "activetab-runs-"));
   const store = new RunStateStore(dir);
   await store.init();
-  try { return await fn(store, dir); } finally { await rm(dir, { recursive: true, force: true }); }
+  try { return await fn(store, dir); } finally { store.close(); await rm(dir, { recursive: true, force: true }); }
 }
 
 test("suspended runs survive restarts and are never auto-failed", () =>
@@ -79,6 +81,47 @@ test("one durable run has a single execution owner across store instances", () =
     await release();
     const releaseAfterOwnerExit = await other.acquireExecutionLease("exclusive-run");
     await releaseAfterOwnerExit();
+  }));
+
+test("different runs cannot control the same browser target concurrently and fencing advances", () =>
+  withRunState(async (store, dir) => {
+    const other = new RunStateStore(dir);
+    await other.init();
+    const first = await store.acquireTargetLease("target-shared", "run-one");
+    await assert.rejects(
+      () => other.acquireTargetLease("target-shared", "run-two"),
+      error => error.code === "RUN_TARGET_LEASE_HELD"
+    );
+    await first.assertCurrent();
+    await first.release();
+
+    const second = await other.acquireTargetLease("target-shared", "run-two");
+    assert.ok(second.fencingToken > first.fencingToken);
+    await assert.rejects(() => first.assertCurrent(), error => error.code === "RUN_TARGET_LEASE_LOST");
+    await second.release();
+  }));
+
+test("target leases refuse a competing process and can be acquired after release", () =>
+  withRunState(async (store, dir) => {
+    const targetId = "cross-process-target";
+    const childScript = fileURLToPath(new URL("../scripts/targetLeaseChild.js", import.meta.url));
+    const first = await store.acquireTargetLease(targetId, "parent-run");
+    const refused = spawnSync(process.execPath, [childScript, dir, targetId, "child-run"], { encoding: "utf8" });
+    assert.equal(refused.status, 23, refused.stderr || refused.stdout);
+    await first.release();
+
+    const acquired = spawnSync(process.execPath, [childScript, dir, targetId, "child-run"], { encoding: "utf8" });
+    assert.equal(acquired.status, 0, acquired.stderr || acquired.stdout);
+  }));
+
+test("browser target lease is bound to the attached endpoint and target identity", () =>
+  withRunState(async store => {
+    const session = { attached: true, target: { id: "tab-original", endpoint: "http://127.0.0.1:9222" } };
+    const lease = await acquireBrowserTargetLease(store, session, "identity-bound-run");
+    assert.notEqual(browserTargetLeaseId(session.target), browserTargetLeaseId({ id: session.target.id, endpoint: "http://127.0.0.1:9223" }));
+    session.target = { id: "tab-substituted", endpoint: "http://127.0.0.1:9222" };
+    await assert.rejects(() => lease.assertCurrent(), error => error.code === "RUN_TARGET_LEASE_LOST");
+    await lease.release();
   }));
 
 test("cancellation remains available from durable run state after the worker cache is gone", () =>

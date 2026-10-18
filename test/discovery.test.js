@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { ApplicationCapabilityMap, RELATIONSHIP_STRENGTH } from "../src/discovery/capabilityMap.js";
 import { ApplicationDiscoveryEngine } from "../src/discovery/engine.js";
 
+const fixtureLease = async () => {};
+
 test("capabilityMap records pages, controls, and network operations", () => {
   const map = new ApplicationCapabilityMap({ applicationId: "http://app.test", origin: "http://app.test" });
   map.recordObservation({
@@ -64,6 +66,18 @@ test("capabilityMap toObject serializes with evidence", () => {
 test("discovery engine requires a session", async () => {
   const engine = new ApplicationDiscoveryEngine({ session: null });
   await assert.rejects(() => engine.discover(), /requires a browser session/);
+});
+
+test("attached-target discovery refuses before observing when no durable lease is supplied", async () => {
+  let observations = 0;
+  const session = {
+    target: { id: "attached-discovery-target", endpoint: "local-cdp" },
+    attached: true,
+    async observe() { observations++; return { page: { url: "http://fixture.local/" }, candidates: [] }; }
+  };
+  const engine = new ApplicationDiscoveryEngine({ session });
+  await assert.rejects(() => engine.discover(), /durable browser target execution lease/);
+  assert.equal(observations, 0);
 });
 
 test("discovery engine performs passive observation and records the initial page", async () => {
@@ -130,7 +144,7 @@ test("discovery engine navigates safe same-origin links", async () => {
     async click() { navigationCount++; },
     async waitForChange() {}
   };
-  const engine = new ApplicationDiscoveryEngine({ session: mockSession, maxSteps: 3, maxLinksPerStep: 2 });
+  const engine = new ApplicationDiscoveryEngine({ session: mockSession, maxSteps: 3, maxLinksPerStep: 2, assertExecutionLease: fixtureLease });
   const result = await engine.discover();
   assert.ok(result.discoveries.some(d => d.type === "navigated" && d.to === "http://fixture.local/archive"));
   assert.ok(result.capabilityMap.pages.some(p => p.url === "http://fixture.local/archive"));

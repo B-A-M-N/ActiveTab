@@ -189,7 +189,7 @@ export class SemanticPageAnalyzer {
         ? await this.provider.requestStructured({ task: "map_controls", instructions: SYSTEM_INSTRUCTIONS, input, schema: SEMANTIC_OUTPUT_SCHEMA, signal })
         : await this.provider.decide(messages, { signal });
     } catch (error) {
-      const failureCode = ["configuration", "privacy", "timeout", "transport", "http", "schema", "response_too_large", "refusal"].includes(error?.kind) ? error.kind : "unknown";
+      const failureCode = ["configuration", "privacy", "timeout", "transport", "http", "schema", "response_too_large", "refusal", "budget_exhausted"].includes(error?.kind) ? error.kind : "unknown";
       for (const semanticRole of roles) {
         this.eventStore.append({
           episodeId, runId, stepId, decisionId, observationId: observation.evidenceId,

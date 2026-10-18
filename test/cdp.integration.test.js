@@ -9,9 +9,11 @@ import { once } from "node:events";
 import { listTargets, resolveAuthorizedTarget } from "../src/browser/targets.js";
 import { connectChromeAuto, listChromeTargets, resolveChromeTarget } from "../src/browser/chrome-autoconnect.js";
 import { BrowserSession } from "../src/browser/session.js";
-import { NavigationEngine } from "../src/navigation/engine.js";
+import { FixtureNavigationEngine as NavigationEngine } from "../test-support/fixtureNavigationEngine.js";
 import { clickObservedElement } from "../src/navigation/observedAction.js";
 import { TaskJournal } from "../src/state/journal.js";
+
+const fixtureLease = async () => {};
 
 const chromePath = process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
 const fixture = await readFile(new URL("./fixtures/navigation.html", import.meta.url));
@@ -175,7 +177,7 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     const selectedBillingControl = sectionChoices.find(candidate => candidate.contextName === "Billing history");
     const callerScreenshot = session.observer.getEvidence(first.evidenceId, { facets: ["page"], includeScreenshot: true });
     assert.equal(typeof callerScreenshot.screenshotBase64, "string", "the caller can retrieve visual evidence locally before choosing an identity");
-    const callerAction = await clickObservedElement(session, { goal: "Open the billing history page", evidenceId: first.evidenceId, backendNodeId: selectedBillingControl.backendNodeId });
+    const callerAction = await clickObservedElement(session, { goal: "Open the billing history page", evidenceId: first.evidenceId, backendNodeId: selectedBillingControl.backendNodeId, assertExecutionLease: fixtureLease });
     assert.equal(callerAction.status, "action_dispatched");
     assert.equal(callerAction.verificationRequired, true);
     assert.equal(callerAction.observation.page.title, "Billing history", "a caller can verify the result from the fresh post-action observation");
@@ -197,7 +199,8 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
       goal: "Continue",
       evidenceId: ambiguousRun.targetResolution.evidenceId,
       backendNodeId: selectedAmbiguousCandidate.backendNodeId,
-      frameTargetId: selectedAmbiguousCandidate.frameTargetId ?? null
+      frameTargetId: selectedAmbiguousCandidate.frameTargetId ?? null,
+      assertExecutionLease: fixtureLease
     });
     assert.equal(resolvedCallerAction.status, "action_dispatched");
     assert.equal(resolvedCallerAction.observation.page.title, "Primary route", "the selected handle is revalidated and the caller can verify the resulting route");
@@ -274,7 +277,7 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
         await click(candidate);
         if (candidate.name === "Open account") process.exit(73);
       };
-      await new NavigationEngine(session, { journal: new TaskJournal(process.env.ACTIVETAB_CRASH_JOURNAL), maxActions: 1, maxRecoveries: 1, planner: new DeterministicPlanner() }).run("Open the account page");
+      await new NavigationEngine(session, { journal: new TaskJournal(process.env.ACTIVETAB_CRASH_JOURNAL), maxActions: 1, maxRecoveries: 1, planner: new DeterministicPlanner(), assertExecutionLease: async () => {} }).run("Open the account page");
       process.exit(74);
     `;
     const crashedProcess = spawnSync(process.execPath, ["--input-type=module", "-e", terminateAfterDispatch], {

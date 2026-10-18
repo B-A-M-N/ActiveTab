@@ -8,7 +8,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { connectChromeAuto, listChromeTargets, resolveChromeTarget } from "../src/browser/chrome-autoconnect.js";
 import { BrowserSession } from "../src/browser/session.js";
-import { NavigationEngine } from "../src/navigation/engine.js";
+import { FixtureNavigationEngine as NavigationEngine } from "../test-support/fixtureNavigationEngine.js";
 
 const chromePath = process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
 

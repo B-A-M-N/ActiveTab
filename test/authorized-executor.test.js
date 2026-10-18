@@ -3,6 +3,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { executeAuthorizedAction } from "../src/runtime/authorizedExecutor.js";
 
+const fixtureLease = async () => {};
+
 function mockSession({ observation = null } = {}) {
   return {
     dispatched: [],
@@ -89,14 +91,14 @@ test("an attached target permits same-origin links but cannot follow them across
   session.target = { id: "tab-1", url: observation.page.url };
   session.attached = true;
 
-  const allowed = await executeAuthorizedAction({ session, action: "click", candidate });
+  const allowed = await executeAuthorizedAction({ session, action: "click", candidate, assertExecutionLease: fixtureLease });
   assert.equal(allowed.dispatched, true);
   assert.deepEqual(session.dispatched, [["click", 9]]);
 
   session.dispatched.length = 0;
   const external = { ...candidate, href: "https://other.example.test/next" };
   session.observe = async () => ({ ...observation, candidates: [external], evidenceId: "e-cross-origin-link" });
-  const refused = await executeAuthorizedAction({ session, action: "click", candidate: external });
+  const refused = await executeAuthorizedAction({ session, action: "click", candidate: external, assertExecutionLease: fixtureLease });
   assert.equal(refused.dispatched, false);
   assert.equal(refused.category, "navigation_target_untrusted");
   assert.deepEqual(session.dispatched, []);
@@ -121,6 +123,7 @@ test("a trusted typed contract is checked even when generic policy allows the co
     session,
     action: "click",
     candidate,
+    assertExecutionLease: fixtureLease,
     operationId: "registered-settings-step",
     operationAuthorizer: { async authorize() { authorizations++; return { allowed: false, reason: "The registered workflow does not include this control." }; } }
   });
@@ -141,6 +144,7 @@ test("a typed operation contract cannot override a hard policy denial", async ()
     session,
     action: "click",
     candidate,
+    assertExecutionLease: fixtureLease,
     operationId: "registered-settings-step",
     operationAuthorizer: { async authorize() { authorizations++; return { allowed: true }; } }
   });
@@ -161,6 +165,7 @@ test("the page and exact candidate are revalidated after pre-dispatch review", a
     session,
     action: "click",
     candidate,
+    assertExecutionLease: fixtureLease,
     onAdmission: async () => {
       observation = { ...observation, documentGeneration: 2, candidates: [{ ...candidate, documentGeneration: 2, backendNodeId: 18 }], evidenceId: "e-after-review" };
       return { allowed: true };
@@ -181,4 +186,63 @@ test("a CDP error after dispatch begins returns an uncertain outcome", async () 
   assert.equal(result.authorized, true);
   assert.equal(result.dispatched, false);
   assert.equal(result.effectStatus, "uncertain");
+});
+
+test("attached targets refuse dispatch when no durable target lease is supplied", async () => {
+  const candidate = { identity: "settings-tab", targetId: "tab-1", documentGeneration: 1, backendNodeId: 22, name: "Settings", role: "tab", tag: "button", visible: true, disabled: false };
+  const observation = { targetId: "tab-1", documentGeneration: 1, page: { url: "https://app.example.test/", title: "Home" }, candidates: [candidate], evidenceId: "e-no-lease" };
+  const session = mockSession({ observation });
+  session.target = { id: "tab-1", url: observation.page.url };
+  session.attached = true;
+  const result = await executeAuthorizedAction({ session, action: "click", candidate });
+  assert.equal(result.dispatched, false);
+  assert.equal(result.category, "target_lease_unavailable");
+  assert.deepEqual(session.dispatched, []);
+});
+
+test("a lost target lease refuses before any durable reservation or browser effect", async () => {
+  const candidate = { identity: "settings-tab", targetId: "tab-1", documentGeneration: 1, backendNodeId: 20, name: "Settings", role: "tab", tag: "button", visible: true, disabled: false };
+  const observation = { targetId: "tab-1", documentGeneration: 1, page: { url: "https://app.example.test/", title: "Home" }, candidates: [candidate], evidenceId: "e-lost-lease" };
+  const session = mockSession({ observation });
+  session.target = { id: "tab-1", url: observation.page.url };
+  session.attached = true;
+  let reservations = 0;
+  const result = await executeAuthorizedAction({
+    session,
+    action: "click",
+    candidate,
+    assertExecutionLease: async () => { throw new Error("lease expired"); },
+    onReserve: async () => { reservations++; return { allowed: true }; }
+  });
+  assert.equal(result.dispatched, false);
+  assert.equal(result.category, "target_lease_lost");
+  assert.equal(reservations, 0);
+  assert.deepEqual(session.dispatched, []);
+});
+
+test("lease loss after reservation closes the reservation as refused without dispatch", async () => {
+  const candidate = { identity: "settings-tab", targetId: "tab-1", documentGeneration: 1, backendNodeId: 21, name: "Settings", role: "tab", tag: "button", visible: true, disabled: false };
+  const observation = { targetId: "tab-1", documentGeneration: 1, page: { url: "https://app.example.test/", title: "Home" }, candidates: [candidate], evidenceId: "e-lease-after-reserve" };
+  const session = mockSession({ observation });
+  session.target = { id: "tab-1", url: observation.page.url };
+  session.attached = true;
+  let checks = 0;
+  let reserved = false;
+  let dispatchStatus = null;
+  const result = await executeAuthorizedAction({
+    session,
+    action: "click",
+    candidate,
+    assertExecutionLease: async () => {
+      checks++;
+      if (checks > 1) throw new Error("lease expired");
+    },
+    onReserve: async () => { reserved = true; return { allowed: true }; },
+    onDispatch: async ({ dispatchStatus: status }) => { dispatchStatus = status; }
+  });
+  assert.equal(result.dispatched, false);
+  assert.equal(result.category, "target_lease_lost");
+  assert.equal(reserved, true);
+  assert.equal(dispatchStatus, "refused");
+  assert.deepEqual(session.dispatched, []);
 });

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { NavigationEngine } from "../src/navigation/engine.js";
+import { FixtureNavigationEngine as NavigationEngine } from "../test-support/fixtureNavigationEngine.js";
 import { DeterministicPlanner } from "../src/navigation/planner.js";
 import { matchesTargetSignature, targetSignature, WorkflowStore } from "../src/state/workflows.js";
 

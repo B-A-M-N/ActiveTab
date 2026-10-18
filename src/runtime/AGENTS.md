@@ -11,6 +11,8 @@ ActiveTab's authorization architecture. Changes here affect every execution entr
 ## Local Contracts
 
 - No effectful operation bypasses the authorized executor or action policy.
+- An attached browser target must have an active durable endpoint-and-target lease. The executor requires a lease assertion callback and checks it before reservation and again before browser dispatch.
+- Lease ownership is exclusive across local ActiveTab processes. Each takeover advances a fencing token; test-run reservations record the token so stale continuation state cannot authorize a new dispatch.
 - Grants cannot be self-issued; the trusted issuer is configured at construction, not caller-supplied.
 - Grant verification rejects omissions of required scope fields; unknown effects fail closed.
 - Single-use grants are consumed atomically; reusable grants are not consumed on first use.

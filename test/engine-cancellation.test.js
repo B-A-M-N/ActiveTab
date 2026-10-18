@@ -1,18 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { NavigationEngine } from "../src/navigation/engine.js";
+import { FixtureNavigationEngine as NavigationEngine } from "../test-support/fixtureNavigationEngine.js";
 
 /**
  * A scripted fake session: the first observe() reports one candidate; the
  * click() hangs until released, simulating an in-flight CDP operation.
  */
 function makeHangingSession() {
+  let signalClickStarted;
+  const clickStarted = new Promise(resolve => { signalClickStarted = resolve; });
   const evidence = { evidenceId: "ev-0", page: { url: "https://example.test", title: "Home" }, headings: [{ level: 1, text: "Home" }], candidates: [], scrollTargets: [] };
   return {
     target: { id: "t1", endpoint: "test", url: "https://example.test/" },
     attached: true,
     observeCalls: 0,
     releaseClick: null,
+    clickStarted,
     async observe() {
       this.observeCalls++;
       return {
@@ -26,7 +29,10 @@ function makeHangingSession() {
       };
     },
     async click() {
-      await new Promise(resolve => { this.releaseClick = resolve; });
+      await new Promise(resolve => {
+        this.releaseClick = resolve;
+        signalClickStarted();
+      });
     },
     async scroll() { throw new Error("not used"); },
     async typeSearchPhrase() { throw new Error("not used"); },
@@ -53,10 +59,14 @@ test("cancellation during an in-flight action yields canceled with the action pr
     async plan() { return { status: "planned", action: { type: "click", target: { identity: "c1", tag: "button", role: "button", name: "Open settings", visible: true, disabled: false } } }; }
   } });
   const pending = engine.run("Open the settings page");
-  // Let the engine reach the click.
-  await new Promise(r => setTimeout(r, 50));
+  // Synchronize with actual dispatch instead of relying on a timing guess.
+  const clickDidStart = await Promise.race([
+    session.clickStarted.then(() => true),
+    new Promise(resolve => setTimeout(() => resolve(false), 1_000))
+  ]);
+  if (!clickDidStart) assert.fail(`The fixture action did not dispatch: ${JSON.stringify(await pending)}`);
   controller.abort();
-  session.releaseClick?.();
+  session.releaseClick();
   const result = await pending;
   assert.equal(result.status, "canceled", JSON.stringify(result));
   assert.equal(result.uncertain, true, "post-dispatch cancellation preserves uncertainty");

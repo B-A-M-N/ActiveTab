@@ -3,6 +3,22 @@ import { DecisionEventStore } from "../telemetry/eventStore.js";
 import { DecisionCoordinator } from "./decisionCoordinator.js";
 import { JEV_MODEL_ID, JevDecisionClient, JevRequestError } from "./jevClient.js";
 import { createConfiguredSemanticAnalyzer, DEFAULT_SEMANTIC_MODEL } from "../navigation/semanticAnalyzer.js";
+import { InferenceAttemptBudget } from "./inferenceBudget.js";
+import { lstatSync } from "node:fs";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
+
+function defaultJevCredentialFile() {
+  if (process.env.ACTIVETAB_JEV_KEY_FILE) return process.env.ACTIVETAB_JEV_KEY_FILE;
+  const workingDirectoryFile = resolve(process.cwd(), "JEV.txt");
+  try {
+    lstatSync(workingDirectoryFile);
+    return workingDirectoryFile;
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  return resolve(homedir(), "JEV.txt");
+}
 
 /**
  * One process-wide decision runtime shared by browser execution entrypoints.
@@ -22,14 +38,22 @@ export function createDecisionRuntime({
     ...(databasePath ? { databasePath } : {}),
     ...(authenticateTrainingApprover ? { authenticateTrainingApprover } : {})
   });
+  const inferenceBudget = new InferenceAttemptBudget({ eventStore: store });
+  const budgetedFetch = (taskCode, fetchImpl = fetch) => inferenceBudget.wrapFetch(taskCode, fetchImpl);
   let client = jevClient;
   if (!client) {
-    try { client = new JevDecisionClient(jevOptions); }
+    try {
+      client = new JevDecisionClient({
+        ...jevOptions,
+        apiKeyFile: jevOptions?.apiKeyFile ?? defaultJevCredentialFile(),
+        fetchImpl: budgetedFetch("jev_review", jevOptions?.fetchImpl ?? fetch)
+      });
+    }
     catch { client = { async decide() { throw new JevRequestError("configuration", "Jev reviewer configuration is unavailable."); } }; }
   }
   let analyzer = semanticAnalyzer;
   if (semanticAnalyzer === undefined) {
-    try { analyzer = createConfiguredSemanticAnalyzer({ eventStore: store, ...semanticOptions }); }
+    try { analyzer = createConfiguredSemanticAnalyzer({ ...semanticOptions, eventStore: store, fetchImpl: budgetedFetch("semantic_inference", semanticOptions?.fetchImpl ?? fetch) }); }
     catch { analyzer = null; }
   }
   const semanticProviderId = analyzer?.providerId ?? semanticOptions?.providerId ?? process.env.ACTIVETAB_SEMANTIC_PROVIDER_ID ?? "freeinference_production";
@@ -42,6 +66,9 @@ export function createDecisionRuntime({
     jevClient: client,
     semanticAnalyzer: analyzer,
     coordinator,
+    withInferenceBudget({ runId }, callback) { return inferenceBudget.run({ runId }, callback); },
+    budgetedFetch(taskCode, fetchImpl = fetch) { return budgetedFetch(taskCode, fetchImpl); },
+    inferenceBudgetSnapshot(runId) { return inferenceBudget.snapshot(runId); },
     startEpisode({ episodeId, runId, workflowId, applicationId = "unknown", environmentClass = "unknown", executionMode = "agent_directed", policyVersion = "active_policy_v1", workflowKind = "browser_workflow" }) {
       const resumed = episodeId ? store.getEpisode(episodeId) : null;
       if (resumed?.run_id === runId) return { episodeId: resumed.episode_id, runId, resumed: true };
@@ -128,6 +155,15 @@ export function createDecisionRuntime({
       } catch (error) {
         if (!error?.kind) throw error;
         return { decisionId, jevFailureCode: error.kind, reviewer: { provider: "openrouter", model: JEV_MODEL_ID }, authorizesOperation: false };
+      }
+    },
+    async reviewWorkflowPlan(input) {
+      const decisionId = input?.decisionId ?? randomUUID();
+      try {
+        return await coordinator.reviewWorkflowPlan({ ...input, decisionId });
+      } catch (error) {
+        if (!error?.kind) throw error;
+        return { decisionId, status: "unavailable", failureCode: error.kind, authorizesOperation: false };
       }
     },
     recordSemanticUnavailable(input) {

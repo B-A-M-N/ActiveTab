@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { authorizePlannedAction } from "../src/navigation/actionPolicy.js";
 import { clickObservedElement } from "../src/navigation/observedAction.js";
 
+const fixtureLease = async () => {};
+
 test("natural-language goals and control labels never classify effects", () => {
   const button = { name: "Place order", role: "button", tag: "button", visible: true };
   for (const goal of ["Open checkout", "Buy the headphones", "Delete my account"]) {
@@ -64,7 +66,7 @@ test("external visual selection clicks only an identity still present in fresh a
     async observe() { return { evidenceId: "fresh-observation", targetId: "tab-1", page: { url: "https://shop.example.test/", title: "Invoices" }, headings: [], candidates: [selected] }; },
     async click(target) { this.clicks++; assert.equal(target.identity, selected.identity); }
   };
-  const result = await clickObservedElement(session, { goal: "Open the billing history page", evidenceId: "visual-evidence", backendNodeId: 4 });
+  const result = await clickObservedElement(session, { goal: "Open the billing history page", evidenceId: "visual-evidence", backendNodeId: 4, assertExecutionLease: fixtureLease });
   assert.equal(result.status, "action_dispatched");
   assert.equal(result.verificationRequired, true);
   assert.equal(session.clicks, 1);
@@ -80,12 +82,12 @@ test("external visual selection rejects stale identities and never authorizes a 
     async observe() { return { evidenceId: "fresh-observation", targetId: "tab-1", page: { url: "https://shop.example.test/checkout", title: "Checkout" }, headings: [], candidates: [{ ...selected, identity: "new-identity" }] }; },
     async click() { this.clicks++; }
   };
-  const stale = await clickObservedElement(session, { goal: "Buy the item", evidenceId: "old-evidence", backendNodeId: 4 });
+  const stale = await clickObservedElement(session, { goal: "Buy the item", evidenceId: "old-evidence", backendNodeId: 4, assertExecutionLease: fixtureLease });
   assert.equal(stale.status, "stale_target");
   assert.equal(session.clicks, 0);
 
   session.observe = async () => ({ evidenceId: "fresh-checkout", targetId: "tab-1", page: { url: "https://shop.example.test/checkout", title: "Checkout" }, headings: [], candidates: [{ ...selected }] });
-  const blocked = await clickObservedElement(session, { goal: "Submit the approved order", evidenceId: "old-evidence", backendNodeId: 4 });
+  const blocked = await clickObservedElement(session, { goal: "Submit the approved order", evidenceId: "old-evidence", backendNodeId: 4, assertExecutionLease: fixtureLease });
   assert.equal(blocked.status, "needs_human");
   assert.equal(blocked.category, "unclassified_form_submission");
   assert.equal(session.clicks, 0);

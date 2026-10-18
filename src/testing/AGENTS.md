@@ -12,11 +12,16 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 
 - Dispatch, observed effects, and verified postconditions are separate states. An unresolved dispatched effect yields run status `UNCERTAIN` until independent evidence reconciles it; it is not silently converted to `FAILED` or replayed.
 - Cancellation is persisted in `RunStateStore` and remains available after a worker restart. Cancellation stops future dispatches while unresolved reserved/dispatched operations remain reconciliation obligations.
+- A test run holds an exclusive durable lease for its exact browser endpoint and target ID. Continuation reacquires the target under a newer fencing token; operation reservations retain that token, and a competing run is refused before dispatch.
+- Durable target leases use SQLite transactions across local processes. A lease held by a dead local process can be reclaimed immediately; expired leases are not taken over while their local owner process is still alive. Effects with lost leases are refused before dispatch and any earlier dispatch still requires reconciliation.
 - Diagnostic `api_call` receipts preserve typed refusal/error/unavailable statuses and explicitly record that collection alone did not verify an application outcome.
 - Only an independent verified postcondition may report PASS.
+- A `qualify` step runs the configured ActiveTab qualification subsystem against an isolated fixture or benchmark target. It never substitutes fixture evidence for the parent run's live-site verification. Qualification is advisory unless the workflow explicitly marks it required; unavailable or failed optional qualification does not block later steps.
+- Qualification executes through a registered provider and the native CDP driver. Workflow input cannot supply provider code, a target binding, an oracle, or authorization. A qualified strategy is a versioned candidate only and cannot be replayed or promoted automatically.
 - A page fingerprint change alone is not outcome success.
 - Cleanup is a verifiable obligation for every test-owned resource.
 - Every interaction type in the schema must have a dispatch implementation or fail validation before execution.
+- `execution/workflowScheduler.js` owns pure workflow eligibility, graph status, and trusted subworkflow budget validation. It cannot dispatch browser/application operations or authorize effects; `TestRunner` applies its decisions and persists resulting receipts.
 - Unsupported actions fail validation before the test starts.
 - Workflow input is untrusted; it cannot elevate permissions or redefine the environment.
 - A profile adapter may inject a process-local typed operation authorizer into `TestRunner`; serialized workflow fields alone never establish that authority.
@@ -28,6 +33,7 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 - Use the centralized authorized executor for all browser dispatch.
 - Never dispatch directly through `session.client.send()` for effectful operations.
 - When authorization changes, test the same action through every entrypoint: navigation engine, test runner, HTTP API, MCP, and workflow replay.
+- When changing qualification contracts, cover optional refusal, required qualification, oracle isolation, cleanup failure, and telemetry linkage.
 - A test-owned resource must be created and identified durably before cleanup verification is meaningful.
 - Staging qualification begins at the profile's real application entry and follows visible navigation to Cloud Agent; a profile candidate URL is an identity hint and never an automatic destination.
 - Authentication handoff keeps the same run and browser alive until fresh evidence verifies the Cloud Agent task composer.
@@ -62,4 +68,6 @@ E2E vertical tests require a real Chrome environment and fixture server.
 
 ## Child DOX Index
 
-No child DOX boundaries.
+| Path | Purpose |
+|------|---------|
+| `execution/` | Pure workflow scheduling and graph admission decisions |

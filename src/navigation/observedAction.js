@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { executeAuthorizedAction } from "../runtime/authorizedExecutor.js";
 import { adjudicatePreActionReview } from "../decisions/adjudication.js";
 
-export async function clickObservedElement(session, { goal, evidenceId, backendNodeId, frameTargetId = null, decisionRuntime = null, environment = null, localFixture = false } = {}) {
+export async function clickObservedElement(session, { goal, evidenceId, backendNodeId, frameTargetId = null, decisionRuntime = null, environment = null, localFixture = false, assertExecutionLease = null } = {}) {
   if (typeof goal !== "string" || !goal.trim() || goal.length > 2_000) throw new Error("A non-empty caller goal of at most 2,000 characters is required.");
   if (typeof evidenceId !== "string" || !evidenceId) throw new Error("An evidence ID is required.");
   if (!Number.isInteger(backendNodeId) || backendNodeId < 0) throw new Error("A non-negative observed backend node ID is required.");
@@ -84,7 +84,7 @@ export async function clickObservedElement(session, { goal, evidenceId, backendN
 
   let dispatch;
   try {
-    dispatch = await executeAuthorizedAction({ session, environment, localFixture, goal, action: "click", candidate: target });
+    dispatch = await executeAuthorizedAction({ session, environment, localFixture, goal, action: "click", candidate: target, assertExecutionLease });
   } catch (error) {
     const afterFailure = await session.observe({ includeScreenshot: false });
     if (episode) {

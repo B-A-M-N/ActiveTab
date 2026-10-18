@@ -9,6 +9,9 @@ import { isOperatorProhibitedNavigation } from "../runtime/controlRestrictions.j
 import { executeAuthorizedAction } from "../runtime/authorizedExecutor.js";
 import { adjudicatePreActionReview } from "../decisions/adjudication.js";
 import { matchesScrollTargetSignature, matchesTargetSignature, observationSemanticFingerprint, observationStateFingerprint, routeFingerprint, scrollPositionFraction, scrollPositionMatches, scrollTargetSignature, targetSignature, visibleCandidatesFingerprint } from "../state/workflows.js";
+import { createConfiguredWorkflowSynthesizer } from "./workflowSynthesizer.js";
+import { WorkflowGraphPlanner } from "./workflowPlanner.js";
+import { createGenericWorkflowCapabilities } from "./workflowCapabilities.js";
 
 function pageChangeWaitBaseline(observation, scrollTarget) {
   return {
@@ -127,13 +130,20 @@ function unchangedAfterFailedClick(attempt) {
 }
 
 export class NavigationEngine {
-  constructor(session, { planner = null, executionMode = "agent_directed", plannerMode = "deterministic", journal, workflowStore, decisionRuntime = null, decisionContext = null, operationAuthorizer = null, maxActions = 8, maxRecoveries = 1, maxScrolls = 5, signal, environment = null, localFixture = false } = {}) {
+  constructor(session, { planner = null, executionMode = "agent_directed", plannerMode = "deterministic", workflowSynthesizer = null, workflowCapabilities = [], workflowKnowledge = [], workflowInputs = {}, workflowIntent = null, workflowScope = null, journal, workflowStore, decisionRuntime = null, decisionContext = null, operationAuthorizer = null, assertExecutionLease = null, maxActions = 8, maxRecoveries = 1, maxScrolls = 5, signal, environment = null, localFixture = false } = {}) {
     this.signal = signal;
     this.session = session;
     if (!["agent_directed", "agent_assisted", "standalone"].includes(executionMode)) throw new Error("Execution mode must be agent_directed, agent_assisted, or standalone.");
     if (planner?.plannerRole === "standalone_action_proposer" && executionMode !== "standalone") throw new Error("The model action planner is available only in explicit standalone mode.");
     this.executionMode = executionMode;
+    this.plannerMode = plannerMode;
     this.planner = planner ?? configuredPlanner({ executionMode, plannerMode });
+    this.workflowSynthesizer = workflowSynthesizer;
+    this.workflowCapabilities = workflowCapabilities;
+    this.workflowKnowledge = workflowKnowledge;
+    this.workflowInputs = workflowInputs;
+    this.workflowIntent = workflowIntent;
+    this.workflowScope = workflowScope;
     // Optional verified environment binding. When present, the engine refuses
     // to count a navigation onto a non-authorized origin as goal progress.
     this.environment = environment;
@@ -143,12 +153,13 @@ export class NavigationEngine {
     this.decisionRuntime = decisionRuntime;
     this.decisionContext = decisionContext;
     this.operationAuthorizer = operationAuthorizer;
+    this.assertExecutionLease = assertExecutionLease;
     this.maxActions = Math.max(1, Math.min(maxActions, 10));
     this.maxRecoveries = Math.max(0, Math.min(maxRecoveries, 3));
     this.maxScrolls = Math.max(0, Math.min(maxScrolls, 8));
   }
 
-  async run(goal, { resumeState, signal } = {}) {
+  async run(goal, { resumeState, signal, workflowInputs = this.workflowInputs, workflowIntent = this.workflowIntent, _executionState = null, _inferenceBudgeted = false } = {}) {
     const abortSignal = signal ?? this.signal;
     const throwIfAborted = () => {
       if (abortSignal?.aborted) {
@@ -161,7 +172,14 @@ export class NavigationEngine {
     throwIfAborted();
     const searchPhrase = searchPhraseFromGoal(goal);
     const searchSubmitAuthorizer = searchPhrase ? createSearchSubmitAuthorizer(searchPhrase) : null;
-    const state = resumeState ?? newTaskState(goal, this.session.target, this.session.target.endpoint ?? "local-cdp");
+    const state = _executionState ?? resumeState ?? newTaskState(goal, this.session.target, this.session.target.endpoint ?? "local-cdp");
+    if (!_inferenceBudgeted && typeof this.decisionRuntime?.withInferenceBudget === "function") {
+      const runId = this.decisionContext?.runId ?? state.taskId;
+      return this.decisionRuntime.withInferenceBudget({ runId }, () => this.run(goal, {
+        resumeState, signal, workflowInputs, workflowIntent,
+        _executionState: state, _inferenceBudgeted: true
+      }));
+    }
     const currentEnvironmentFingerprint = environmentBindingFingerprint(this.environment);
     if (resumeState && (resumeState.environmentFingerprint ?? null) !== currentEnvironmentFingerprint) {
       throw new Error("Resume state environment binding does not match the current authorized profile.");
@@ -216,7 +234,7 @@ export class NavigationEngine {
     const workflowReplay = { status: this.workflowStore ? searchPhrase ? "skipped_form_input" : "miss" : "disabled", actions: 0 };
     const workflowTraceAttempts = [];
     let workflowTraceSafe = true;
-    const planner = searchPhrase ? new DeterministicPlanner() : this.planner;
+    let planner = searchPhrase ? new DeterministicPlanner() : this.planner;
 
     const updateJournal = async () => { if (this.journal) await updateTaskJournal(this.journal, state); };
     let decisionEpisodeId = null;
@@ -239,10 +257,33 @@ export class NavigationEngine {
       state.decisionEpisodeId = decisionEpisodeId;
       await updateJournal();
     }
+    if (this.plannerMode === "workflow" && !searchPhrase && !resumeState) {
+      const synthesizer = this.workflowSynthesizer ?? createConfiguredWorkflowSynthesizer({
+        eventStore: this.decisionRuntime?.eventStore,
+        ...(typeof this.decisionRuntime?.budgetedFetch === "function" ? { fetchImpl: this.decisionRuntime.budgetedFetch("workflow_synthesis") } : {})
+      });
+      const environmentId = String(this.environment?.environmentId ?? "").toLowerCase();
+      const environmentClass = this.workflowScope?.environmentClass
+        ?? this.environment?.environmentClass
+        ?? (environmentId.includes("production") ? "production" : environmentId.includes("staging") ? "staging" : environmentId ? "local" : "unknown");
+      const applicationId = this.workflowScope?.applicationId ?? this.environment?.applications?.[0]?.applicationId ?? "unknown";
+      planner = new WorkflowGraphPlanner({
+        synthesizer,
+        capabilities: Array.isArray(this.workflowCapabilities) && this.workflowCapabilities.length ? this.workflowCapabilities : createGenericWorkflowCapabilities(),
+        knowledge: this.workflowKnowledge,
+        inputs: workflowInputs,
+        taskIntent: workflowIntent,
+        decisionRuntime: this.decisionRuntime,
+        episodeId: decisionEpisodeId,
+        runId: decisionRunId,
+        scope: { applicationId, environmentClass, principalId: this.workflowScope?.principalId ?? this.environment?.principalId ?? "unknown" },
+        fallbackPlanner: new DeterministicPlanner()
+      });
+    }
     const decisionStepId = () => this.decisionContext?.stepPrefix
       ? `${this.decisionContext.stepPrefix}_a${Math.min(999, state.attempts.length + 1)}`
       : `step_${Math.min(999, state.attempts.length + 1)}`;
-    const prepareTelemetryDecision = async (attempt, actionType, target, authorized = true, operationId = null) => {
+    const prepareTelemetryDecision = async (attempt, actionType, target, authorized = true, operationId = null, workflowCapability = null, workflowReview = null) => {
       if (!this.decisionRuntime || !decisionEpisodeId) return { allowed: true, grantsAuthority: false };
       attempt.decisionId ??= randomUUID();
       attempt.decisionStepId ??= decisionStepId();
@@ -250,6 +291,8 @@ export class NavigationEngine {
       const operationContext = this.operationAuthorizer?.decisionContext?.(operationId ?? attempt.operationId) ?? null;
       const targetIsLink = actionType === "click" && (target?.tag === "a" || target?.role === "link") && typeof target?.href === "string";
       const reviewRequired = operationContext?.reviewRequired === true
+        || workflowCapability?.requiresApproval === true
+        || ["shared_mutation", "security_change"].includes(workflowCapability?.effectClass)
         || actionType === "navigate"
         || actionType === "upload"
         || actionType === "toggle"
@@ -271,7 +314,13 @@ export class NavigationEngine {
         signal: abortSignal
       };
       let review;
-      if (reviewRequired) {
+      if (workflowReview?.status === "reviewed") {
+        await this.decisionRuntime.recordReviewSkipped({
+          ...reviewInput,
+          reasonCode: "covered_by_batched_workflow_review"
+        });
+        review = { decisionId: attempt.decisionId, authorizesOperation: false, coveredByWorkflowReview: true };
+      } else if (reviewRequired) {
         // The semantic model is invoked only by an explicit ambiguity resolver
         // (for example, the FreeInference adapter). A selected target does not
         // need a second model to repeat the coding agent's intent.
@@ -347,6 +396,21 @@ export class NavigationEngine {
         evidenceRefs: [attempt.beforeEvidenceId, attempt.afterEvidenceId]
       });
     };
+    const recordWorkflowVerification = async (attempt, verification) => {
+      if (!this.decisionRuntime || !decisionEpisodeId || !attempt.decisionId || !attempt.afterEvidenceId || !verification) return;
+      await this.decisionRuntime.recordVerification({
+        episodeId: decisionEpisodeId,
+        runId: decisionRunId,
+        stepId: attempt.decisionStepId,
+        decisionId: attempt.decisionId,
+        observationId: attempt.afterEvidenceId,
+        status: verification.status,
+        oracleType: "workflow_capability",
+        reasonCode: verification.reasonCode,
+        ...(verification.verifiedCode ? { verifiedCode: verification.verifiedCode } : {}),
+        evidenceRefs: verification.evidenceRefs ?? [attempt.beforeEvidenceId, attempt.afterEvidenceId].filter(Boolean)
+      });
+    };
     const completeDecisionEpisode = status => {
       if (!this.decisionRuntime || !decisionEpisodeId || this.decisionContext?.sharedEpisode || state.decisionEpisodeCompleted === true) return;
       const normalized = status === "succeeded" ? "passed"
@@ -392,9 +456,12 @@ export class NavigationEngine {
     };
     const resultWithWorkflow = result => {
       completeDecisionEpisode(result.status);
+      const workflowPlanStatus = planner?.getStatus?.();
       return {
         ...result,
         goal: "[redacted task goal]",
+        ...(this.decisionRuntime?.inferenceBudgetSnapshot ? { inferenceBudget: this.decisionRuntime.inferenceBudgetSnapshot(decisionRunId) } : {}),
+        ...(workflowPlanStatus ? { workflowPlan: workflowPlanStatus } : {}),
         ...(this.workflowStore ? { workflowReplay: { ...workflowReplay } } : {})
       };
     };
@@ -414,6 +481,11 @@ export class NavigationEngine {
     const outcomeVerified = async () => {
       if (!hasVerifiedOutcome(latest, goal, state.initialPageLabelHashes, this.environment)) return false;
       return !searchPhrase || await this.session.verifySearchOutcome(searchPhrase);
+    };
+    const workflowPlanCanFinish = () => {
+      if (!(planner instanceof WorkflowGraphPlanner)) return true;
+      const status = planner.getStatus();
+      return !status.planHash || planner.isComplete();
     };
     const handoffIfNeeded = async observation => {
       const handoff = classifyHumanHandoff(observation);
@@ -495,7 +567,7 @@ export class NavigationEngine {
       delete state.interventionRequired;
       await updateJournal();
     }
-    if (await outcomeVerified()) return await succeed();
+    if (await outcomeVerified() && workflowPlanCanFinish()) return await succeed();
     if (recoveredPendingAction) {
       if (recoveries >= this.maxRecoveries) {
         state.status = "unresolved";
@@ -551,6 +623,7 @@ export class NavigationEngine {
                 await dispatchThroughAuthorizedExecutor(this.session, {
                   environment: this.environment,
                   localFixture: this.localFixture,
+                  assertExecutionLease: this.assertExecutionLease,
                   goal,
                   action: "scroll",
                   candidate: target
@@ -653,6 +726,7 @@ export class NavigationEngine {
               await dispatchThroughAuthorizedExecutor(this.session, {
                 environment: this.environment,
                 localFixture: this.localFixture,
+                assertExecutionLease: this.assertExecutionLease,
                 goal,
                 action: "click",
                 candidate: target
@@ -752,6 +826,7 @@ export class NavigationEngine {
         throw error;
       }
       if (plan.status !== "planned") {
+        if (plan.status === "completed" && planner?.isComplete?.()) return await succeed();
         state.status = recoveries ? "needs_human" : "unresolved";
         state.terminationReason = plan.reason;
         await updateJournal();
@@ -796,7 +871,8 @@ export class NavigationEngine {
         await updateJournal();
         return resultWithWorkflow({ status: state.status, goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: latest.evidenceId });
       }
-      let operationId = this.operationAuthorizer?.operationId ?? null;
+      const workflowCapability = plan.workflowCapability ?? null;
+      let operationId = workflowCapability?.operationId ?? this.operationAuthorizer?.operationId ?? null;
       let operationAuthorizer = this.operationAuthorizer;
       if (searchPhrase && searchSubmitAuthorizer && (
         (actionType === "type" && selectedTarget.tag === "input" && String(selectedTarget.type).toLowerCase() === "search")
@@ -806,7 +882,22 @@ export class NavigationEngine {
         operationAuthorizer = searchSubmitAuthorizer;
       }
       let authorization = authorizePlannedAction(goal, selectedTarget, actionType);
-      if (!authorization.authorized
+      const workflowNeedsScopedAuthorization = workflowCapability && (
+        workflowCapability.requiresApproval === true
+        || ["test_owned_mutation", "shared_mutation", "security_change"].includes(workflowCapability.effectClass)
+      );
+      if (workflowCapability?.effectClass === "unknown") {
+        authorization = { authorized: false, category: "unknown_effect_denied", reason: "The trusted workflow capability classifies this operation as unknown; no effect was dispatched." };
+      } else if (workflowNeedsScopedAuthorization) {
+        if (!operationAuthorizer || typeof operationAuthorizer.authorize !== "function" || !operationId) {
+          authorization = { authorized: false, category: "scoped_operation_authorizer_required", reason: "This workflow capability requires its registered scoped operation authorizer." };
+        } else {
+          // The central executor consumes the scoped grant exactly once and
+          // rechecks it against the fresh target immediately before dispatch.
+          // Do not pre-consume a single-use grant here.
+          authorization = { authorized: true, category: "deferred_to_authorized_executor" };
+        }
+      } else if (!authorization.authorized
         && ["unclassified_form_submission", "unknown_control_effect"].includes(authorization.category)
         && operationAuthorizer && typeof operationId === "string" && operationId) {
         const typedOperation = await operationAuthorizer.authorize({
@@ -823,7 +914,7 @@ export class NavigationEngine {
           beforeEvidenceId: latest.evidenceId,
           startedAt: new Date().toISOString()
         };
-        await prepareTelemetryDecision(deniedAttempt, actionType, selectedTarget, false, operationId);
+        await prepareTelemetryDecision(deniedAttempt, actionType, selectedTarget, false, operationId, workflowCapability, plan.workflowReview);
         state.status = "needs_human";
         state.terminationReason = authorization.reason;
         state.authorizationRequired = {
@@ -834,6 +925,7 @@ export class NavigationEngine {
         await updateJournal();
         return resultWithWorkflow(handoffResult(goal, state.terminationReason, state.authorizationRequired, state.attempts.length, recoveries, latest.evidenceId));
       }
+      const beforeObservation = latest;
       const beforeStateFingerprint = observationStateFingerprint(latest);
       const beforeSemanticFingerprint = observationSemanticFingerprint(latest);
       const waitBaseline = pageChangeWaitBaseline(latest, actionType === "scroll" ? selectedTarget : undefined);
@@ -851,7 +943,7 @@ export class NavigationEngine {
         beforeEvidenceId: latest.evidenceId,
         startedAt: new Date().toISOString()
       };
-      const review = await prepareTelemetryDecision(attempt, actionType, selectedTarget, authorization.authorized, operationId);
+      const review = await prepareTelemetryDecision(attempt, actionType, selectedTarget, authorization.authorized, operationId, workflowCapability, plan.workflowReview);
       if (authorization.authorized && !review.allowed) return await suspendForDecisionReview(attempt, review);
       await beginAction(attempt);
       await reserveTelemetryOperation(attempt, actionType);
@@ -862,6 +954,7 @@ export class NavigationEngine {
         await dispatchThroughAuthorizedExecutor(this.session, {
           environment: this.environment,
           localFixture: this.localFixture,
+          assertExecutionLease: this.assertExecutionLease,
           goal,
           action: actionType,
           candidate: selectedTarget,
@@ -894,6 +987,7 @@ export class NavigationEngine {
               await dispatchThroughAuthorizedExecutor(this.session, {
                 environment: this.environment,
                 localFixture: this.localFixture,
+                assertExecutionLease: this.assertExecutionLease,
                 goal,
                 action: actionType,
                 candidate: selectedTarget,
@@ -968,6 +1062,17 @@ export class NavigationEngine {
         attempt.afterRouteFingerprint = routeFingerprint(latest.page.url);
         attempt.afterEvidenceId = latest.evidenceId;
         attempt.completedAt = new Date().toISOString();
+        if (plan.workflowStepId && typeof planner.recordOutcome === "function") {
+          const verification = await planner.recordOutcome({
+            action: plan.action,
+            beforeObservation,
+            afterObservation: latest,
+            dispatchStatus: dispatchOutcome,
+            error: attempt.error,
+            signal: abortSignal
+          });
+          await recordWorkflowVerification(attempt, verification);
+        }
         finishAction(attempt);
         if (this.workflowStore && !attempt.error && moved && scrollTraceContext?.scrollTargetSignature && Number.isFinite(scrollTraceContext.beforePositionFraction)) {
           const matchingAfterTargets = (latest.scrollTargets ?? []).filter(target => matchesScrollTargetSignature(target, scrollTraceContext.scrollTargetSignature));
@@ -996,7 +1101,8 @@ export class NavigationEngine {
         await updateJournal();
         const scrollHandoff = await handoffIfNeeded(latest);
         if (scrollHandoff) return scrollHandoff;
-        if (await outcomeVerified()) return await succeed();
+        if (planner instanceof WorkflowGraphPlanner && planner.isComplete()) return await succeed();
+        if (await outcomeVerified() && workflowPlanCanFinish()) return await succeed();
         if (attempt.error || !moved) {
           if (!moved) state.scrollRecoveryBlocked = true;
           state.status = "unresolved";
@@ -1043,6 +1149,7 @@ export class NavigationEngine {
           await dispatchThroughAuthorizedExecutor(this.session, {
             environment: this.environment,
             localFixture: this.localFixture,
+            assertExecutionLease: this.assertExecutionLease,
             recovery: true,
             goal,
             action: "navigate",
@@ -1064,13 +1171,25 @@ export class NavigationEngine {
       attempt.afterRouteFingerprint = routeFingerprint(latest.page.url);
       attempt.afterEvidenceId = latest.evidenceId;
       attempt.completedAt = new Date().toISOString();
+      if (plan.workflowStepId && typeof planner.recordOutcome === "function") {
+        const verification = await planner.recordOutcome({
+          action: plan.action,
+          beforeObservation,
+          afterObservation: latest,
+          dispatchStatus: dispatchOutcome,
+          error: attempt.error,
+          signal: abortSignal
+        });
+        await recordWorkflowVerification(attempt, verification);
+      }
       await recordTelemetryObservation(attempt, afterStateFingerprint !== beforeStateFingerprint,
         dispatchOutcome === "dispatched" ? "browser_state_observed" : "dispatch_failed_state_observed");
       finishAction(attempt);
       await updateJournal();
       const actionHandoff = await handoffIfNeeded(latest);
       if (actionHandoff) return actionHandoff;
-      if (await outcomeVerified()) return await succeed();
+      if (planner instanceof WorkflowGraphPlanner && planner.isComplete()) return await succeed();
+      if (await outcomeVerified() && workflowPlanCanFinish()) return await succeed();
       if (actionType === "type") {
         if (attempt.error) {
           state.status = "unresolved";

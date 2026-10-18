@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { McpTaskJournalStore } from "../src/state/mcpTaskJournals.js";
 import { TaskJournal, taskGoalFingerprint } from "../src/state/journal.js";
 import { runMcpGoal } from "../src/mcp/runGoal.js";
+import { createRunStateFixture } from "./runStateFixture.js";
 
 async function withDirectory(run) {
   const directory = await mkdtemp(join(tmpdir(), "activetab-mcp-journal-"));
@@ -90,14 +91,18 @@ test("MCP run_goal survives process termination after dispatch and resumes witho
   const goal = "Open the account page";
   const runChild = stage => {
     const storeModule = new URL("../src/state/mcpTaskJournals.js", import.meta.url).href;
+    const runStateModule = new URL("../src/testing/runState.js", import.meta.url).href;
     const runnerModule = new URL("../src/mcp/runGoal.js", import.meta.url).href;
     const code = `
       import { writeSync } from "node:fs";
       import { McpTaskJournalStore } from ${JSON.stringify(storeModule)};
+      import { RunStateStore } from ${JSON.stringify(runStateModule)};
       import { runMcpGoal } from ${JSON.stringify(runnerModule)};
       const target = { id: "resume-target", endpoint: "local-cdp", url: "https://shop.example.test/" };
       const goal = "Open the account page";
       const stage = process.env.ACTIVETAB_TEST_STAGE;
+      const runStateStore = new RunStateStore(process.env.ACTIVETAB_TEST_RUN_STATE_DIR);
+      await runStateStore.init();
       const account = { page: { url: "https://shop.example.test/account", title: "Account" }, headings: [{ level: 1, text: "Account" }], candidates: [] };
       const session = stage === "first" ? {
         target,
@@ -114,13 +119,25 @@ test("MCP run_goal survives process termination after dispatch and resumes witho
         async click() { throw new Error("A resumed completed navigation must not click again."); },
         async waitForChange() {}
       };
-      const result = await runMcpGoal(session, { goal, maxActions: 2 }, { journalStore: new McpTaskJournalStore({ directory: process.env.ACTIVETAB_TEST_JOURNAL_DIR }) });
-      writeSync(1, JSON.stringify(result));
+      try {
+        const result = await runMcpGoal(session, { goal, maxActions: 2 }, {
+          journalStore: new McpTaskJournalStore({ directory: process.env.ACTIVETAB_TEST_JOURNAL_DIR }),
+          runStateStore
+        });
+        writeSync(1, JSON.stringify(result));
+      } finally {
+        runStateStore.close();
+      }
     `;
     const child = spawnSync(process.execPath, ["--input-type=module", "-e", code], {
       encoding: "utf8",
       timeout: 10_000,
-      env: { ...process.env, ACTIVETAB_TEST_STAGE: stage, ACTIVETAB_TEST_JOURNAL_DIR: join(directory, "tasks") }
+      env: {
+        ...process.env,
+        ACTIVETAB_TEST_STAGE: stage,
+        ACTIVETAB_TEST_JOURNAL_DIR: join(directory, "tasks"),
+        ACTIVETAB_TEST_RUN_STATE_DIR: join(directory, "run-state")
+      }
     });
     return child;
   };
@@ -154,12 +171,14 @@ test("MCP run_goal survives process termination after dispatch and resumes witho
 
 test("MCP run_goal rejects concurrent tasks on the same browser target", async () => withDirectory(async directory => {
   const target = { id: "locked-target", endpoint: "local-cdp" };
+  const runState = await createRunStateFixture("activetab-mcp-journal-run-state-");
   let releaseObservation;
   const observationGate = new Promise(resolve => { releaseObservation = resolve; });
   let enteredObservation;
   const observationStarted = new Promise(resolve => { enteredObservation = resolve; });
   const session = {
     target,
+    attached: true,
     async observe() {
       enteredObservation();
       await observationGate;
@@ -167,9 +186,13 @@ test("MCP run_goal rejects concurrent tasks on the same browser target", async (
     }
   };
   const store = new McpTaskJournalStore({ directory: join(directory, "tasks") });
-  const running = runMcpGoal(session, { goal: "Open the account page" }, { journalStore: store });
-  await observationStarted;
-  await assert.rejects(runMcpGoal(session, { goal: "Open the billing page" }, { journalStore: store }), /already active on this browser target/);
-  releaseObservation();
-  assert.equal((await running).status, "unresolved");
+  try {
+    const running = runMcpGoal(session, { goal: "Open the account page" }, { journalStore: store, runStateStore: runState.store });
+    await observationStarted;
+    await assert.rejects(runMcpGoal(session, { goal: "Open the billing page" }, { journalStore: store, runStateStore: runState.store }), /already active on this browser target/);
+    releaseObservation();
+    assert.equal((await running).status, "unresolved");
+  } finally {
+    await runState.cleanup();
+  }
 }));

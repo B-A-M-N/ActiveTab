@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { canonicalJson } from "../telemetry/decisionEvents.js";
 import { normalizeObservedRole, normalizeObservedTag } from "../telemetry/privacy.js";
 import { JEV_MODEL_ID } from "./jevClient.js";
-import { INTENT_ALIGNMENT_QUESTION, TARGET_CLARITY_QUESTION, EVIDENCE_SUPPORT_QUESTION, OUTCOME_ANOMALY_QUESTION, RUBRIC_VERSION } from "./rubrics.js";
+import { INTENT_ALIGNMENT_QUESTION, TARGET_CLARITY_QUESTION, EVIDENCE_SUPPORT_QUESTION, OUTCOME_ANOMALY_QUESTION, WORKFLOW_PLAN_QUESTIONS, RUBRIC_VERSION } from "./rubrics.js";
 
 const REVIEW_THRESHOLD = 0.8;
 const STRUCTURAL_CODE_CHARACTERS = new Set("abcdefghijklmnopqrstuvwxyz0123456789_:-");
@@ -38,7 +38,7 @@ function rubricFingerprint(value) {
 }
 
 function jevFailureCode(error) {
-  return ["configuration", "privacy", "timeout", "transport", "http", "schema", "response_too_large", "refusal"].includes(error?.kind) ? error.kind : "unknown";
+  return ["configuration", "privacy", "timeout", "transport", "http", "schema", "response_too_large", "refusal", "budget_exhausted"].includes(error?.kind) ? error.kind : "unknown";
 }
 
 function recordJevFailure(eventStore, { episodeId, runId, stepId, decisionId, observationId, questions, rubricHash, inputFingerprint: requestFingerprint, inputEventIds = [], error }) {
@@ -235,6 +235,87 @@ export class DecisionCoordinator {
       }));
     }
     return { decisionId, reviewer: { provider: "openrouter", model: response.model, rubricVersion: RUBRIC_VERSION }, answers: response.answers, inputEventIds: outcomeInputEventIds, eventIds: events.map(event => event.eventId), authorizesOperation: false };
+  }
+
+  async reviewWorkflowPlan({ episodeId, runId, stepId, decisionId = randomUUID(), observationId, planProjection, signal } = {}) {
+    if (!episodeId || !runId || !stepId || !observationId || !Array.isArray(planProjection)
+      || planProjection.length < 1 || planProjection.length > 24) {
+      throw new Error("Jev workflow review requires stable run identities, an observation, and a bounded plan projection.");
+    }
+    const state = {
+      plan_version: 1,
+      step_count: planProjection.length,
+      steps: planProjection.map(step => ({
+        step_id: step.stepId,
+        capability_id: step.capabilityId,
+        effect_class: step.effectClass,
+        target_role: step.targetRole,
+        verification_code: step.verificationCode,
+        requires_approval: step.requiresApproval
+      }))
+    };
+    const questions = WORKFLOW_PLAN_QUESTIONS;
+    const rubricHash = rubricFingerprint(questions);
+    const requestFingerprint = inputFingerprint({ state, questions });
+    const inputEvent = this.eventStore.append({
+      episodeId, runId, stepId, decisionId, observationId,
+      eventType: "decision.input_captured",
+      trainingEligibility: "pending",
+      payload: {
+        inputKind: "workflow_plan_review",
+        inputProjection: { state, questions: Object.entries(questions).map(([id, question]) => ({ id, type: question.type })) },
+        rubricIds: Object.keys(questions),
+        rubricHash,
+        inputFingerprint: requestFingerprint
+      }
+    });
+    const inputEventIds = [inputEvent.eventId];
+    let response;
+    try {
+      response = await this.client.decide({ state, questions, signal });
+    } catch (error) {
+      recordJevFailure(this.eventStore, {
+        episodeId, runId, stepId, decisionId, observationId, questions, rubricHash,
+        inputFingerprint: requestFingerprint, inputEventIds, error
+      });
+      return { decisionId, status: "unavailable", failureCode: jevFailureCode(error), authorizesOperation: false };
+    }
+    if (response.model !== JEV_MODEL_ID) {
+      const error = Object.assign(new Error("Jev returned a model other than the pinned 1.14 model."), { kind: "schema" });
+      recordJevFailure(this.eventStore, {
+        episodeId, runId, stepId, decisionId, observationId, questions, rubricHash,
+        inputFingerprint: requestFingerprint, inputEventIds, error
+      });
+      return { decisionId, status: "unavailable", failureCode: "schema", authorizesOperation: false };
+    }
+    const events = [];
+    for (const [rubricId, answer] of Object.entries(response.answers)) {
+      events.push(this.eventStore.append({
+        episodeId, runId, stepId, decisionId, observationId,
+        parentEventId: inputEvent.eventId,
+        eventType: "decision.predicted",
+        trainingEligibility: "pending",
+        payload: {
+          provider: "openrouter", model: response.model, rubricId, rubricVersion: RUBRIC_VERSION,
+          rubricHash, questionType: answer.type, answer, inputFingerprint: requestFingerprint,
+          inputEventIds,
+          ...(response.usage ? { usage: response.usage } : {})
+        }
+      }));
+    }
+    const threshold = this.thresholds.workflowPlan ?? REVIEW_THRESHOLD;
+    const supported = Object.keys(questions).every(id => Number.isFinite(response.answers[id]?.probabilityYes)
+      && response.answers[id].probabilityYes >= threshold);
+    return {
+      decisionId,
+      status: "reviewed",
+      disposition: supported ? "supported" : "needs_agent_review",
+      reviewer: { provider: "openrouter", model: response.model, rubricVersion: RUBRIC_VERSION },
+      answers: response.answers,
+      inputEventIds,
+      eventIds: events.map(event => event.eventId),
+      authorizesOperation: false
+    };
   }
 
   async annotateRoles({ semanticAnalyzer, requestedRoles, intentHints = [], ...review } = {}) {

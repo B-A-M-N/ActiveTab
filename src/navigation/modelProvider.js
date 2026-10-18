@@ -135,6 +135,7 @@ export class OpenAICompatibleProvider {
           signal: controller.signal
         });
       } catch (error) {
+        if (error?.kind === "budget_exhausted") throw error;
         if (controller.signal.aborted) {
           if (signal?.aborted) {
             const abortError = new Error("The model request was canceled.");
