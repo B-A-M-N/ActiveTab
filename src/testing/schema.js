@@ -9,7 +9,8 @@
 export const STEP_TYPES = Object.freeze([
   "setup", "navigate", "interact", "api_call", "wait_for", "assert",
   "diagnostic_snapshot", "controlled_failure", "retry_verification",
-  "postcondition", "cleanup", "goal", "qualify", "set_variable", "repeat", "subworkflow"
+  "postcondition", "cleanup", "goal", "qualify", "set_variable", "repeat", "subworkflow",
+  "discover_tables", "extract_records", "collect_records", "emit_output"
 ]);
 
 /** Human-intervention declaration for goal steps (P0-4). */
@@ -73,7 +74,7 @@ export function isWaitingRunStatus(status) {
  * Validate a test workflow object.
  * Returns { valid: true, errors: [] } or { valid: false, errors: string[] }.
  */
-export function validateWorkflow(workflow, { maxSteps = 128 } = {}) {
+export function validateWorkflow(workflow, { maxSteps = 128, requireFinalizedOutputs = true } = {}) {
   const errors = [];
   if (!workflow || typeof workflow !== "object") return { valid: false, errors: ["Workflow must be an object."] };
   if (typeof workflow.id !== "string" || !workflow.id) errors.push("Workflow requires an id.");
@@ -196,6 +197,11 @@ export function validateWorkflow(workflow, { maxSteps = 128 } = {}) {
     if (step.type === "wait_for" && !step.condition) errors.push(`${prefix}.condition is required for wait_for steps.`);
     if (step.type === "api_call" && !step.operation) errors.push(`${prefix}.operation is required for api_call steps.`);
     if (step.type === "api_call" && step.operation && !step.operation.operationId) errors.push(`${prefix}.operation.operationId is required for api_call steps.`);
+    if (step.type === "extract_records" || step.type === "collect_records" || step.type === "emit_output") {
+      if (!isScopedName(step.capabilityId)) errors.push(`${prefix}.capabilityId must be a bounded registered capability identifier.`);
+      if (step.capabilityVersion !== undefined && (!Number.isInteger(step.capabilityVersion) || step.capabilityVersion < 1 || step.capabilityVersion > 1000)) errors.push(`${prefix}.capabilityVersion must be from 1 to 1000.`);
+      if (!isScopedName(step.outputName)) errors.push(`${prefix}.outputName must be a bounded output identifier.`);
+    }
     if (step.type === "qualify") {
       if (typeof step.scenarioId !== "string" || !step.scenarioId.trim() || step.scenarioId.length > 96) errors.push(`${prefix}.scenarioId must be a bounded scenario identifier.`);
       if (typeof step.providerId !== "string" || !step.providerId.trim() || step.providerId.length > 96) errors.push(`${prefix}.providerId must be a bounded provider identifier.`);
@@ -219,7 +225,7 @@ export function validateWorkflow(workflow, { maxSteps = 128 } = {}) {
         if (["repeat", "subworkflow"].includes(child?.type)) errors.push(`${prefix}.body cannot nest repeat or subworkflow controls in schema version 1.`);
       }
       if (Array.isArray(step.body)) {
-        const nested = validateWorkflow({ id: `${step.id ?? "repeat"}-body`, name: "bounded repeat body", steps: step.body }, { maxSteps: 32 });
+        const nested = validateWorkflow({ id: `${step.id ?? "repeat"}-body`, name: "bounded repeat body", steps: step.body }, { maxSteps: 32, requireFinalizedOutputs: false });
         errors.push(...nested.errors.map(error => `${prefix}.body: ${error}`));
       }
     }
@@ -256,6 +262,45 @@ export function validateWorkflow(workflow, { maxSteps = 128 } = {}) {
         }
       }
     }
+  }
+  if (requireFinalizedOutputs) {
+    const producers = [];
+    const visit = (steps, owner = null) => {
+      for (const step of steps ?? []) {
+        const ownerStepId = owner ?? step?.id;
+        if (step?.type === "extract_records" || step?.type === "collect_records") producers.push({ step, ownerStepId });
+        if (step?.type === "repeat") visit(step.body, ownerStepId);
+      }
+    };
+    visit(workflow.steps);
+    const outputs = new Map();
+    for (const item of producers) {
+      const entries = outputs.get(item.step.outputName) ?? [];
+      entries.push(item);
+      outputs.set(item.step.outputName, entries);
+    }
+    const emitters = new Map();
+    for (const step of workflow.steps) {
+      if (step?.type !== "emit_output") continue;
+      const entries = emitters.get(step.outputName) ?? [];
+      entries.push(step);
+      emitters.set(step.outputName, entries);
+    }
+    for (const [outputName, entries] of outputs) {
+      const matching = emitters.get(outputName) ?? [];
+      if (matching.length !== 1) errors.push(`Output '${outputName}' must have exactly one top-level emit_output step.`);
+      else {
+        const emitter = matching[0];
+        for (const { step: producer, ownerStepId } of entries) {
+          if (producer.capabilityId !== emitter.capabilityId) errors.push(`Output '${outputName}' cannot combine different registered capabilities.`);
+          if (dagMode && !emitter.dependsOn?.includes(ownerStepId)) errors.push(`emit_output '${emitter.id}' must depend on extraction step '${ownerStepId}'.`);
+          if (!dagMode && workflow.steps.findIndex(item => item.id === emitter.id) <= workflow.steps.findIndex(item => item.id === ownerStepId)) {
+            errors.push(`emit_output '${emitter.id}' must follow extraction step '${ownerStepId}'.`);
+          }
+        }
+      }
+    }
+    for (const outputName of emitters.keys()) if (!outputs.has(outputName)) errors.push(`emit_output references '${outputName}' without an extract_records step.`);
   }
   const expandedStepCount = workflow.steps.reduce((count, step) => count + 1
     + (step?.type === "repeat" && Number.isInteger(step.maxIterations) && Array.isArray(step.body) ? step.maxIterations * step.body.length : 0), 0);

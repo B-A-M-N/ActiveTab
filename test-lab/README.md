@@ -9,6 +9,8 @@ Qualification uses the same native CDP navigation engine as ordinary ActiveTab w
 - `fi-agent-twin`: local two-origin Cloud Agent simulation with separate authentication realms, asynchronous runs, scoped diagnostics, fault injection, and a separate oracle.
 - `webarena-infinity-gmail`: the standalone Gmail application from WebArena-Infinity, pinned to commit `1ca77813bf8d8e4011aa3fb1f740f70d78bd522d`. The checked-in adapter supports one bounded task: mark the seeded `Q1 Product Roadmap Review` message from Sarah Chen as read.
 
+The first structured extraction qualifier is an in-process seeded resolver baseline. It is not a replacement for these application targets. The existing WebArena-Infinity Gmail adapter currently qualifies its bounded mail-state task; it has not yet been adapted as an extraction capability oracle.
+
 ## Run the external application locally
 
 WebArena-Infinity's application server uses the Python standard library. ActiveTab does not need Docker, Playwright, BrowserGym, or additional Node packages to control it.

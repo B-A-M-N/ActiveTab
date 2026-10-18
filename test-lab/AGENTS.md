@@ -18,6 +18,7 @@ This package is part of ActiveTab's capability surface. It owns benchmark orches
 - A fixture result may qualify a candidate strategy but cannot authorize a live target or substitute for live-site verification.
 - Qualified strategies remain versioned candidates. Promotion, replay, and training export require their own explicit review and authorization.
 - Scenario and fault variation is deterministic from a recorded seed. Unsupported variations fail validation.
+- The built-in extraction qualifier is a deterministic in-process resolver baseline. It does not claim to exercise an independently maintained application; external benchmark targets remain in scope and must be selected through their registered Fixture Lab adapters and independent oracles.
 
 ## Work Guidance
 

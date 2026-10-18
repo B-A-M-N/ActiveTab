@@ -4,14 +4,13 @@
  * Guarantees:
  * - Atomic writes (temp file + fsync + rename), 0o600 permissions.
  * - Interruption reconciliation on startup: tasks persisted as running,
- *   queued, or created by a dead process become failed/interrupted —
- *   they can never remain falsely successful after a crash or restart.
+ *   queued, or created by a dead process become reconciling — a lost worker
+ *   is not evidence that a remote operation failed or never happened.
  * - Terminal-state fencing: update() refuses to overwrite a terminal
  *   state with a different one, so stale workers cannot resurrect or
  *   rewrite finished/canceled/failed tasks.
- * - Human-handoff states (needs_human and the resumable waiting_* states)
- *   are SUSPENSIONS, not terminals: a run must automatically continue once
- *   the required human action has completed and been verified (P0-3).
+ * - Human-handoff and reconciliation states (needs_human, waiting_*, and
+ *   reconciling) remain resumable suspensions rather than terminal results.
  * - Capacity bound with a clear error when full.
  */
 import { randomUUID } from "node:crypto";
@@ -48,10 +47,9 @@ export class TaskStore {
       try {
         const task = JSON.parse(await readFile(join(this.baseDir, entry.name), "utf8"));
         if (task?.status === "running" || task?.status === "created" || task?.status === "queued") {
-          task.status = "failed";
-          task.error = "interrupted: the API server restarted while this task was running; the task did not complete and no outcome is claimed.";
-          task.finished_at = new Date().toISOString();
-          task.updated_at = task.finished_at;
+          task.status = "reconciling";
+          task.error = "interrupted: the API server restarted while this task was running; its remote outcome must be reconciled before retry or completion.";
+          task.updated_at = new Date().toISOString();
           await this.#writeAtomic(entry.name, task);
         }
         // Suspended (human-blocked) runs survive restarts: they are reloaded
@@ -139,8 +137,8 @@ export class TaskStore {
     try {
       const task = JSON.parse(await readFile(join(this.baseDir, `${taskId}.json`), "utf8"));
       if (task?.status === "running" || task?.status === "queued") {
-        task.status = "failed";
-        task.error = task.error ?? "interrupted: this task was not running in a live process.";
+        task.status = "reconciling";
+        task.error = task.error ?? "interrupted: this task was not running in a live process; its outcome must be reconciled.";
       }
       this.tasks.set(taskId, task);
       return task;

@@ -112,6 +112,8 @@ Run `npm test` in a disposable environment. The CDP integration suite launches i
 | `src/runtime/` | Policy, approvals, and execution boundary contracts |
 | `src/browser/` | CDP transport, target authorization, and session lifecycle |
 | `src/testing/` | Declarative workflows, receipts, and verification semantics |
+| `src/capabilities/` | Observed, scoped, qualified, reusable site capability contracts |
+| `src/extraction/` | Typed structured record extraction, provenance, completeness, and release projection |
 | `test-lab/` | Native ActiveTab qualification, fixture providers, external benchmark adapters, and independent scoring |
 | `src/diagnostics/` | Diagnostic contracts, evidence collection, and correlation |
 | `src/telemetry/` | Append-only decision events, privacy projections, and reviewed training labels |

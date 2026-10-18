@@ -21,6 +21,9 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 - A page fingerprint change alone is not outcome success.
 - Cleanup is a verifiable obligation for every test-owned resource.
 - Every interaction type in the schema must have a dispatch implementation or fail validation before execution.
+- `discover_tables`, `extract_records`, `collect_records`, and `emit_output` are read-only capability steps. They require a registered fixture-qualified manifest and fresh target/environment/principal/route scope; page advances re-enter the browser step handler and authorized executor.
+- Extraction values and accumulators are in-memory run artifacts. On continuation they are re-observed and rebuilt; missing artifacts after process restart produce an inconclusive result rather than a reconstructed PASS.
+- `collect_records` obeys its registered page and row limits, verifies typed fields, uniqueness, provenance, and the declared count-completion policy, and never treats a dispatch acknowledgment as complete output.
 - `execution/workflowScheduler.js` owns pure workflow eligibility, graph status, and trusted subworkflow budget validation. `execution/stepDispatcher.js` routes validated workflow steps to focused handlers. Neither component authorizes effects; browser effects remain behind the shared authorized executor.
 - `lifecycle/RunStateCoordinator` owns durable run bindings, leases, checkpoints, and durable status; it cannot authorize or dispatch effects.
 - `lifecycle/InterventionCoordinator` owns persisted human handoffs and evidence-gated resume while re-entering the same runner callback and shared execution budget.

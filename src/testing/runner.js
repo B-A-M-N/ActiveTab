@@ -19,6 +19,7 @@ import { VerificationStepHandler } from "./steps/verificationStepHandler.js";
 import { QualificationStepHandler } from "./steps/qualificationStepHandler.js";
 import { BrowserStepHandler } from "./steps/browserStepHandler.js";
 import { ApiStepHandler } from "./steps/apiStepHandler.js";
+import { ExtractionStepHandler } from "./steps/extractionStepHandler.js";
 import { InterventionCoordinator } from "./lifecycle/interventionCoordinator.js";
 import { StepDispatcher } from "./execution/stepDispatcher.js";
 import {
@@ -58,13 +59,14 @@ function executionWorkflowFingerprint(workflow, registry) {
 }
 
 function canRestoreStepWithoutExecution(step, status) {
+  if (["discover_tables", "extract_records", "collect_records", "emit_output"].includes(step?.type)) return false;
   if (status === STEP_STATUS.PASS) return true;
   const effectfulStepTypes = new Set(["navigate", "interact", "api_call", "cleanup", "goal", "controlled_failure"]);
   return effectfulStepTypes.has(step?.type) && status === STEP_STATUS.FAIL;
 }
 
 export class TestRunner {
-  constructor({ session, collector, correlator, journal, maxSteps = 32, signal, interventions = null, environment = null, localFixture = false, decisionRuntime = null, qualificationService = null, operationAuthorizer = null, workflowRegistry = null, runStateStore = null, existingRunStateId = null, principalId = null, profileId = null, policyVersion = "active_policy_v1" } = {}) {
+  constructor({ session, collector, correlator, journal, maxSteps = 32, signal, interventions = null, environment = null, localFixture = false, decisionRuntime = null, qualificationService = null, operationAuthorizer = null, workflowRegistry = null, capabilityRegistry = null, capabilityService = null, authorizeExtractionField = null, authorizeExtractionRelease = null, runStateStore = null, existingRunStateId = null, principalId = null, profileId = null, policyVersion = "active_policy_v1" } = {}) {
     this.session = session;
     this.collector = collector;
     this.correlator = correlator;
@@ -82,6 +84,10 @@ export class TestRunner {
     // JSON can name an operation, but cannot provide or replace this authority.
     this.operationAuthorizer = operationAuthorizer;
     this.workflowRegistry = workflowRegistry;
+    this.capabilityRegistry = capabilityRegistry;
+    this.capabilityService = capabilityService;
+    this.outputResults = {};
+    this.capabilityDiscoveries = [];
     this.runStateStore = runStateStore;
     this.runStateCoordinator = new RunStateCoordinator({
       runStateStore,
@@ -137,6 +143,24 @@ export class TestRunner {
       getExecutionLeaseAssertion: () => this.targetLease ? () => this.#assertTargetLeaseCurrent() : null
     });
     this.apiStepHandler = new ApiStepHandler({ collector });
+    this.extractionStepHandler = new ExtractionStepHandler({
+      session,
+      environment,
+      principalId,
+      capabilityRegistry,
+      capabilityService,
+      authorizeField: authorizeExtractionField,
+      authorizeRelease: authorizeExtractionRelease,
+      advancePage: async ({ url, receipt, stepId, pageNumber }) => await this.browserStepHandler.executeNavigate({
+        id: `${stepId}.page.${pageNumber}`,
+        type: "navigate",
+        url,
+        redactUrlDetails: true,
+        timeoutMs: 5_000
+      }, receipt, new Date().toISOString()),
+      onOutput: (name, output) => { this.outputResults[name] = output; },
+      onDiscovery: result => { this.capabilityDiscoveries.push(result); }
+    });
     this.stepDispatcher = new StepDispatcher({
       executeSetup: (...args) => this.#executeSetup(...args),
       executeNavigate: (...args) => this.#executeNavigate(...args),
@@ -145,6 +169,7 @@ export class TestRunner {
       apiStepHandler: this.apiStepHandler,
       verificationStepHandler: this.verificationStepHandler,
       qualificationStepHandler: this.qualificationStepHandler,
+      extractionStepHandler: this.extractionStepHandler,
       controlFlowStepHandler: this.controlFlowStepHandler,
       getTelemetryStepId: step => this.currentTelemetryStepId ?? telemetryStepId(step.id)
     });
@@ -242,6 +267,7 @@ export class TestRunner {
     const persistedState = await this.#initializeRunState(workflow, receipt);
     if (persistedState?.completedSteps?.length) {
       for (const item of persistedState.completedSteps) {
+        if (["discover_tables", "extract_records", "collect_records", "emit_output"].includes(item.type)) continue;
         if (!Object.values(STEP_STATUS).includes(item.status)) continue;
         context.completedStatuses.set(item.stepId, item.status);
         receipt.recordStep({

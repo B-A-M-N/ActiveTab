@@ -22,7 +22,7 @@ import { open } from "node:fs/promises";
 import { TaskStore } from "./task-store.js";
 import { RunLifecycle } from "./run-lifecycle.js";
 import { checkHost, checkOrigin, createMutationAuthorizer, createOperatorAuthenticator } from "./security.js";
-import { OFFICIAL_TEMPLATES, REGIONS, findTemplate, validateInput, renderGoal } from "./templates.js";
+import { OFFICIAL_TEMPLATES, REGIONS, findTemplate, validateInput, renderGoal, buildPageDataExtractionWorkflow } from "./templates.js";
 import { projectInput } from "./input-projection.js";
 import { sendJson, sendError, readBody, parseQuery } from "./http-utils.js";
 import { createDiagnostics } from "../runtime/diagnostics.js";
@@ -44,6 +44,7 @@ import { AuthorizationGrantStore } from "../runtime/approvals.js";
 import { trackRunResult } from "../runtime/runTracker.js";
 import { randomUUID } from "node:crypto";
 import { createQualificationRuntime } from "../testing/qualificationRuntime.js";
+import { projectExtractionOutput, projectExtractionOutputs } from "../extraction/outputRelease.js";
 
 const DEFAULT_PORT = 9377;
 const API_PREFIX = "/v3/bots";
@@ -55,7 +56,7 @@ const OUTPUT_EXTENSIONS = new Set(["json", "md", "csv", "xml"]);
 // the run as finished.
 const TERMINAL = new Set(["finished", "failed", "canceled"]);
 
-export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationRunner, decisionRuntime = null, qualificationService = null, apiToken, operatorToken = process.env.ACTIVETAB_OPERATOR_TOKEN ?? null, operatorId = process.env.ACTIVETAB_OPERATOR_ID ?? null, operatorAuthenticator = null, host = "127.0.0.1", maxTasks = MAX_TASK_RECORDS, executorName, reportDir, testSessionResolver = null, testEnvironmentResolver = null, testProfileIdResolver = null, testPrincipalResolver = null, runStateStore: suppliedRunStateStore = null } = {}) {
+export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationRunner, decisionRuntime = null, qualificationService = null, capabilityRegistry = null, capabilityService = null, authorizeExtractionField = null, authorizeExtractionRelease = null, apiToken, operatorToken = process.env.ACTIVETAB_OPERATOR_TOKEN ?? null, operatorId = process.env.ACTIVETAB_OPERATOR_ID ?? null, operatorAuthenticator = null, host = "127.0.0.1", maxTasks = MAX_TASK_RECORDS, executorName, reportDir, testSessionResolver = null, testEnvironmentResolver = null, testProfileIdResolver = null, testPrincipalResolver = null, runStateStore: suppliedRunStateStore = null } = {}) {
   const store = new TaskStore(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"));
   const lifecycle = new RunLifecycle({ store, navigationRunner, executorName, reportDir });
   const token = apiToken ?? process.env.ACTIVETAB_API_TOKEN ?? null;
@@ -148,7 +149,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
   function installTestRun({ runId, session, workflow, binding, controller, collector, correlator, runner, runPromise, runCtx }) {
     const runState = trackRunResult(runPromise);
     testRuns.set(runId, {
-      collector, correlator, controller, runPromise, runState, session, runner, workflow,
+      collector, correlator, controller, runPromise, runState, session, runner, workflow, binding,
       startedAt: new Date().toISOString(),
       resume: async () => {
         if (!runState.settled) return { resumed: false, reason: "Run is still executing." };
@@ -212,7 +213,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
     const controller = new AbortController();
     const runner = new TestRunner({
       session, collector, correlator, signal: controller.signal, interventions: interventionStore,
-      decisionRuntime, qualificationService: runQualificationService, runStateStore, ...binding
+      decisionRuntime, qualificationService: runQualificationService, capabilityRegistry, capabilityService, authorizeExtractionField, authorizeExtractionRelease, runStateStore, ...binding
     });
     const runCtx = createTestVerificationContext(session);
     const runPromise = runner.run(workflow, { runId });
@@ -283,7 +284,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
     const controller = new AbortController();
     const runner = new TestRunner({
       session, collector, correlator, signal: controller.signal, interventions: interventionStore,
-      decisionRuntime, qualificationService: runQualificationService, runStateStore, existingRunStateId: runId, ...binding
+      decisionRuntime, qualificationService: runQualificationService, capabilityRegistry, capabilityService, authorizeExtractionField, authorizeExtractionRelease, runStateStore, existingRunStateId: runId, ...binding
     });
     const runCtx = createTestVerificationContext(session);
     const runPromise = intervention
@@ -303,7 +304,18 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
         await ensureRunStateStore();
         const state = await runStateStore.getFresh(runId);
         if (state) {
-          sendJson(res, 200, receiptFromRunState(state).toObject());
+          const receipt = receiptFromRunState(state).toObject();
+          const missingExtractionArtifact = (state.completedSteps ?? []).some(item => ["emit_output", "discover_tables", "extract_records", "collect_records"].includes(item.type) && item.status === "PASS");
+          if (missingExtractionArtifact) {
+            receipt.status = "UNCERTAIN";
+            receipt.limitations.push("Capability discovery and structured extraction artifacts are held in memory only; their result cannot be reconstructed after process restart.");
+            const outputStep = [...receipt.steps].reverse().find(item => ["emit_output", "discover_tables", "extract_records", "collect_records"].includes(item.type));
+            if (outputStep) {
+              outputStep.status = "UNCERTAIN";
+              outputStep.reason = "The prior process completed this capability step, but its in-memory result is unavailable after restart.";
+            }
+          }
+          sendJson(res, 200, { ...receipt, outputs: {}, capability_discoveries: [] });
           return;
         }
       } catch (error) {
@@ -313,7 +325,14 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
       sendError(res, 404, 99404, `No test run found for runId '${runId}'.`); return;
     }
     if (!run.runState.settled) { sendJson(res, 200, { runId, status: "RUNNING", startedAt: run.startedAt }); return; }
-    if (run.runState.receipt) { sendJson(res, 200, run.runState.receipt.toObject()); return; }
+    if (run.runState.receipt) {
+      sendJson(res, 200, {
+        ...run.runState.receipt.toObject(),
+        outputs: projectExtractionOutputs(run.runner?.outputResults ?? {}, authorizeExtractionRelease, { req, runId, principalId: run.binding?.principalId ?? null }),
+        capability_discoveries: run.runner?.capabilityDiscoveries ?? []
+      });
+      return;
+    }
     sendJson(res, 200, { runId, status: "FAILED", startedAt: run.startedAt, error: String(run.runState.error?.message ?? "Run failed.").slice(0, 300) });
   }
 
@@ -584,11 +603,79 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
           return;
         }
 
+        if (method === "GET" && path === "/v3/capabilities") {
+          const items = (capabilityService?.registry?.list?.() ?? capabilityRegistry?.list?.() ?? []).map(manifest => ({
+            capability_id: manifest.capabilityId,
+            version: manifest.capabilityVersion,
+            application_id: manifest.applicationId,
+            environment_id: manifest.environmentId,
+            origin: manifest.origin,
+            page_path: manifest.pagePath,
+            output_schema: manifest.extractionContract.fields.map(({ name, type, required, dataClass }) => ({ name, type, required, data_class: dataClass })),
+            completion_policy: manifest.extractionContract.completionPolicy,
+            ...(manifest.extractionContract.expectedRecords === undefined ? {} : { expected_records: manifest.extractionContract.expectedRecords }),
+            min_records: manifest.extractionContract.minRecords ?? 1,
+            unique_by: manifest.extractionContract.uniqueBy,
+            ...(manifest.extractionContract.pagination ? { pagination: manifest.extractionContract.pagination } : {}),
+            qualification: manifest.qualification
+          }));
+          sendJson(res, 200, { items });
+          return;
+        }
+
+        if (method === "POST" && path === "/v3/capabilities/discover") {
+          if (!executorReady || typeof navigationRunner.discoverCapabilities !== "function") {
+            sendError(res, 503, 99503, "Capability discovery is unavailable on this server.");
+            return;
+          }
+          const input = await readBody(req) ?? {};
+          const result = await navigationRunner.discoverCapabilities({ input, req, templateId: "capability-discovery", taskId: randomUUID() });
+          sendJson(res, 200, result);
+          return;
+        }
+
+        if (method === "POST" && path === "/v3/capabilities/compile") {
+          if (!executorReady || typeof navigationRunner.compileCapability !== "function") {
+            sendError(res, 503, 99503, "Capability compilation is unavailable on this server.");
+            return;
+          }
+          const body = await readBody(req) ?? {};
+          const result = await navigationRunner.compileCapability({
+            candidateId: body.candidate_id,
+            capabilityId: body.capability_id,
+            capabilityVersion: body.capability_version ?? 1,
+            fields: body.fields,
+            maxRecords: body.max_records,
+            minRecords: body.min_records ?? 1,
+            expectedRecords: body.expected_records,
+            completionPolicy: body.completion_policy ?? "exact_count",
+            uniqueBy: body.unique_by ?? [],
+            ...(body.pagination ? { pagination: body.pagination } : {})
+          }, { req, templateId: "capability-compile" });
+          sendJson(res, 200, result);
+          return;
+        }
+
+        const qualifyCapabilityMatch = method === "POST" && path.match(/^\/v3\/capabilities\/recipes\/([0-9a-f-]{36})\/qualify$/);
+        if (qualifyCapabilityMatch) {
+          if (!executorReady || typeof navigationRunner.qualifyCapability !== "function") {
+            sendError(res, 503, 99503, "Capability qualification is unavailable on this server.");
+            return;
+          }
+          const body = await readBody(req) ?? {};
+          const result = await navigationRunner.qualifyCapability(qualifyCapabilityMatch[1], {
+            variants: body.variants ?? 30,
+            ...(req.signal ? { signal: req.signal } : {})
+          }, { req });
+          sendJson(res, 200, result);
+          return;
+        }
+
         // ── POST run creation (template and bot routes share one path) ──
         const templateRun = method === "POST" && path.match(/^\/v3\/bots\/templates\/[^/]+\/runs$/);
         const botRun = method === "POST" && path.match(/^\/v3\/bots\/[^/]+\/runs$/);
         if (templateRun || botRun) {
-          await handleCreateRun(req, res, { templateRun, botRun, path, executorReady, store, lifecycle, maxTaskRecords, diagnostics, runStateStore });
+          await handleCreateRun(req, res, { templateRun, botRun, path, executorReady, store, lifecycle, maxTaskRecords, diagnostics, runStateStore, capabilityService, authorizeExtractionRelease });
           return;
         }
 
@@ -699,7 +786,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
 
 // ── Route handlers ───────────────────────────────────────────────────────
 
-async function handleCreateRun(req, res, { templateRun, botRun, path, executorReady, store, lifecycle, maxTaskRecords, diagnostics, runStateStore }) {
+async function handleCreateRun(req, res, { templateRun, botRun, path, executorReady, store, lifecycle, maxTaskRecords, diagnostics, runStateStore, capabilityService, authorizeExtractionRelease }) {
   if (!executorReady) {
     // Fail closed: no executor, no acknowledged executable task.
     sendError(res, 503, 99503, "Navigation execution is unavailable on this server.");
@@ -723,20 +810,49 @@ async function handleCreateRun(req, res, { templateRun, botRun, path, executorRe
     return;
   }
 
+  if (id === "local-page-data-extractor" && typeof body.input.capability_id === "string") {
+    let requestedUrl;
+    try { requestedUrl = new URL(body.input.url); }
+    catch { sendError(res, 400, 99001, "url must match the exact route of a registered extraction capability."); return; }
+    const matchingCapabilities = (capabilityService?.registry?.list?.() ?? []).filter(manifest => {
+      if (manifest.capabilityId !== body.input.capability_id
+        || manifest.capabilityVersion !== (body.input.capability_version ?? 1)
+        || manifest.origin !== requestedUrl.origin || manifest.pagePath !== requestedUrl.pathname) return false;
+      return true;
+    });
+    if (requestedUrl.username || requestedUrl.password || requestedUrl.search || requestedUrl.hash
+      || !["http:", "https:"].includes(requestedUrl.protocol) || matchingCapabilities.length !== 1) {
+      sendError(res, 400, 99001, "capability_id and url must identify one registered origin and exact route without credentials, query, or fragment.");
+      return;
+    }
+  }
+
   const task = store.create(id, body.input, templateRun ? null : id);
   store.update(task.task_id, { status: "queued" });
   await store.persist(task.task_id);
   diagnostics.bump("runs.created");
   logger.info("run.created", { task: task.task_id, template: id, executor: lifecycle.executorReady ? "configured" : "none" });
 
-  lifecycle.start(task.task_id, controller => lifecycle.navigationRunner.run(renderGoal(template, body.input), {
-    signal: controller.signal,
-    input: body.input,
-    templateId: id,
-    taskId: task.task_id,
-    inputSchema: template.input_schema,
-    runStateStore
-  }));
+  const extractionWorkflow = id === "local-page-data-extractor" && capabilityService
+    ? buildPageDataExtractionWorkflow(body.input, task.task_id)
+    : null;
+  const goal = extractionWorkflow
+    ? `Go to ${body.input.url} and ${body.input.capability_id ? "extract with a qualified capability" : "discover visible structured data"}.`
+    : renderGoal(template, body.input);
+  lifecycle.start(task.task_id, async controller => {
+    const result = await lifecycle.navigationRunner.run(goal, {
+      signal: controller.signal,
+      input: body.input,
+      templateId: id,
+      taskId: task.task_id,
+      inputSchema: template.input_schema,
+      ...(extractionWorkflow ? { workflow: extractionWorkflow } : {}),
+      runStateStore
+    });
+    return extractionWorkflow
+      ? projectRunResultForRelease(result, authorizeExtractionRelease, { req, taskId: task.task_id })
+      : result;
+  });
 
   sendJson(res, 200, { status: "created", task_id: task.task_id });
 }
@@ -787,6 +903,30 @@ async function handlePeerRun(req, res, { store, lifecycle, executorReady, diagno
     task_id: task.task_id,
     ...(finished.error ? { error: finished.error } : {})
   });
+}
+
+function projectRunResultForRelease(result, authorizeExtractionRelease, context) {
+  if (!result?.output || typeof result.output !== "object") return result;
+  const output = result.output;
+  const outputs = projectExtractionOutputs(output.outputs ?? {}, authorizeExtractionRelease, context);
+  const primary = output.schema?.items
+    ? projectExtractionOutput(output, authorizeExtractionRelease, context)
+    : null;
+  return {
+    ...result,
+    output: {
+      ...output,
+      ...(primary ? {
+        schema: primary.schema,
+        records: primary.records,
+        fieldProvenance: primary.fieldProvenance,
+        completeness: primary.completeness,
+        verification: primary.verification,
+        ...(primary.release ? { release: primary.release } : {})
+      } : {}),
+      outputs
+    }
+  };
 }
 
 async function serveOutputFile(res, { store, path }) {

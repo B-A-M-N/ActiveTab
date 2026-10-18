@@ -81,6 +81,13 @@ export class BrowserStepHandler {
     try { await this.session.waitForChange(step.timeoutMs ?? 5_000, waitBaseline); }
     catch { /* Wait may time out; the postcondition check below is the authority. */ }
     const postObservation = await this.session.observe();
+    const reportUrl = value => {
+      if (typeof value !== "string") return null;
+      try {
+        const parsed = new URL(value);
+        return step.redactUrlDetails === true ? `${parsed.origin}${parsed.pathname}` : parsed.href;
+      } catch { return step.redactUrlDetails === true ? "[redacted destination]" : value; }
+    };
     const navigationSucceeded = postObservation?.page?.url && (
       url === postObservation.page.url ||
       postObservation.page.url.startsWith(url) ||
@@ -90,7 +97,7 @@ export class BrowserStepHandler {
     if (telemetry) await telemetry.recordObserved(postObservation, telemetryChanged, navigationSucceeded ? "navigation_destination_observed" : "navigation_mismatch_observed");
     let status = authResult?.telemetryError ? STEP_STATUS.UNCERTAIN : navigationSucceeded ? STEP_STATUS.PASS : STEP_STATUS.FAIL;
     let reason = navigationSucceeded
-      ? `Navigated to ${postObservation.page.url}.`
+      ? `Navigated to ${reportUrl(postObservation.page.url)}.`
       : "Post-navigation URL did not match the requested destination.";
     if (telemetry) {
       try {
@@ -106,11 +113,11 @@ export class BrowserStepHandler {
         reason = "Navigation was observed but its durable operation receipt could not be reconciled.";
       }
     }
-    this.emitTraceEvent({ eventId: `step:${step.id}:verify`, runId: receipt.runId, stepId: step.id, event: "outcome_verification", status, observedUrl: postObservation?.page?.url, evidenceId: postObservation?.evidenceId });
+    this.emitTraceEvent({ eventId: `step:${step.id}:verify`, runId: receipt.runId, stepId: step.id, event: "outcome_verification", status, observedUrl: reportUrl(postObservation?.page?.url), evidenceId: postObservation?.evidenceId });
     receipt.recordStep({
       stepId: step.id, type: step.type, status, reason, startedAt,
       evidenceIds: [postObservation?.evidenceId ?? ""].filter(Boolean),
-      details: { finalUrl: postObservation?.page?.url ?? null, title: postObservation?.page?.title ?? null }
+      details: { finalUrl: reportUrl(postObservation?.page?.url), title: postObservation?.page?.title ?? null }
     });
     return { status, reason, observation: postObservation };
   }

@@ -22,6 +22,11 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { withTargetExecutionLease } from "../testing/runState.js";
+import { TestRunner } from "../testing/runner.js";
+import { DiagnosticCollector } from "../diagnostics/collector.js";
+import { DiagnosticCorrelator } from "../diagnostics/correlator.js";
+import { RUN_STATUS } from "../testing/schema.js";
+import { projectExtractionOutputs } from "../extraction/outputRelease.js";
 
 function abortedMarker(signal) {
   if (!signal?.aborted) return null;
@@ -52,10 +57,32 @@ export function createNavigationRunner({
   journalDir = join(process.cwd(), ".activetab", "journals"),
   outputFormats,
   sensitiveExports = false,
-  engineOptions = {}
+  engineOptions = {},
+  capabilityRegistry = null,
+  capabilityService = null,
+  authorizeExtractionField = null,
+  authorizeExtractionRelease = null,
+  resolveEnvironmentBinding = null,
+  resolvePrincipal = null
 } = {}) {
   if (typeof resolveSession !== "function") {
     throw new Error("createNavigationRunner requires an authorized session resolver (resolveSession). The API cannot select or authorize browser targets implicitly.");
+  }
+  async function withAuthorizedSession(context, callback) {
+    const session = await resolveSession(context);
+    if (!session || session.attached !== true || !session.target?.id) {
+      throw new Error("The session resolver did not return an attached authorized browser session.");
+    }
+    try { return await callback(session); }
+    finally {
+      if (session.persistent !== true) {
+        try { await session.close(); }
+        catch (error) {
+          const { logger, bound } = await import("../runtime/logger.js");
+          logger.warn("session.close.failed", { reason: bound(error?.message ?? error, 120) });
+        }
+      }
+    }
   }
   return {
     /**
@@ -69,7 +96,7 @@ export function createNavigationRunner({
      * @param {object} [context.inputSchema] - Template input schema (for redacted exports)
      * @param {boolean} [context.ownerAuthorizedExport] - Run owner explicitly authorized a full export
      */
-    async run(goal, { signal, input, templateId, taskId: providedTaskId, inputSchema, ownerAuthorizedExport, plannerMode, workflowIntent, runStateStore = null } = {}) {
+    async run(goal, { signal, input, templateId, taskId: providedTaskId, inputSchema, ownerAuthorizedExport, plannerMode, workflowIntent, workflow = null, environmentBinding = null, principalId = null, runStateStore = null } = {}) {
       let abortError = abortedMarker(signal);
 
       let session;
@@ -86,6 +113,78 @@ export function createNavigationRunner({
         if (abortError) throw abortError;
 
         const taskId = providedTaskId ?? randomUUID();
+        if (workflow) {
+          const environment = environmentBinding ?? (typeof resolveEnvironmentBinding === "function"
+            ? await resolveEnvironmentBinding({ session, goal, input, templateId, taskId, signal })
+            : null);
+          const resolvedPrincipalId = principalId ?? (typeof resolvePrincipal === "function"
+            ? await resolvePrincipal({ session, goal, input, templateId, taskId })
+            : "local_api_automation");
+          const collector = new DiagnosticCollector({ runId: taskId });
+          const runner = new TestRunner({
+            session,
+            collector,
+            correlator: new DiagnosticCorrelator(),
+            signal,
+            environment,
+            decisionRuntime: engineOptions.decisionRuntime ?? null,
+            qualificationService: engineOptions.qualificationService ?? null,
+            capabilityRegistry,
+            capabilityService,
+            authorizeExtractionField,
+            authorizeExtractionRelease,
+            runStateStore,
+            principalId: resolvedPrincipalId,
+            profileId: environment?.profileId ?? environment?.id ?? environment?.environmentId ?? null
+          });
+          const receipt = await runner.run(workflow, { runId: taskId });
+          abortError ??= abortedMarker(signal);
+          if (abortError) throw abortError;
+          let status = receipt.status === RUN_STATUS.PASSED ? "succeeded"
+            : receipt.status === RUN_STATUS.UNCERTAIN || receipt.status === RUN_STATUS.RECONCILING ? "reconciling"
+              : receipt.status === RUN_STATUS.CANCELED ? "canceled"
+                : receipt.status.startsWith("WAITING_") ? receipt.status.toLowerCase()
+                  : "failed";
+          const outputs = projectExtractionOutputs(runner.outputResults, authorizeExtractionRelease, {
+            runId: taskId,
+            principalId: resolvedPrincipalId
+          });
+          if (status === "succeeded" && Object.values(outputs).some(item => item?.completeness !== "complete")) status = "failed";
+          const namedOutputs = Object.keys(outputs);
+          const primaryOutput = namedOutputs.length === 1 ? outputs[namedOutputs[0]] : null;
+          const output = {
+            status,
+            run_id: taskId,
+            receipt: receipt.toObject(),
+            ...(receipt.status !== RUN_STATUS.PASSED
+              ? { reason: receipt.steps.at(-1)?.reason ?? `Workflow ended with ${receipt.status}.` }
+              : status !== "succeeded"
+                ? { reason: "The extracted result is incomplete after applying the caller's field-release policy." }
+                : {}),
+            outputs,
+            ...(primaryOutput ? { records: primaryOutput.records, schema: primaryOutput.schema, completeness: primaryOutput.completeness, verification: primaryOutput.verification } : {}),
+            capability_discoveries: runner.capabilityDiscoveries
+          };
+          const outputFiles = await generateOutputFiles(
+            taskId,
+            { goal, input, output: primaryOutput ? { ...output, ...primaryOutput } : output, status, inputSchema },
+            outputDir,
+            {
+              ...(outputFormats ? { formats: outputFormats } : {}),
+              includeSensitive: sensitiveExports === true,
+              authorized: ownerAuthorizedExport === true
+            }
+          );
+          return {
+            status,
+            output,
+            usage: { actions: receipt.steps.length, recoveries: 0, planner_calls: 0, tokens_used: null, elapsed_ms: Date.now() - startedAt },
+            output_files: outputFiles,
+            live_url_info: null,
+            task_id: taskId,
+            evidence_id: receipt.steps.flatMap(step => step.evidenceIds ?? []).at(-1) ?? null
+          };
+        }
         const journalPath = join(journalDir, `${taskId}.json`);
         const journal = new TaskJournal(journalPath);
 
@@ -140,6 +239,35 @@ export function createNavigationRunner({
           }
         }
       }
+    },
+    async discoverCapabilities(context = {}) {
+      if (!capabilityService?.discover) throw new Error("Capability discovery is not configured.");
+      return await withAuthorizedSession(context, async session => {
+        const environment = typeof resolveEnvironmentBinding === "function"
+          ? await resolveEnvironmentBinding({ ...context, session }) : null;
+        const principalId = typeof resolvePrincipal === "function"
+          ? await resolvePrincipal({ ...context, session }) : "local_api_automation";
+        return await capabilityService.discover({ session, environment, principalId });
+      });
+    },
+    async compileCapability(input, context = {}) {
+      if (!capabilityService?.compile) throw new Error("Capability compilation is not configured.");
+      return await withAuthorizedSession(context, async session => {
+        const environment = typeof resolveEnvironmentBinding === "function"
+          ? await resolveEnvironmentBinding({ ...context, session }) : null;
+        const principalId = typeof resolvePrincipal === "function"
+          ? await resolvePrincipal({ ...context, session }) : "local_api_automation";
+        return capabilityService.compile({ ...input, session, environment, principalId });
+      });
+    },
+    async qualifyCapability(recipeId, options = {}, context = {}) {
+      if (!capabilityService?.qualify) throw new Error("Capability qualification is not configured.");
+      const principalId = typeof resolvePrincipal === "function"
+        ? await resolvePrincipal(context) : "local_api_automation";
+      return await capabilityService.qualify(recipeId, { ...options, principalId });
+    },
+    listCapabilities() {
+      return capabilityRegistry?.list?.() ?? [];
     }
   };
 }

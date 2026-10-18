@@ -432,7 +432,7 @@ test("output endpoint rejects path traversal and non-allowlisted names", async (
   assert.ok([403, 404].includes(res.status));
 });
 
-test("interrupted running tasks are reconciled to failed after restart", async () => {
+test("interrupted running tasks remain reconciling after restart", async () => {
   const dir = join(tempDir, "tasks-reconcile");
   const first = createApiServer({ port: 0, taskStoreDir: dir, navigationRunner: MOCK_NAVIGATION_RUNNER, apiToken: "test-token" });
   const { url } = await first.start();
@@ -448,7 +448,7 @@ test("interrupted running tasks are reconciled to failed after restart", async (
   const second = createApiServer({ port: 0, taskStoreDir: dir, navigationRunner: MOCK_NAVIGATION_RUNNER, apiToken: "test-token" });
   const secondInfo = await second.start();
   const detail = await fetch(`${secondInfo.url}/v3/bots/runs/${create.task_id}`, { headers: { "Authorization": "Bearer test-token" } }).then(r => r.json());
-  assert.equal(detail.status, "failed", "a task left running by a dead process is never falsely successful");
+  assert.equal(detail.status, "reconciling", "a lost worker is not treated as proof of remote failure");
   assert.match(detail.error, /interrupted/);
   await second.stop();
 });

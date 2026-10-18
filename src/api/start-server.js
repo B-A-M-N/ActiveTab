@@ -27,12 +27,21 @@
  *                             (exactly one; overrides the env-flag detection)
  *   ACTIVETAB_OUTPUT_FORMATS  Optional comma-separated export formats
  *                             (json,md,csv,xml; default json+md[+csv])
+ *   ACTIVETAB_CAPABILITY_DIR  Optional owner-private qualified recipe registry
+ *   ACTIVETAB_EXTRACTION_POLICY_FILE  Optional owner-private field/pagination policy
+ *   ACTIVETAB_PROFILE_ID      Explicit environment binding required for browser runs
  */
 import { createApiServer } from "./local-server.js";
 import { createNavigationRunner, resolveConfiguredSession } from "./navigation-runner.js";
 import { createRemoteExecutor } from "../runtime/remote-executor.js";
 import { join } from "node:path";
 import { createDecisionRuntime } from "../decisions/runtime.js";
+import { CapabilityRegistry } from "../capabilities/capabilityRegistry.js";
+import { CapabilityService } from "../capabilities/capabilityService.js";
+import { CapabilityQualifier } from "../capabilities/capabilityQualifier.js";
+import { loadExtractionFieldPolicy } from "../capabilities/fieldPolicy.js";
+import { loadEnvironmentBinding } from "../testing/profiles.js";
+import { qualifyExtractionManifest } from "../../test-lab/fixtures/extractionQualification.js";
 
 const port = parseInt(process.env.ACTIVETAB_API_PORT ?? "9377", 10);
 const taskStoreDir = process.env.ACTIVETAB_TASK_DIR;
@@ -40,6 +49,26 @@ const taskStoreDir = process.env.ACTIVETAB_TASK_DIR;
 const outputFormats = process.env.ACTIVETAB_OUTPUT_FORMATS
   ? process.env.ACTIVETAB_OUTPUT_FORMATS.split(",").map(value => value.trim()).filter(Boolean)
   : undefined;
+
+const capabilityRegistry = await new CapabilityRegistry({
+  directory: process.env.ACTIVETAB_CAPABILITY_DIR ?? join(process.cwd(), ".activetab", "capabilities")
+}).init();
+const extractionFieldPolicy = await loadExtractionFieldPolicy(process.env.ACTIVETAB_EXTRACTION_POLICY_FILE);
+const capabilityService = new CapabilityService({
+  registry: capabilityRegistry,
+  qualifier: new CapabilityQualifier({ runQualification: qualifyExtractionManifest }),
+  classifyField: extractionFieldPolicy.classifyField,
+  authorizePagination: extractionFieldPolicy.authorizePagination
+});
+const resolveEnvironmentBinding = async () => {
+  const profileId = process.env.ACTIVETAB_PROFILE_ID;
+  if (!profileId) return null;
+  const profilesDir = process.env.ACTIVETAB_PROFILES_DIR ?? join(process.cwd(), "profiles");
+  return await loadEnvironmentBinding(profilesDir, profileId);
+};
+const resolvePrincipal = () => process.env.ACTIVETAB_PRINCIPAL_ID ?? "local_api_automation";
+const authorizeExtractionField = field => extractionFieldPolicy.authorizeRead(field);
+const authorizeExtractionRelease = field => extractionFieldPolicy.authorizeRelease(field);
 
 // Executor selection:
 // - ACTIVETAB_REMOTE_PEER_URL set → this node forwards redacted run
@@ -69,6 +98,12 @@ if (process.env.ACTIVETAB_REMOTE_PEER_URL) {
       throw new Error(`Navigation execution is unavailable: ${String(error.message ?? error)}`);
     }),
     engineOptions: { decisionRuntime },
+    capabilityRegistry,
+    capabilityService,
+    authorizeExtractionField,
+    authorizeExtractionRelease,
+    resolveEnvironmentBinding,
+    resolvePrincipal,
     ...(outputFormats ? { outputFormats } : {})
   });
 } catch (error) {
@@ -83,6 +118,7 @@ if (!navigationRunner) {
 process.env.ACTIVETAB_REPORT_DIR ??= join(process.env.ACTIVETAB_TASK_DIR ?? join(process.cwd(), ".activetab"), "reports");
 const api = createApiServer({
   port, taskStoreDir, navigationRunner, decisionRuntime,
+  capabilityRegistry, capabilityService, authorizeExtractionField, authorizeExtractionRelease,
   executorName: process.env.ACTIVETAB_REMOTE_PEER_URL ? "remote-peer" : "local",
   reportDir: process.env.ACTIVETAB_REPORT_DIR
 });

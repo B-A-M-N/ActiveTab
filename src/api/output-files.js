@@ -32,8 +32,16 @@ function escapeXml(str) {
 }
 
 function escapeCsv(str) {
-  const s = String(str ?? "");
-  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  let value = str ?? "";
+  let s = String(value);
+  if (typeof value === "string") {
+    let first = 0;
+    while (first < s.length && [" ", "\t", "\r", "\n"].includes(s[first])) first++;
+    if (["=", "+", "-", "@"].includes(s[first])) s = `'${s}`;
+  }
+  let quote = false;
+  for (const character of s) if ([",", '"', "\n", "\r"].includes(character)) quote = true;
+  if (quote) return `"${s.replaceAll('"', '""')}"`;
   return s;
 }
 
@@ -48,7 +56,7 @@ function flattenObject(obj, prefix = "") {
     } else if (Array.isArray(value)) {
       result[flatKey] = JSON.stringify(value);
     } else {
-      result[flatKey] = String(value);
+      result[flatKey] = value;
     }
   }
   return result;
@@ -85,6 +93,48 @@ function defaultFormats(records) {
   const formats = ["json", "md"];
   if (Array.isArray(records) && records.length > 0) formats.push("csv");
   return formats;
+}
+
+function projectExportOutput(output, includeSensitive) {
+  const fields = output?.schema?.items;
+  if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
+    if (!Array.isArray(output?.records) || output.records.length === 0) return output;
+    return {
+      ...output,
+      records: [],
+      completeness: "incomplete",
+      release: { status: "partial", omittedFields: ["unclassified_records"] },
+      verification: {
+        ...output.verification,
+        releaseStatus: "partial",
+        omittedFields: ["unclassified_records"],
+        reason: "Records without a declared field schema cannot be released as structured output."
+      }
+    };
+  }
+  const allowed = new Set(Object.entries(fields)
+    .filter(([, field]) => field?.dataClass === "public"
+      || (includeSensitive && ["personal", "sensitive"].includes(field?.dataClass)))
+    .map(([name]) => name));
+  const omitted = Object.keys(fields).filter(name => !allowed.has(name));
+  if (omitted.length === 0) return output;
+  return {
+    ...output,
+    schema: { ...output.schema, items: Object.fromEntries(Object.entries(fields).filter(([name]) => allowed.has(name))) },
+    ...(Array.isArray(output.records) ? { records: output.records.map(record => Object.fromEntries(Object.entries(record ?? {}).filter(([name]) => allowed.has(name)))) } : {}),
+    ...(Array.isArray(output.fieldProvenance) ? { fieldProvenance: output.fieldProvenance.map(record => ({
+      ...record,
+      fields: Object.fromEntries(Object.entries(record.fields ?? {}).filter(([name]) => allowed.has(name)))
+    })) } : {}),
+    completeness: "incomplete",
+    release: { status: "partial", omittedFields: omitted },
+    verification: {
+      ...output.verification,
+      releaseStatus: "partial",
+      omittedFields: omitted,
+      reason: "Some output fields were omitted by the artifact release policy."
+    }
+  };
 }
 
 function generateMarkdown(taskId, input, output, status) {
@@ -154,12 +204,11 @@ export async function generateOutputFiles(taskId, { goal, input, output, status,
 
   const exportedInput = includeSensitive ? input : redactInput(input, inputSchema);
   const exportedGoal = includeSensitive ? goal : "[redacted]";
-  const exportOutput = { ...output, goal: exportedGoal };
-  if (!includeSensitive && exportOutput.records === undefined && output?.records) {
-    // records are scraped page data, not caller secrets; keep them
-    exportOutput.records = output.records;
-  }
+  const exportOutput = { ...projectExportOutput(output, includeSensitive), goal: exportedGoal };
   if (evidenceId && !includeSensitive) exportOutput.evidence_id = evidenceId;
+  const artifactStatus = exportOutput.completeness === "incomplete" && status === "succeeded"
+    ? "partial"
+    : status;
 
   const files = {};
   const write = async (name, content, mime) => {
@@ -180,18 +229,22 @@ export async function generateOutputFiles(taskId, { goal, input, output, status,
     if (format === "json") {
       files.json = await write("result.json", JSON.stringify({
         task_id: taskId,
-        status,
+        status: artifactStatus,
         goal: exportedGoal,
         input: exportedInput,
         output: exportOutput,
         ...(includeSensitive && options.includeEvidence === true && options.evidence ? { evidence: options.evidence } : {})
       }, null, 2), "application/json");
     } else if (format === "md") {
-      files.md = await write("result.md", generateMarkdown(taskId, exportedInput, exportOutput, status), "text/markdown");
+      files.md = await write("result.md", generateMarkdown(taskId, exportedInput, exportOutput, artifactStatus), "text/markdown");
     } else if (format === "csv") {
-      files.csv = await write("result.csv", generateCsv(output?.records), "text/csv");
+      // A flat CSV cannot express that privacy filtering removed columns. Do
+      // not publish a partial row set as if it were the complete result.
+      if (exportOutput.completeness !== "incomplete") {
+        files.csv = await write("result.csv", generateCsv(exportOutput?.records), "text/csv");
+      }
     } else if (format === "xml") {
-      files.xml = await write("result.xml", generateXml(taskId, exportedInput, exportOutput, status), "application/xml");
+      files.xml = await write("result.xml", generateXml(taskId, exportedInput, exportOutput, artifactStatus), "application/xml");
     }
   }
 

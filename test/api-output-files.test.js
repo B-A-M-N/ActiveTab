@@ -46,7 +46,14 @@ test("generateOutputFiles writes redacted JSON and MD by default (goal and raw i
   const result = {
     goal: "Go to example.com and extract 3 reviews",
     input: { url: "https://example.com/reviews", review_count: 3, password: "do-not-export" },
-    output: { status: "succeeded", records: [{ author: "Alice", rating: 5 }] },
+    output: {
+      status: "succeeded",
+      schema: { type: "array", items: {
+        author: { type: "string", dataClass: "public" },
+        rating: { type: "integer", dataClass: "public" }
+      } },
+      records: [{ author: "Alice", rating: 5 }]
+    },
     status: "succeeded",
     evidenceId: "ev-123",
     inputSchema: schema
@@ -77,7 +84,13 @@ test("generateOutputFiles produces every requested format with the same privacy 
   const result = {
     goal: "Extract data",
     input: { url: "https://example.com", token: "abc" },
-    output: { records: [{ id: 1, name: "Widget" }] },
+    output: {
+      schema: { type: "array", items: {
+        id: { type: "integer", dataClass: "public" },
+        name: { type: "string", dataClass: "public" }
+      } },
+      records: [{ id: 1, name: "Widget" }]
+    },
     status: "succeeded",
     inputSchema: { type: "object", properties: { url: { type: "string" } } }
   };
@@ -96,7 +109,13 @@ test("generateOutputFiles escapes CSV special characters", async () => {
   const result = {
     goal: "Extract data",
     input: {},
-    output: { records: [{ name: 'John "JD" Doe', city: "New York, NY" }] },
+    output: {
+      schema: { type: "array", items: {
+        name: { type: "string", dataClass: "public" },
+        city: { type: "string", dataClass: "public" }
+      } },
+      records: [{ name: 'John "JD" Doe', city: "New York, NY" }]
+    },
     status: "succeeded"
   };
 
@@ -104,6 +123,102 @@ test("generateOutputFiles escapes CSV special characters", async () => {
   const csvContent = await readFile(join(tempDir, taskId, "result.csv"), "utf8");
   assert.ok(csvContent.includes('"John ""JD"" Doe"'));
   assert.ok(csvContent.includes('"New York, NY"'));
+});
+
+test("generateOutputFiles neutralizes spreadsheet formulas in untrusted string cells", async () => {
+  const taskId = "test-csv-formula-001";
+  const result = {
+    goal: "Extract data",
+    input: {},
+    output: {
+      schema: { type: "array", items: { value: { type: "string", dataClass: "public" } } },
+      records: [
+      { value: "=1+1" },
+      { value: " +SUM(A1:A2)" },
+      { value: "-CMD()" },
+      { value: "@SUM(A1:A2)" },
+      { value: -12 }
+      ]
+    },
+    status: "succeeded"
+  };
+  await generateOutputFiles(taskId, result, tempDir, { formats: ["csv"] });
+  const content = await readFile(join(tempDir, taskId, "result.csv"), "utf8");
+  for (const value of ["'=1+1", "' +SUM(A1:A2)", "'-CMD()", "'@SUM(A1:A2)"]) assert.ok(content.includes(value));
+  assert.ok(content.includes("-12"), "numeric negative values remain numeric literals");
+});
+
+test("structured exports apply field-level data classification", async () => {
+  const taskId = "test-field-privacy-001";
+  const result = {
+    goal: "Extract data",
+    input: {},
+    output: {
+      schema: { type: "array", items: {
+        title: { type: "string", dataClass: "public" },
+        email: { type: "string", dataClass: "personal" },
+        token: { type: "string", dataClass: "credential" }
+      } },
+      records: [{ title: "Public title", email: "person@example.test", token: "never-export" }]
+    },
+    status: "succeeded"
+  };
+  const redacted = await generateOutputFiles(taskId, result, tempDir);
+  const redactedContent = await readFile(join(tempDir, taskId, redacted.json.file_name), "utf8");
+  assert.ok(redactedContent.includes("Public title"));
+  assert.equal(redactedContent.includes("person@example.test"), false);
+  assert.equal(redactedContent.includes("never-export"), false);
+
+  const authorized = await generateOutputFiles(taskId, result, tempDir, { includeSensitive: true, authorized: true });
+  const authorizedContent = await readFile(join(tempDir, taskId, authorized.json.file_name), "utf8");
+  assert.ok(authorizedContent.includes("person@example.test"));
+  assert.equal(authorizedContent.includes("never-export"), false, "credentials remain non-exportable");
+});
+
+test("artifacts identify privacy-filtered outputs as partial and omit ambiguous CSV", async () => {
+  const taskId = "test-field-privacy-partial-001";
+  const result = {
+    goal: "Extract records",
+    input: {},
+    output: {
+      schema: { type: "array", items: {
+        title: { type: "string", dataClass: "public" },
+        email: { type: "string", dataClass: "personal" },
+        token: { type: "string", dataClass: "credential" }
+      } },
+      records: [{ title: "Public title", email: "person@example.test", token: "secret-value" }],
+      completeness: "complete"
+    },
+    status: "succeeded"
+  };
+
+  const files = await generateOutputFiles(taskId, result, tempDir, { formats: ["json", "md", "csv", "xml"] });
+  assert.equal(files.csv, undefined, "CSV cannot communicate that fields were withheld");
+  const json = JSON.parse(await readFile(join(tempDir, taskId, files.json.file_name), "utf8"));
+  assert.equal(json.status, "partial");
+  assert.equal(json.output.completeness, "incomplete");
+  assert.deepEqual(json.output.release.omittedFields, ["email", "token"]);
+  assert.deepEqual(Object.keys(json.output.records[0]), ["title"]);
+  const markdown = await readFile(join(tempDir, taskId, files.md.file_name), "utf8");
+  assert.ok(markdown.includes("**Status:** partial"));
+  const xml = await readFile(join(tempDir, taskId, files.xml.file_name), "utf8");
+  assert.ok(xml.includes('status="partial"'));
+});
+
+test("unclassified records are withheld from artifacts", async () => {
+  const taskId = "test-unclassified-records-001";
+  const files = await generateOutputFiles(taskId, {
+    goal: "Extract data",
+    input: {},
+    output: { records: [{ secret: "unclassified-value" }] },
+    status: "succeeded"
+  }, tempDir);
+  assert.equal(files.csv, undefined);
+  const json = JSON.parse(await readFile(join(tempDir, taskId, files.json.file_name), "utf8"));
+  assert.equal(json.status, "partial");
+  assert.deepEqual(json.output.records, []);
+  assert.deepEqual(json.output.release.omittedFields, ["unclassified_records"]);
+  assert.equal(JSON.stringify(json).includes("unclassified-value"), false);
 });
 
 test("sensitive full exports require both includeSensitive and owner authorization", async () => {

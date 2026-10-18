@@ -24,14 +24,17 @@ export const OFFICIAL_TEMPLATES = [
     template_id: "local-page-data-extractor",
     name: "Local Page Data Extractor",
     bot_type: "agent",
-    recommend_desc: "Navigate to a page and extract structured data using local browser automation.",
+    recommend_desc: "Discover visible structured data, or execute a previously qualified extraction capability.",
     detail_url: "local://template/local-page-data-extractor",
     input_schema: {
       type: "object",
       required: ["url"],
       properties: {
         url: { type: "string", minLength: 1, maxLength: 2000, description: "URL of the page to extract data from." },
-        extraction_goal: { type: "string", maxLength: 500, default: "Extract all visible structured data", description: "What data to extract from the page." }
+        extraction_goal: { type: "string", maxLength: 500, default: "Discover visible structured data", description: "Optional discovery intent; discovery reports structure only." },
+        capability_id: { type: "string", minLength: 1, maxLength: 96, description: "Optional exact ID of a registered, fixture-qualified extraction capability." },
+        capability_version: { type: "integer", minimum: 1, maximum: 1000, default: 1, description: "Version of the registered extraction capability." },
+        output_name: { type: "string", minLength: 1, maxLength: 64, default: "records", description: "Name for the structured extraction result." }
       }
     },
     goal_template: "Go to {{url}} and {{extraction_goal}}"
@@ -58,6 +61,36 @@ export const REGIONS = [{ code: "LOCAL", name: "Local Machine" }];
 
 export function findTemplate(id) {
   return OFFICIAL_TEMPLATES.find(t => t.template_id === id);
+}
+
+/** Build the bounded workflow used by the public data-extractor template. */
+export function buildPageDataExtractionWorkflow(input, taskId) {
+  const steps = [
+    { id: "navigate", type: "navigate", url: input.url },
+    ...(input.capability_id
+      ? [
+          {
+            id: "collect_records",
+            type: "collect_records",
+            capabilityId: input.capability_id,
+            capabilityVersion: input.capability_version ?? 1,
+            outputName: input.output_name ?? "records"
+          },
+          {
+            id: "emit_output",
+            type: "emit_output",
+            capabilityId: input.capability_id,
+            capabilityVersion: input.capability_version ?? 1,
+            outputName: input.output_name ?? "records"
+          }
+        ]
+      : [{ id: "discover_tables", type: "discover_tables" }])
+  ];
+  return {
+    id: `page-data-${taskId}`,
+    name: "Qualified page data extraction",
+    steps
+  };
 }
 
 export function validateInput(schema, input) {

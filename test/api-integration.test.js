@@ -46,7 +46,17 @@ function createMockNavigationRunner(outputDir, delayMs = 100) {
         date: "2 days ago"
       }));
 
-      const output = { status: "succeeded", records };
+      const output = {
+        status: "succeeded",
+        schema: { type: "array", items: {
+          rank: { type: "integer", dataClass: "public" },
+          author: { type: "string", dataClass: "public" },
+          text: { type: "string", dataClass: "public" },
+          rating: { type: "integer", dataClass: "public" },
+          date: { type: "string", dataClass: "public" }
+        } },
+        records
+      };
       const credit = Math.ceil(recordCount * 1.5) + 2;
       const outputFiles = await generateOutputFiles(
         taskId,

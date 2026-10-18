@@ -14,6 +14,9 @@ ActiveTab's core execution layer. Contains the browser control plane, runtime po
 - Browser sessions own freshness, target validity, and lifecycle checks; the authorized executor owns action policy.
 - The extension broker's process/session shutdown is transport teardown, not consent revocation. It preserves the extension's explicit tab leases for same-browser-session reconnection; only an explicit detach releases a lease.
 - Application-specific logic belongs in profiles or integration adapters, not in generic navigation, policy, or browser execution paths.
+- Reusable site capabilities require fresh observed evidence, a trusted field policy, fixture qualification, and exact origin/environment/application/route/principal scope. Workflow input cannot define its own effects, data sensitivity, qualification evidence, or endpoint.
+- Structured extraction reads visible retained DOM evidence. Pagination is available only through an explicitly trusted same-origin, same-path policy and dispatches each page advance through `BrowserStepHandler` and the authorized executor.
+- Extraction outputs remain incomplete unless their declared exact-count or pagination-exhaustion contract, typed schema, uniqueness, field provenance, and release policy all pass. Raw extraction values are not placed in receipts or durable task journals.
 - All authorization boundaries are enforced by code, not documentation.
 - Semantic model output is only a candidate annotation from a configurable structured OpenAI-compatible service (default FreeInference Production `GLM5.3-flash`). Jev is a built-in pinned reviewer whose output never grants authority or verifies success; a Jev disagreement may pause dispatch for agent review.
 - Semantic and Jev predictions share stable observation/decision lineage but remain distinct, append-only telemetry events.
@@ -50,3 +53,5 @@ node --test test/targets.test.js test/approvals.test.js test/authorized-executor
 | `src/decisions/` | Semantic inference and pinned Jev review services |
 | `src/telemetry/` | Append-only decision events and offline evaluation/export |
 | `src/integrations/` | Application-specific workflow adapters over generic ActiveTab execution |
+| `src/capabilities/` | Capability discovery, compilation, qualification, registry, and invocation contracts |
+| `src/extraction/` | Typed record extraction, collection, provenance, verification, and release policy |

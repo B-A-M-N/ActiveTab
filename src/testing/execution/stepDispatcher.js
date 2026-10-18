@@ -10,6 +10,7 @@ export class StepDispatcher {
     apiStepHandler,
     verificationStepHandler,
     qualificationStepHandler,
+    extractionStepHandler,
     controlFlowStepHandler,
     getTelemetryStepId
   } = {}) {
@@ -20,6 +21,7 @@ export class StepDispatcher {
     this.apiStepHandler = apiStepHandler;
     this.verificationStepHandler = verificationStepHandler;
     this.qualificationStepHandler = qualificationStepHandler;
+    this.extractionStepHandler = extractionStepHandler;
     this.controlFlowStepHandler = controlFlowStepHandler;
     this.getTelemetryStepId = getTelemetryStepId ?? (() => null);
   }
@@ -47,6 +49,10 @@ export class StepDispatcher {
           context,
           this.getTelemetryStepId(step)
         );
+        case "extract_records": return await this.extractionStepHandler.executeExtractRecords(step, receipt, startedAt);
+        case "collect_records": return await this.extractionStepHandler.executeCollectRecords(step, receipt, startedAt);
+        case "emit_output": return this.extractionStepHandler.executeEmitOutput(step, receipt, startedAt);
+        case "discover_tables": return await this.extractionStepHandler.executeDiscoverTables(step, receipt, startedAt);
         case "set_variable": return this.controlFlowStepHandler.executeSetVariable(step, receipt, startedAt, context, stepStatuses);
         case "repeat": return await this.controlFlowStepHandler.executeRepeat(step, receipt, startedAt, context);
         case "subworkflow": return await this.controlFlowStepHandler.executeSubworkflow(step, receipt, startedAt, context);
