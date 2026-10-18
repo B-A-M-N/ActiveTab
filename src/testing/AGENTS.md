@@ -22,6 +22,7 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 - Cleanup is a verifiable obligation for every test-owned resource.
 - Every interaction type in the schema must have a dispatch implementation or fail validation before execution.
 - `execution/workflowScheduler.js` owns pure workflow eligibility, graph status, and trusted subworkflow budget validation. It cannot dispatch browser/application operations or authorize effects; `TestRunner` applies its decisions and persists resulting receipts.
+- `lifecycle/RunStateCoordinator` owns durable run bindings, leases, checkpoints, and durable status; it cannot authorize or dispatch effects.
 - `telemetry/RunDecisionRecorder` owns the testing layer's mapping from workflow operations to decision events and durable operation receipts. It records but never authorizes or dispatches effects.
 - Unsupported actions fail validation before the test starts.
 - Workflow input is untrusted; it cannot elevate permissions or redefine the environment.
@@ -72,4 +73,5 @@ E2E vertical tests require a real Chrome environment and fixture server.
 | Path | Purpose |
 |------|---------|
 | `execution/` | Pure workflow scheduling and graph admission decisions |
+| `lifecycle/` | Durable run bindings, leases, checkpoints, and run status |
 | `telemetry/` | Workflow decision events and durable operation receipt integration |

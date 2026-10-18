@@ -14,8 +14,8 @@ import { isLoopbackUrl, verifyObservedUrl } from "../environments/model.js";
 import { NavigationEngine } from "../navigation/engine.js";
 import { executeAuthorizedAction } from "../runtime/authorizedExecutor.js";
 import { createHash } from "node:crypto";
-import { acquireBrowserTargetLease } from "./runState.js";
 import { RunDecisionRecorder } from "./telemetry/runDecisionRecorder.js";
+import { RunStateCoordinator } from "./lifecycle/runStateCoordinator.js";
 import {
   deriveWorkflowRunStatus,
   estimateWorkflowExecutionCost,
@@ -104,7 +104,14 @@ export class TestRunner {
     this.operationAuthorizer = operationAuthorizer;
     this.workflowRegistry = workflowRegistry;
     this.runStateStore = runStateStore;
-    this.targetLease = null;
+    this.runStateCoordinator = new RunStateCoordinator({
+      runStateStore,
+      session,
+      environment,
+      principalId,
+      profileId,
+      policyVersion
+    });
     this.decisionRecorder = new RunDecisionRecorder({
       decisionRuntime,
       runStateStore,
@@ -123,6 +130,10 @@ export class TestRunner {
     this.onRunSuspended = null; // async (receipt, record) => {}
   }
 
+  get targetLease() {
+    return this.runStateCoordinator.targetLease;
+  }
+
   async run(workflow, { runId } = {}) {
     const effectiveRunId = runId ?? this.existingRunStateId ?? this.collector?.runId ?? crypto.randomUUID();
     const releaseLease = await this.#acquireExecutionLeases(effectiveRunId);
@@ -131,26 +142,11 @@ export class TestRunner {
   }
 
   async #acquireExecutionLeases(runId) {
-    if (!this.runStateStore) return null;
-    const releaseRunLease = await this.runStateStore.acquireExecutionLease(runId);
-    let targetLease = null;
-    try {
-      const targetId = this.session?.target?.id;
-      if (targetId) targetLease = await acquireBrowserTargetLease(this.runStateStore, this.session, runId);
-      this.targetLease = targetLease;
-    } catch (error) {
-      await releaseRunLease();
-      throw error;
-    }
-    return async () => {
-      if (this.targetLease === targetLease) this.targetLease = null;
-      await targetLease?.release();
-      await releaseRunLease();
-    };
+    return this.runStateCoordinator.acquireExecutionLeases(runId);
   }
 
   async #assertTargetLeaseCurrent() {
-    if (this.targetLease) await this.targetLease.assertCurrent();
+    await this.runStateCoordinator.assertTargetLeaseCurrent();
   }
 
   async #runWorkflow(workflow, { runId } = {}) {
@@ -344,105 +340,23 @@ export class TestRunner {
 
   async #initializeRunState(workflow, receipt) {
     if (!this.runStateStore) return null;
-    let run = await this.runStateStore.getFresh(this.existingRunStateId ?? receipt.runId);
-    if (this.existingRunStateId && !run) throw new Error("The bound durable run state no longer exists.");
-    const environmentId = this.environment?.environmentId ?? null;
-    const targetId = this.session?.target?.id ?? null;
-    const authenticationRealm = this.environment?.applications?.[0]?.authenticationRealm ?? null;
-    if (run) {
-      if (run.runId !== receipt.runId || environmentId !== run.environmentId
-        || targetId !== (run.target?.targetId ?? null)
-        || authenticationRealm !== run.authenticationRealm
-        || (this.profileId ?? null) !== (run.profileId ?? null)
-        || (this.principalId ?? null) !== (run.principalId ?? null)
-        || this.policyVersion !== run.policyVersion) {
-        throw new Error("Existing run state does not match the current run, environment, or browser target binding.");
-      }
-    } else {
-      await this.runStateStore.create({
-        runId: receipt.runId,
-        workflowId: workflow.id,
-        workflowName: workflow.name,
-        workflowVersion: workflow.version ?? null,
-        environmentId,
-        authenticationRealm,
-        targetId,
-        principalId: this.principalId,
-        profileId: this.profileId,
-        policyVersion: this.policyVersion,
-        episodeId: this.decisionRecorder.episodeId
-      });
-      run = await this.runStateStore.getFresh(receipt.runId);
-    }
-    if (targetId && this.session?.attached !== true) throw new Error("Durable run continuation requires the exact browser target to be attached.");
-    await this.runStateStore.bindExecutionContract(receipt.runId, {
-      workflowId: workflow.id,
-      workflowVersion: workflow.version ?? null,
-      workflowHash: executionWorkflowFingerprint(workflow, this.workflowRegistry),
-      environmentId,
-      targetId,
-      principalId: this.principalId,
-      profileId: this.profileId,
-      policyVersion: this.policyVersion
+    return this.runStateCoordinator.initializeRunState(workflow, receipt, {
+      existingRunStateId: this.existingRunStateId,
+      decisionEpisodeId: this.decisionRecorder.episodeId,
+      workflowHash: executionWorkflowFingerprint(workflow, this.workflowRegistry)
     });
-    run = await this.runStateStore.getFresh(receipt.runId);
-    if (this.decisionRecorder.episodeId && !run?.episodeId) {
-      await this.runStateStore.update(receipt.runId, { episodeId: this.decisionRecorder.episodeId });
-      run = await this.runStateStore.getFresh(receipt.runId);
-    } else if (this.decisionRecorder.episodeId && run?.episodeId !== this.decisionRecorder.episodeId) {
-      throw new Error("Decision episode does not match the durable run binding.");
-    }
-    if (run?.pendingOperations?.some(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status))) return run;
-    if (["passed", "failed", "blocked", "canceled", "expired", "reconciling"].includes(run?.status)) return run;
-    if (targetId) {
-      const current = await this.runStateStore.getFresh(receipt.runId);
-      await this.runStateStore.update(receipt.runId, { target: { ...current.target, targetId, attached: true } });
-      if (this.targetLease) await this.runStateStore.bindTargetLease(receipt.runId, { targetId, fencingToken: this.targetLease.fencingToken });
-    }
-    await this.runStateStore.update(receipt.runId, { status: "running", currentStepId: null });
-    return this.runStateStore.getFresh(receipt.runId);
   }
 
   async #persistStepCheckpoint(receipt, stepId) {
-    if (!this.runStateStore) return;
-    const step = receipt.steps.findLast(item => item.stepId === stepId);
-    if (!step) return;
-    await this.runStateStore.updateCheckpoint(receipt.runId, {
-      currentStepId: step.status === STEP_STATUS.PASS || step.status === STEP_STATUS.SKIPPED ? null : stepId,
-      stepId,
-      type: step.type,
-      status: step.status,
-      evidenceIds: step.evidenceIds ?? []
-    });
+    return this.runStateCoordinator.persistStepCheckpoint(receipt, stepId);
   }
 
   async #checkpointRecordedStep(receipt, stepId) {
-    try {
-      await this.#persistStepCheckpoint(receipt, stepId);
-      return true;
-    } catch {
-      const step = receipt.steps.findLast(item => item.stepId === stepId);
-      if (step) {
-        step.status = STEP_STATUS.UNCERTAIN;
-        step.reason = "The execution result could not be durably checkpointed; reconciliation is required.";
-      }
-      return false;
-    }
+    return this.runStateCoordinator.checkpointRecordedStep(receipt, stepId);
   }
 
   async #completeRunState(receipt) {
-    if (!this.runStateStore) return;
-    const waiting = isWaitingRunStatus(receipt.status);
-    const status = waiting ? receipt.status.toLowerCase()
-      : receipt.status === RUN_STATUS.UNCERTAIN ? "reconciling" : receipt.status.toLowerCase();
-    const state = await this.runStateStore.getFresh(receipt.runId);
-    await this.runStateStore.update(receipt.runId, {
-      status,
-      currentStepId: waiting || receipt.status === RUN_STATUS.UNCERTAIN ? state?.currentStepId ?? null : null,
-      pendingInterventionId: waiting
-        ? receipt.interventions?.findLast(item => item.state === INTERVENTION_STATE.WAITING)?.interventionId ?? null
-        : null
-    });
+    return this.runStateCoordinator.completeRunState(receipt);
   }
 
   async #ensureDecisionEpisode(receipt) {
