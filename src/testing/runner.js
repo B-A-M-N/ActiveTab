@@ -5,11 +5,10 @@
  * evidence-backed.
  */
 
-import { validateWorkflow, STEP_STATUS, RUN_STATUS, isWaitingRunStatus } from "./schema.js";
+import { validateWorkflow, STEP_STATUS, RUN_STATUS } from "./schema.js";
 import { evaluateAssertion } from "./assertions.js";
-import { TestReceipt, deriveRunStatus, STEP_STATUS_EXTENDED } from "./receipts.js";
+import { TestReceipt, STEP_STATUS_EXTENDED } from "./receipts.js";
 import { classifyHumanHandoff } from "../navigation/handoff.js";
-import { InterventionStore, evaluateCompletion, externalRunState, INTERVENTION_STATE } from "../runtime/interventions.js";
 import { isLoopbackUrl, verifyObservedUrl } from "../environments/model.js";
 import { NavigationEngine } from "../navigation/engine.js";
 import { createHash } from "node:crypto";
@@ -20,6 +19,7 @@ import { VerificationStepHandler } from "./steps/verificationStepHandler.js";
 import { QualificationStepHandler } from "./steps/qualificationStepHandler.js";
 import { BrowserStepHandler } from "./steps/browserStepHandler.js";
 import { ApiStepHandler } from "./steps/apiStepHandler.js";
+import { InterventionCoordinator } from "./lifecycle/interventionCoordinator.js";
 import { StepDispatcher } from "./execution/stepDispatcher.js";
 import {
   deriveWorkflowRunStatus,
@@ -156,6 +156,30 @@ export class TestRunner {
     this.currentRuntimeStepId = null;
     this.onIntervention = null; // async (record) => {}
     this.onRunSuspended = null; // async (receipt, record) => {}
+    this.interventionCoordinator = new InterventionCoordinator({
+      interventions,
+      environment,
+      session,
+      runStateStore,
+      runStateCoordinator: this.runStateCoordinator,
+      maxSteps: this.maxSteps,
+      workflowRegistry,
+      profileId,
+      principalId,
+      policyVersion,
+      acquireExecutionLeases: runId => this.#acquireExecutionLeases(runId),
+      ensureDecisionEpisode: receipt => this.#ensureDecisionEpisode(receipt),
+      persistStepCheckpoint: (receipt, stepId) => this.#persistStepCheckpoint(receipt, stepId),
+      completeRunState: receipt => this.#completeRunState(receipt),
+      completeDecisionEpisode: receipt => this.#completeDecisionEpisode(receipt),
+      executeWorkflowSteps: (...args) => this.#executeWorkflowSteps(...args),
+      executeGoalStep: (...args) => this.#executeGoal(...args),
+      getWorkflowFingerprint: workflow => executionWorkflowFingerprint(workflow, this.workflowRegistry),
+      getOnRunSuspended: () => this.onRunSuspended,
+      getOnIntervention: () => this.onIntervention,
+      setCurrentTelemetryStepId: value => { this.currentTelemetryStepId = value; },
+      telemetryStepId
+    });
   }
 
   get targetLease() {
@@ -503,7 +527,7 @@ export class TestRunner {
       if (observedUrl) {
         const verified = verifyObservedUrl(this.environment, observedUrl);
         if (!verified.ok) {
-          return await this.#suspendForIntervention(step, receipt, startedAt, {
+          return await this.interventionCoordinator.suspend(step, receipt, startedAt, {
             type: "human_decision",
             reasonCode: "environment_identity_mismatch",
             reason: `Environment identity mismatch: ${verified.reason}`,
@@ -540,7 +564,7 @@ export class TestRunner {
     if (result.status === "needs_human") {
       const category = result.interventionRequired?.category ?? "authentication";
       const type = category === "anti_automation" ? "human_decision" : category === "authorization" ? "external_authorization" : "authentication";
-      return await this.#suspendForIntervention(step, receipt, startedAt, {
+      return await this.interventionCoordinator.suspend(step, receipt, startedAt, {
         type,
         reason: result.reason ?? "A human requirement was detected.",
         requiredHumanAction: "Complete the required step in the attached browser (authentication, challenge, or authorization), then let ActiveTab verify it.",
@@ -561,49 +585,6 @@ export class TestRunner {
       details: { goal: step.goal, engineStatus: result.status, attempts: result.attempts, recoveries: result.recoveries }
     });
     return { status, reason, result };
-  }
-
-  /**
-   * Persist the intervention BEFORE returning control, record the suspended
-   * step, and notify the watcher plumbing. The run stays resumable.
-   */
-  async #suspendForIntervention(step, receipt, startedAt, { type, reason, reasonCode = null, requiredHumanAction, condition, preObservation = null, engineResult = null }) {
-    if (!this.interventions) {
-      // No durable store: fall back to a blocked step rather than losing state.
-      const fallback = `Human requirement detected but no intervention store is configured: ${reason}`;
-      receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason: fallback, startedAt, evidenceIds: [preObservation?.evidenceId ?? engineResult?.evidenceId ?? ""].filter(Boolean) });
-      return { status: STEP_STATUS.BLOCKED, reason: fallback };
-    }
-    const record = await this.interventions.create({
-      runId: receipt.runId,
-      stepId: step.id,
-      type,
-      reason,
-      reasonCode,
-      requiredHumanAction,
-      completionCondition: condition,
-      environmentId: this.environment?.environmentId ?? step.intervention?.environmentId ?? null,
-      authenticationRealm: condition?.realm ?? step.intervention?.realm ?? null,
-      targetId: this.session?.target?.id ?? null,
-      applicationId: this.environment?.applications?.find(a => a.authenticationRealm === condition?.realm)?.applicationId ?? null,
-      ...(step.intervention?.ttlMs ? { ttlMs: step.intervention.ttlMs } : {})
-    });
-    receipt.recordStep({
-      stepId: step.id, type: step.type, status: STEP_STATUS_EXTENDED.SUSPENDED, reason, startedAt,
-      evidenceIds: [preObservation?.evidenceId ?? engineResult?.evidenceId ?? ""].filter(Boolean),
-      details: { interventionId: record.intervention_id, interventionType: type }
-    });
-    receipt.recordIntervention({
-      stepId: step.id, interventionId: record.intervention_id, type,
-      state: record.state, reason, externalState: externalRunState(record)
-    });
-    if (typeof this.onRunSuspended === "function") {
-      await this.onRunSuspended(receipt, record);
-    }
-    if (typeof this.onIntervention === "function") {
-      try { await this.onIntervention(record); } catch { /* notification is best-effort */ }
-    }
-    return { status: STEP_STATUS_EXTENDED.SUSPENDED, reason, intervention: record, externalState: externalRunState(record) };
   }
 
   /**
@@ -629,153 +610,7 @@ export class TestRunner {
    *   covered by the verified completion predicate; these are never replayed.
    */
   async resume(receipt, options = {}) {
-    const releaseLease = await this.#acquireExecutionLeases(receipt.runId);
-    try { return await this.#resumeWorkflow(receipt, options); }
-    finally { await releaseLease?.(); }
-  }
-
-  async #resumeWorkflow(receipt, { verify = null, evaluate = null, workflow = null, completedStepIds = [] } = {}) {
-    const pending = (receipt.interventions ?? []).filter(i => i.state === INTERVENTION_STATE.WAITING || i.state === INTERVENTION_STATE.ACKNOWLEDGED);
-    const suspendedStep = [...receipt.steps].reverse().find(s => s.status === STEP_STATUS_EXTENDED.SUSPENDED);
-    if (!suspendedStep) {
-      return { resumed: false, reason: "No suspended step to resume." };
-    }
-    await this.#ensureDecisionEpisode(receipt);
-    const interventionRef = pending.find(i => i.stepId === suspendedStep.stepId);
-    const record = (interventionRef?.interventionId && this.interventions
-      ? this.interventions.get(interventionRef.interventionId)
-      : null)
-      ?? (this.interventions ? this.interventions.get(suspendedStep.details?.interventionId) : null);
-    if (!record) return { resumed: false, reason: "No durable intervention record found for the suspended step." };
-    if (Date.parse(record.expiresAt) <= Date.now()) {
-      return { resumed: false, reason: `Intervention expired at ${record.expiresAt}.`, expired: true };
-    }
-    // 1. Acquire continuation ownership (fencing lease): only one worker
-    //    may resume this run. Without a store, the single in-process
-    //    runner implicitly holds ownership.
-    let lease = null;
-    const alreadySatisfied = record.state === INTERVENTION_STATE.SATISFIED;
-    if (this.interventions && !alreadySatisfied) {
-      try {
-        const acquired = await this.interventions.acquireResume(record.intervention_id);
-        lease = acquired.lease;
-      } catch (error) {
-        return { resumed: false, reason: `Could not acquire resume ownership: ${String(error?.message ?? error).slice(0, 200)}` };
-      }
-    }
-    try {
-      // 2. Evaluate the completion predicate with fresh evidence.
-      const evaluator = evaluate ?? ((intervention, ctx) => evaluateCompletion(intervention, ctx));
-      const evaluation = await evaluator(record, verify ?? {});
-      if (!evaluation.satisfied) {
-        if (lease) await this.interventions.releaseResume(record.intervention_id, lease).catch(() => {});
-        return { resumed: false, reason: `Completion condition not verified: ${evaluation.reason}`, intervention: record };
-      }
-      // 3. Consume the intervention with the held lease.
-      if (!alreadySatisfied) {
-        await this.interventions?.completeResume(record.intervention_id, lease ?? record.resumeHeldBy ?? record.generation, { evidenceId: evaluation.evidenceId ?? null, note: evaluation.summary });
-      }
-      const receiptIntervention = receipt.interventions?.find(item => item.interventionId === record.intervention_id);
-      if (receiptIntervention) {
-        receiptIntervention.state = "satisfied";
-        receiptIntervention.resumedAt = new Date().toISOString();
-      }
-
-      // 4. Re-enter the original workflow graph. Completed nodes are restored
-      //    as prior outcomes, so topological dependencies and branches are
-      //    reevaluated without replaying completed effects.
-      if (workflow && Array.isArray(workflow.steps)) {
-        if (this.runStateStore) {
-          const state = await this.runStateStore.getFresh(receipt.runId);
-          const environmentId = this.environment?.environmentId ?? null;
-          const targetId = this.session?.target?.id ?? null;
-          const authenticationRealm = this.environment?.applications?.[0]?.authenticationRealm ?? null;
-          if (!state || state.runId !== receipt.runId || state.environmentId !== environmentId
-            || (state.target?.targetId ?? null) !== targetId
-            || state.authenticationRealm !== authenticationRealm
-            || (state.profileId ?? null) !== (this.profileId ?? null)
-            || (state.principalId ?? null) !== (this.principalId ?? null)
-            || state.policyVersion !== this.policyVersion) {
-            return { resumed: false, reason: "Durable continuation bindings do not match the current workflow, environment, target, principal, or policy." };
-          }
-          if (targetId && this.targetLease) {
-            await this.runStateStore.bindTargetLease(receipt.runId, { targetId, fencingToken: this.targetLease.fencingToken });
-          }
-          await this.runStateStore.bindExecutionContract(receipt.runId, {
-            workflowId: workflow.id,
-            workflowVersion: workflow.version ?? null,
-            workflowHash: executionWorkflowFingerprint(workflow, this.workflowRegistry),
-            environmentId,
-            targetId,
-            principalId: this.principalId,
-            profileId: this.profileId,
-            policyVersion: this.policyVersion
-          });
-        }
-        receipt.status = RUN_STATUS.RUNNING;
-        const completedByPredicate = new Set(completedStepIds).has(suspendedStep.stepId);
-        if (completedByPredicate && !receipt.completeSuspendedStep(suspendedStep.stepId, {
-          reason: evaluation.summary ?? "The suspended step's exact completion predicate was verified.",
-          evidenceId: evaluation.evidenceId ?? null
-        })) {
-          return { resumed: false, reason: "The verified suspended step is missing from the receipt.", intervention: record };
-        }
-        if (completedByPredicate) await this.#persistStepCheckpoint(receipt, suspendedStep.stepId);
-        const completedStatuses = new Map();
-        for (const step of receipt.steps) {
-          if (step.status !== STEP_STATUS_EXTENDED.SUSPENDED) completedStatuses.set(step.stepId, step.status);
-        }
-        const context = {
-          variables: new Map(Object.entries(workflow.inputs ?? {})),
-          workflowStack: new Set([workflow.id]),
-          depth: 0,
-          stepStatuses: new Map(),
-          completedStatuses,
-          budget: { limit: this.maxSteps, used: 0 }
-        };
-        const execution = await this.#executeWorkflowSteps(workflow, receipt, context);
-        if (receipt.status === RUN_STATUS.RUNNING) receipt.finish(deriveWorkflowRunStatus(workflow, execution.stepStatuses));
-        await this.#completeRunState(receipt);
-        this.#completeDecisionEpisode(receipt);
-        return { resumed: !isWaitingRunStatus(receipt.status), receipt, evaluation };
-      }
-      // No original workflow available: re-run only the suspended step with
-      // fresh evidence and return its outcome (never the whole run).
-      if (this.runStateStore && this.session?.target?.id && this.targetLease) {
-        const state = await this.runStateStore.getFresh(receipt.runId);
-        if (state?.target?.targetId !== this.session.target.id) {
-          return { resumed: false, reason: "Durable continuation target does not match the attached browser target." };
-        }
-        await this.runStateStore.bindTargetLease(receipt.runId, {
-          targetId: this.session.target.id,
-          fencingToken: this.targetLease.fencingToken
-        });
-      }
-      const suspendedGoal = workflow?.steps?.find(s => s.id === suspendedStep.stepId)?.goal
-        ?? receipt.steps.find(s => s.stepId === suspendedStep.stepId)?.details?.goal
-        ?? "";
-      this.currentTelemetryStepId = telemetryStepId(suspendedStep.stepId);
-      const stepResult = await this.#executeGoal({ id: suspendedStep.stepId, type: "goal", goal: suspendedGoal }, { ...receipt, status: RUN_STATUS.RUNNING, interventions: receipt.interventions }, new Date().toISOString());
-      receipt.replaceSuspendedStep(suspendedStep.stepId);
-      if (stepResult.status === STEP_STATUS_EXTENDED.SUSPENDED) {
-        const EXTERNAL_TO_RUN = {
-          waiting_for_tab_authorization: RUN_STATUS.WAITING_FOR_TAB_AUTHORIZATION,
-          waiting_for_authentication: RUN_STATUS.WAITING_FOR_AUTHENTICATION,
-          waiting_for_mfa: RUN_STATUS.WAITING_FOR_MFA,
-          waiting_for_human_approval: RUN_STATUS.WAITING_FOR_HUMAN_APPROVAL,
-          waiting_for_external_authorization: RUN_STATUS.WAITING_FOR_EXTERNAL_AUTHORIZATION,
-          waiting_for_human_decision: RUN_STATUS.WAITING_FOR_HUMAN_DECISION
-        };
-        receipt.finish(EXTERNAL_TO_RUN[stepResult.externalState] ?? RUN_STATUS.WAITING_FOR_HUMAN_DECISION);
-      } else {
-        receipt.finish(deriveRunStatus(receipt.steps));
-      }
-      this.#completeDecisionEpisode(receipt);
-      return { resumed: !isWaitingRunStatus(receipt.status), stepResult, receipt, evaluation };
-    } catch (error) {
-      if (lease) await this.interventions.releaseResume(record.intervention_id, lease).catch(() => {});
-      throw error;
-    }
+    return this.interventionCoordinator.resume(receipt, options);
   }
 
   async #executeCleanup(step, receipt, startedAt, context = null) {

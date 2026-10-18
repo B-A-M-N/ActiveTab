@@ -23,6 +23,7 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 - Every interaction type in the schema must have a dispatch implementation or fail validation before execution.
 - `execution/workflowScheduler.js` owns pure workflow eligibility, graph status, and trusted subworkflow budget validation. `execution/stepDispatcher.js` routes validated workflow steps to focused handlers. Neither component authorizes effects; browser effects remain behind the shared authorized executor.
 - `lifecycle/RunStateCoordinator` owns durable run bindings, leases, checkpoints, and durable status; it cannot authorize or dispatch effects.
+- `lifecycle/InterventionCoordinator` owns persisted human handoffs and evidence-gated resume while re-entering the same runner callback and shared execution budget.
 - `steps/ControlFlowStepHandler` owns scalar variable assignment, bounded repetition, and trusted subworkflow composition. Nested work re-enters the same `TestRunner` callback and shared budget.
 - `steps/VerificationStepHandler` owns assertions, diagnostic snapshots, bounded waiting, controlled fixture failures, retry verification, postconditions, and cleanup verification. Cleanup dispatch is injected from `TestRunner` and must pass through the same authorized interaction path.
 - `steps/QualificationStepHandler` invokes the registered qualification service and records its advisory result. Fixture outcomes never authorize parent-run effects or verify live-site success.
@@ -78,6 +79,6 @@ E2E vertical tests require a real Chrome environment and fixture server.
 | Path | Purpose |
 |------|---------|
 | `execution/` | Workflow scheduling and validated type-to-handler dispatch |
-| `lifecycle/` | Durable run bindings, leases, checkpoints, and run status |
+| `lifecycle/` | Durable run bindings, leases, checkpoints, interventions, and continuation |
 | `steps/` | Isolated workflow control-flow step behavior |
 | `telemetry/` | Workflow decision events and durable operation receipt integration |
