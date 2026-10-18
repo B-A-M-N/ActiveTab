@@ -1,5 +1,6 @@
 import { fieldIsPermitted } from "../extraction/extractionContract.js";
 import { discoverVisibleNextPage, resolveVisibleTableRecords } from "../extraction/recordResolver.js";
+import { resolveVisibleRecordGroupRecords } from "../extraction/recordGroupResolver.js";
 
 function applicationIdFor(environment, origin) {
   return environment?.applications?.find(application => application.origin === origin)?.applicationId ?? null;
@@ -34,10 +35,12 @@ export async function executeExtractionCapability({ capabilityId, capabilityVers
   if (evidence?.status !== "available" || !evidence.domSnapshot) {
     return { status: "uncertain", reasonCode: "retained_dom_evidence_unavailable", evidenceId: observation.evidenceId };
   }
-  const resolved = resolveVisibleTableRecords(evidence.domSnapshot, manifest.extractionContract);
+  const resolved = manifest.kind === "visible_record_group"
+    ? resolveVisibleRecordGroupRecords(evidence.domSnapshot, manifest.extractionContract)
+    : resolveVisibleTableRecords(evidence.domSnapshot, manifest.extractionContract);
   if (resolved.status !== "available") return {
     status: resolved.status === "ambiguous" ? "blocked" : "incomplete",
-    reasonCode: `visible_table_${resolved.status}`,
+    reasonCode: `${manifest.kind === "visible_record_group" ? "visible_record_group" : "visible_table"}_${resolved.status}`,
     evidenceId: observation.evidenceId,
     capabilityId: manifest.capabilityId,
     capabilityVersion: manifest.capabilityVersion,

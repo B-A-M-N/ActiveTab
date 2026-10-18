@@ -607,11 +607,19 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
           const items = (capabilityService?.registry?.list?.() ?? capabilityRegistry?.list?.() ?? []).map(manifest => ({
             capability_id: manifest.capabilityId,
             version: manifest.capabilityVersion,
+            kind: manifest.kind,
             application_id: manifest.applicationId,
             environment_id: manifest.environmentId,
             origin: manifest.origin,
             page_path: manifest.pagePath,
-            output_schema: manifest.extractionContract.fields.map(({ name, type, required, dataClass }) => ({ name, type, required, data_class: dataClass })),
+            output_schema: manifest.extractionContract.fields.map(field => ({
+              name: field.name,
+              type: field.type,
+              required: field.required,
+              data_class: field.dataClass,
+              ...(field.sourceHeader ? { source_header: field.sourceHeader } : {}),
+              ...(field.sourceKey ? { source_key: field.sourceKey, source_tag: field.sourceTagName } : {})
+            })),
             completion_policy: manifest.extractionContract.completionPolicy,
             ...(manifest.extractionContract.expectedRecords === undefined ? {} : { expected_records: manifest.extractionContract.expectedRecords }),
             min_records: manifest.extractionContract.minRecords ?? 1,

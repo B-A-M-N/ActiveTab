@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "scenario_id": "webarena-infinity-gmail-extract-001",
+  "site_family": "webarena-infinity-gmail",
+  "seed": 41002,
+  "application": {
+    "build": "webarena-infinity-1ca77813bf8d8e4011aa3fb1f740f70d78bd522d"
+  },
+  "faults": [],
+  "task": {
+    "operation": "extract_inbox_records",
+    "goal": "Return the sender and subject for every message visible in the inbox as structured records.",
+    "emails": [
+      { "sender": "Fixture Sender A", "subject": "ActiveTab Fixture Alpha" },
+      { "sender": "Fixture Sender B", "subject": "ActiveTab Fixture Beta" },
+      { "sender": "Fixture Sender C", "subject": "ActiveTab Fixture Gamma" }
+    ]
+  },
+  "oracle": {
+    "kind": "email_list_contents"
+  }
+}

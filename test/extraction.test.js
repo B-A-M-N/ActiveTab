@@ -4,11 +4,12 @@ import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { discoverVisibleNextPage, discoverVisibleTables, resolveVisibleTableRecords } from "../src/extraction/recordResolver.js";
+import { discoverVisibleRecordGroups, resolveVisibleRecordGroupRecords } from "../src/extraction/recordGroupResolver.js";
 import { normalizeFieldValue, validateExtractionContract } from "../src/extraction/extractionContract.js";
 import { verifyExtractionResult } from "../src/extraction/extractionVerifier.js";
 import { CapabilityRegistry } from "../src/capabilities/capabilityRegistry.js";
 import { discoverTableCapabilities } from "../src/capabilities/capabilityDiscovery.js";
-import { compileTableRecipe } from "../src/capabilities/recipeCompiler.js";
+import { compileTableRecipe, compileVisibleExtractionRecipe } from "../src/capabilities/recipeCompiler.js";
 import { CapabilityQualifier } from "../src/capabilities/capabilityQualifier.js";
 import { CapabilityService } from "../src/capabilities/capabilityService.js";
 import { createExtractionFieldPolicy } from "../src/capabilities/fieldPolicy.js";
@@ -69,6 +70,50 @@ function tableSnapshot(rows, { nextHref = null } = {}) {
   };
 }
 
+function recordGroupSnapshot(records, { containerClass = "mail-list", itemClass = "mail-item", senderClass = "mail-sender", subjectClass = "mail-subject", nextHref = null } = {}) {
+  const strings = [];
+  const intern = value => { strings.push(value); return strings.length - 1; };
+  const nodeName = [];
+  const nodeValue = [];
+  const textValue = [];
+  const parentIndex = [];
+  const attributes = [];
+  const layoutIndexes = [];
+  const add = (tag, parent, text = null, attrs = []) => {
+    const index = nodeName.length;
+    nodeName.push(intern(tag));
+    nodeValue.push(-1);
+    textValue.push(text === null ? -1 : intern(text));
+    parentIndex.push(parent);
+    attributes.push(attrs.flatMap(([name, value]) => [intern(name), intern(value)]));
+    if (tag !== "#text") layoutIndexes.push(index);
+    return index;
+  };
+  const html = add("HTML", -1);
+  const body = add("BODY", html);
+  const list = add("DIV", body, null, [["class", containerClass]]);
+  for (const record of records) {
+    const row = add("DIV", list, null, [["class", itemClass]]);
+    const sender = add("SPAN", row, null, [["class", senderClass]]);
+    add("#text", sender, record.sender);
+    const subject = add("SPAN", row, null, [["class", subjectClass]]);
+    add("#text", subject, record.subject);
+  }
+  if (nextHref) {
+    const link = add("A", body);
+    attributes[link] = [intern("rel"), intern("next"), intern("href"), intern(nextHref)];
+    add("#text", link, "Next");
+  }
+  return {
+    strings,
+    documents: [{
+      documentURL: intern("https://mail.example/inbox"),
+      nodes: { nodeName, nodeValue, textValue, parentIndex, attributes },
+      layout: { nodeIndex: layoutIndexes, bounds: layoutIndexes.map(() => [0, 0, 100, 20]) }
+    }]
+  };
+}
+
 function candidateAndRecipe(snapshot, { expectedRecords = 2, maxRecords = 10, pagination = undefined, completionPolicy = "exact_count" } = {}) {
   const observation = {
     evidenceId: "observation-1",
@@ -100,6 +145,40 @@ function candidateAndRecipe(snapshot, { expectedRecords = 2, maxRecords = 10, pa
       ...(pagination ? { pagination, authorizePagination: () => true } : {})
     })
   };
+}
+
+function candidateAndRecordGroupRecipe(snapshot, { expectedRecords = 2, maxRecords = 10, pagination = undefined, completionPolicy = "exact_count" } = {}) {
+  const observation = {
+    evidenceId: "mail-observation-1",
+    documentGeneration: 1,
+    page: { url: "https://mail.example/inbox", title: "Inbox" }
+  };
+  const discovery = discoverTableCapabilities({
+    observation,
+    domSnapshot: snapshot,
+    environmentId: "webarena-infinity-local",
+    applicationId: "webarena-infinity-gmail",
+    principalId: "fixture-operator"
+  });
+  const candidate = discovery.candidates.find(item => item.kind === "visible_record_group"
+    && item.fields.some(field => field.sourceKey === "mail-sender")
+    && item.fields.some(field => field.sourceKey === "mail-subject"));
+  assert.ok(candidate, "visible repeated mail rows should be discovered");
+  const recipe = compileVisibleExtractionRecipe({
+    candidate,
+    capabilityId: "webarena.gmail.inbox",
+    fields: [
+      { name: "sender", sourceKey: "mail-sender", type: "string", required: true },
+      { name: "subject", sourceKey: "mail-subject", type: "string", required: true }
+    ],
+    classifyField: () => "public",
+    maxRecords,
+    ...(completionPolicy === "exact_count" ? { expectedRecords } : {}),
+    completionPolicy,
+    uniqueBy: ["subject"],
+    ...(pagination ? { pagination, authorizePagination: () => true } : {})
+  });
+  return { observation, candidate, recipe };
 }
 
 async function qualifiedRegistry(candidate) {
@@ -313,6 +392,57 @@ test("qualified capability manifests persist owner-only and reload with their sc
   }
 });
 
+test("qualified repeated-record capabilities persist their observed field mappings for later reuse", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "activetab-record-group-registry-"));
+  try {
+    const records = [
+      { sender: "Synthetic Sender A", subject: "Fixture Roadmap A" },
+      { sender: "Synthetic Sender B", subject: "Fixture Roadmap B" }
+    ];
+    const snapshot = recordGroupSnapshot(records);
+    const { recipe } = candidateAndRecordGroupRecipe(snapshot);
+    const qualified = await new CapabilityQualifier({ runQualification: qualifyExtractionManifest })
+      .qualify(recipe, { variants: 3 });
+    assert.equal(qualified.status, "qualified");
+
+    const firstRegistry = await new CapabilityRegistry({ directory }).init();
+    await firstRegistry.register(qualified.manifest);
+    const [filename] = await readdir(directory);
+    assert.equal((await stat(join(directory, filename))).mode & 0o777, 0o600);
+
+    const restored = await new CapabilityRegistry({ directory }).init();
+    const manifest = restored.resolve("webarena.gmail.inbox", {
+      origin: "https://mail.example",
+      environmentId: "webarena-infinity-local",
+      applicationId: "webarena-infinity-gmail",
+      principalId: "fixture-operator"
+    });
+    assert.equal(manifest.kind, "visible_record_group");
+    assert.equal(manifest.extractionContract.fields[0].sourceTagName, "SPAN");
+    const session = {
+      target: { id: "mail-persistent-target" },
+      documentGeneration: 1,
+      async observe() { return { evidenceId: "mail-persistent-observation", documentGeneration: 1, page: { url: "https://mail.example/inbox" } }; },
+      observer: { getEvidence() { return { status: "available", domSnapshot: snapshot }; } }
+    };
+    const result = await executeExtractionCapability({
+      capabilityId: "webarena.gmail.inbox",
+      registry: restored,
+      session,
+      environment: {
+        environmentId: "webarena-infinity-local",
+        applications: [{ applicationId: "webarena-infinity-gmail", origin: "https://mail.example" }]
+      },
+      principalId: "fixture-operator",
+      authorizeField: () => true
+    });
+    assert.equal(result.status, "available");
+    assert.deepEqual(result.records.map(record => record.values), records);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("visible rows normalize into typed records with observation provenance", () => {
   const snapshot = tableSnapshot([["Widget A", "1.25"], ["Widget B", "2.50"]]);
   const { recipe } = candidateAndRecipe(snapshot);
@@ -323,6 +453,145 @@ test("visible rows normalize into typed records with observation provenance", ()
     { name: "Widget B", price: 2.5 }
   ]);
   assert.equal(resolved.records[0].fieldEvidence.price.validation, "valid");
+});
+
+test("observed repeated record groups compile and verify structured outputs without returning discovery values", async () => {
+  const records = [
+    { sender: "Synthetic Sender A", subject: "Fixture Roadmap A" },
+    { sender: "Synthetic Sender B", subject: "Fixture Roadmap B" }
+  ];
+  const snapshot = recordGroupSnapshot(records);
+  const discovered = discoverVisibleRecordGroups(snapshot);
+  assert.ok(discovered.some(group => group.recordGroup.itemClassToken === "mail-item"));
+  const { recipe } = candidateAndRecordGroupRecipe(snapshot);
+  const serializedCandidate = JSON.stringify(discovered);
+  assert.equal(serializedCandidate.includes("Synthetic Sender A"), false);
+  assert.equal(serializedCandidate.includes("Fixture Roadmap A"), false);
+  const resolved = resolveVisibleRecordGroupRecords(snapshot, recipe.extractionContract);
+  assert.equal(resolved.status, "available");
+  assert.deepEqual(resolved.records.map(item => item.values), records.map(({ sender, subject }) => ({ sender, subject })));
+  assert.equal(resolved.records[0].fieldEvidence.sender.method, "visible_record_group_text");
+
+  const capabilityRegistry = await qualifiedRegistry(recipe);
+  const session = {
+    attached: true,
+    target: { id: "mail-target" },
+    documentGeneration: 1,
+    async observe() {
+      return { evidenceId: "mail-observation-live", documentGeneration: 1, page: { url: "https://mail.example/inbox", title: "Inbox" } };
+    },
+    observer: { getEvidence() { return { status: "available", domSnapshot: snapshot }; } }
+  };
+  const runner = new TestRunner({
+    session,
+    environment: { environmentId: "webarena-infinity-local", applications: [{ applicationId: "webarena-infinity-gmail", origin: "https://mail.example" }] },
+    principalId: "fixture-operator",
+    capabilityRegistry
+  });
+  const receipt = await runner.run({
+    id: "extract-mail",
+    name: "Extract visible messages",
+    steps: [
+      { id: "collect", type: "collect_records", capabilityId: "webarena.gmail.inbox", outputName: "messages" },
+      { id: "emit", type: "emit_output", capabilityId: "webarena.gmail.inbox", outputName: "messages" }
+    ]
+  }, { runId: "mail-extraction-run" });
+  assert.equal(receipt.status, "PASSED", JSON.stringify(receipt.toObject()));
+  const output = runner.outputResults.messages;
+  assert.equal(output.completeness, "complete");
+  assert.deepEqual(output.records, records.map(({ sender, subject }) => ({ sender, subject })));
+  assert.equal(output.fieldProvenance[0].fields.sender.sourceKey, "mail-sender");
+  assert.equal(verifyExtractionResult(output).status, "complete");
+
+  const drifted = recordGroupSnapshot(records, { subjectClass: "mail-subject-drift" });
+  const driftedResult = resolveVisibleRecordGroupRecords(drifted, recipe.extractionContract);
+  assert.equal(driftedResult.status, "available");
+  assert.equal(driftedResult.records.every(record => record.valid), false);
+});
+
+test("repeated visible record extraction verifies exact totals across pages and rejects missing, duplicate, and drifted pages", async () => {
+  const makeRecords = start => Array.from({ length: 10 }, (_, offset) => ({
+    sender: `Sender ${start + offset}`,
+    subject: `Message ${start + offset}`
+  }));
+  const makePages = ({ missingNextAt = -1, duplicateAt = -1, driftAt = -1 } = {}) => Array.from({ length: 10 }, (_, page) => {
+    const records = makeRecords(page * 10);
+    if (page === duplicateAt) records[0] = { sender: "Sender 0", subject: "Message 0" };
+    return recordGroupSnapshot(records, {
+      ...(page < 9 && page !== missingNextAt ? { nextHref: `?page=${page + 2}` } : {}),
+      ...(page === driftAt ? { subjectClass: "mail-subject-changed" } : {})
+    });
+  });
+
+  async function runPages(pages, runId) {
+    const { recipe } = candidateAndRecordGroupRecipe(pages[0], {
+      expectedRecords: 100,
+      maxRecords: 100,
+      pagination: { kind: "rel_next_same_path", maxPages: 10 }
+    });
+    const registry = await qualifiedRegistry(recipe);
+    let pageIndex = 0;
+    const session = {
+      attached: true,
+      target: { id: `mail-pagination-${runId}` },
+      documentGeneration: 1,
+      async observe() {
+        return {
+          evidenceId: `mail-page-${pageIndex}`,
+          documentGeneration: 1,
+          page: { url: `https://mail.example/inbox?page=${pageIndex + 1}`, title: "Inbox" }
+        };
+      },
+      observer: {
+        getEvidence(evidenceId) {
+          const index = Number(evidenceId.split("-").at(-1));
+          return { status: "available", domSnapshot: pages[index] };
+        }
+      }
+    };
+    const runner = new TestRunner({
+      session,
+      environment: { environmentId: "webarena-infinity-local", applications: [{ applicationId: "webarena-infinity-gmail", origin: "https://mail.example" }] },
+      principalId: "fixture-operator",
+      capabilityRegistry: registry
+    });
+    runner.browserStepHandler.executeNavigate = async (step, receipt, startedAt) => {
+      pageIndex++;
+      receipt.recordStep({ stepId: step.id, type: step.type, status: "PASS", reason: "Scoped pagination was observed.", startedAt });
+      return { status: "PASS" };
+    };
+    const receipt = await runner.run({
+      id: "extract-mail-pages",
+      name: "Extract mail across pages",
+      steps: [
+        { id: "collect", type: "collect_records", capabilityId: "webarena.gmail.inbox", outputName: "messages" },
+        { id: "emit", type: "emit_output", capabilityId: "webarena.gmail.inbox", outputName: "messages" }
+      ]
+    }, { runId });
+    return { receipt, output: runner.outputResults.messages };
+  }
+
+  const complete = await runPages(makePages(), "mail-pages-complete");
+  assert.equal(complete.receipt.status, "PASSED", JSON.stringify(complete.receipt.toObject()));
+  assert.equal(complete.output.records.length, 100);
+  assert.equal(complete.output.completeness, "complete");
+  assert.equal(verifyExtractionResult(complete.output).status, "complete");
+
+  const missing = await runPages(makePages({ missingNextAt: 4 }), "mail-pages-missing");
+  assert.equal(missing.receipt.status, "FAILED");
+  assert.equal(missing.output.completeness, "incomplete");
+  assert.equal(missing.output.records.length, 50);
+
+  const duplicated = await runPages(makePages({ duplicateAt: 5 }), "mail-pages-duplicate");
+  assert.equal(duplicated.receipt.status, "FAILED");
+  assert.equal(duplicated.output.completeness, "incomplete");
+  assert.ok(duplicated.output.verification.duplicateKeys > 0);
+
+  const drifted = await runPages(makePages({ driftAt: 4 }), "mail-pages-drift");
+  assert.equal(drifted.receipt.status, "FAILED");
+  assert.equal(drifted.output.completeness, "incomplete");
+  assert.equal(drifted.output.records.length, 100);
+  assert.ok(drifted.output.verification.invalidRows > 0);
 });
 
 test("runner extracts and emits a verified output only through a qualified capability", async () => {

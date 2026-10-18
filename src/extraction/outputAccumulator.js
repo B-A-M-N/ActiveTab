@@ -20,10 +20,12 @@ export class OutputAccumulator {
         fields: Object.fromEntries(Object.entries(record.fieldEvidence).map(([field, source]) => [field, {
           pageUrl: provenance.pageUrl,
           observationId: provenance.observationId,
-          tableIndex: resolved.evidence[0]?.tableIndex ?? null,
           rowIndex: source.rowIndex,
-          sourceHeader: source.sourceHeader,
-          method: "visible_html_table_cell",
+          ...(Number.isInteger(resolved.evidence[0]?.tableIndex) ? { tableIndex: resolved.evidence[0].tableIndex } : {}),
+          ...(typeof source.sourceHeader === "string" ? { sourceHeader: source.sourceHeader } : {}),
+          ...(typeof source.sourceKey === "string" ? { sourceKey: source.sourceKey } : {}),
+          ...(typeof source.sourceTagName === "string" ? { sourceTagName: source.sourceTagName } : {}),
+          method: source.method ?? "visible_html_table_cell",
           validation: source.validation
         }]))
       });
@@ -47,7 +49,11 @@ export class OutputAccumulator {
     const accumulated = this.outputs.get(outputName);
     if (!accumulated) return {
       scope: { origin: contract.origin ?? null, pagePath: contract.pagePath ?? null, environmentId: contract.environmentId ?? null, applicationId: contract.applicationId ?? null },
-      schema: { type: "array", items: Object.fromEntries(contract.fields.map(field => [field.name, { type: field.type, required: field.required, dataClass: field.dataClass, sourceHeader: field.sourceHeader }])) },
+      schema: { type: "array", items: Object.fromEntries(contract.fields.map(field => [field.name, {
+        type: field.type, required: field.required, dataClass: field.dataClass,
+        ...(field.sourceHeader ? { sourceHeader: field.sourceHeader } : {}),
+        ...(field.sourceKey ? { sourceKey: field.sourceKey, sourceTagName: field.sourceTagName } : {})
+      }])) },
       records: [],
       fieldProvenance: [],
       completeness: "incomplete",
@@ -85,7 +91,11 @@ export class OutputAccumulator {
       },
       schema: {
         type: "array",
-        items: Object.fromEntries(contract.fields.map(field => [field.name, { type: field.type, required: field.required, dataClass: field.dataClass, sourceHeader: field.sourceHeader }]))
+        items: Object.fromEntries(contract.fields.map(field => [field.name, {
+          type: field.type, required: field.required, dataClass: field.dataClass,
+          ...(field.sourceHeader ? { sourceHeader: field.sourceHeader } : {}),
+          ...(field.sourceKey ? { sourceKey: field.sourceKey, sourceTagName: field.sourceTagName } : {})
+        }]))
       },
       records: accumulated.records.map(record => ({ ...record })),
       fieldProvenance: accumulated.fieldProvenance.map(record => structuredClone(record)),

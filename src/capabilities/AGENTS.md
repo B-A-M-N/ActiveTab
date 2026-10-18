@@ -10,7 +10,8 @@ ActiveTab's capability layer. It defines typed read-only site recipes and delega
 
 ## Local Contracts
 
-- Discovery returns bounded structural metadata from fresh retained evidence; it does not return records or authorize an action.
+- Discovery returns bounded structural metadata for visible HTML tables and repeated visible record groups from fresh retained evidence; it does not return records or authorize an action.
+- Repeated-group recipes bind to observed container/item tag names and exact class tokens. Field extraction binds to observed source tag/class-token pairs; callers cannot supply CSS selectors or page scripts.
 - Compilation receives field sensitivity and read policy only from trusted application composition, and binds each manifest to exact origin, route, environment, application, and verified principal.
 - A capability is executable only after a configured Fixture Lab qualifier returns independently scored evidence and the owner-only registry accepts the manifest.
 - Recipes name registered operations only. They cannot contain JavaScript, arbitrary endpoints, credentials, or caller-authored authority.

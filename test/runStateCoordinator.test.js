@@ -36,3 +36,26 @@ test("waiting run completion preserves the suspended step and intervention bindi
     pendingInterventionId: "intervention-auth"
   });
 });
+
+test("run coordinator reuses an outer target lease without releasing it", async () => {
+  let currentAssertions = 0;
+  let targetReleases = 0;
+  let runReleases = 0;
+  const targetLease = {
+    fencingToken: 12,
+    async assertCurrent() { currentAssertions++; },
+    async release() { targetReleases++; }
+  };
+  const coordinator = new RunStateCoordinator({
+    runStateStore: { async acquireExecutionLease() { return async () => { runReleases++; }; } },
+    session: { attached: true, target: { id: "target-outer" } },
+    targetLease
+  });
+  const releaseRun = await coordinator.acquireExecutionLeases("run_outer_lease");
+  assert.equal(currentAssertions, 1);
+  assert.equal(coordinator.targetLease, targetLease);
+  await releaseRun();
+  assert.equal(targetReleases, 0);
+  assert.equal(runReleases, 1);
+  assert.equal(coordinator.targetLease, targetLease);
+});

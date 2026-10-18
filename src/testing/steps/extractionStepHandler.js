@@ -62,8 +62,8 @@ export class ExtractionStepHandler {
     }
     this.onDiscovery(discovered);
     const reason = discovered.status === "candidate"
-      ? `Discovered ${discovered.candidates.length} visible table candidate(s); records and page text were not returned.`
-      : "Discovery completed; no visible structured HTML tables were found.";
+      ? `Discovered ${discovered.candidates.length} visible structured-source candidate(s); records and page text were not returned.`
+      : "Discovery completed; no visible HTML tables or repeated record groups were found.";
     receipt.recordStep({
       stepId: step.id,
       type: step.type,
@@ -120,7 +120,7 @@ export class ExtractionStepHandler {
       pageUrl: result.pageUrl,
       maxRecords: result.contract.maxRecords
     });
-    const reason = `Collected ${result.records.length} visible table rows from fresh browser evidence; overall output remains unverified until finalized.`;
+    const reason = `Collected ${result.records.length} visible records from fresh browser evidence; overall output remains unverified until finalized.`;
     receipt.recordStep({
       stepId: step.id,
       type: step.type,

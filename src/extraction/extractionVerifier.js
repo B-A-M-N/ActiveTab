@@ -31,8 +31,14 @@ export function verifyExtractionResult(result) {
     }
     for (const [name, field] of Object.entries(record.fields ?? {})) {
       const fieldUrl = (() => { try { return new URL(field.pageUrl); } catch { return null; } })();
-      if (!field.observationId || field.validation !== "valid" || field.method !== "visible_html_table_cell"
-        || field.sourceHeader !== schemaFields?.[name]?.sourceHeader
+      const schemaField = schemaFields?.[name];
+      const sourceMatches = schemaField?.sourceHeader
+        ? field.method === "visible_html_table_cell" && field.sourceHeader === schemaField.sourceHeader
+        : schemaField?.sourceKey
+          ? field.method === "visible_record_group_text" && field.sourceKey === schemaField.sourceKey
+            && field.sourceTagName === schemaField.sourceTagName
+          : false;
+      if (!field.observationId || field.validation !== "valid" || !sourceMatches
         || !fieldUrl || fieldUrl.origin !== result.scope?.origin || fieldUrl.pathname !== result.scope?.pagePath
         || fieldUrl.search || fieldUrl.hash) {
         return { status: "incomplete", reason: "A field lacks valid observation provenance." };

@@ -4,10 +4,12 @@ import { QualificationService } from "./qualificationService.js";
 import { createNativeCdpQualificationDriver } from "../../test-lab/runtime/nativeCdpDriver.js";
 import { createFiAgentTwinProvider } from "../../test-lab/fixtures/fi-agent-twin/provider.js";
 import { createWebArenaInfinityGmailProvider } from "../../test-lab/adapters/webarenaInfinityGmailProvider.js";
+import { createWebArenaInfinityGmailExtractionDriver } from "../../test-lab/adapters/webarenaInfinityGmailDriver.js";
 
 const scenarioFiles = [
   new URL("../../test-lab/catalog/scenarios/fi-task-recovery-004.json", import.meta.url),
-  new URL("../../test-lab/catalog/scenarios/webarena-infinity-gmail-task-001.json", import.meta.url)
+  new URL("../../test-lab/catalog/scenarios/webarena-infinity-gmail-task-001.json", import.meta.url),
+  new URL("../../test-lab/catalog/scenarios/webarena-infinity-gmail-extract-001.json", import.meta.url)
 ];
 
 function loadScenario(url) {
@@ -28,6 +30,7 @@ export function createQualificationRuntime({
   scenarios = scenarioFiles.map(loadScenario)
 } = {}) {
   const nativeDriver = createNativeCdpQualificationDriver({ decisionRuntime });
+  const gmailExtractionDriver = createWebArenaInfinityGmailExtractionDriver({ decisionRuntime });
   const configuredProviders = {
     fi_agent_twin: () => createFiAgentTwinProvider(),
     ...(externalGmailOrigin && externalGmailOracleToken ? {
@@ -37,7 +40,10 @@ export function createQualificationRuntime({
   };
   const configuredDrivers = {
     fi_agent_twin: nativeDriver,
-    ...(externalGmailOrigin && externalGmailOracleToken ? { webarena_infinity_gmail: nativeDriver } : {}),
+    ...(externalGmailOrigin && externalGmailOracleToken ? {
+      webarena_infinity_gmail: context => context.task?.operation === "extract_inbox_records"
+        ? gmailExtractionDriver(context) : nativeDriver(context)
+    } : {}),
     ...drivers
   };
   return new QualificationService({ decisionRuntime, scenarioCatalog: scenarios, providers: configuredProviders, drivers: configuredDrivers });

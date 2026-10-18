@@ -25,6 +25,7 @@ This package is part of ActiveTab's capability surface. It owns benchmark orches
 - Preserve the existing local fixtures while adding independent applications.
 - Keep external benchmark source and data outside the ActiveTab checkout unless the user explicitly requests vendoring.
 - Use exact, reviewed modifications for external bind-address changes; never expose an external fixture server beyond loopback.
+- WebArena-Infinity setup uses a disposable pinned checkout. Its UI seed adapter may provide only bounded synthetic scenario rows to the page; preserve pre-existing modified checkouts and never surface the oracle credential to browser content.
 - Keep fixture setup, driver execution, oracle scoring, and cleanup independently reportable.
 
 ## Verification

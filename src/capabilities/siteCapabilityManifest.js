@@ -15,7 +15,7 @@ export function validateSiteCapabilityManifest(manifest, { requireQualified = fa
   if (manifest.version !== 1) errors.push("Capability manifest version must be 1.");
   if (typeof manifest.capabilityId !== "string" || !manifest.capabilityId || manifest.capabilityId.length > 96) errors.push("capabilityId must be a bounded identifier.");
   if (!Number.isInteger(manifest.capabilityVersion) || manifest.capabilityVersion < 1 || manifest.capabilityVersion > 1000) errors.push("capabilityVersion must be from 1 to 1000.");
-  if (manifest.kind !== "visible_html_table") errors.push("Only the registered visible_html_table capability is supported.");
+  if (!new Set(["visible_html_table", "visible_record_group"]).has(manifest.kind)) errors.push("Capability kind must be a supported visible DOM extraction source.");
   if (typeof manifest.applicationId !== "string" || !manifest.applicationId || manifest.applicationId.length > 96) errors.push("applicationId must be a bounded identifier.");
   if (typeof manifest.environmentId !== "string" || !manifest.environmentId || manifest.environmentId.length > 128) errors.push("environmentId must be a bounded identifier.");
   try {
@@ -26,6 +26,12 @@ export function validateSiteCapabilityManifest(manifest, { requireQualified = fa
   const contract = manifest.extractionContract;
   const validation = validateExtractionContract(contract);
   if (!validation.valid) errors.push(...validation.errors.map(error => `extractionContract: ${error}`));
+  if (manifest.kind === "visible_html_table" && (contract?.recordGroup !== undefined || contract?.fields?.some(field => typeof field?.sourceHeader !== "string"))) {
+    errors.push("visible_html_table capabilities require table header fields and cannot include a recordGroup.");
+  }
+  if (manifest.kind === "visible_record_group" && (!contract?.recordGroup || contract?.fields?.some(field => typeof field?.sourceKey !== "string"))) {
+    errors.push("visible_record_group capabilities require an exact recordGroup and sourceKey fields.");
+  }
   if (contract && (contract.id !== manifest.capabilityId || contract.origin !== manifest.origin || contract.environmentId !== manifest.environmentId
     || contract.applicationId !== manifest.applicationId || contract.pagePath !== manifest.pagePath
     || contract.principalId !== manifest.principalId)) {

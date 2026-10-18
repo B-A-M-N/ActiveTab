@@ -7,22 +7,23 @@ Qualification uses the same native CDP navigation engine as ordinary ActiveTab w
 ## Current targets
 
 - `fi-agent-twin`: local two-origin Cloud Agent simulation with separate authentication realms, asynchronous runs, scoped diagnostics, fault injection, and a separate oracle.
-- `webarena-infinity-gmail`: the standalone Gmail application from WebArena-Infinity, pinned to commit `1ca77813bf8d8e4011aa3fb1f740f70d78bd522d`. The checked-in adapter supports one bounded task: mark the seeded `Q1 Product Roadmap Review` message from Sarah Chen as read.
+- `webarena-infinity-gmail`: the standalone Gmail application from WebArena-Infinity, pinned to commit `1ca77813bf8d8e4011aa3fb1f740f70d78bd522d`. The adapter supports marking a seeded message as read and extracting a bounded synthetic inbox through ActiveTab's qualified visible-record capability. The independent oracle checks exact extracted values and cleanup.
 
-The first structured extraction qualifier is an in-process seeded resolver baseline. It is not a replacement for these application targets. The existing WebArena-Infinity Gmail adapter currently qualifies its bounded mail-state task; it has not yet been adapted as an extraction capability oracle.
+The in-process seeded resolver remains a fast baseline. WebArena-Infinity is an independent application target: its Gmail extraction task launches a dedicated Chromium profile, observes the real rendered UI, discovers and qualifies a visible-record recipe, runs collection through ActiveTab's declarative runner, and scores the result against an isolated oracle. This is one pinned extraction task, not broad benchmark coverage.
 
 ## Run the external application locally
 
 WebArena-Infinity's application server uses the Python standard library. ActiveTab does not need Docker, Playwright, BrowserGym, or additional Node packages to control it.
 
-Clone the pinned upstream checkout outside this repository, for example under `/tmp/activetab-webarena-infinity`, then enter `apps/gmail`. Apply ActiveTab's reviewed adapter patch from that directory:
+Use a disposable copy of the pinned upstream checkout outside this repository, for example `/tmp/activetab-webarena-infinity-qualification-copy`; keep any existing checkout with local changes untouched. From its `apps/gmail` directory, apply ActiveTab's reviewed server and UI seed adapters:
 
 ```sh
 python3 /home/bamn/ActiveTab/test-lab/adapters/prepareWebArenaInfinity.py
+python3 /home/bamn/ActiveTab/test-lab/adapters/prepareWebArenaInfinitySyntheticUiSeed.py
 python3 server.py --port 8000
 ```
 
-Set a random `ACTIVETAB_WEBARENA_ORACLE_TOKEN` of at least 32 characters in both the app server and ActiveTab process, and set `ACTIVETAB_BENCHMARK_WEBARENA_INFINITY_URL=http://127.0.0.1:8000` for ActiveTab. Keep the token out of task inputs and browser-visible page data. The patch binds the upstream server to loopback, protects verifier state and reset routes, and accepts only a small bounded seed through a separate oracle route. The provider seeds and verifies state over that route; it does not launch a setup browser. The actual benchmark driver owns the browser lifecycle and opens the app for the task. No external app state or oracle credential is retained in telemetry.
+Set a random `ACTIVETAB_WEBARENA_ORACLE_TOKEN` of at least 32 characters in both the app server and ActiveTab process, and set `ACTIVETAB_BENCHMARK_WEBARENA_INFINITY_URL=http://127.0.0.1:8000` for ActiveTab. Keep the token out of task inputs and browser-visible page data. The server patch binds the upstream app to loopback, protects verifier state and reset routes, and accepts only a small bounded seed through a separate oracle route. The UI patch serves only the synthetic seeded email fields to the page before app initialization. The provider seeds and verifies state through the isolated route; the driver owns a dedicated browser profile and runs the actual extraction workflow. No external app state or oracle credential is retained in telemetry.
 
 The service is available to declarative test workflows through a `qualify` step. Set `required: true` only when fixture qualification itself is a workflow requirement. By default, unavailable qualification is recorded as advisory so the parent automation flow can continue.
 
@@ -38,5 +39,7 @@ Example step:
   "required": false
 }
 ```
+
+The extraction scenario is `webarena-infinity-gmail-extract-001`. It seeds only synthetic subjects and sender names. When ActiveTab runs this qualification operation, it uses a dedicated browser profile and returns only the schema-validated synthetic records; the oracle state and token are never passed to the browser driver.
 
 Completed qualifications are linked to the originating run and source events. Successful records are scoped candidate knowledge, not automatic workflow promotion, permission, or training labels.

@@ -12,11 +12,13 @@ export function createExtractionFieldPolicy(entries = [], paginationEntries = []
   if (!Array.isArray(paginationEntries) || paginationEntries.length > 1000) throw new Error("Extraction pagination policy must be a bounded list.");
   const policies = new Map();
   for (const entry of entries) {
+    const hasHeader = validText(entry?.sourceHeader, 160);
+    const hasSourceKey = validText(entry?.sourceKey, 128);
     if (!validText(entry?.environmentId, 128) || !validText(entry?.applicationId, 96)
-      || !validText(entry?.origin, 512) || !validText(entry?.sourceHeader, 160)
+      || !validText(entry?.origin, 512) || hasHeader === hasSourceKey
       || !DATA_CLASSES.has(entry?.dataClass)
       || typeof entry.allowRead !== "boolean" || typeof entry.allowRelease !== "boolean") {
-      throw new Error("Every extraction field policy entry requires exact scope, data class, and explicit read/release decisions.");
+      throw new Error("Every extraction field policy entry requires exact scope, one sourceHeader or sourceKey, data class, and explicit read/release decisions.");
     }
     const origin = new URL(entry.origin);
     if (!["http:", "https:"].includes(origin.protocol) || origin.origin !== entry.origin) {
@@ -78,7 +80,8 @@ function policyKey(value) {
     value?.environmentId ?? null,
     value?.applicationId ?? null,
     value?.origin ?? null,
-    value?.sourceHeader ?? null
+    value?.sourceHeader ?? null,
+    value?.sourceKey ?? null
   ]);
 }
 

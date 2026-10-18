@@ -2,6 +2,7 @@ import { OutputAccumulator } from "../../src/extraction/outputAccumulator.js";
 import { verifyExtractionResult } from "../../src/extraction/extractionVerifier.js";
 import { projectExtractionOutput } from "../../src/extraction/outputRelease.js";
 import { discoverVisibleNextPage, resolveVisibleTableRecords } from "../../src/extraction/recordResolver.js";
+import { resolveVisibleRecordGroupRecords } from "../../src/extraction/recordGroupResolver.js";
 
 const MAX_VARIANT_CELLS = 100_000;
 
@@ -77,6 +78,64 @@ function visibleTableSnapshot(contract, { rowCount, rowOffset = 0, seed, driftHe
   };
 }
 
+function visibleRecordGroupSnapshot(contract, { rowCount, rowOffset = 0, seed, driftHeader = false, duplicateKey = false, nextHref = null } = {}) {
+  const strings = [];
+  const intern = value => { strings.push(value); return strings.length - 1; };
+  const nodeName = [];
+  const nodeValue = [];
+  const textValue = [];
+  const parentIndex = [];
+  const attributes = [];
+  const layoutIndexes = [];
+  const add = (tag, parent, text = null, attrs = []) => {
+    const index = nodeName.length;
+    nodeName.push(intern(tag));
+    nodeValue.push(-1);
+    textValue.push(text === null ? -1 : intern(text));
+    parentIndex.push(parent);
+    attributes.push(attrs.flatMap(([name, value]) => [intern(name), intern(value)]));
+    if (tag !== "#text") layoutIndexes.push(index);
+    return index;
+  };
+  const html = add("HTML", -1);
+  const body = add("BODY", html);
+  const wrapper = add(seed % 2 ? "MAIN" : "DIV", body);
+  const container = contract.recordGroup;
+  const list = add(container.containerTagName, wrapper, null, [["class", container.containerClassToken]]);
+  const fields = seed % 2 ? [...contract.fields].reverse() : [...contract.fields];
+  const truth = [];
+  for (let rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+    const globalRowIndex = rowOffset + rowIndex;
+    const row = add(container.itemTagName, list, null, [["class", `${container.itemClassToken}${seed % 2 ? " fixture-layout" : ""}`]]);
+    const record = {};
+    for (const field of fields) {
+      const sourceKey = driftHeader && globalRowIndex === rowOffset ? `${field.sourceKey}-changed` : field.sourceKey;
+      const value = duplicateKey && globalRowIndex === (contract.expectedRecords ?? rowCount) - 1 && contract.uniqueBy.includes(field.name)
+        ? fixtureValue(field, 0)
+        : fixtureValue(field, globalRowIndex);
+      record[field.name] = value;
+      const source = add(field.sourceTagName, row, null, [["class", sourceKey]]);
+      if ((seed + globalRowIndex) % 3 === 0) {
+        const span = add("SPAN", source);
+        add("#text", span, String(value));
+      } else add("#text", source, String(value));
+    }
+    truth.push(record);
+  }
+  if (nextHref) add("A", body, "Next", [["rel", "next"], ["href", nextHref]]);
+  return {
+    snapshot: {
+      strings,
+      documents: [{
+        documentURL: intern(`${contract.origin ?? "https://fixture.invalid"}${contract.pagePath ?? "/catalog"}?variant=${seed}`),
+        nodes: { nodeName, nodeValue, textValue, parentIndex, attributes },
+        layout: { nodeIndex: layoutIndexes, bounds: layoutIndexes.map(() => [0, 0, 100, 20]) }
+      }]
+    },
+    truth
+  };
+}
+
 function executeFixtureVariant(manifest, seed, { rowCount, driftHeader = false, duplicateKey = false, omitNextAt = -1 } = {}) {
   const contract = manifest.extractionContract;
   const totalRows = rowCount ?? contract.expectedRecords ?? Math.max(1, Math.min(7, contract.maxRecords));
@@ -94,15 +153,26 @@ function executeFixtureVariant(manifest, seed, { rowCount, driftHeader = false, 
     const count = Math.max(0, Math.min(pageSize, totalRows - offset));
     const hasNext = page + 1 < pageCount && page !== omitNextAt;
     const pageUrl = `${contract.origin ?? "https://fixture.invalid"}${contract.pagePath ?? "/catalog"}`;
-    const fixture = visibleTableSnapshot(contract, {
+    const fixture = manifest.kind === "visible_record_group"
+      ? visibleRecordGroupSnapshot(contract, {
+          seed: seed + page,
+          rowCount: count,
+          rowOffset: offset,
+          driftHeader: driftHeader && page === 0,
+          duplicateKey,
+          ...(hasNext ? { nextHref: `?page=${page + 2}` } : {})
+        })
+      : visibleTableSnapshot(contract, {
       seed: seed + page,
       rowCount: count,
       rowOffset: offset,
       driftHeader: driftHeader && page === 0,
       duplicateKey,
       ...(hasNext ? { nextHref: `?page=${page + 2}` } : {})
-    });
-    const resolved = resolveVisibleTableRecords(fixture.snapshot, contract);
+      });
+    const resolved = manifest.kind === "visible_record_group"
+      ? resolveVisibleRecordGroupRecords(fixture.snapshot, contract)
+      : resolveVisibleTableRecords(fixture.snapshot, contract);
     resolvedPages.push(resolved);
     accumulator.append("records", `${manifest.capabilityId}@${manifest.capabilityVersion}`, {
       records: resolved.records ?? [],
@@ -180,14 +250,14 @@ export async function qualifyExtractionManifest({ manifest, variants = 30, signa
       : null;
     const faultDetection = (!missingPage.output || missingPage.output.completeness !== "complete" || !equalRecords(missingPage.output.records, missingPage.truth))
       && (fixtureCount < 2 || duplicateRows.output.completeness !== "complete" || !equalRecords(duplicateRows.output.records, duplicateRows.truth))
-      && drift.resolved.status !== "available";
+      && (drift.resolved.status !== "available" || drift.output.completeness !== "complete");
     const paginationTested = !contract.pagination
       || (positive.output.verification.pageCount > 1 && positive.output.verification.paginationExhausted === true
         && earlyTerminal && !equalRecords(earlyTerminal.output.records, earlyTerminal.truth));
     const positiveComplete = validation.status === "complete"
       && (contract.expectedRecords === undefined || positive.output.verification.recordCount === contract.expectedRecords);
     reports.push({
-      scenarioId: `extraction-table-variant-${seed}`,
+      scenarioId: `extraction-${manifest.kind}-variant-${seed}`,
       evidenceRef: `fixture-extraction:${manifest.capabilityId}:${seed}`,
       status: positiveComplete && schemaMatch && faultDetection && paginationTested && privacyBoundaryPassed ? "complete" : "incomplete",
       schemaMatch,

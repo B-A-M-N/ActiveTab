@@ -44,6 +44,22 @@ function localHttpOrigin(value) {
   return parsed.origin;
 }
 
+function scenarioEmails(scenario) {
+  if (scenario.task.operation === "extract_inbox_records") {
+    return scenario.task.emails.map(email => ({ subject: email.subject, from: { name: email.sender }, isRead: true }));
+  }
+  return [{ subject: scenario.task.subject, from: { name: scenario.task.sender }, isRead: scenario.task.initialIsRead }];
+}
+
+function visibleEmailRecords(emails) {
+  return (emails ?? []).map(email => ({ sender: email?.from?.name ?? null, subject: email?.subject ?? null }));
+}
+
+function sameRecords(left, right) {
+  const canonical = records => [...records].map(record => JSON.stringify([record.sender, record.subject])).sort();
+  return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
+}
+
 /**
  * Adapter for the independently maintained WebArena-Infinity Gmail app.
  * The app process remains an external target; its loopback state endpoint is
@@ -80,12 +96,12 @@ export class WebArenaInfinityGmailProvider extends FixtureProvider {
     this.#assertEpisode(episodeId);
     if (signal?.aborted) throw new Error("External benchmark setup was canceled.");
     const oracleOptions = { redirect: "error", headers: { "x-activetab-fixture-oracle": this.#oracleToken } };
-    const target = this.#scenario.task;
+    const expectedEmails = scenarioEmails(this.#scenario);
     const response = await fetch(`${this.#origin}/api/oracle/seed`, {
       method: "POST",
       ...oracleOptions,
       headers: { ...oracleOptions.headers, "content-type": "application/json" },
-      body: JSON.stringify({ emails: [{ subject: target.subject, from: { name: target.sender }, isRead: target.initialIsRead }] })
+      body: JSON.stringify({ emails: expectedEmails })
     });
     if (!response.ok) throw new Error("WebArena-Infinity reset endpoint refused fixture setup.");
     const reset = await readJsonBounded(response);
@@ -93,10 +109,10 @@ export class WebArenaInfinityGmailProvider extends FixtureProvider {
     const stateResponse = await fetch(`${this.#origin}/api/state`, oracleOptions);
     if (!stateResponse.ok) throw new Error("WebArena-Infinity seeded state is unavailable.");
     const state = await readJsonBounded(stateResponse);
-    const targets = (state.emails ?? []).filter(email => email.subject === this.#scenario.task.subject
-      && email.from?.name === this.#scenario.task.sender);
-    if (targets.length !== 1 || targets[0].isRead !== this.#scenario.task.initialIsRead) {
-      throw new Error("WebArena-Infinity target is not in the scenario's declared initial state.");
+    if (!Array.isArray(state.emails) || state.emails.length !== expectedEmails.length
+      || expectedEmails.some(expected => state.emails.filter(email => email.subject === expected.subject
+        && email.from?.name === expected.from.name && email.isRead === expected.isRead).length !== 1)) {
+      throw new Error("WebArena-Infinity state is not in the scenario's declared initial state.");
     }
   }
 
@@ -111,6 +127,7 @@ export class WebArenaInfinityGmailProvider extends FixtureProvider {
         authorizedOrigins: Object.freeze([this.#origin]),
         applications: Object.freeze([Object.freeze({
           applicationId: "webarena-infinity-gmail",
+          origin: this.#origin,
           authenticationRealm: "local-synthetic-account",
           candidateEntry: this.#origin,
           finalOrigin: this.#origin,
@@ -140,12 +157,25 @@ export class WebArenaInfinityGmailProvider extends FixtureProvider {
 
   async verifyOutcome({ episodeId, scenario } = {}) {
     this.#assertEpisode(episodeId);
-    if (scenario.scenario_id !== this.#scenario.scenario_id || scenario.task?.operation !== "mark_email_read") {
+    if (scenario.scenario_id !== this.#scenario.scenario_id
+      || !["mark_email_read", "extract_inbox_records"].includes(scenario.task?.operation)) {
       throw new Error("WebArena-Infinity oracle request is outside the registered task contract.");
     }
     const response = await fetch(`${this.#origin}/api/state`, { redirect: "error", headers: { "x-activetab-fixture-oracle": this.#oracleToken } });
     if (!response.ok) throw new Error("WebArena-Infinity state oracle is unavailable.");
     const state = await readJsonBounded(response);
+    if (scenario.task.operation === "extract_inbox_records") {
+      const expected = scenarioEmails(scenario);
+      const exactFixture = Array.isArray(state.emails) && state.emails.length === expected.length
+        && expected.every(item => state.emails.filter(email => email.subject === item.subject
+          && email.from?.name === item.from.name && email.isRead === item.isRead).length === 1);
+      return Object.freeze({
+        verified: exactFixture,
+        recordCount: state.emails?.length ?? 0,
+        records: visibleEmailRecords(state.emails),
+        evidenceRefs: [`webarena-state:${scenario.scenario_id}`]
+      });
+    }
     const matches = (state.emails ?? []).filter(email => email.subject === scenario.task.subject
       && email.from?.name === scenario.task.sender);
     const exactTarget = matches.length === 1 ? matches[0] : null;
@@ -159,7 +189,32 @@ export class WebArenaInfinityGmailProvider extends FixtureProvider {
     });
   }
 
-  async scoreOutcome({ driverResult, oracle, cleanupVerified }) {
+  async scoreOutcome({ scenario, driverResult, oracle, cleanupVerified }) {
+    if (scenario.task.operation === "extract_inbox_records") {
+      const actual = driverResult?.records;
+      const expected = oracle?.records;
+      const schemaValid = Array.isArray(actual) && actual.every(record => record && typeof record === "object"
+        && !Array.isArray(record) && Object.keys(record).length === 2
+        && typeof record.sender === "string" && typeof record.subject === "string");
+      const outputComplete = driverResult?.completeness === "complete"
+        && driverResult?.verification?.recordCount === scenario.task.emails.length
+        && driverResult?.verification?.duplicateKeys === 0
+        && driverResult?.verification?.invalidRows === 0
+        && driverResult?.verification?.overflow === false;
+      const exactRecords = oracle?.verified === true && schemaValid && sameRecords(actual, expected);
+      const verifiedPass = driverResult?.status === "succeeded" && exactRecords && outputComplete && cleanupVerified;
+      return Object.freeze({
+        status: verifiedPass ? "PASS" : "FAIL",
+        falseSuccess: driverResult?.status === "succeeded" && !verifiedPass,
+        driverClaimsSuccess: driverResult?.status === "succeeded",
+        oracleVerified: oracle?.verified === true,
+        schemaValid,
+        exactRecords,
+        outputComplete,
+        cleanupVerified,
+        evidenceRefs: oracle?.evidenceRefs ?? []
+      });
+    }
     const exactTarget = oracle?.verified === true && oracle.exactTargetCount === 1;
     const statusMatch = oracle?.outcomeMatches === true;
     const verifiedPass = driverResult?.status === "succeeded" && exactTarget && statusMatch && cleanupVerified;
@@ -185,9 +240,16 @@ export class WebArenaInfinityGmailProvider extends FixtureProvider {
     const stateResponse = await fetch(`${this.#origin}/api/state`, { redirect: "error", headers });
     if (!stateResponse.ok) return { status: "unverified" };
     const state = await readJsonBounded(stateResponse);
-    const original = (state.emails ?? []).filter(email => email.subject === this.#scenario.task.subject
-      && email.from?.name === this.#scenario.task.sender);
-    if (original.length !== 1 || original[0].isRead !== this.#scenario.task.initialIsRead) return { status: "unverified" };
+    const expectedEmails = scenarioEmails(this.#scenario);
+    if (this.#scenario.task.operation === "extract_inbox_records") {
+      if (!Array.isArray(state.emails) || state.emails.length !== expectedEmails.length
+        || expectedEmails.some(expected => state.emails.filter(email => email.subject === expected.subject
+          && email.from?.name === expected.from.name && email.isRead === expected.isRead).length !== 1)) return { status: "unverified" };
+    } else {
+      const target = state.emails?.filter(email => email.subject === this.#scenario.task.subject
+        && email.from?.name === this.#scenario.task.sender);
+      if (target?.length !== 1 || target[0].isRead !== this.#scenario.task.initialIsRead) return { status: "unverified" };
+    }
     this.#disposed = true;
     return { status: "verified", evidenceRef: `webarena-cleanup:${this.#episodeId}` };
   }

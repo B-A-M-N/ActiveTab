@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { discoverTableCapabilities } from "./capabilityDiscovery.js";
-import { compileTableRecipe } from "./recipeCompiler.js";
+import { compileVisibleExtractionRecipe } from "./recipeCompiler.js";
 import { executeExtractionCapability } from "./recipeExecutor.js";
 
 /** Native ActiveTab facade for discovery, candidate compilation, qualification, and reuse. */
@@ -56,7 +56,7 @@ export class CapabilityService {
       || entry.environmentId !== (environment?.environmentId ?? environment?.id ?? null)) {
       throw new Error("Capability candidate is bound to a different browser target, principal, or environment.");
     }
-    const recipe = compileTableRecipe({
+    const recipe = compileVisibleExtractionRecipe({
       ...input,
       candidate: entry.candidate,
       classifyField: this.classifyField,

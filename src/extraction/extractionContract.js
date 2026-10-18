@@ -62,20 +62,38 @@ export function validateExtractionContract(contract) {
     errors.push("fields must contain between 1 and 64 entries.");
   } else {
     const names = new Set();
-    const headers = new Set();
+    const sources = new Set();
     for (const field of contract.fields) {
       if (!field || typeof field !== "object" || Array.isArray(field)) { errors.push("Every extraction field must be an object."); continue; }
       if (!isCode(field.name, 64)) errors.push("Field names must be bounded identifiers.");
       if (names.has(field.name)) errors.push(`Field '${field.name}' is duplicated.`);
       names.add(field.name);
-      if (typeof field.sourceHeader !== "string" || !field.sourceHeader.trim() || field.sourceHeader.length > 160) errors.push(`Field '${field.name}' requires a bounded sourceHeader.`);
-      const header = normalizeHeader(field.sourceHeader);
-      if (headers.has(header)) errors.push(`Source header '${field.sourceHeader}' is duplicated.`);
-      headers.add(header);
+      const hasHeader = typeof field.sourceHeader === "string" && field.sourceHeader.trim().length > 0 && field.sourceHeader.length <= 160;
+      const hasSourceKey = isCode(field.sourceKey, 128);
+      if (hasHeader === hasSourceKey) errors.push(`Field '${field.name}' requires exactly one bounded sourceHeader or sourceKey.`);
+      const sourceIdentity = hasHeader ? `header:${normalizeHeader(field.sourceHeader)}` : hasSourceKey ? `key:${field.sourceKey}` : null;
+      if (sourceIdentity && sources.has(sourceIdentity)) errors.push(`Field '${field.name}' duplicates an extraction source.`);
+      if (sourceIdentity) sources.add(sourceIdentity);
       if (!FIELD_TYPES.has(field.type)) errors.push(`Field '${field.name}' has an unsupported type.`);
       if (typeof field.required !== "boolean") errors.push(`Field '${field.name}' must declare required as a boolean.`);
       if (!DATA_CLASSES.has(field.dataClass)) errors.push(`Field '${field.name}' must declare a trusted dataClass.`);
     }
+  }
+  if (contract.recordGroup !== undefined) {
+    const group = contract.recordGroup;
+    if (!group || typeof group !== "object" || Array.isArray(group)
+      || !isCode(group.containerTagName, 16) || !isCode(group.itemTagName, 16)
+      || !isCode(group.containerClassToken, 128) || !isCode(group.itemClassToken, 128)) {
+      errors.push("recordGroup must contain bounded observed container/item tag names and exact class tokens.");
+    }
+    if (contract.fields?.some(field => typeof field?.sourceHeader === "string")) {
+      errors.push("recordGroup fields must use observed sourceKey mappings, not table headers.");
+    }
+    if (contract.fields?.some(field => !isCode(field?.sourceTagName, 16))) {
+      errors.push("recordGroup fields require a bounded observed sourceTagName.");
+    }
+  } else if (contract.fields?.some(field => typeof field?.sourceKey === "string")) {
+    errors.push("sourceKey fields require an observed recordGroup contract.");
   }
   if (!Array.isArray(contract.uniqueBy) || contract.uniqueBy.length < 1
     || contract.uniqueBy.length > 8 || contract.uniqueBy.some(name => !contract.fields?.some(field => field.name === name))) {

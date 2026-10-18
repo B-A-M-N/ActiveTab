@@ -3,7 +3,7 @@ import { fixtureFaults, fixtureFaultTrigger } from "./faultInjector.js";
 const allowedRealms = new Set(["platform", "cloud-agent"]);
 const allowedOperations = new Set(["create_test_agent_run"]);
 const allowedStatuses = new Set(["succeeded", "failed"]);
-const externalOperations = new Set(["mark_email_read"]);
+const externalOperations = new Set(["mark_email_read", "extract_inbox_records"]);
 
 export function validateScenario(scenario) {
   const errors = [];
@@ -29,12 +29,30 @@ export function validateScenario(scenario) {
     if (typeof scenario.application?.build !== "string" || !scenario.application.build) errors.push("application.build must pin the external application version.");
     if (!externalOperations.has(scenario.task?.operation)) errors.push("task.operation is unsupported for WebArena-Infinity Gmail.");
     if (typeof scenario.task?.goal !== "string" || !scenario.task.goal.trim() || scenario.task.goal.length > 1000) errors.push("task.goal must be bounded and non-empty.");
-    if (typeof scenario.task?.subject !== "string" || !scenario.task.subject.trim() || scenario.task.subject.length > 200) errors.push("task.subject must be bounded and non-empty.");
-    if (typeof scenario.task?.sender !== "string" || !scenario.task.sender.trim() || scenario.task.sender.length > 200) errors.push("task.sender must be bounded and non-empty.");
-    if (typeof scenario.task?.initialIsRead !== "boolean" || typeof scenario.task?.expectedIsRead !== "boolean"
-      || scenario.task.initialIsRead === scenario.task.expectedIsRead) errors.push("Gmail task must declare a changing, typed read-state postcondition.");
-    if (scenario.task?.expectedIsRead !== true) errors.push("This benchmark adapter only supports marking a message as read.");
-    if (scenario.oracle?.kind !== "email_read_state") errors.push("oracle.kind must be email_read_state.");
+    if (scenario.task?.operation === "mark_email_read") {
+      if (typeof scenario.task?.subject !== "string" || !scenario.task.subject.trim() || scenario.task.subject.length > 200) errors.push("task.subject must be bounded and non-empty.");
+      if (typeof scenario.task?.sender !== "string" || !scenario.task.sender.trim() || scenario.task.sender.length > 200) errors.push("task.sender must be bounded and non-empty.");
+      if (typeof scenario.task?.initialIsRead !== "boolean" || typeof scenario.task?.expectedIsRead !== "boolean"
+        || scenario.task.initialIsRead === scenario.task.expectedIsRead) errors.push("Gmail task must declare a changing, typed read-state postcondition.");
+      if (scenario.task?.expectedIsRead !== true) errors.push("This benchmark adapter only supports marking a message as read.");
+      if (scenario.oracle?.kind !== "email_read_state") errors.push("oracle.kind must be email_read_state.");
+    } else if (scenario.task?.operation === "extract_inbox_records") {
+      if (!Array.isArray(scenario.task?.emails) || scenario.task.emails.length < 2 || scenario.task.emails.length > 20) errors.push("Inbox extraction scenarios require 2 to 20 synthetic emails.");
+      else {
+        const subjects = new Set();
+        for (const email of scenario.task.emails) {
+          if (!email || typeof email !== "object" || Array.isArray(email)
+            || typeof email.subject !== "string" || !email.subject.trim() || email.subject.length > 200
+            || typeof email.sender !== "string" || !email.sender.trim() || email.sender.length > 120) {
+            errors.push("Every synthetic email requires a bounded subject and sender.");
+            continue;
+          }
+          if (subjects.has(email.subject)) errors.push("Synthetic inbox subjects must be unique for independent completeness checks.");
+          subjects.add(email.subject);
+        }
+      }
+      if (scenario.oracle?.kind !== "email_list_contents") errors.push("oracle.kind must be email_list_contents.");
+    }
   } else {
     errors.push(`Unsupported site_family '${scenario.site_family}'.`);
   }

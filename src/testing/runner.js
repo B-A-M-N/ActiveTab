@@ -66,7 +66,7 @@ function canRestoreStepWithoutExecution(step, status) {
 }
 
 export class TestRunner {
-  constructor({ session, collector, correlator, journal, maxSteps = 32, signal, interventions = null, environment = null, localFixture = false, decisionRuntime = null, qualificationService = null, operationAuthorizer = null, workflowRegistry = null, capabilityRegistry = null, capabilityService = null, authorizeExtractionField = null, authorizeExtractionRelease = null, runStateStore = null, existingRunStateId = null, principalId = null, profileId = null, policyVersion = "active_policy_v1" } = {}) {
+  constructor({ session, collector, correlator, journal, maxSteps = 32, signal, interventions = null, environment = null, localFixture = false, decisionRuntime = null, qualificationService = null, operationAuthorizer = null, workflowRegistry = null, capabilityRegistry = null, capabilityService = null, authorizeExtractionField = null, authorizeExtractionRelease = null, runStateStore = null, existingRunStateId = null, principalId = null, profileId = null, policyVersion = "active_policy_v1", targetLease = null } = {}) {
     this.session = session;
     this.collector = collector;
     this.correlator = correlator;
@@ -95,7 +95,8 @@ export class TestRunner {
       environment,
       principalId,
       profileId,
-      policyVersion
+      policyVersion,
+      targetLease
     });
     this.decisionRecorder = new RunDecisionRecorder({
       decisionRuntime,

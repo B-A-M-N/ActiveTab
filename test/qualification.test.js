@@ -9,6 +9,7 @@ import { QualificationService } from "../src/testing/qualificationService.js";
 import { TestRunner } from "../src/testing/runner.js";
 
 const gmailScenario = JSON.parse(await readFile(new URL("../test-lab/catalog/scenarios/webarena-infinity-gmail-task-001.json", import.meta.url), "utf8"));
+const gmailExtractionScenario = JSON.parse(await readFile(new URL("../test-lab/catalog/scenarios/webarena-infinity-gmail-extract-001.json", import.meta.url), "utf8"));
 
 function makeProvider() {
   return {
@@ -119,14 +120,14 @@ test("a caller-required qualification fails its step when unavailable", async ()
   } finally { decisionRuntime.close(); }
 });
 
-async function startGmailStateServer({ initialIsRead = false, resetIsRead = initialIsRead } = {}) {
+async function startGmailStateServer({ initialIsRead = false, resetIsRead = initialIsRead, initialState = null, resetStateOverride = null } = {}) {
   const oracleToken = "unit-test-webarena-oracle-token-do-not-use-outside-tests";
-  const original = {
+  const original = initialState ?? {
     emails: [{ subject: gmailScenario.task.subject, from: { name: gmailScenario.task.sender }, isRead: initialIsRead }]
   };
   let state = structuredClone(original);
-  const resetState = structuredClone(original);
-  resetState.emails[0].isRead = resetIsRead;
+  let resetState = resetStateOverride ?? structuredClone(original);
+  if (!resetStateOverride) resetState.emails[0].isRead = resetIsRead;
   const server = createServer(async (request, response) => {
     response.setHeader("content-type", "application/json");
     if (request.method === "GET" && request.url === "/") {
@@ -145,6 +146,7 @@ async function startGmailStateServer({ initialIsRead = false, resetIsRead = init
           const chunks = [];
           for await (const chunk of request) chunks.push(chunk);
           state = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          if (!resetStateOverride) resetState = structuredClone(state);
           response.end(JSON.stringify({ status: "ok", seed_created: true }));
         } else {
           state = structuredClone(resetState);
@@ -200,10 +202,61 @@ test("WebArena-Infinity adapter is loopback-bound, scores browser claims against
   assert.equal(server.getState().emails[0].isRead, false);
 });
 
+test("WebArena-Infinity extraction scores schema and visible records against its isolated oracle", async t => {
+  const { WebArenaInfinityGmailProvider } = await import("../test-lab/adapters/webarenaInfinityGmailProvider.js");
+  const expectedState = {
+    emails: gmailExtractionScenario.task.emails.map(email => ({
+      subject: email.subject,
+      from: { name: email.sender },
+      isRead: true
+    }))
+  };
+  const server = await startGmailStateServer({ initialState: expectedState });
+  t.after(() => server.close());
+  const report = await (await import("../test-lab/runtime/benchmarkRunner.js")).runBenchmarkEpisode({
+    provider: new WebArenaInfinityGmailProvider({ origin: server.origin, oracleToken: server.oracleToken }),
+    scenario: gmailExtractionScenario,
+    driver: async ({ targetBinding, task }) => {
+      assert.equal(task.operation, "extract_inbox_records");
+      assert.equal(Object.hasOwn(targetBinding, "oracleToken"), false);
+      assert.equal(Object.hasOwn(targetBinding, "oracleUrl"), false);
+      assert.equal((await fetch(`${targetBinding.entryUrl}/api/state`)).status, 403);
+      return {
+        status: "succeeded",
+        records: gmailExtractionScenario.task.emails.map(email => ({ sender: email.sender, subject: email.subject })),
+        completeness: "complete",
+        verification: { recordCount: 3, duplicateKeys: 0, invalidRows: 0, overflow: false }
+      };
+    }
+  });
+  assert.equal(report.score.status, "PASS");
+  assert.equal(report.cleanupStatus, "verified");
+  assert.equal(server.getState().emails.length, 3);
+
+  const incomplete = await (await import("../test-lab/runtime/benchmarkRunner.js")).runBenchmarkEpisode({
+    provider: new WebArenaInfinityGmailProvider({ origin: server.origin, oracleToken: server.oracleToken }),
+    scenario: gmailExtractionScenario,
+    driver: async () => ({
+      status: "succeeded",
+      records: [{ sender: "Fixture Sender A", subject: "ActiveTab Fixture Alpha" }],
+      completeness: "complete",
+      verification: { recordCount: 1, duplicateKeys: 0, invalidRows: 0, overflow: false }
+    })
+  });
+  assert.equal(incomplete.score.status, "FAIL");
+  assert.equal(incomplete.score.falseSuccess, true);
+  assert.equal(incomplete.cleanupStatus, "verified");
+});
+
 test("WebArena-Infinity adapter rejects non-loopback origins and refuses mismatched initial state", async t => {
   const { WebArenaInfinityGmailProvider } = await import("../test-lab/adapters/webarenaInfinityGmailProvider.js");
   assert.throws(() => new WebArenaInfinityGmailProvider({ origin: "http://localhost:8000" }), /loopback HTTP origin/u);
-  const server = await startGmailStateServer({ initialIsRead: false, resetIsRead: true });
+  const server = await startGmailStateServer({
+    initialIsRead: false,
+    resetStateOverride: {
+      emails: [{ subject: gmailScenario.task.subject, from: { name: gmailScenario.task.sender }, isRead: true }]
+    }
+  });
   t.after(() => server.close());
   const report = await (await import("../test-lab/runtime/benchmarkRunner.js")).runBenchmarkEpisode({
     provider: new WebArenaInfinityGmailProvider({ origin: server.origin, oracleToken: server.oracleToken }),

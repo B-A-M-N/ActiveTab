@@ -4,31 +4,39 @@ import { acquireBrowserTargetLease } from "../runState.js";
 
 /** Owns durable workflow-run bindings, leases, checkpoints, and terminal state. */
 export class RunStateCoordinator {
-  constructor({ runStateStore = null, session = null, environment = null, principalId = null, profileId = null, policyVersion = "active_policy_v1" } = {}) {
+  constructor({ runStateStore = null, session = null, environment = null, principalId = null, profileId = null, policyVersion = "active_policy_v1", targetLease = null } = {}) {
     this.runStateStore = runStateStore;
     this.session = session;
     this.environment = environment;
     this.principalId = principalId;
     this.profileId = profileId;
     this.policyVersion = policyVersion;
-    this.targetLease = null;
+    this.externalTargetLease = targetLease;
+    this.targetLease = targetLease;
   }
 
   async acquireExecutionLeases(runId) {
-    if (!this.runStateStore) return null;
-    const releaseRunLease = await this.runStateStore.acquireExecutionLease(runId);
-    let targetLease = null;
+    if (!this.runStateStore && !this.externalTargetLease) return null;
+    const releaseRunLease = this.runStateStore
+      ? await this.runStateStore.acquireExecutionLease(runId)
+      : async () => {};
+    let targetLease = this.externalTargetLease;
+    let ownsTargetLease = false;
     try {
       const targetId = this.session?.target?.id;
-      if (targetId) targetLease = await acquireBrowserTargetLease(this.runStateStore, this.session, runId);
+      if (targetId && !targetLease) {
+        targetLease = await acquireBrowserTargetLease(this.runStateStore, this.session, runId);
+        ownsTargetLease = true;
+      }
+      if (targetLease) await targetLease.assertCurrent();
       this.targetLease = targetLease;
     } catch (error) {
       await releaseRunLease();
       throw error;
     }
     return async () => {
-      if (this.targetLease === targetLease) this.targetLease = null;
-      await targetLease?.release();
+      if (this.targetLease === targetLease) this.targetLease = this.externalTargetLease;
+      if (ownsTargetLease) await targetLease?.release();
       await releaseRunLease();
     };
   }
