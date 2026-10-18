@@ -20,6 +20,7 @@ import { VerificationStepHandler } from "./steps/verificationStepHandler.js";
 import { QualificationStepHandler } from "./steps/qualificationStepHandler.js";
 import { BrowserStepHandler } from "./steps/browserStepHandler.js";
 import { ApiStepHandler } from "./steps/apiStepHandler.js";
+import { StepDispatcher } from "./execution/stepDispatcher.js";
 import {
   deriveWorkflowRunStatus,
   estimateWorkflowExecutionCost,
@@ -136,6 +137,17 @@ export class TestRunner {
       getExecutionLeaseAssertion: () => this.targetLease ? () => this.#assertTargetLeaseCurrent() : null
     });
     this.apiStepHandler = new ApiStepHandler({ collector });
+    this.stepDispatcher = new StepDispatcher({
+      executeSetup: (...args) => this.#executeSetup(...args),
+      executeNavigate: (...args) => this.#executeNavigate(...args),
+      executeInteract: (...args) => this.#executeInteract(...args),
+      executeGoal: (...args) => this.#executeGoal(...args),
+      apiStepHandler: this.apiStepHandler,
+      verificationStepHandler: this.verificationStepHandler,
+      qualificationStepHandler: this.qualificationStepHandler,
+      controlFlowStepHandler: this.controlFlowStepHandler,
+      getTelemetryStepId: step => this.currentTelemetryStepId ?? telemetryStepId(step.id)
+    });
     this.existingRunStateId = existingRunStateId;
     this.principalId = principalId;
     this.profileId = profileId;
@@ -395,42 +407,7 @@ export class TestRunner {
   }
 
   async #executeStep(step, receipt, context = null, stepStatuses = new Map()) {
-    const startedAt = new Date().toISOString();
-    try {
-      switch (step.type) {
-        case "setup": return await this.#executeSetup(step, receipt, startedAt);
-        case "navigate": return await this.#executeNavigate(step, receipt, startedAt, context);
-        case "interact": return await this.#executeInteract(step, receipt, startedAt, context);
-        case "api_call": return await this.apiStepHandler.execute(step, receipt, startedAt);
-        case "wait_for": return await this.verificationStepHandler.executeWaitFor(step, receipt, startedAt);
-        case "assert": return await this.verificationStepHandler.executeAssert(step, receipt, startedAt);
-        case "diagnostic_snapshot": return await this.verificationStepHandler.executeDiagnosticSnapshot(step, receipt, startedAt);
-        case "controlled_failure": return await this.verificationStepHandler.executeControlledFailure(step, receipt, startedAt);
-        case "retry_verification": return await this.verificationStepHandler.executeRetryVerification(step, receipt, startedAt);
-        case "postcondition": return await this.verificationStepHandler.executePostcondition(step, receipt, startedAt);
-        case "cleanup": return await this.verificationStepHandler.executeCleanup(step, receipt, startedAt, context);
-        case "goal": return await this.#executeGoal(step, receipt, startedAt);
-        case "qualify": return await this.qualificationStepHandler.execute(
-          step,
-          receipt,
-          startedAt,
-          context,
-          this.currentTelemetryStepId ?? telemetryStepId(step.id)
-        );
-        case "set_variable": return this.controlFlowStepHandler.executeSetVariable(step, receipt, startedAt, context, stepStatuses);
-        case "repeat": return await this.controlFlowStepHandler.executeRepeat(step, receipt, startedAt, context);
-        case "subworkflow": return await this.controlFlowStepHandler.executeSubworkflow(step, receipt, startedAt, context);
-        default: {
-          const message = `Unsupported step type '${step.type}'.`;
-          receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason: message, startedAt });
-          return { status: STEP_STATUS.BLOCKED, reason: message };
-        }
-      }
-    } catch (error) {
-      const reason = String(error?.message ?? error).slice(0, 500);
-      receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.FAIL, reason, startedAt });
-      return { status: STEP_STATUS.FAIL, reason };
-    }
+    return this.stepDispatcher.execute(step, receipt, context, stepStatuses);
   }
 
   async #observe() {

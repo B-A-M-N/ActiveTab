@@ -21,7 +21,7 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 - A page fingerprint change alone is not outcome success.
 - Cleanup is a verifiable obligation for every test-owned resource.
 - Every interaction type in the schema must have a dispatch implementation or fail validation before execution.
-- `execution/workflowScheduler.js` owns pure workflow eligibility, graph status, and trusted subworkflow budget validation. It cannot dispatch browser/application operations or authorize effects; `TestRunner` applies its decisions and persists resulting receipts.
+- `execution/workflowScheduler.js` owns pure workflow eligibility, graph status, and trusted subworkflow budget validation. `execution/stepDispatcher.js` routes validated workflow steps to focused handlers. Neither component authorizes effects; browser effects remain behind the shared authorized executor.
 - `lifecycle/RunStateCoordinator` owns durable run bindings, leases, checkpoints, and durable status; it cannot authorize or dispatch effects.
 - `steps/ControlFlowStepHandler` owns scalar variable assignment, bounded repetition, and trusted subworkflow composition. Nested work re-enters the same `TestRunner` callback and shared budget.
 - `steps/VerificationStepHandler` owns assertions, diagnostic snapshots, bounded waiting, controlled fixture failures, retry verification, postconditions, and cleanup verification. Cleanup dispatch is injected from `TestRunner` and must pass through the same authorized interaction path.
@@ -77,7 +77,7 @@ E2E vertical tests require a real Chrome environment and fixture server.
 
 | Path | Purpose |
 |------|---------|
-| `execution/` | Pure workflow scheduling and graph admission decisions |
+| `execution/` | Workflow scheduling and validated type-to-handler dispatch |
 | `lifecycle/` | Durable run bindings, leases, checkpoints, and run status |
 | `steps/` | Isolated workflow control-flow step behavior |
 | `telemetry/` | Workflow decision events and durable operation receipt integration |
