@@ -12,6 +12,7 @@ This package is part of ActiveTab's capability surface. It owns benchmark orches
 
 - The driver receives only the target binding and public task. Fixture oracles remain in the provider and are queried after the driver finishes.
 - Browser automation uses ActiveTab's native CDP execution path. Playwright is not an ActiveTab control or observation dependency.
+- An owned Chrome qualification target receives a durable endpoint-and-target lease for the entire driver run. The authorized executor rechecks that lease before dispatch.
 - External applications are separately installed qualification targets, never ActiveTab runtime dependencies.
 - Every target must have an explicit environment binding, bounded execution, independent scoring, and cleanup verification.
 - A fixture result may qualify a candidate strategy but cannot authorize a live target or substitute for live-site verification.

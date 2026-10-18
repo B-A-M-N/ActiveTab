@@ -1,6 +1,10 @@
 import { isSafeTelemetryCode } from "../../src/telemetry/privacy.js";
 import { NavigationEngine } from "../../src/navigation/engine.js";
 import { launchOwnedChrome } from "../../src/browser/ownedChrome.js";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { acquireBrowserTargetLease, RunStateStore } from "../../src/testing/runState.js";
 
 function observedRunId(observation) {
   for (const heading of observation?.headings ?? []) {
@@ -43,15 +47,22 @@ export function createNativeCdpQualificationDriver({
       })) {
       return { status: "uncertain", reasonCode: "fixture_environment_unbound" };
     }
-    const owned = await launchBrowser({
-      initialUrl: targetBinding.entryUrl,
-      headed,
-      signal,
-      keepBrowserOpen: false,
-      preserveProfile: false,
-      reuseExisting: false
-    });
+    const stateDirectory = await mkdtemp(join(tmpdir(), "activetab-qualification-lease-"));
+    let owned = null;
+    let runStateStore = null;
+    let targetLease = null;
     try {
+      owned = await launchBrowser({
+        initialUrl: targetBinding.entryUrl,
+        headed,
+        signal,
+        keepBrowserOpen: false,
+        preserveProfile: false,
+        reuseExisting: false
+      });
+      runStateStore = new RunStateStore(stateDirectory);
+      await runStateStore.init();
+      targetLease = await acquireBrowserTargetLease(runStateStore, owned.session, automationRunId);
       const engine = new NavigationEngine(owned.session, {
         environment,
         decisionRuntime,
@@ -62,6 +73,7 @@ export function createNativeCdpQualificationDriver({
         },
         executionMode: "standalone",
         plannerMode,
+        assertExecutionLease: () => targetLease.assertCurrent(),
         signal,
         maxActions: 10,
         maxRecoveries: 1
@@ -76,7 +88,14 @@ export function createNativeCdpQualificationDriver({
           : result?.status === "succeeded" ? null : "active_tab_run_incomplete"
       });
     } finally {
-      await owned.close();
+      try { await owned?.close(); }
+      finally {
+        try { await targetLease?.release(); }
+        finally {
+          runStateStore?.close();
+          await rm(stateDirectory, { recursive: true, force: true });
+        }
+      }
     }
   };
 }
