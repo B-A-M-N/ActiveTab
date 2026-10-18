@@ -86,7 +86,7 @@ test("task journals enforce a byte cap and reject unapproved pending-action fiel
 }));
 
 test("MCP run_goal survives process termination after dispatch and resumes without repeating the action", { timeout: 15_000 }, async () => withDirectory(async directory => {
-  const target = { id: "resume-target", endpoint: "local-cdp" };
+  const target = { id: "resume-target", endpoint: "local-cdp", url: "https://shop.example.test/" };
   const goal = "Open the account page";
   const runChild = stage => {
     const storeModule = new URL("../src/state/mcpTaskJournals.js", import.meta.url).href;
@@ -95,20 +95,22 @@ test("MCP run_goal survives process termination after dispatch and resumes witho
       import { writeSync } from "node:fs";
       import { McpTaskJournalStore } from ${JSON.stringify(storeModule)};
       import { runMcpGoal } from ${JSON.stringify(runnerModule)};
-      const target = { id: "resume-target", endpoint: "local-cdp" };
+      const target = { id: "resume-target", endpoint: "local-cdp", url: "https://shop.example.test/" };
       const goal = "Open the account page";
       const stage = process.env.ACTIVETAB_TEST_STAGE;
       const account = { page: { url: "https://shop.example.test/account", title: "Account" }, headings: [{ level: 1, text: "Account" }], candidates: [] };
       const session = stage === "first" ? {
         target,
+        attached: true,
         clicks: 0,
-        state: { page: { url: "https://shop.example.test/", title: "Shop" }, headings: [{ level: 1, text: "Shop" }], candidates: [{ identity: "account-link", backendNodeId: 1, name: "Open account", role: "link", tag: "a", visible: true, disabled: false }] },
-        async observe() { return { evidenceId: "before-interruption", ...structuredClone(this.state) }; },
+        state: { page: { url: "https://shop.example.test/", title: "Shop" }, headings: [{ level: 1, text: "Shop" }], candidates: [{ identity: "account-link", targetId: target.id, documentGeneration: 1, backendNodeId: 1, name: "Open account", role: "link", tag: "a", href: "https://shop.example.test/account", visible: true, disabled: false }] },
+        async observe() { return { evidenceId: "before-interruption", targetId: target.id, ...structuredClone(this.state) }; },
         async click() { this.clicks++; this.state = account; },
         async waitForChange() { process.exit(73); }
       } : {
         target,
-        async observe() { return { evidenceId: "after-process-restart", ...structuredClone(account) }; },
+        attached: true,
+        async observe() { return { evidenceId: "after-process-restart", targetId: target.id, ...structuredClone(account) }; },
         async click() { throw new Error("A resumed completed navigation must not click again."); },
         async waitForChange() {}
       };

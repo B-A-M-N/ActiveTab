@@ -10,9 +10,9 @@
  *  - Status/cancellation tools work on long-running and suspended runs.
  */
 
-import { evaluateCompletion, externalRunState } from "../runtime/interventions.js";
+import { externalRunState, INTERVENTION_STATE, INTERVENTION_TYPE } from "../runtime/interventions.js";
 
-export function createInterventionTools({ store, runs = new Map(), ctx = {} }) {
+export function createInterventionTools({ store, runs = new Map(), runStateStore = null, ctx = {} }) {
   if (!store) throw new Error("Intervention tools require an InterventionStore.");
 
   return {
@@ -25,6 +25,7 @@ export function createInterventionTools({ store, runs = new Map(), ctx = {} }) {
           stepId: record.stepId,
           type: record.type,
           state: record.state,
+          revision: record.revision,
           reason: record.reason,
           requiredHumanAction: record.requiredHumanAction,
           completionCondition: record.completionCondition,
@@ -55,13 +56,29 @@ export function createInterventionTools({ store, runs = new Map(), ctx = {} }) {
     async request_operation_approval({ interventionId } = {}) {
       const record = store.get(interventionId);
       if (!record) throw new Error(`No intervention '${interventionId}'.`);
+      if (record.type !== INTERVENTION_TYPE.HUMAN_APPROVAL || record.completionCondition?.type !== "approval_grant") {
+        throw new Error("This intervention does not contain a scoped operation-approval request.");
+      }
+      if (record.approvalResolution || (record.state !== INTERVENTION_STATE.WAITING && record.state !== INTERVENTION_STATE.ACKNOWLEDGED)) {
+        throw new Error("This approval request is no longer pending.");
+      }
+      const condition = record.completionCondition;
       // Agent-callable: creates a pending approval request only. It never
       // issues authority; resolution requires an independently authenticated
       // operator channel.
       return {
         interventionId,
+        requestId: record.intervention_id,
+        expectedRevision: record.revision,
         status: "pending_approval",
-        message: "Approval requested. Resolve via an independently authenticated operator channel; this client cannot issue grants."
+        operation: condition.operation ?? null,
+        effects: Array.isArray(condition.allowedEffects) ? [...condition.allowedEffects] : [],
+        resource: condition.resource ?? record.applicationId ?? null,
+        environmentId: record.environmentId,
+        authenticationRealm: record.authenticationRealm,
+        reason: record.reason,
+        reversible: typeof condition.reversible === "boolean" ? condition.reversible : null,
+        message: "Approval requested. Resolve this exact revision through an independently authenticated operator channel; this client cannot issue grants."
       };
     },
 
@@ -71,21 +88,46 @@ export function createInterventionTools({ store, runs = new Map(), ctx = {} }) {
       if (!authenticatedOperator || typeof authenticatedOperator !== "string") {
         throw new Error("Operator authentication is required to resolve an approval.");
       }
-      if (decision !== "approve") {
-        const canceled = await store.cancel(interventionId);
-        return { interventionId, state: canceled.state, decision: "rejected" };
+      if (record.type !== INTERVENTION_TYPE.HUMAN_APPROVAL || record.completionCondition?.type !== "approval_grant") {
+        throw new Error("This intervention does not contain a scoped operation-approval request.");
       }
-      if (typeof ctx.issueGrant !== "function") throw new Error("No approval-grant issuer is configured.");
-      const grant = ctx.issueGrant({
-        principal: authenticatedOperator,
-        environmentId: record.environmentId,
-        authenticationRealm: record.authenticationRealm,
-        resource: record.applicationId ?? record.runId,
-        operation: record.completionCondition?.operation ?? record.type,
-        input: record.completionCondition?.input ?? {},
-        allowedEffects: record.completionCondition?.allowedEffects ?? [`${record.type}:approved`]
-      });
-      return { interventionId, grantId: grant.grantId, expiresAt: grant.expiresAt, state: grant.state };
+      const condition = record.completionCondition;
+      if (decision !== "approve" && decision !== "reject") throw new Error("Approval decision must be approve or reject.");
+      let resource = null;
+      if (decision === "approve") {
+        if (typeof condition.operation !== "string" || !condition.operation ||
+            !Array.isArray(condition.allowedEffects) || condition.allowedEffects.length === 0 ||
+            condition.allowedEffects.some(effect => typeof effect !== "string" || !effect) ||
+            typeof condition.inputHash !== "string" || condition.inputHash.length !== 64) {
+          throw new Error("Approval request lacks an exact operation, effect, or structured input binding.");
+        }
+        resource = condition.resource ?? record.applicationId ?? record.runId;
+        if (typeof resource !== "string" || !resource) throw new Error("Approval request lacks an exact resource binding.");
+        if (typeof ctx.issueGrant !== "function") throw new Error("No approval-grant issuer is configured.");
+      }
+
+      const reserved = await store.reserveApprovalResolution(interventionId, expectedRevision, authenticatedOperator, decision);
+      if (decision === "reject") {
+        return { interventionId, requestId: record.intervention_id, state: reserved.state, decision: "rejected", revision: reserved.revision };
+      }
+
+      let grant;
+      try {
+        grant = await ctx.issueGrant({
+          principal: authenticatedOperator,
+          environmentId: record.environmentId,
+          authenticationRealm: record.authenticationRealm,
+          resource,
+          operation: condition.operation,
+          inputHash: condition.inputHash,
+          allowedEffects: condition.allowedEffects
+        });
+        const completed = await store.completeApprovalResolution(interventionId, reserved.revision, grant);
+        return { interventionId, requestId: record.intervention_id, grantId: grant.grantId, expiresAt: grant.expiresAt, state: grant.state, revision: completed.revision };
+      } catch (error) {
+        if (grant?.grantId && typeof ctx.revokeGrant === "function") ctx.revokeGrant(grant.grantId);
+        throw error;
+      }
     },
 
     async reject_operation({ interventionId, reason = "rejected by operator" } = {}) {
@@ -97,42 +139,55 @@ export function createInterventionTools({ store, runs = new Map(), ctx = {} }) {
      * Resume a run: acquire continuation ownership, verify the exact
      * completion predicate with fresh evidence, then admit execution.
      */
-    async resume_run({ interventionId, verify = {} } = {}) {
-      const { record, lease } = await store.acquireResume(interventionId);
-      try {
-        const evaluation = await evaluateCompletion(record, { ...ctx, intervention: record, ...verify });
-        if (!evaluation.satisfied) {
-          await store.releaseResume(interventionId, lease);
-          return {
-            resumed: false,
-            interventionId,
-            state: record.state,
-            reason: `Completion condition not verified: ${evaluation.reason}`
-          };
-        }
-        const satisfied = await store.completeResume(interventionId, lease, { evidenceId: evaluation.evidenceId ?? null, note: evaluation.summary });
-        const run = runs.get(record.runId);
-        if (run && typeof run.resume === "function") {
-          await run.resume(satisfied);
-        }
+    async resume_run({ interventionId } = {}) {
+      const record = store.get(interventionId);
+      if (!record) throw new Error(`No intervention '${interventionId}'.`);
+      const run = runs.get(record.runId);
+      if (!run || typeof run.resume !== "function") {
         return {
-          resumed: true,
+          resumed: false,
           interventionId,
           runId: record.runId,
           stepId: record.stepId,
-          state: satisfied.state,
-          verifiedBy: record.completionCondition?.type,
-          summary: evaluation.summary
+          state: record.state,
+          reason: "No live continuation owner is available; the intervention remains pending."
         };
-      } catch (error) {
-        await store.releaseResume(interventionId, lease).catch(() => {});
-        throw error;
       }
+      // TestRunner.resume is the sole continuation-lease owner. It evaluates
+      // the exact predicate, commits satisfaction, and resumes the original
+      // workflow under the same fencing lease.
+      const result = await run.resume(record);
+      const current = store.get(interventionId);
+      const runStatus = typeof run.getState === "function" ? await run.getState() : result.receipt?.status ?? null;
+      return {
+        resumed: result.resumed === true,
+        interventionId,
+        runId: record.runId,
+        stepId: record.stepId,
+        state: current?.state ?? record.state,
+        ...(runStatus ? { runStatus } : {}),
+        ...(result.reason ? { reason: result.reason } : {}),
+        ...(result.evaluation?.summary ? { summary: result.evaluation.summary } : {}),
+        ...(result.expired ? { expired: true } : {})
+      };
     },
 
     async get_run_state({ runId }) {
       const run = runs.get(runId);
       if (!run) {
+        const durable = await runStateStore?.getFresh(runId);
+        if (durable) {
+          const unresolvedOperations = (durable.pendingOperations ?? []).filter(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status));
+          return {
+            runId,
+            state: durable.status,
+            currentStepId: durable.currentStepId ?? null,
+            pendingInterventionId: durable.pendingInterventionId ?? null,
+            unresolvedOperationIds: unresolvedOperations.map(operation => operation.operationId),
+            cancellationRequested: durable.cancellationRequested === true,
+            resumable: !["passed", "failed", "blocked", "canceled", "expired"].includes(durable.status)
+          };
+        }
         // Fall back to durable interventions for suspended runs.
         const interventions = store.listForRun(runId);
         if (interventions.length === 0) throw new Error(`No run '${runId}' is known.`);
@@ -154,7 +209,13 @@ export function createInterventionTools({ store, runs = new Map(), ctx = {} }) {
         return { canceled: true, interventionId: record.intervention_id, state: record.state };
       }
       const run = runs.get(runId);
-      if (!run) throw new Error(`No run '${runId}' is known.`);
+      if (!run) {
+        const durable = await runStateStore?.getFresh(runId);
+        if (!durable) throw new Error(`No run '${runId}' is known.`);
+        await runStateStore.requestCancellation(runId);
+        const unresolved = (durable.pendingOperations ?? []).some(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status));
+        return { canceled: true, runId, cancellationRequested: true, requiresReconciliation: unresolved };
+      }
       if (typeof run.cancel === "function") await run.cancel();
       return { canceled: true, runId };
     }

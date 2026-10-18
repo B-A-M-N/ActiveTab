@@ -1,6 +1,63 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { NavigationEngine } from "../src/navigation/engine.js";
+import { NavigationEngine as RuntimeNavigationEngine } from "../src/navigation/engine.js";
+import { taskGoalFingerprint } from "../src/state/journal.js";
+import { buildEnvironmentBinding } from "../src/environments/model.js";
+
+const authorizedFixtureSessions = new WeakSet();
+
+async function authorizeFixtureSession(session) {
+  if (!session || typeof session.observe !== "function") return session;
+  if (authorizedFixtureSessions.has(session)) return session;
+  const originalObserve = session.observe.bind(session);
+  const asNavigationFixture = observation => ({
+    ...observation,
+    candidates: (observation?.candidates ?? []).map(candidate => {
+      // These synthetic UI fixtures model route controls as explicit
+      // same-origin links. Production observations must carry real hrefs.
+      if (candidate?.submitsForm !== true && (
+        (candidate?.tag === "button" && candidate?.role === "button")
+        || candidate?.role === "link"
+        || candidate?.tag === "a"
+      )) {
+        return {
+          ...candidate,
+          role: "link",
+          tag: "a",
+          href: candidate.href ?? `#fixture-${candidate.identity ?? "link"}`
+        };
+      }
+      return candidate;
+    })
+  });
+  const cachedObservation = asNavigationFixture(await originalObserve());
+  let hasCachedObservation = true;
+  session.observe = async (...args) => {
+    if (hasCachedObservation) {
+      hasCachedObservation = false;
+      return cachedObservation;
+    }
+    return asNavigationFixture(await originalObserve(...args));
+  };
+  session.attached = true;
+  session.target ??= { id: "navigation-test-target", endpoint: "fixture" };
+  session.target.url ??= cachedObservation?.page?.url ?? null;
+  authorizedFixtureSessions.add(session);
+  return session;
+}
+
+class NavigationEngine extends RuntimeNavigationEngine {
+  async run(goal, options) {
+    await authorizeFixtureSession(this.session);
+    if (!this.environment) {
+      try {
+        const origin = new URL(this.session.target.url).origin;
+        this.environment = { environmentId: "navigation-test-fixture", authorizedOrigins: [origin] };
+      } catch { /* A fixture without an HTTP(S) URL remains unbound. */ }
+    }
+    return super.run(goal, options);
+  }
+}
 
 class FailingRouteSession {
   target = { id: "test-target", endpoint: "local-cdp" };
@@ -29,6 +86,73 @@ test("an unrelated URL change is not treated as task success", async () => {
   assert.equal(result.status, "needs_human");
   assert.equal(result.attempts, 1);
   assert.equal(result.page, undefined);
+});
+
+test("resume refuses a changed environment binding before observing or dispatching", async () => {
+  const goal = "Open the account page";
+  let observations = 0;
+  const session = {
+    target: { id: "resume-bound-target", endpoint: "local-cdp" },
+    async observe() { observations++; throw new Error("resume must reject before observing"); }
+  };
+  const resumeState = {
+    schemaVersion: 1,
+    taskId: "resume-bound-task",
+    goal: "[redacted task goal]",
+    goalFingerprint: taskGoalFingerprint(goal),
+    targetId: session.target.id,
+    endpoint: "local-cdp",
+    status: "running",
+    attempts: [],
+    environmentFingerprint: "a".repeat(64)
+  };
+  const environment = {
+    environmentId: "freeinference-staging",
+    authorizedOrigins: ["https://staging.freeinference.org"],
+    applications: [{ applicationId: "fi-dashboard", authenticationRealm: "fi-session" }]
+  };
+  await assert.rejects(
+    new RuntimeNavigationEngine(session, { environment }).run(goal, { resumeState }),
+    /environment binding does not match/
+  );
+  assert.equal(observations, 0, "a mismatched profile is rejected before browser observation or action");
+});
+
+test("resume is fenced when a profile changes its authentication realm", async () => {
+  const environment = profileId => buildEnvironmentBinding({
+    profile_id: profileId,
+    authentication_realms: [{ realm_id: profileId === "staging-agents" ? "agents-session" : "dashboard-admin", scope: ["staging"], separate_credentials: true }],
+    environment: {
+      environment_id: "shared-staging",
+      application_entry_url: "https://staging.example.test",
+      authorized_origins: ["https://staging.example.test"],
+      applications: [{ application_id: "app", authentication_realm: profileId === "staging-agents" ? "agents-session" : "dashboard-admin" }]
+    }
+  });
+  const firstBinding = environment("staging-agents");
+  const secondBinding = environment("staging-dashboard-admin");
+  let observations = 0;
+  const session = {
+    target: { id: "profile-bound-target", endpoint: "local-cdp" },
+    async observe() {
+      observations++;
+      return {
+        evidenceId: `profile-observation-${observations}`,
+        page: { url: "https://staging.example.test/account", title: "Account" },
+        headings: [{ level: 1, text: "Account" }],
+        candidates: []
+      };
+    }
+  };
+  const journal = { value: null, async write(value) { this.value = structuredClone(value); } };
+  await new RuntimeNavigationEngine(session, { environment: firstBinding, journal, maxActions: 1 }).run("Open the Account page");
+  assert.ok(journal.value?.environmentFingerprint);
+  const observationsBeforeResume = observations;
+  await assert.rejects(
+    new RuntimeNavigationEngine(session, { environment: secondBinding, journal }).run("Open the Account page", { resumeState: journal.value }),
+    /environment binding does not match/
+  );
+  assert.equal(observations, observationsBeforeResume, "changed profile identity is refused before reobserving or dispatch");
 });
 
 test("a matching label on the unchanged starting page does not verify navigation", async () => {
@@ -289,7 +413,7 @@ test("a failed action that partially changes the route is journaled and replanne
   assert.deepEqual(session.clicks, [firstTarget.identity, continuationTarget.identity]);
   assert.equal(plannerCalls[1].evidenceId, "Contact options-evidence");
   assert.ok(plannerCalls[1].excludedIdentities.includes(firstTarget.identity));
-  assert.equal(journal.value.attempts[0].error.message, "The route changed before the original node detached.");
+  assert.equal(journal.value.attempts[0].error.message, "Dispatch failed: The route changed before the original node detached.");
   assert.notEqual(journal.value.attempts[0].beforeRouteFingerprint, journal.value.attempts[0].afterRouteFingerprint);
   assert.deepEqual(recordedWorkflows, [], "a trace containing a failed action that changed page state must not be persisted");
 });
@@ -466,7 +590,7 @@ test("a model-selected sensitive action outside the user goal is handed off with
   const planner = { async plan() { return { status: "planned", action: { type: "click", target } }; } };
   const result = await new NavigationEngine(session, { planner }).run("Open the checkout page");
   assert.equal(result.status, "needs_human");
-  assert.equal(result.authorizationRequired.category, "purchase");
+  assert.equal(result.authorizationRequired.category, "unclassified_form_submission");
   assert.equal(result.authorizationRequired.evidenceId, "evidence-0");
   assert.equal(session.count, 0, "page content or a planner decision cannot authorize a purchase");
 });
@@ -476,8 +600,8 @@ test("search phrase runs locally, verifies the query, and never persists or retu
     value: undefined,
     async write(value) { this.value = structuredClone(value); }
   };
-  const searchField = { identity: "search-field", backendNodeId: 1, documentGeneration: 1, tag: "input", type: "search", role: "searchbox", name: "Search products", visible: true };
-  const submitButton = { identity: "search-submit", backendNodeId: 2, documentGeneration: 1, tag: "button", role: "button", name: "Search", submitsForm: true, visible: true };
+  const searchField = { identity: "search-field", targetId: "search-target", formIdentity: "search-form", backendNodeId: 1, documentGeneration: 1, tag: "input", type: "search", role: "searchbox", name: "Search products", visible: true };
+  const submitButton = { identity: "search-submit", targetId: "search-target", formIdentity: "search-form", formMethod: "get", formActionOrigin: "https://shop.example.test", backendNodeId: 2, documentGeneration: 1, tag: "button", role: "button", name: "Search", submitsForm: true, visible: true };
   const session = {
     target: { id: "search-target", endpoint: "local-cdp" },
     current: {
@@ -601,8 +725,8 @@ test("resuming a redacted search journal re-enters the caller phrase instead of 
     value: undefined,
     async write(value) { this.value = structuredClone(value); }
   };
-  const searchField = { identity: "resume-search-field", backendNodeId: 1, documentGeneration: 1, tag: "input", type: "search", role: "searchbox", name: "Search", visible: true };
-  const submitButton = { identity: "resume-search-submit", backendNodeId: 2, documentGeneration: 1, tag: "button", role: "button", name: "Search", submitsForm: true, visible: true };
+  const searchField = { identity: "resume-search-field", targetId: "resume-search-target", formIdentity: "resume-search-form", backendNodeId: 1, documentGeneration: 1, tag: "input", type: "search", role: "searchbox", name: "Search", visible: true };
+  const submitButton = { identity: "resume-search-submit", targetId: "resume-search-target", formIdentity: "resume-search-form", formMethod: "get", formActionOrigin: "https://shop.example.test", backendNodeId: 2, documentGeneration: 1, tag: "button", role: "button", name: "Search", submitsForm: true, visible: true };
   const session = {
     target: { id: "resume-search-target", endpoint: "local-cdp" },
     current: {

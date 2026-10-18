@@ -8,11 +8,32 @@ import { DeterministicPlanner } from "../src/navigation/planner.js";
 import { matchesTargetSignature, targetSignature, WorkflowStore } from "../src/state/workflows.js";
 
 class FixtureSession {
-  target = { id: "fixture-target", endpoint: "local-cdp" };
+  target = { id: "fixture-target", endpoint: "local-cdp", url: null };
+  attached = true;
   clicks = [];
   scrolls = [];
-  constructor(states) { this.states = states; this.index = 0; }
-  async observe() { return { evidenceId: `e-${this.index}`, ...structuredClone(this.states[this.index]) }; }
+  constructor(states) { this.states = states; this.index = 0; this.target.url = states[0]?.page?.url ?? null; }
+  async observe() {
+    const state = structuredClone(this.states[this.index]);
+    this.target.url = state.page?.url ?? this.target.url;
+    return {
+      evidenceId: `e-${this.index}`,
+      targetId: this.target.id,
+      ...state,
+      candidates: (state.candidates ?? []).map((candidate, index) => ({
+        ...candidate,
+        targetId: this.target.id,
+        documentGeneration: this.index + 1,
+        backendNodeId: index + 1
+      })),
+      scrollTargets: (state.scrollTargets ?? []).map((target, index) => ({
+        ...target,
+        targetId: this.target.id,
+        documentGeneration: this.index + 1,
+        backendNodeId: index + 1
+      }))
+    };
+  }
   async click(target) {
     this.clicks.push(target.identity);
     if (this.index + 1 < this.states.length) this.index++;
@@ -32,7 +53,7 @@ const pageState = (path, title, heading, candidates = [], scrollTargets = []) =>
   candidates,
   scrollTargets
 });
-const candidate = (identity, name) => ({ identity, name, tag: "button", role: "button", visible: true, disabled: false, href: null });
+const candidate = (identity, name) => ({ identity, name, tag: "a", role: "link", visible: true, disabled: false, href: "/next" });
 const listTarget = (identity, scrollTop) => ({
   identity, name: "Invoice list", contextName: "Invoices", tag: "div", role: "list", kind: "container",
   visible: true, canScrollDown: scrollTop < 1_200, scrollTop, maxScrollTop: 1_200, clientHeight: 168

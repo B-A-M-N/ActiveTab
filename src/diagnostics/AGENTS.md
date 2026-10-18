@@ -11,6 +11,7 @@ ActiveTab's diagnostic evidence plane. Browser instrumentation and privileged ba
 ## Local Contracts
 
 - Diagnostic reads require declared authority, exact scope, bounded collection, and sensitivity controls.
+- The configured diagnostic service URL must exactly match the active profile binding. An endpoint URL and admin credential alone never authorize a request.
 - A broad administrative GET is not inherently safe.
 - Empty responses are not automatically success; semantic status must be propagated into test outcomes.
 - Correlation distinguishes exact, probable, temporal-only, and unavailable relationships.

@@ -97,15 +97,21 @@ limits, including its dropdowns; do not open the view or inspect its options.
 No Log or Audit Log data has been inventoried.
 
 Admin Console Settings and Config need a read-only inventory so their current
-configuration is understood. Record visible control labels and non-sensitive
-current values, redact secrets, and do not operate controls or change values
-without explicit FreeInference authorization. A screenshot has partially
-inventoried the Settings page; the Configuration page and content below the
-visible Settings viewport remain unknown. The recipe only runs after the
-operator opens a profile-declared Settings or Configuration route in the
-authorized tab; it reads visible headings and control state/value metadata,
-submits no forms, and writes a private local report. Run it with
-`npm run discover:staging-admin-config`.
+configuration is understood. Record visible control labels, select option
+labels, and toggle states. Never read input or textarea contents. Do not
+operate controls or change values without explicit FreeInference
+authorization. A screenshot has partially inventoried the Settings page; the
+Configuration page and content below the visible Settings viewport remain
+unknown. The recipe only runs after the operator opens a profile-declared
+Settings or Configuration route in the authorized tab; it submits no forms
+and writes a private local report with explicit evidence provenance. It
+attaches to the existing ActiveTab-owned Chrome profile and leaves the browser
+running. It does not launch a browser. If that browser was closed, reopen the
+same owned profile with the staging launcher and keep its process alive before
+inventory. List its page targets, then provide the exact target ID:
+
+    node src/cli.js targets --auto-connect --user-data-dir .activetab/qualification/browser-profiles/cloud-agent-staging
+    ACTIVETAB_AUTHORIZED_TARGET_ID=<target-id> npm run discover:staging-admin-config -- --browser-profile=cloud-agent-staging
 
 ### Account Admin Console Settings
 
@@ -287,10 +293,11 @@ Configuration page, run:
 
 This command does not navigate. It requires the exact attached tab to already
 be on a profile-declared Settings or Configuration route under
-`/dashboard/admin/`; it reads visible control labels and non-sensitive current
-values only. Audit Log routes are refused.
+`/dashboard/admin/`; it reads visible control labels, select option labels,
+and toggle states. Input and textarea contents are never read. Audit Log
+routes are refused.
 
-Reports are written under .activetab/qualification/admin-discovery with
+Reports are written under .activetab/qualification/staging-admin-config with
 owner-only directory and file permissions. Discovery closes only its CDP
 attachment; it leaves the operator's browser process and tab open.
 
@@ -301,13 +308,25 @@ If an owned run is interrupted during login, resume its exact run with:
 
     npm run qualify:staging -- --mode=owned --resume-run-id=<runId>
 
-The command launches the same profile-specific Chrome directory, then verifies
-the observed staging environment and the Cloud Agent task composer before it
-continues the saved run. It does not repeat the suspended navigation step. For
-attached mode, the independently authorized target ID must still match the
-target recorded by the run. An unfinished run blocks a fresh run; explicitly
-mark one abandoned with `--discard-run=<runId>` if it should not resume. The
-report and intervention records remain available after abandonment.
+The command reattaches to the exact page target and persistent Chrome profile
+recorded by the run, then verifies the observed staging environment and Cloud
+Agent task composer before it continues. It does not launch a replacement
+browser or repeat the suspended navigation step. For attached mode, the
+independently authorized target ID must still match the target recorded by the
+run. An unfinished run blocks a fresh run; explicitly mark one abandoned with
+`--discard-run=<runId>` if it should not resume. The report and intervention
+records remain available after abandonment.
+
+`npm run browser:staging` is the browser-only path for manual authentication
+and inspection. It launches the persistent owned browser or reuses its live
+profile without navigating or selecting a page, then exits while leaving
+Chrome open. When reusing a live profile, it prints page target IDs and
+origins without controlling a page. To qualify one of those pages, pass its
+exact ID with `npm run qualify:staging -- --mode=owned --target-id=<targetId>`.
+This attaches without reloading the staging entry and preserves Chrome after
+the qualification command exits. The browser-only command does not load or
+change qualification run/intervention records or execute a workflow;
+unfinished qualification runs continue to block a new qualification.
 
 Reaching the task composer is still only entry qualification. The profile has
 no executable Cloud Agent test pack, so this workflow does not create an Agent
@@ -321,3 +340,37 @@ inspect content below the viewport, and inspect Configuration. A read-only
 live run requires the authenticated tab to be explicitly attached to this
 ActiveTab runtime and the operator to open the exact Settings or Configuration
 page first.
+
+## Cloud Agent task creation and cleanup boundary
+
+The synthetic observations in `test/cloudAgentWorkflowAdapter.test.js` and
+`test/prepareCloudAgentTask.test.js` use fixture labels such as `Model`,
+`Task`, and `Run task`. They exercise adapter logic only; they are not copied
+from or evidence about the current staging UI. Live control mappings must come
+from a fresh observation of the explicitly attached staging tab.
+
+The Cloud Agent task composer is an effectful operation. A source review of
+the local `hybridInference-cloud-agent` checkout found that Run submits
+`POST /v1/agent/jobs` with a repository, task prompt, runtime, and model, plus
+optional branch, reasoning, skill, attachment, plugin, and MCP selections.
+The response identifies a persistent task conversation and the UI navigates
+to that task. The application runs coding agents against the chosen repository
+and can publish pull requests, so the task is not a read-only diagnostic.
+This source review describes the checked-out implementation; it has not been
+revalidated against the live staging deployment.
+
+Therefore a future test pack must bind approval to the exact repository/ref,
+prompt, runtime/model, selected or omitted optional capabilities, target
+environment, and expected result before submission. It must preserve the
+returned job identifier and reconcile an uncertain submission before
+retrying. It must not inherit the composer's runtime/model defaults or treat a
+page message as proof of task completion.
+
+The checked-out application exposes archive and session deletion operations.
+Archive hides a conversation from active history; deletion is allowed only
+after archive and retains audit data. Neither operation proves that a produced
+pull request, branch, or retained sandbox was removed. Cleanup must identify
+each created resource and use an independently verified, explicitly approved
+lifecycle action. Until that lifecycle and an independent result oracle are
+specified for a particular PR test, `test_packs` remains empty and staging
+qualification must continue to report that no Cloud Agent task was executed.

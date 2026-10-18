@@ -55,6 +55,74 @@ test("test-owned resources and their cleanup obligations persist", () =>
     assert.ok(restarted.get(run.runId).testOwnedResources[0].cleanedAt);
   }));
 
+test("run-state updates use cross-instance compare-and-swap revisions", () =>
+  withRunState(async (store, dir) => {
+    const run = await store.create({ runId: "cross-process-cas", workflowId: "wf", workflowName: "CAS" });
+    const other = new RunStateStore(dir);
+    await other.init();
+    const revision = run.revision;
+    const results = await Promise.allSettled([
+      store.update(run.runId, { status: "running" }, { expectedRevision: revision }),
+      other.update(run.runId, { status: "waiting_for_authentication" }, { expectedRevision: revision })
+    ]);
+    assert.equal(results.filter(result => result.status === "fulfilled").length, 1);
+    assert.equal(results.filter(result => result.status === "rejected").length, 1);
+    assert.equal((await other.getFresh(run.runId)).revision, revision + 1);
+  }));
+
+test("one durable run has a single execution owner across store instances", () =>
+  withRunState(async (store, dir) => {
+    const other = new RunStateStore(dir);
+    await other.init();
+    const release = await store.acquireExecutionLease("exclusive-run");
+    await assert.rejects(() => other.acquireExecutionLease("exclusive-run"), error => error.code === "RUN_EXECUTION_LEASE_HELD");
+    await release();
+    const releaseAfterOwnerExit = await other.acquireExecutionLease("exclusive-run");
+    await releaseAfterOwnerExit();
+  }));
+
+test("reserved and possibly dispatched operations become uncertain across restart and cannot be replayed", () =>
+  withRunState(async (store, dir) => {
+    const run = await store.create({
+      runId: "operation-recovery",
+      workflowId: "wf",
+      workflowName: "Operation recovery",
+      environmentId: "freeinference-staging",
+      targetId: "tab-exact"
+    });
+    await store.reserveOperation(run.runId, {
+      operationId: "operation-1",
+      stepId: "submit-task",
+      action: "click",
+      effectDigest: "contract-1",
+      environmentId: "freeinference-staging",
+      targetId: "tab-exact"
+    });
+    await store.recordOperationDispatch(run.runId, { operationId: "operation-1", status: "UNCERTAIN" });
+
+    const restarted = new RunStateStore(dir);
+    await restarted.init();
+    const reconciled = await restarted.reconcileRestart(run.runId, {
+      attachmentCheck: async targetId => targetId === "tab-exact",
+      environmentCheck: async environmentId => ({ ok: environmentId === "freeinference-staging" })
+    });
+    assert.equal(reconciled.status, "reconciling");
+    assert.equal(reconciled.uncertainOperations[0].status, "UNCERTAIN");
+    await assert.rejects(() => restarted.reserveOperation(run.runId, {
+      operationId: "operation-1", stepId: "submit-task", action: "click", effectDigest: "contract-1",
+      environmentId: "freeinference-staging", targetId: "tab-exact"
+    }), /already reached UNCERTAIN/);
+    await restarted.reconcileOperation(run.runId, { operationId: "operation-1", status: "VERIFIED", evidenceIds: ["browser-evidence", "backend-evidence"] });
+    assert.equal((await restarted.getFresh(run.runId)).pendingOperations[0].status, "VERIFIED");
+  }));
+
+test("run bindings cannot be retargeted after creation", () =>
+  withRunState(async store => {
+    const run = await store.create({ workflowId: "wf", workflowName: "Bound", environmentId: "staging", targetId: "tab-one" });
+    await assert.rejects(() => store.update(run.runId, { environmentId: "production" }), /immutable/);
+    await assert.rejects(() => store.update(run.runId, { target: { targetId: "tab-two", attached: true } }), /cannot change/);
+  }));
+
 test("needs_human and waiting_* are suspensions, not terminals; cancellation works mid-suspension", async () => {
   const dir = await mkdtemp(join(tmpdir(), "activetab-tasks-"));
   try {

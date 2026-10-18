@@ -60,7 +60,11 @@ test("acknowledgement is not satisfaction; resume verifies the predicate", () =>
     assert.ok(!continueEvaluation.satisfied);
     // Authoritative session check succeeds → satisfied.
     const ok = await evaluateCompletion(store.get(record.intervention_id), {
-      verifyAuthentication: async realm => ({ authenticated: true, identity: "test-operator", evidenceId: "ev-1", realm })
+      verifyAuthentication: async (realm, intervention) => {
+        assert.equal(intervention.intervention_id, record.intervention_id);
+        assert.equal(intervention.runId, "run-1");
+        return { authenticated: true, identity: "test-operator", evidenceId: "ev-1", realm };
+      }
     });
     assert.ok(ok.satisfied);
     const { lease } = await store.acquireResume(record.intervention_id);
@@ -105,7 +109,12 @@ test("watcher resumes only after the verified condition holds (event-driven)", (
       pollIntervalMs: 60_000 // events drive checks; polling is a fallback only
     });
     watcher.watch(events, ["tab-attached", "navigated", "session-changed", "grant-issued"]);
-    watcher.onResume = async (satisfied) => { resumed = satisfied; };
+    watcher.onResume = async candidate => {
+      const { record: owned, lease } = await store.acquireResume(candidate.intervention_id);
+      const reevaluated = await evaluateCompletion(owned, watcher.ctx);
+      if (!reevaluated.satisfied) { await store.releaseResume(owned.intervention_id, lease); return; }
+      resumed = await store.completeResume(owned.intervention_id, lease, { evidenceId: reevaluated.evidenceId, note: reevaluated.summary });
+    };
     watcher.start();
     try {
       // A navigation event alone must not resume: predicate still false.
@@ -124,21 +133,20 @@ test("watcher resumes only after the verified condition holds (event-driven)", (
 
 test("no secrets are persisted in intervention records", () =>
   withStore(async store => {
-    // Sensitive values inside declared fields must be rejected, never written.
-    await assert.rejects(() => store.create({
-      runId: "r", stepId: "s", type: INTERVENTION_TYPE.AUTHENTICATION,
-      reason: "x", requiredHumanAction: "the password is hunter2",
-      completionCondition: { type: "authenticated_session_check" }
-    }), /must not persist 'password'/);
-    // Benign records persist fine and contain no credential material.
     const record = await store.create({
       runId: "r", stepId: "s", type: INTERVENTION_TYPE.AUTHENTICATION,
-      reason: "Agents application requires authentication",
-      requiredHumanAction: "Complete sign-in in the attached browser tab",
+      reason: "the password is hunter2",
+      requiredHumanAction: "Use token private-token-value",
       completionCondition: { type: "authenticated_session_check", realm: "agents-session" }
     });
     const serialized = JSON.stringify(record).toLowerCase();
-    assert.ok(!/"password"/.test(serialized));
-    assert.ok(!/"mfacode"/.test(serialized));
-    assert.ok(!/"token":"(?!null)/.test(serialized));
+    assert.equal(serialized.includes("hunter2"), false);
+    assert.equal(serialized.includes("private-token-value"), false);
+    assert.equal(record.reason, "Authentication is required.");
+    assert.equal(record.requiredHumanAction, "Complete sign-in in the attached browser tab.");
+    assert.deepEqual(record.completionCondition, { type: "authenticated_session_check", realm: "agents-session" });
+    await assert.rejects(
+      () => store.create({ runId: "r", stepId: "bad", type: INTERVENTION_TYPE.AUTHENTICATION, reason: "x", requiredHumanAction: "x", completionCondition: { type: "authenticated_session_check", pageText: "private text" } }),
+      error => String(error.message).includes("unsupported field")
+    );
   }));

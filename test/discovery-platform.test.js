@@ -19,6 +19,32 @@ function page(url, candidates = []) {
   return { page: { url, title: "FI" }, headings: [], candidates, evidenceId: url, pageChangeFingerprint: url, domMutationCount: 0, lifecycleEventCount: 0 };
 }
 
+function scriptedSession(pages) {
+  let step = 0;
+  const target = { id: "staging-fixture-tab", url: pages[0].page.url };
+  return {
+    target,
+    attached: true,
+    async observe() {
+      const observed = structuredClone(pages[Math.min(step, pages.length - 1)]);
+      return {
+        ...observed,
+        targetId: target.id,
+        candidates: observed.candidates.map((candidate, index) => ({
+          ...candidate,
+          identity: candidate.identity ?? `candidate-${index}`,
+          targetId: target.id,
+          documentGeneration: step + 1,
+          backendNodeId: index + 1
+        }))
+      };
+    },
+    async click() {},
+    async waitForChange() { step++; },
+    client: { send: async () => {} }
+  };
+}
+
 test("cross-origin navigation inside the platform is recorded and verified", async () => {
   const main = page("https://staging.freeinference.org/", [
     { name: "Agents", role: "link", href: "https://staging.freeinference.org/agents/", visible: true }
@@ -26,12 +52,7 @@ test("cross-origin navigation inside the platform is recorded and verified", asy
   const agents = page("https://staging.freeinference.org/agents/", [
     { name: "New connector", role: "button", visible: true }
   ]);
-  let step = 0;
-  const session = {
-    async observe() { return step === 0 ? main : agents; },
-    async waitForChange() { step++; },
-    client: { send: async () => {} }
-  };
+  const session = scriptedSession([main, agents]);
   const engine = new ApplicationDiscoveryEngine({ session, environment, maxSteps: 3 });
   const result = await engine.discover();
   // Same-origin navigation within the platform: pages accumulate, no child
@@ -45,20 +66,17 @@ test("arbitrary cross-origin links are never trusted: discovery stops at the bou
   const main = page("https://staging.freeinference.org/", [
     { name: "External promo", role: "link", href: "https://evil.example.net/promo", visible: true }
   ]);
-  const evil = page("https://evil.example.net/promo", []);
-  let step = 0;
-  const session = {
-    async observe() { return step === 0 ? main : evil; },
-    async waitForChange() { step++; },
-    client: { send: async () => {} }
-  };
+  const session = scriptedSession([main]);
   const engine = new ApplicationDiscoveryEngine({ session, environment, maxSteps: 3 });
   const result = await engine.discover();
-  assert.ok(result.discoveries.some(d => d.type === "cross_origin_untrusted"),
+  const refused = result.discoveries.find(d => d.type === "cross_origin_untrusted");
+  assert.ok(refused,
     "untrusted cross-origin navigation must be recorded and refused");
+  assert.equal(refused.observed, false, "the destination is not claimed to have been visited");
+  assert.equal(refused.dispatched, false, "the blocked navigation must not dispatch");
+  assert.equal(refused.toOrigin, "https://evil.example.net");
   const children = result.capabilityMap.childApplications ?? [];
-  assert.equal(children.length, 1);
-  assert.equal(children[0].verified, false, "untrusted destinations stay unverified");
+  assert.equal(children.length, 0, "an unvisited link is not recorded as an observed child application");
 });
 
 test("an authentication boundary pauses discovery instead of bypassing it", async () => {
@@ -69,12 +87,7 @@ test("an authentication boundary pauses discovery instead of bypassing it", asyn
     { name: "Sign in to continue", role: "heading", visible: true },
     { name: "Password", role: "textbox", type: "password", visible: true }
   ]);
-  let step = 0;
-  const session = {
-    async observe() { return step === 0 ? main : login; },
-    async waitForChange() { step++; },
-    client: { send: async () => {} }
-  };
+  const session = scriptedSession([main, login]);
   const boundaries = [];
   const engine = new ApplicationDiscoveryEngine({
     session, environment, maxSteps: 3,

@@ -5,7 +5,7 @@
   "type": "module",
   "description": "A local-first native browser navigation runtime built on CDP",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.5.0"
   },
   "scripts": {
     "start": "node src/cli.js",

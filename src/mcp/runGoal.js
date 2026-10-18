@@ -2,7 +2,7 @@ import { NavigationEngine } from "../navigation/engine.js";
 
 const activeTargets = new Set();
 
-export async function runMcpGoal(session, args, { journalStore, workflowStore } = {}) {
+export async function runMcpGoal(session, args, { journalStore, workflowStore, decisionRuntime = null, environment = null } = {}) {
   if (!journalStore) throw new Error("MCP task journal storage is unavailable.");
   if (args.reuseWorkflows === true && !workflowStore) throw new Error("Set ACTIVETAB_WORKFLOW_STORE before enabling workflow reuse.");
 
@@ -33,9 +33,13 @@ export async function runMcpGoal(session, args, { journalStore, workflowStore } 
     }
 
     const result = await new NavigationEngine(session, {
+      executionMode: "standalone",
+      plannerMode: args.plannerMode ?? "deterministic",
       maxActions: args.maxActions ?? 8,
       maxScrolls: args.maxScrolls ?? 5,
       journal,
+      environment,
+      decisionRuntime,
       ...(args.reuseWorkflows === true ? { workflowStore } : {})
     }).run(args.goal, { ...(resumeState ? { resumeState } : {}) });
     const finalState = await journal.read();

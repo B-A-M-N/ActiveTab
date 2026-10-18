@@ -2,10 +2,10 @@
 /**
  * Single-invocation FreeInference staging qualification entrypoint (P0-2).
  *
- * One Node.js process owns Chrome, the CDP connection, ActiveTab
- * execution, diagnostic collection, and cleanup for the entire run.
- * Nothing relies on background processes surviving between command
- * invocations.
+ * Qualification runs own Chrome, the CDP connection, ActiveTab execution,
+ * diagnostics, and cleanup. The browser-only open mode detaches from its
+ * persistent Chrome profile so operator authentication can outlive the
+ * command invocation.
  *
  * Modes:
  *   --mode=owned    (default) Launch an owned headed Chrome with a private,
@@ -23,10 +23,11 @@
  * desktop). Use the current display (DISPLAY already set) for
  * human-assisted runs.
  *
- * Human handoff: owned mode keeps the same browser and run alive while the
- * operator follows staging → visible Cloud Agents → Agent login. It resumes
- * only after fresh evidence shows the Agent task composer. After qualification
- * it leaves the authenticated page open until Ctrl-C.
+ * Human handoff: qualification owned mode keeps the same browser and run
+ * alive while the operator follows staging → visible Cloud Agents → Agent
+ * login. It resumes only after fresh evidence shows the Agent task composer.
+ * Browser-only open mode never navigates an already-running profile and
+ * leaves Chrome open after releasing ActiveTab's CDP connection.
  */
 
 import { spawn } from "node:child_process";
@@ -37,12 +38,13 @@ import { fileURLToPath } from "node:url";
 
 import { launchOwnedChrome } from "../src/browser/ownedChrome.js";
 import { InterventionStore } from "../src/runtime/interventions.js";
-import { RunStateStore } from "../src/testing/runState.js";
+import { RunStateStore, blockingQualificationRuns } from "../src/testing/runState.js";
 import { loadEnvironmentBinding } from "../src/testing/profiles.js";
-import { qualifyCloudAgent } from "../src/testing/qualifyCloudAgent.js";
+import { qualifyCloudAgent, shouldKeepOwnedBrowserOpen } from "../src/testing/qualifyCloudAgent.js";
 import { listTargets, resolveAuthorizedTarget } from "../src/browser/targets.js";
 import { BrowserSession } from "../src/browser/session.js";
 import { selectAuthorizedStagingTarget } from "../src/testing/qualifyTarget.js";
+import { createDecisionRuntime } from "../src/decisions/runtime.js";
 
 const args = process.argv.slice(2);
 function arg(name, fallback = null) {
@@ -55,6 +57,7 @@ const hasFlag = name => args.includes(`--${name}`);
 const mode = arg("mode", "owned");
 const profileId = arg("profile", "cloud-agent-staging");
 const openOnly = hasFlag("open-only");
+const requestedTargetId = arg("target-id", null);
 const resumeRunId = arg("resume-run-id", process.env.ACTIVETAB_RESUME_RUN_ID ?? null);
 const discardRunId = arg("discard-run", null);
 
@@ -71,6 +74,18 @@ if (mode === "attached" && useXvfb) {
 }
 if (mode === "attached" && openOnly) {
   console.error("--open-only requires --mode=owned.");
+  process.exit(2);
+}
+if (requestedTargetId !== null && (!requestedTargetId.trim() || requestedTargetId !== requestedTargetId.trim())) {
+  console.error("--target-id must be a non-empty exact target ID without surrounding whitespace.");
+  process.exit(2);
+}
+if (requestedTargetId !== null && (mode !== "owned" || openOnly || useXvfb)) {
+  console.error("--target-id is for reattaching to an existing owned headed profile during qualification; remove it from attached, open-only, or Xvfb mode.");
+  process.exit(2);
+}
+if (openOnly && (resumeRunId || discardRunId || process.env.ACTIVETAB_DISCARD_SUSPENDED_RUN === "1")) {
+  console.error("--open-only only launches or reuses the owned browser; remove resume and discard options.");
   process.exit(2);
 }
 if (mode === "owned" && process.env.ACTIVETAB_HEADLESS === "1") {
@@ -104,7 +119,19 @@ function delayOrAbort(ms, signal) {
   });
 }
 
-if (!/^[a-z0-9][a-z0-9-]{0,63}$/i.test(profileId)) {
+function isSafeProfileId(value) {
+  if (typeof value !== "string" || value.length < 1 || value.length > 64) return false;
+  const first = value.charCodeAt(0);
+  if (!((first >= 48 && first <= 57) || (first >= 65 && first <= 90) || (first >= 97 && first <= 122))) return false;
+  for (const character of value) {
+    const code = character.charCodeAt(0);
+    const alphanumeric = (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+    if (!alphanumeric && character !== "-") return false;
+  }
+  return true;
+}
+
+if (!isSafeProfileId(profileId)) {
   console.error("Profile ID must contain only letters, digits, and hyphens.");
   process.exit(2);
 }
@@ -157,69 +184,84 @@ async function main() {
   process.on("SIGINT", onSig);
   process.on("SIGTERM", onSig);
 
-  // Browser-profile persistence and run-state persistence are independent:
-  // either mode can resume a durable run, but each must revalidate its target.
+  // Browser-profile persistence is independent from run-state persistence.
+  // Open-only mode parks the browser and deliberately neither loads nor
+  // changes durable workflow/intervention records.
   const interventionDir = mode === "attached"
     ? join(repoRoot, ".activetab", "interventions")
     : join(stateDir, "interventions-owned");
   const runStoreDir = join(repoRoot, ".activetab", "run-state");
-  const interventions = new InterventionStore(interventionDir);
-  await interventions.init();
-  const runStore = new RunStateStore(runStoreDir);
-  await runStore.init();
-  const relevantRun = run => run.workflowId === "cloud-agent-staging-qualification"
-    && run.environmentId === binding.environmentId
-    && (!run.profileId || run.profileId === profileId);
-  const pendingRuns = [...new Map([...runStore.listSuspended(), ...runStore.listActive()]
-    .filter(relevantRun).map(run => [run.runId, run])).values()];
+  let interventions = null;
+  let runStore = null;
   let resumeRunState = null;
 
-  let selectedDiscardId = discardRunId;
-  if (!selectedDiscardId && process.env.ACTIVETAB_DISCARD_SUSPENDED_RUN === "1" && pendingRuns.length === 1) {
-    selectedDiscardId = pendingRuns[0].runId;
-  }
-  if (selectedDiscardId) {
-    const abandoned = pendingRuns.find(run => run.runId === selectedDiscardId);
-    if (!abandoned) {
-      console.error(`[qualification] --discard-run '${selectedDiscardId}' does not identify a pending run for profile '${profileId}'.`);
-      process.exit(3);
-    }
-    await runStore.update(abandoned.runId, {
-      status: "abandoned",
-      pendingInterventionId: null,
-      suspendedStepId: null,
-      resumeCursor: null
-    });
-    console.error(`[qualification] Explicitly abandoned suspended run ${abandoned.runId}; its report and intervention records remain available.`);
-  }
+  if (!openOnly) {
+    interventions = new InterventionStore(interventionDir);
+    await interventions.init();
+    runStore = new RunStateStore(runStoreDir);
+    await runStore.init();
+    const relevantRun = run => run.workflowId === "cloud-agent-staging-qualification"
+      && run.environmentId === binding.environmentId
+      && (!run.profileId || run.profileId === profileId);
+    const pendingRuns = [...new Map([...runStore.listSuspended(), ...runStore.listActive()]
+      .filter(relevantRun).map(run => [run.runId, run])).values()];
 
-  if (resumeRunId) {
-    const candidate = pendingRuns.find(run => run.runId === resumeRunId);
-    if (!candidate || !candidate.resumeCursor || !candidate.pendingInterventionId) {
-      console.error(`[qualification] Run '${resumeRunId}' has no resumable human-authentication cursor for profile '${profileId}'.`);
-      process.exit(3);
+    let selectedDiscardId = discardRunId;
+    if (!selectedDiscardId && process.env.ACTIVETAB_DISCARD_SUSPENDED_RUN === "1" && pendingRuns.length === 1) {
+      selectedDiscardId = pendingRuns[0].runId;
     }
-    if (candidate.mode && candidate.mode !== mode) {
-      console.error(`[qualification] Run '${resumeRunId}' was created in ${candidate.mode} mode; refusing to resume it in ${mode} mode.`);
-      process.exit(3);
+    if (selectedDiscardId) {
+      const abandoned = pendingRuns.find(run => run.runId === selectedDiscardId);
+      if (!abandoned) {
+        console.error(`[qualification] --discard-run '${selectedDiscardId}' does not identify a pending run for profile '${profileId}'.`);
+        process.exit(3);
+      }
+      await runStore.update(abandoned.runId, {
+        status: "abandoned",
+        pendingInterventionId: null,
+        suspendedStepId: null,
+        resumeCursor: null
+      });
+      console.error(`[qualification] Explicitly abandoned suspended run ${abandoned.runId}; its report and intervention records remain available.`);
     }
-    if (candidate.profileId && candidate.profileId !== profileId) {
-      console.error(`[qualification] Run '${resumeRunId}' belongs to profile '${candidate.profileId}', not '${profileId}'.`);
-      process.exit(3);
-    }
-    resumeRunState = candidate;
-  } else {
-    const remaining = pendingRuns.filter(run => run.runId !== selectedDiscardId);
-    if (remaining.length) {
-      console.error(`[qualification] ${remaining.length} unfinished run(s) exist in ${runStoreDir}; refusing to start a replacement run.`);
-      for (const run of remaining) console.error(`  runId=${run.runId} status=${run.status} pendingIntervention=${run.pendingInterventionId ?? "none"} suspendedStep=${run.suspendedStepId ?? "none"}`);
-      console.error("  Resume with --resume-run-id=<runId>, or explicitly abandon one with --discard-run=<runId>.");
-      process.exit(3);
+
+    if (resumeRunId) {
+      const candidate = pendingRuns.find(run => run.runId === resumeRunId);
+      if (!candidate || !candidate.resumeCursor || !candidate.pendingInterventionId) {
+        console.error(`[qualification] Run '${resumeRunId}' has no resumable human-authentication cursor for profile '${profileId}'.`);
+        process.exit(3);
+      }
+      if (candidate.mode && candidate.mode !== mode) {
+        console.error(`[qualification] Run '${resumeRunId}' was created in ${candidate.mode} mode; refusing to resume it in ${mode} mode.`);
+        process.exit(3);
+      }
+      if (candidate.profileId && candidate.profileId !== profileId) {
+        console.error(`[qualification] Run '${resumeRunId}' belongs to profile '${candidate.profileId}', not '${profileId}'.`);
+        process.exit(3);
+      }
+      resumeRunState = candidate;
+      if (mode === "owned" && !resumeRunState.target?.targetId) {
+        console.error(`[qualification] Run '${resumeRunId}' has no exact owned browser target to resume.`);
+        process.exit(3);
+      }
+      if (requestedTargetId && requestedTargetId !== resumeRunState.target?.targetId) {
+        console.error(`[qualification] --target-id does not match run '${resumeRunId}' exact target '${resumeRunState.target?.targetId ?? "unknown"}'.`);
+        process.exit(3);
+      }
+    } else {
+      const remaining = blockingQualificationRuns(pendingRuns, { selectedDiscardId });
+      if (remaining.length) {
+        console.error(`[qualification] ${remaining.length} unfinished run(s) exist in ${runStoreDir}; refusing to start a replacement run.`);
+        for (const run of remaining) console.error(`  runId=${run.runId} status=${run.status} pendingIntervention=${run.pendingInterventionId ?? "none"} suspendedStep=${run.suspendedStepId ?? "none"}`);
+        console.error("  Resume with --resume-run-id=<runId>, or explicitly abandon one with --discard-run=<runId>.");
+        process.exit(3);
+      }
     }
   }
 
   let owned = null;
   let session = null;
+  let decisionRuntime = null;
   let attachedFromOutside = false;
   const evidence = { screenshots: [], navigation: [] };
 
@@ -235,7 +277,11 @@ async function main() {
         displayMode: useXvfb ? "xvfb" : "current-display",
         signal: controller.signal,
         userDataDir: join(browserProfilesDir, profileId),
-        preserveProfile: true
+        preserveProfile: true,
+        reuseExisting: openOnly,
+        keepBrowserOpen: !useXvfb,
+        attachExistingTargetId: openOnly ? null : (resumeRunState?.target?.targetId ?? requestedTargetId),
+        allowedExistingOrigins: binding.authorizedOrigins
       });
       session = owned.session;
       evidence.browser = {
@@ -247,20 +293,29 @@ async function main() {
         profileDir: "<private persistent profile>",
         readiness: owned.readiness
       };
-      console.log(`[owned] Chrome ${owned.browserVersion} launched (${owned.launchMode}, ${displaySource}), target ${owned.targetId}`);
+      console.log(owned.reusedExisting
+        ? `[owned] Chrome ${owned.browserVersion} reused (${owned.launchMode}).`
+        : owned.attachedExisting
+          ? `[owned] Chrome ${owned.browserVersion} reattached to exact target ${owned.targetId} (${owned.readiness.origin}) without navigation.`
+        : `[owned] Chrome ${owned.browserVersion} launched (${owned.launchMode}, ${displaySource}), target ${owned.targetId}`);
       if (openOnly) {
-        const cdpHttp = new URL(owned.endpoint);
-        cdpHttp.protocol = "http:";
-        cdpHttp.pathname = "";
-        cdpHttp.search = "";
-        console.log(`[owned] Staging entry: ${binding.applicationEntryUrl}`);
-        console.log(`[owned] Browser parked for manual login/navigation. Persistent profile: ${owned.profileDir}`);
-        console.log(`[owned] CDP endpoint: ${cdpHttp.href}`);
-        console.log("[owned] Authenticate on staging, follow the visible Cloud Agents link, and leave this process running for attachment.");
-        await new Promise(resolve => {
-          if (controller.signal.aborted) return resolve();
-          controller.signal.addEventListener("abort", resolve, { once: true });
-        });
+        if (owned.reusedExisting) {
+          console.log("[owned] Reused the already-running Chrome profile. The current page was left unchanged.");
+          if (owned.pageTargets.length) {
+            for (const target of owned.pageTargets) {
+              let origin = "unavailable";
+              try { origin = new URL(target.url).origin; } catch { /* omit page details */ }
+              console.log(`[owned] Available page target: ${target.id} origin=${origin}`);
+            }
+            console.log("[owned] To qualify an existing page, pass its exact ID with --target-id=<id>. No page was selected or controlled by this listing.");
+          } else {
+            console.log("[owned] No page targets are currently available.");
+          }
+        } else {
+          console.log(`[owned] Staging entry: ${binding.applicationEntryUrl}`);
+        }
+        console.log("[owned] Chrome remains open for inspection or authentication after this command exits.");
+        console.log(`[owned] Persistent profile retained: ${owned.profileDir}`);
         return;
       }
     } else {
@@ -307,6 +362,7 @@ async function main() {
       environment: binding,
       interventions,
       runStore,
+      decisionRuntime: decisionRuntime ??= createDecisionRuntime(),
       resumeRunState,
       profileId,
       mode,
@@ -365,21 +421,23 @@ async function main() {
     // Leave the authenticated page available for the operator's next
     // read-only discovery or explicitly requested PR test. The profile is
     // persistent, and Ctrl-C is the explicit close boundary.
-    if (mode === "owned" && report.gates?.agents_application_entered?.passed === true && !controller.signal.aborted) {
+    if (shouldKeepOwnedBrowserOpen(mode, report, controller.signal)) {
       const cdpHttp = new URL(owned.endpoint);
       cdpHttp.protocol = "http:";
       cdpHttp.pathname = "";
       cdpHttp.search = "";
-      console.log(`[owned] Authenticated Cloud Agent remains open at the observed application page. Target: ${owned.targetId}`);
+      console.log(`[owned] Browser remains open at its current page for inspection or authentication. Target: ${owned.targetId}`);
       console.log(`[owned] CDP endpoint: ${cdpHttp.href}`);
       console.log(`[owned] Persistent profile retained: ${owned.profileDir}`);
       console.log("[owned] Press Ctrl-C when you are done using this browser.");
       await waitForAbort();
     }
   } finally {
+    decisionRuntime?.close();
     if (owned) {
       const cleanup = await owned.close();
-      console.log(`[owned] Browser closed: graceful=${cleanup.graceful} forced=${cleanup.forced} exitCode=${cleanup.exitCode} profilePreserved=${cleanup.profilePreserved}${cleanup.error ? ` error=${cleanup.error}` : ""}`);
+      const lifecycle = cleanup.browserPreserved ? "CDP session released; Chrome remains open" : "Chrome closed";
+      console.log(`[owned] ${lifecycle}: graceful=${cleanup.graceful} forced=${cleanup.forced} exitCode=${cleanup.exitCode} profilePreserved=${cleanup.profilePreserved}${cleanup.error ? ` error=${cleanup.error}` : ""}`);
       if (xvfbProcess) { try { xvfbProcess.kill("SIGTERM"); } catch { /* best-effort */ } }
     } else if (session && attachedFromOutside) {
       // Detach without closing the operator's browser.

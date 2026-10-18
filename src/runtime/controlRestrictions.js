@@ -15,30 +15,58 @@ export function isOperatorProhibitedNavigation(destination) {
   let url;
   try { url = new URL(destination); }
   catch { return false; }
-  if (url.origin !== "https://staging.freeinference.org"
-      || !/^\/dashboard\/admin(?:\/|$)/.test(url.pathname)) return false;
   const segments = url.pathname.toLowerCase().split("/").filter(Boolean);
+  if (url.origin !== "https://staging.freeinference.org"
+      || segments[0] !== "dashboard" || segments[1] !== "admin") return false;
   return segments.some(segment => ["audit", "audit-log", "auditlog"].includes(segment));
+}
+
+function normalizeWords(value) {
+  if (typeof value !== "string") return [];
+  const words = [];
+  let word = "";
+  for (const character of value.normalize("NFKC").toLowerCase()) {
+    if (character.trim() === "") {
+      if (word) words.push(word);
+      word = "";
+    } else {
+      word += character;
+    }
+  }
+  if (word) words.push(word);
+  return words;
+}
+
+function containsPhrase(words, phrase) {
+  const needle = normalizeWords(phrase);
+  if (!needle.length || needle.length > words.length) return false;
+  for (let start = 0; start <= words.length - needle.length; start++) {
+    if (needle.every((word, offset) => words[start + offset] === word)) return true;
+  }
+  return false;
+}
+
+function isDashboardPath(segments) {
+  return segments[0] === "dashboard";
+}
+
+function isAdminPath(segments) {
+  return segments[0] === "dashboard" && segments[1] === "admin";
 }
 
 export function isOperatorProhibitedControl(candidate, actionType = "click") {
   const label = [candidate?.name, candidate?.label, candidate?.ariaLabel, candidate?.text]
     .filter(value => typeof value === "string")
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-  if ([...NEVER_ALLOWED_CONTROL_LABELS].some(prohibited => label.includes(prohibited))) return true;
+    .flatMap(normalizeWords);
+  if ([...NEVER_ALLOWED_CONTROL_LABELS].some(prohibited => containsPhrase(label, prohibited))) return true;
 
   let url;
   try { url = new URL(candidate?.documentUrl); }
   catch { return false; }
-  const isStagingDashboard = url.origin === "https://staging.freeinference.org"
-    && /^\/dashboard(?:\/|$)/.test(url.pathname);
-  const isStagingAdmin = url.origin === "https://staging.freeinference.org"
-    && /^\/dashboard\/admin(?:\/|$)/.test(url.pathname);
-  const context = String(candidate?.contextName ?? "").replace(/\s+/g, " ").trim().toLowerCase();
-  const pathSegments = url.pathname.split("/").map(part => part.toLowerCase());
+  const pathSegments = url.pathname.toLowerCase().split("/").filter(Boolean);
+  const isStagingDashboard = url.origin === "https://staging.freeinference.org" && isDashboardPath(pathSegments);
+  const isStagingAdmin = url.origin === "https://staging.freeinference.org" && isAdminPath(pathSegments);
+  const context = normalizeWords(candidate?.contextName);
   if (isStagingAdmin && actionType === "click") {
     try {
       const destination = new URL(candidate?.href, url.origin);
@@ -65,13 +93,13 @@ export function isOperatorProhibitedControl(candidate, actionType = "click") {
     return ["click", "type", "fill", "select", "upload"].includes(actionType);
   }
   const isAuditLogSurface = isStagingAdmin && (
-    label.includes("audit log")
+    containsPhrase(label, "audit log")
     || (context.includes("audit") && context.includes("log"))
     || isOperatorProhibitedNavigation(url.href)
   );
   if (isAuditLogSurface) return true;
   const isProvidersArea = context.includes("providers") || pathSegments.includes("providers");
-  return isStagingAdmin && isProvidersArea && NEVER_ALLOWED_PROVIDER_LABELS.has(label);
+  return isStagingAdmin && isProvidersArea && NEVER_ALLOWED_PROVIDER_LABELS.has(label.join(" "));
 }
 
 export function operatorProhibitedControlReason() {

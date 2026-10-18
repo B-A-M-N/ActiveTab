@@ -13,6 +13,7 @@
  */
 
 import { createDiagnosticContract, AUTHORITY, OPERATION, SENSITIVITY } from "../contracts.js";
+import { randomUUID } from "node:crypto";
 
 export const EFFECT_CLASSIFICATION = Object.freeze({
   READ_ONLY: "read_only",
@@ -40,6 +41,9 @@ export class ApplicationOperationExecutor {
     if (typeof path !== "string" && typeof handler !== "function") throw new Error(`Operation '${operationId}' requires a path or handler.`);
     if (typeof handler !== "function") throw new Error(`Operation '${operationId}' requires a handler function.`);
     if (!Object.values(EFFECT_CLASSIFICATION).includes(effect)) throw new Error(`Operation '${operationId}': unknown effect '${effect}'.`);
+    if (requiresGrant === false && effect !== EFFECT_CLASSIFICATION.READ_ONLY) {
+      throw new Error(`Operation '${operationId}': mutating and destructive operations cannot disable grant requirements.`);
+    }
     if (this.operations.has(operationId)) throw new Error(`Operation '${operationId}' is already registered.`);
     const effectiveContract = contract ?? createDiagnosticContract({
       id: sourceId,
@@ -55,7 +59,7 @@ export class ApplicationOperationExecutor {
       // when a grant store is bound or the operation opts in explicitly.
       // Fail closed: mutating and destructive operations always require a
       // grant, regardless of whether a grant store is currently bound.
-      requiresGrant: requiresGrant ?? (effect !== EFFECT_CLASSIFICATION.READ_ONLY)
+      requiresGrant: effect !== EFFECT_CLASSIFICATION.READ_ONLY || requiresGrant === true
     });
     return this;
   }
@@ -76,6 +80,9 @@ export class ApplicationOperationExecutor {
   hasOperation(operationId) { return this.operations.has(operationId); }
 
   #authorize(operation, options) {
+    if (options.effect !== undefined && options.effect !== operation.effect) {
+      return { ok: false, reason: `Operation '${operation.operationId}' is registered as '${operation.effect}'; callers cannot substitute an effect.` };
+    }
     if (!operation.requiresGrant) return { ok: true };
     if (options.explicitDestructiveApproval !== undefined) {
       throw new Error(
@@ -97,7 +104,7 @@ export class ApplicationOperationExecutor {
       resource: options.resource ?? operation.sourceId,
       operation: operation.operationId,
       input: options.input ?? {},
-      effect: options.effect ?? operation.effect
+      effect: operation.effect
     });
     if (!consumed.ok) return { ok: false, reason: `Grant rejected: ${consumed.reason}` };
     return { ok: true, grant: consumed.grant };
@@ -106,6 +113,18 @@ export class ApplicationOperationExecutor {
   async execute(operationId, options = {}) {
     const operation = this.operations.get(operationId);
     if (!operation) throw new Error(`Application operation '${operationId}' is not registered.`);
+    if (options.signal?.aborted) {
+      return {
+        status: "canceled",
+        operationId,
+        sourceId: operation.sourceId,
+        effect: operation.effect,
+        effectStatus: "not_dispatched",
+        verificationStatus: "not_verified",
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString()
+      };
+    }
     const authorization = this.#authorize(operation, options);
     if (!authorization.ok) {
       return {
@@ -119,31 +138,93 @@ export class ApplicationOperationExecutor {
       };
     }
     const startedAt = new Date().toISOString();
+    const executionId = randomUUID();
+    const controller = new AbortController();
+    let timeout;
+    let callerCanceled = false;
+    let timedOut = false;
+    const callerSignal = options.signal;
+    let resolveAbortResult = null;
+    const abortResult = callerSignal ? new Promise(resolveAbort => { resolveAbortResult = resolveAbort; }) : new Promise(() => {});
+    const onCallerAbort = () => {
+      callerCanceled = true;
+      controller.abort();
+      resolveAbortResult?.({ kind: "uncertain" });
+    };
+    callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+    const handlerResult = Promise.resolve().then(() => {
+      if (controller.signal.aborted) return { kind: "not_dispatched" };
+      return operation.handler({ ...options, executionId, signal: controller.signal });
+    }).then(value => value?.kind === "not_dispatched" ? value : ({ kind: "result", value }), error => ({ kind: "error", error }));
+    const timeoutResult = new Promise(resolveTimeout => {
+      timeout = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+        resolveTimeout({ kind: "uncertain" });
+      }, this.timeoutMs);
+    });
     try {
-      const result = await Promise.race([
-        operation.handler(options),
-        new Promise((_, reject) => setTimeout(() => reject(new Error(`Operation '${operationId}' timed out after ${this.timeoutMs}ms.`)), this.timeoutMs))
-      ]);
+      const outcome = await Promise.race([handlerResult, timeoutResult, abortResult]);
+      if (outcome.kind === "not_dispatched") {
+        return {
+          status: "canceled",
+          operationId,
+          executionId,
+          sourceId: operation.sourceId,
+          effect: operation.effect,
+          effectStatus: "not_dispatched",
+          verificationStatus: "not_verified",
+          startedAt,
+          finishedAt: new Date().toISOString()
+        };
+      }
+      if (outcome.kind === "uncertain") {
+        return {
+          status: "uncertain",
+          operationId,
+          executionId,
+          sourceId: operation.sourceId,
+          effect: operation.effect,
+          effectStatus: "uncertain",
+          verificationStatus: "not_verified",
+          startedAt,
+          finishedAt: new Date().toISOString(),
+          reason: timedOut ? `Operation '${operationId}' timed out after ${this.timeoutMs}ms; handler cancellation was requested and the effect must be reconciled before retry.`
+            : `Operation '${operationId}' was canceled after dispatch began; the effect must be reconciled before retry.`
+        };
+      }
+      if (outcome.kind === "error") {
+        const uncertain = operation.effect !== EFFECT_CLASSIFICATION.READ_ONLY;
+        return {
+          status: uncertain ? "uncertain" : "error",
+          operationId,
+          executionId,
+          sourceId: operation.sourceId,
+          effect: operation.effect,
+          effectStatus: uncertain ? "uncertain" : "failed",
+          verificationStatus: "not_verified",
+          startedAt,
+          finishedAt: new Date().toISOString(),
+          error: String(outcome.error?.message ?? outcome.error).slice(0, 500),
+          ...(uncertain ? { reason: "A mutating handler failed after invocation; reconcile target state before retry." } : {})
+        };
+      }
       return {
         status: "ok",
         operationId,
+        executionId,
         sourceId: operation.sourceId,
         effect: operation.effect,
+        effectStatus: "completed",
+        verificationStatus: "not_verified",
         startedAt,
         finishedAt: new Date().toISOString(),
         ...(authorization.grant ? { grantId: authorization.grant.grantId } : {}),
-        result
+        result: outcome.value
       };
-    } catch (error) {
-      return {
-        status: "error",
-        operationId,
-        sourceId: operation.sourceId,
-        effect: operation.effect,
-        startedAt,
-        finishedAt: new Date().toISOString(),
-        error: String(error.message ?? error).slice(0, 500)
-      };
+    } finally {
+      clearTimeout(timeout);
+      callerSignal?.removeEventListener("abort", onCallerAbort);
     }
   }
 }

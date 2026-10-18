@@ -71,3 +71,20 @@ export function createMutationAuthorizer(token, { allowUnauthenticated = false }
     return ok;
   };
 }
+
+/**
+ * Authenticate the independently configured local operator channel.
+ * The returned identity is server-owned; request JSON never supplies it.
+ */
+export function createOperatorAuthenticator(token, operatorId) {
+  return req => {
+    if (typeof token !== "string" || !token || typeof operatorId !== "string" || !operatorId) return null;
+    const presented = req.headers["x-activetab-operator-token"];
+    const ok = typeof presented === "string" &&
+      Buffer.byteLength(presented) === Buffer.byteLength(token) &&
+      timingSafeEqual(Buffer.from(presented), Buffer.from(token));
+    const origin = parseOrigin(req.headers.origin);
+    if (!ok || (origin && !isAllowedBrowserOrigin(origin))) return null;
+    return operatorId;
+  };
+}

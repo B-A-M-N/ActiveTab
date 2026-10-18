@@ -31,6 +31,15 @@ export function canonicalInputHash(input) {
   return createHash("sha256").update(JSON.stringify(normalize(input ?? {}))).digest("hex") ?? stable;
 }
 
+function isLowercaseDigest(value) {
+  if (typeof value !== "string" || value.length !== 64) return false;
+  for (const character of value) {
+    const code = character.charCodeAt(0);
+    if (!((code >= 48 && code <= 57) || (code >= 97 && code <= 102))) return false;
+  }
+  return true;
+}
+
 export class AuthorizationGrantStore {
   constructor({ now = () => Date.now(), trustedIssuer = null } = {}) {
     this.grants = new Map();
@@ -48,7 +57,7 @@ export class AuthorizationGrantStore {
    */
   issue({
     principal, environmentId, authenticationRealm, resource, operation,
-    input, allowedEffects, expiresInMs = 15 * 60 * 1000, singleUse = true, issuedBy = "human_operator"
+    input, inputHash = null, allowedEffects, expiresInMs = 15 * 60 * 1000, singleUse = true, issuedBy = "human_operator"
   }) {
     for (const [name, value] of Object.entries({ principal, environmentId, resource, operation })) {
       if (typeof value !== "string" || !value) throw new Error(`Grant requires '${name}'.`);
@@ -56,6 +65,7 @@ export class AuthorizationGrantStore {
     if (!Array.isArray(allowedEffects) || allowedEffects.length === 0) {
       throw new Error("Grant requires explicit allowedEffects.");
     }
+    if (inputHash !== null && !isLowercaseDigest(inputHash)) throw new Error("Grant inputHash must be a lowercase SHA-256 digest.");
     const now = this.now();
     const grant = {
       grantId: randomUUID(),
@@ -64,7 +74,7 @@ export class AuthorizationGrantStore {
       authenticationRealm: authenticationRealm ?? null,
       resource: String(resource),
       operation: String(operation),
-      inputHash: canonicalInputHash(input ?? {}),
+      inputHash: inputHash ?? canonicalInputHash(input ?? {}),
       allowedEffects: allowedEffects.map(String),
       state: GRANT_STATE.ACTIVE,
       singleUse,
@@ -80,7 +90,7 @@ export class AuthorizationGrantStore {
   get(grantId) { return this.grants.get(grantId) ?? null; }
 
   /** Read-only check; does not consume. */
-  verify(grantId, { principal, environmentId, authenticationRealm = undefined, resource, operation, input, effect = null } = {}) {
+  verify(grantId, { principal, environmentId, authenticationRealm = undefined, resource, operation, input, inputHash = undefined, effect = null } = {}) {
     const grant = this.grants.get(grantId);
     if (!grant) return { ok: false, reason: "No such grant." };
     if (grant.state === GRANT_STATE.CONSUMED) return { ok: false, reason: "Grant was already consumed." };
@@ -103,10 +113,13 @@ export class AuthorizationGrantStore {
     if (grant.authenticationRealm !== null && authenticationRealm !== grant.authenticationRealm) mismatch.push("realm");
     if (resource !== grant.resource) mismatch.push("resource");
     if (operation !== grant.operation) mismatch.push("operation");
-    if (input === undefined || input === null) {
-      return { ok: false, reason: "Grant verification requires 'input'." };
+    if (inputHash !== undefined) {
+      if (!isLowercaseDigest(inputHash)) return { ok: false, reason: "Grant verification requires a valid 'inputHash'." };
+      if (inputHash !== grant.inputHash) mismatch.push("input");
+    } else {
+      if (input === undefined || input === null) return { ok: false, reason: "Grant verification requires 'input' or 'inputHash'." };
+      if (canonicalInputHash(input) !== grant.inputHash) mismatch.push("input");
     }
-    if (canonicalInputHash(input) !== grant.inputHash) mismatch.push("input");
     if (mismatch.length > 0) return { ok: false, reason: `Grant scope mismatch: ${mismatch.join(", ")}.` };
     if (effect === null || effect === undefined) {
       return { ok: false, reason: "Grant verification requires the exact 'effect'." };

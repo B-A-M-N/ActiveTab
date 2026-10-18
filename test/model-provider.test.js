@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { OpenAICompatibleProvider, ModelRequestError } from "../src/navigation/modelProvider.js";
 
 function jsonResponse(payload, { ok = true, status = 200 } = {}) {
-  return { ok, status, json: async () => payload };
+  return new Response(JSON.stringify(payload), { status: ok ? status : status || 500, headers: { "content-type": "application/json" } });
 }
 
 test("provider returns the parsed decision and records usage when provided", async () => {
@@ -23,6 +23,8 @@ test("provider returns the parsed decision and records usage when provided", asy
   assert.equal(seen.url, "https://model.example.test/v1/chat/completions", "trailing slashes are normalized");
   assert.equal(seen.body.model, "test-model");
   assert.equal(seen.headers.authorization, "Bearer provider-secret");
+  assert.equal(Object.hasOwn(provider, "apiKey"), false, "provider credentials are held in a private class field");
+  assert.equal(JSON.stringify(provider).includes("provider-secret"), false);
 });
 
 test("malformed JSON is a schema error, never a decision", async () => {
@@ -66,6 +68,41 @@ test("caller cancellation aborts the in-flight request", async () => {
   await assert.rejects(pending, error => error.name === "AbortError");
 });
 
+test("caller cancellation while reading a response body remains an abort, not a schema failure", async () => {
+  const provider = new OpenAICompatibleProvider({
+    endpoint: "https://model.example.test/v1",
+    model: "test-model",
+    fetchImpl: async (_url, { signal }) => new Response(new ReadableStream({
+      start(controller) {
+        signal.addEventListener("abort", () => controller.error(new Error("aborted")), { once: true });
+      }
+    }))
+  });
+  const controller = new AbortController();
+  const pending = provider.decide([{ role: "user", content: "x" }], { signal: controller.signal });
+  controller.abort();
+  await assert.rejects(pending, error => error.name === "AbortError");
+});
+
+test("the total request deadline covers response-body reading", async () => {
+  let attempts = 0;
+  const provider = new OpenAICompatibleProvider({
+    endpoint: "https://model.example.test/v1",
+    model: "test-model",
+    timeoutMs: 1000,
+    fetchImpl: async (_url, { signal }) => {
+      attempts++;
+      return new Response(new ReadableStream({
+        start(controller) {
+          signal.addEventListener("abort", () => controller.error(new Error("aborted")), { once: true });
+        }
+      }));
+    }
+  });
+  await assert.rejects(provider.decide([{ role: "user", content: "x" }]), error => error.kind === "timeout");
+  assert.equal(attempts, 1, "an expired total deadline does not start another attempt");
+});
+
 test("transport failures retry with backoff; HTTP 4xx never retries", async () => {
   let attempts = 0;
   const flaky = new OpenAICompatibleProvider({
@@ -89,6 +126,63 @@ test("transport failures retry with backoff; HTTP 4xx never retries", async () =
   });
   await assert.rejects(unauthorized.decide([{ role: "user", content: "x" }]), /HTTP 401/);
   assert.equal(hardAttempts, 1, "4xx responses are not retried");
+});
+
+test("structured requests use declared provider format, token bounds, schema validation, and usage", async () => {
+  let request;
+  const provider = new OpenAICompatibleProvider({
+    endpoint: "https://model.example.test/v1",
+    model: "GLM5.3-flash",
+    structuredOutput: "json_schema",
+    maxTokens: 512,
+    fetchImpl: async (url, options) => {
+      request = { url, body: JSON.parse(options.body) };
+      return jsonResponse({
+        choices: [{ message: { content: JSON.stringify({ observationId: "obs-1", annotations: [] }) } }],
+        usage: { prompt_tokens: 20, completion_tokens: 4, total_tokens: 24, prompt_tokens_details: { cached_tokens: 8 } }
+      });
+    }
+  });
+  const schema = {
+    type: "object", required: ["observationId", "annotations"], additionalProperties: false,
+    properties: { observationId: { type: "string" }, annotations: { type: "array", items: { type: "object" } } }
+  };
+  const result = await provider.requestStructured({ task: "map_controls", instructions: "Annotate only.", input: { observationId: "obs-1" }, schema });
+  assert.equal(result.result.observationId, "obs-1");
+  assert.equal(result.model, "GLM5.3-flash");
+  assert.deepEqual(result.usage, { prompt_tokens: 20, completion_tokens: 4, total_tokens: 24, cached_tokens: 8 });
+  assert.equal(request.body.max_tokens, 512);
+  assert.equal(request.body.response_format.type, "json_schema");
+  assert.deepEqual(request.body.response_format.json_schema.schema, schema);
+});
+
+test("structured inference retries rate limits and rejects schema-invalid annotations", async () => {
+  let attempts = 0;
+  const provider = new OpenAICompatibleProvider({
+    endpoint: "https://model.example.test/v1",
+    model: "test-model",
+    fetchImpl: async () => {
+      attempts++;
+      if (attempts < 2) return jsonResponse({}, { ok: false, status: 429 });
+      return jsonResponse({ choices: [{ message: { content: JSON.stringify({ result: "invented" }) } }] });
+    }
+  });
+  await assert.rejects(provider.requestStructured({
+    task: "classify_page",
+    instructions: "Return a category.",
+    input: { pageType: "unknown" },
+    schema: { type: "object", required: ["result"], additionalProperties: false, properties: { result: { type: "string", enum: ["form", "list"] } } }
+  }), error => error.kind === "schema");
+  assert.equal(attempts, 2, "HTTP 429 is retried within the total request deadline.");
+});
+
+test("OpenAI-compatible response bodies are byte bounded", async () => {
+  const provider = new OpenAICompatibleProvider({
+    endpoint: "https://model.example.test/v1",
+    model: "test-model",
+    fetchImpl: async () => new Response(`${JSON.stringify({ choices: [] })}${" ".repeat(256 * 1024)}`)
+  });
+  await assert.rejects(provider.decide([{ role: "user", content: "x" }]), error => error.kind === "response_too_large");
 });
 
 test("provider constructor validates endpoint, model, and timeout bounds", () => {

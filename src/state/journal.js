@@ -17,15 +17,17 @@ function validTargetSignature(value) {
 }
 
 function validPendingAction(value) {
+  const stableId = candidate => candidate === undefined || typeof candidate === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$/.test(candidate);
   if (value === undefined) return true;
   if (!value || typeof value !== "object" || Array.isArray(value) ||
-      Object.keys(value).some(key => !["action", "targetIdentity", "targetSignature", "scrollTopBefore", "beforeStateFingerprint", "beforeRouteFingerprint", "beforeEvidenceId", "startedAt"].includes(key)) ||
-      !["click", "type", "scroll"].includes(value.action) ||
+      Object.keys(value).some(key => !["action", "targetIdentity", "targetSignature", "scrollTopBefore", "beforeStateFingerprint", "beforeRouteFingerprint", "beforeEvidenceId", "startedAt", "decisionId", "decisionStepId", "operationId"].includes(key)) ||
+      !["click", "type", "fill", "select", "toggle", "upload", "scroll"].includes(value.action) ||
       typeof value.targetIdentity !== "string" || value.targetIdentity.length < 1 || value.targetIdentity.length > 256 ||
       !HASH_PATTERN.test(value.beforeStateFingerprint ?? "") ||
       typeof value.beforeRouteFingerprint !== "string" || value.beforeRouteFingerprint.length > 64 ||
       typeof value.beforeEvidenceId !== "string" || value.beforeEvidenceId.length > 256 ||
-      typeof value.startedAt !== "string" || !Number.isFinite(Date.parse(value.startedAt))) return false;
+      typeof value.startedAt !== "string" || !Number.isFinite(Date.parse(value.startedAt)) ||
+      !stableId(value.decisionId) || !stableId(value.decisionStepId) || !stableId(value.operationId)) return false;
   if (value.targetSignature !== undefined && value.targetSignature !== null && !validTargetSignature(value.targetSignature)) return false;
   return value.action !== "scroll" || Number.isFinite(value.scrollTopBefore);
 }
@@ -62,7 +64,7 @@ export class TaskJournal {
       contents = await file.readFile("utf8");
     } finally { await file.close(); }
     const value = JSON.parse(contents);
-    if (value?.schemaVersion !== 1 || typeof value.goal !== "string" || typeof value.targetId !== "string" || !Array.isArray(value.attempts) || value.attempts.length > 10 || !Number.isInteger(value.recoveryCount ?? 0) || (value.recoveryCount ?? 0) < 0 || (value.recoveryCount ?? 0) > 3 || (value.goalFingerprint !== undefined && !HASH_PATTERN.test(value.goalFingerprint)) || !validPendingAction(value.pendingAction)) throw new Error("Task journal is invalid or unsupported.");
+    if (value?.schemaVersion !== 1 || typeof value.goal !== "string" || typeof value.targetId !== "string" || !Array.isArray(value.attempts) || value.attempts.length > 10 || !Number.isInteger(value.recoveryCount ?? 0) || (value.recoveryCount ?? 0) < 0 || (value.recoveryCount ?? 0) > 3 || (value.goalFingerprint !== undefined && !HASH_PATTERN.test(value.goalFingerprint)) || (value.environmentFingerprint !== undefined && value.environmentFingerprint !== null && !HASH_PATTERN.test(value.environmentFingerprint)) || !validPendingAction(value.pendingAction)) throw new Error("Task journal is invalid or unsupported.");
     return value;
   }
 

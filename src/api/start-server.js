@@ -32,6 +32,7 @@ import { createApiServer } from "./local-server.js";
 import { createNavigationRunner, resolveConfiguredSession } from "./navigation-runner.js";
 import { createRemoteExecutor } from "../runtime/remote-executor.js";
 import { join } from "node:path";
+import { createDecisionRuntime } from "../decisions/runtime.js";
 
 const port = parseInt(process.env.ACTIVETAB_API_PORT ?? "9377", 10);
 const taskStoreDir = process.env.ACTIVETAB_TASK_DIR;
@@ -48,6 +49,7 @@ const outputFormats = process.env.ACTIVETAB_OUTPUT_FORMATS
 // - Otherwise → this node executes locally and requires an explicit,
 //   authorized session mode (fail closed when none is configured).
 let navigationRunner;
+const decisionRuntime = createDecisionRuntime();
 if (process.env.ACTIVETAB_REMOTE_PEER_URL) {
   navigationRunner = createRemoteExecutor({
     peerUrl: process.env.ACTIVETAB_REMOTE_PEER_URL,
@@ -66,6 +68,7 @@ if (process.env.ACTIVETAB_REMOTE_PEER_URL) {
     }).then(session => session, error => {
       throw new Error(`Navigation execution is unavailable: ${String(error.message ?? error)}`);
     }),
+    engineOptions: { decisionRuntime },
     ...(outputFormats ? { outputFormats } : {})
   });
 } catch (error) {
@@ -79,7 +82,7 @@ if (!navigationRunner) {
 
 process.env.ACTIVETAB_REPORT_DIR ??= join(process.env.ACTIVETAB_TASK_DIR ?? join(process.cwd(), ".activetab"), "reports");
 const api = createApiServer({
-  port, taskStoreDir, navigationRunner,
+  port, taskStoreDir, navigationRunner, decisionRuntime,
   executorName: process.env.ACTIVETAB_REMOTE_PEER_URL ? "remote-peer" : "local",
   reportDir: process.env.ACTIVETAB_REPORT_DIR
 });

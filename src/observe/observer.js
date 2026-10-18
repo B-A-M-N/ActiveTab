@@ -294,6 +294,13 @@ function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, { 
     const nodeValues = nodes.nodeValue ?? [];
     const textValues = nodes.textValue ?? [];
     const parents = nodes.parentIndex ?? [];
+    const attributesByNode = nodeNames.map((_, index) => unpackAttributes(nodes.attributes?.[index], snapshot.strings));
+    const formIndexesById = new Map();
+    for (let index = 0; index < nodeNames.length; index++) {
+      if (stringAt(snapshot.strings, nodeNames[index]).toUpperCase() !== "FORM") continue;
+      const formId = attributesByNode[index].id;
+      if (formId) formIndexesById.set(formId, index);
+    }
     for (let index = nodeNames.length - 1; index >= 0; index--) {
       const value = stringAt(snapshot.strings, textValues[index] ?? nodeValues[index]);
       if (value) text[index] = value.slice(0, 2_000);
@@ -334,9 +341,9 @@ function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, { 
     };
     for (let index = 0; index < nodeNames.length; index++) {
       const tag = stringAt(snapshot.strings, nodeNames[index]).toUpperCase();
-      const attrs = unpackAttributes(nodes.attributes?.[index], snapshot.strings);
+      const attrs = attributesByNode[index];
       const role = attrs.role?.toLowerCase();
-      const isActionable = ACTIONABLE_TAGS.has(tag) || ["button", "link", "menuitem", "option", "checkbox", "radio", "tab"].includes(role) || "tabindex" in attrs || attrs["contenteditable"] === "true";
+      const isActionable = ACTIONABLE_TAGS.has(tag) || ["button", "link", "menuitem", "option", "checkbox", "radio", "tab", "textbox", "combobox"].includes(role) || "tabindex" in attrs || attrs["contenteditable"] === "true";
       const backendNodeId = nodes.backendNodeId?.[index];
       if (!controlSupported || !Number.isInteger(backendNodeId)) continue;
       const accessible = axFacts.get(backendNodeId);
@@ -345,11 +352,19 @@ function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, { 
       const visible = rect ? rect.width > 0 && rect.height > 0 : null;
       const explicitType = String(attrs.type ?? "").toLowerCase();
       const submitsByDefault = tag === "BUTTON" && (!explicitType || explicitType === "submit") || tag === "INPUT" && ["submit", "image"].includes(explicitType);
+      let formIndex = attrs.form ? formIndexesById.get(String(attrs.form)) : undefined;
       let ancestor = parents[index];
-      let associatedWithForm = Boolean(attrs.form);
-      while (!associatedWithForm && Number.isInteger(ancestor) && ancestor >= 0) {
-        associatedWithForm = stringAt(snapshot.strings, nodeNames[ancestor]).toUpperCase() === "FORM";
+      while (!Number.isInteger(formIndex) && Number.isInteger(ancestor) && ancestor >= 0) {
+        if (stringAt(snapshot.strings, nodeNames[ancestor]).toUpperCase() === "FORM") formIndex = ancestor;
         ancestor = parents[ancestor];
+      }
+      const associatedWithForm = Number.isInteger(formIndex);
+      const formAttributes = Number.isInteger(formIndex) ? attributesByNode[formIndex] : null;
+      const formBackendNodeId = Number.isInteger(formIndex) ? nodes.backendNodeId?.[formIndex] : null;
+      let formActionOrigin = null;
+      if (formAttributes) {
+        try { formActionOrigin = new URL(formAttributes.action || documentUrl, documentUrl).origin; }
+        catch { formActionOrigin = null; }
       }
       if (/^H[1-6]$/.test(tag) && text[index]) headings.push({ level: Number(tag[1]), text: text[index].trim().slice(0, 300), frameId });
       if (!isActionable) continue;
@@ -364,11 +379,17 @@ function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, { 
         documentGeneration: generation,
         tag: tag.toLowerCase(),
         role: accessible?.role || role || tag.toLowerCase(),
+        contentEditable: ["true", "", "plaintext-only"].includes(attrs.contenteditable),
         name: String(label).trim().slice(0, 300),
         contextName: contextNameFor(index),
         href: attrs.href ? sanitizeUrl(attrs.href, { base: stringAt(snapshot.strings, document.documentURL) }) : null,
         type: attrs.type ?? null,
         submitsForm: submitsByDefault && associatedWithForm,
+        ...(formAttributes && Number.isInteger(formBackendNodeId) ? {
+          formIdentity: `${targetId}:${frameTargetId ?? "root"}:${frameId}:${formBackendNodeId}:${generation}`,
+          formMethod: String(formAttributes.method ?? "get").toLowerCase(),
+          formActionOrigin
+        } : {}),
         disabled: attrs.disabled !== undefined || attrs["aria-disabled"] === "true",
         visible,
         bounds: rect ?? null,
@@ -731,6 +752,7 @@ export class BrowserObserver {
     }
     const compact = {
       evidenceId: id,
+      targetId: this.session.target.id,
       capturedAt: evidence.capturedAt,
       documentGeneration: evidence.documentGeneration,
       page: { ...pageState, url: sanitizeUrl(pageState.url ?? "") },

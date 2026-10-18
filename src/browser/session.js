@@ -17,6 +17,38 @@ function assertControlAllowed(candidate, actionType) {
   if (isOperatorProhibitedControl(candidate, actionType)) throw new Error(operatorProhibitedControlReason());
 }
 
+async function replaceFocusedText(client, value) {
+  const modifier = process.platform === "darwin"
+    ? { key: "Meta", code: "MetaLeft", keyCode: 91, flag: 4 }
+    : { key: "Control", code: "ControlLeft", keyCode: 17, flag: 2 };
+  await client.send("Input.dispatchKeyEvent", {
+    type: "keyDown", key: modifier.key, code: modifier.code,
+    windowsVirtualKeyCode: modifier.keyCode, nativeVirtualKeyCode: modifier.keyCode
+  });
+  try {
+    await client.send("Input.dispatchKeyEvent", {
+      type: "keyDown", key: "a", code: "KeyA", modifiers: modifier.flag,
+      windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65
+    });
+    await client.send("Input.dispatchKeyEvent", {
+      type: "keyUp", key: "a", code: "KeyA", modifiers: modifier.flag,
+      windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65
+    });
+  } finally {
+    await client.send("Input.dispatchKeyEvent", {
+      type: "keyUp", key: modifier.key, code: modifier.code,
+      windowsVirtualKeyCode: modifier.keyCode, nativeVirtualKeyCode: modifier.keyCode
+    }).catch(() => {});
+  }
+  await client.send("Input.dispatchKeyEvent", {
+    type: "keyDown", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8
+  });
+  await client.send("Input.dispatchKeyEvent", {
+    type: "keyUp", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8
+  });
+  if (value) await client.send("Input.insertText", { text: value });
+}
+
 const IFRAME_TARGET_FILTER = [{ type: "iframe", exclude: false }];
 const MAX_OUT_OF_PROCESS_SESSIONS = 16;
 const ROOT_NETWORK_TOTAL_BUFFER_BYTES = 8 * 1024 * 1024;
@@ -530,7 +562,11 @@ export class BrowserSession {
     if (candidate.frameTargetId) throw new Error("Field text entry is limited to the main frame.");
     if (candidate.documentGeneration !== this.documentGeneration) throw new Error("Candidate belongs to a stale document generation; observe again before acting.");
     const tag = String(candidate.tag ?? "").toLowerCase();
-    if (!["input", "textarea"].includes(tag)) throw new Error("fillField is limited to input and textarea elements.");
+    const contentEditable = candidate.contentEditable === true;
+    const ariaTextbox = ["textbox", "searchbox"].includes(String(candidate.role ?? "").toLowerCase());
+    if (!["input", "textarea"].includes(tag) && !(contentEditable && ariaTextbox)) {
+      throw new Error("fillField requires an observed native text field or contenteditable ARIA textbox.");
+    }
     const { node } = await this.client.send("DOM.describeNode", { backendNodeId: candidate.backendNodeId, depth: 0, pierce: true });
     if (!node?.backendNodeId) throw new Error("The selected form field no longer exists.");
     await this.client.send("DOM.scrollIntoViewIfNeeded", { backendNodeId: candidate.backendNodeId });
@@ -538,20 +574,24 @@ export class BrowserSession {
     if (!resolved.object?.objectId) throw new Error("The selected form field could not be revalidated.");
     const validation = await this.client.send("Runtime.callFunctionOn", {
       objectId: resolved.object.objectId,
-      functionDeclaration: "function(expectedLabel){const r=this.getBoundingClientRect(),s=getComputedStyle(this);let top=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2);const label=(this.getAttribute('aria-label')||this.title||Array.from(this.labels??[]).map(l=>l.innerText||l.textContent||'').join(' ')||this.getAttribute('name')||'').replace(/\s+/g,' ').trim();return {connected:this.isConnected,visible:r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)>0&&s.pointerEvents!=='none',tag:this.tagName.toLowerCase(),type:String(this.type||'').toLowerCase(),disabled:this.disabled===true,readOnly:this.readOnly===true,label,occluded:!!top&&top!==this&&!this.contains(top),labelMatches:!expectedLabel||!label||label.toLocaleLowerCase()===expectedLabel.toLocaleLowerCase()}}",
+      functionDeclaration: "function(expectedLabel){const r=this.getBoundingClientRect(),s=getComputedStyle(this);let top=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2);const label=(this.getAttribute('aria-label')||this.title||Array.from(this.labels??[]).map(l=>l.innerText||l.textContent||'').join(' ')||this.getAttribute('name')||'').replace(/\s+/g,' ').trim();return {connected:this.isConnected,visible:r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)>0&&s.pointerEvents!=='none',tag:this.tagName.toLowerCase(),type:String(this.type||'').toLowerCase(),editable:this.isContentEditable===true,role:this.getAttribute('role')||'',disabled:this.disabled===true,readOnly:this.readOnly===true,label,occluded:!!top&&top!==this&&!this.contains(top),labelMatches:!expectedLabel||!label||label.toLocaleLowerCase()===expectedLabel.toLocaleLowerCase()}}",
       arguments: [{ value: candidate.name ?? "" }],
       returnByValue: true,
       awaitPromise: false
     });
     const current = validation.result?.value;
-    if (!current?.connected || current.disabled || current.readOnly) throw new Error("The selected form field is no longer editable.");
+    if (!current?.connected || current.disabled || current.readOnly
+      || (!["input", "textarea"].includes(current.tag) && !(current.editable && ["textbox", "searchbox"].includes(current.role)))) {
+      throw new Error("The selected form field is no longer editable.");
+    }
     if (!current.visible) throw new Error("The selected form field is no longer visible.");
-    if (!current.labelMatches) throw new Error("The selected form field label changed; observe and plan again.");
+    if (!current.labelMatches && !current.editable) throw new Error("The selected form field label changed; observe and plan again.");
+    if (current.editable && current.role !== String(candidate.role ?? "")) throw new Error("The selected contenteditable role changed; observe and plan again.");
     if (current.occluded) throw new Error("The selected form field is occluded.");
     const sensitiveTypes = new Set(["password", "file", "hidden", "submit", "button", "image", "reset"]);
     if (sensitiveTypes.has(current.type)) throw new Error(`fillField does not support input type '${current.type}'.`);
     await this.client.send("DOM.focus", { backendNodeId: candidate.backendNodeId });
-    await this.client.send("Input.insertText", { text: value });
+    await replaceFocusedText(this.client, value);
     return { dispatched: true, backendNodeId: candidate.backendNodeId, valueLength: value.length };
   }
 
@@ -562,7 +602,23 @@ export class BrowserSession {
     if (candidate.targetId !== this.target.id) throw new Error("Candidate belongs to a different browser target.");
     if (candidate.frameTargetId) throw new Error("Select is limited to the main frame.");
     if (candidate.documentGeneration !== this.documentGeneration) throw new Error("Candidate belongs to a stale document generation; observe again before acting.");
-    if (String(candidate.tag ?? "").toLowerCase() !== "select") throw new Error("selectOption is limited to select elements.");
+    if (String(candidate.tag ?? "").toLowerCase() !== "select") {
+      if (String(candidate.role ?? "").toLowerCase() !== "combobox") {
+        throw new Error("selectOption requires a native select or an observed ARIA combobox.");
+      }
+      await this.click(candidate);
+      const opened = await this.observe();
+      if (opened.targetId !== this.target.id) throw new Error("The opened combobox menu belongs to a different browser target.");
+      const options = (opened.candidates ?? []).filter(option => option.targetId === this.target.id
+        && option.documentGeneration === this.documentGeneration
+        && option.frameTargetId == null && option.visible === true && option.disabled !== true
+        && String(option.role ?? "").toLowerCase() === "option" && option.name === value);
+      if (options.length !== 1) {
+        return { dispatched: true, selected: false, selectionStatus: "unresolved", reason: "The open combobox did not expose exactly one visible option with the caller's exact value." };
+      }
+      const selected = await this.click(options[0]);
+      return { ...selected, selected: true, selectionStatus: "selected", selectedLabelMatches: true };
+    }
     const resolved = await this.client.send("DOM.resolveNode", { backendNodeId: candidate.backendNodeId });
     const objectId = resolved.object?.objectId;
     if (!objectId) throw new Error("The selected dropdown could not be resolved.");
@@ -587,6 +643,44 @@ export class BrowserSession {
       });
       return { dispatched: true, backendNodeId: candidate.backendNodeId, selectedValue: current.matchValue };
     } finally { await this.client.send("Runtime.releaseObject", { objectId }).catch(() => {}); }
+  }
+
+  /**
+   * Verify an exact caller-supplied value in a freshly revalidated native or
+   * supported ARIA control. The value never leaves the browser process.
+   */
+  async verifyControlValue(candidate, expectedValue) {
+    this.#assertTargetAttached();
+    if (typeof expectedValue !== "string") throw new Error("Control value verification requires an exact string value.");
+    if (candidate?.targetId !== this.target.id) throw new Error("Candidate belongs to a different browser target.");
+    if (candidate?.frameTargetId) throw new Error("Control value verification is limited to the main frame.");
+    if (candidate?.documentGeneration !== this.documentGeneration) throw new Error("Candidate belongs to a stale document generation; observe again before verifying.");
+    const tag = String(candidate?.tag ?? "").toLowerCase();
+    const role = String(candidate?.role ?? "").toLowerCase();
+    const editable = candidate?.contentEditable === true;
+    const customValueControl = (editable && ["textbox", "searchbox"].includes(role)) || role === "combobox";
+    if (!["input", "textarea", "select"].includes(tag) && !customValueControl) {
+      throw new Error("Value verification requires an observed native control or supported ARIA value control.");
+    }
+    const { node } = await this.client.send("DOM.describeNode", { backendNodeId: candidate.backendNodeId, depth: 0, pierce: true });
+    if (!node?.backendNodeId) throw new Error("The selected control no longer exists.");
+    const resolved = await this.client.send("DOM.resolveNode", { backendNodeId: candidate.backendNodeId });
+    const objectId = resolved.object?.objectId;
+    if (!objectId) throw new Error("The selected control could not be resolved for verification.");
+    try {
+      const result = await this.client.send("Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: "function(expected){if(!this.isConnected||this.disabled===true)return {valid:false,matches:false};if(this.tagName.toLowerCase()==='select'){const option=this.options[this.selectedIndex];return {valid:true,matches:!!option&&(this.value===arguments[0]||option.text.trim()===arguments[0])}}if(this.isContentEditable)return {valid:true,matches:this.innerText===arguments[0]||this.textContent===arguments[0]};if(this.getAttribute('role')==='combobox'){const current=this.getAttribute('aria-valuetext')||this.getAttribute('aria-valuenow')||this.innerText||this.textContent||'';return {valid:true,matches:current.trim()===arguments[0]}}return {valid:true,matches:this.value===arguments[0]}}",
+        arguments: [{ value: expectedValue }],
+        returnByValue: true,
+        awaitPromise: false
+      });
+      const value = result.result?.value;
+      if (!value?.valid) return { verified: false, matches: false, reason: "The selected control is no longer available." };
+      return { verified: true, matches: value.matches === true };
+    } finally {
+      await this.client.send("Runtime.releaseObject", { objectId }).catch(() => {});
+    }
   }
 
   async uploadFile(candidate, filePaths) {

@@ -15,10 +15,10 @@ The runtime supports three native CDP transports: an already-exposed loopback en
 npm test
 npm start -- targets --endpoint http://127.0.0.1:9222
 npm start -- observe --target TARGET_ID --endpoint http://127.0.0.1:9222
-npm start -- run --target TARGET_ID --goal "Open the account page" --journal .activetab/task.json --workflow-store ~/.local/share/activetab/workflows.json
-npm start -- run --target TARGET_ID --goal "Search for blue shoes" --journal .activetab/search.json
-npm start -- resume --journal .activetab/task.json --goal "Open the account page" --endpoint http://127.0.0.1:9222
-npm start -- resume --journal .activetab/search.json --goal "Search for blue shoes" --endpoint http://127.0.0.1:9222
+npm start -- run --target TARGET_ID --profile PROFILE_ID --goal "Open the account page" --journal .activetab/task.json --workflow-store ~/.local/share/activetab/workflows.json
+npm start -- run --target TARGET_ID --profile PROFILE_ID --goal "Search for blue shoes" --journal .activetab/search.json
+npm start -- resume --journal .activetab/task.json --profile PROFILE_ID --goal "Open the account page" --endpoint http://127.0.0.1:9222
+npm start -- resume --journal .activetab/search.json --profile PROFILE_ID --goal "Search for blue shoes" --endpoint http://127.0.0.1:9222
 npm start -- targets --auto-connect
 npm start -- observe --target TARGET_ID --auto-connect
 ```
@@ -43,11 +43,11 @@ ACTIVETAB_VISIBLE_CHROME=1 npm test -- --test-concurrency=1
 
 ## FreeInference Staging and Cloud Agent
 
-Cloud Agent is an application realm **within the FreeInference staging platform** (`https://staging.freeinference.org` → `/agents/`), not a localhost application. ActiveTab operates the real staging website in an authorized headed browser; backend diagnostics are a separate, optional path. The three paths are distinct:
+Cloud Agent is reached from an authenticated FreeInference staging page by following its visible Agents/Cloud Agents link. It is a separate application page and may have a different URL; ActiveTab observes that destination instead of guessing it. Browser control and backend diagnostics remain separate paths:
 
 | Path | Endpoint | Role |
 |------|----------|------|
-| Browser | `https://staging.freeinference.org` | The actual application under test |
+| Browser | Visible FreeInference staging → Agents/Cloud Agents link | The actual application under test; destination is observed at runtime |
 | Control | CDP / extension broker | Transport only — never the application |
 | Diagnostic | `ACTIVETAB_CLOUD_AGENT_URL` | Optional authorized backend records |
 
@@ -65,36 +65,29 @@ The test verifies environment/application identity from the observed URL, discov
 
 ### Backend diagnostics (optional diagnostic path)
 
-ActiveTab can collect privileged backend diagnostics from a Cloud Agent control plane (direct or via a verified SSH tunnel). Set both environment variables to enable it:
+The Cloud Agent backend adapter is separate from the browser session and accepts only profile-validated, exact-run diagnostic routes. Configure the service URL and credential only when those routes have been independently observed and added to the profile:
 
 ```sh
-ACTIVETAB_CLOUD_AGENT_URL=http://127.0.0.1:18000
+ACTIVETAB_CLOUD_AGENT_URL=https://<verified-diagnostic-service>
 ACTIVETAB_CLOUD_AGENT_ADMIN_TOKEN=<the Cloud Agent ADMIN_TOKEN>
-# A loopback URL additionally requires the tunnel transport and verified remote target:
-ACTIVETAB_CLOUD_AGENT_TRANSPORT=ssh_tunnel
-ACTIVETAB_CLOUD_AGENT_REMOTE_TARGET=<staging-host>:18000
 ```
 
-When configured, the MCP server and local API server automatically register the following diagnostic sources alongside browser CDP evidence:
+The checked-in staging profile currently has no diagnostic endpoint bindings, so setting these variables alone sends no request. A binding must name the exact observed GET route, its successful JSON response evidence, and an exact `{runId}` slot for run detail/activity. Loopback diagnostics also require a trusted in-process tunnel adapter to verify the remote service identity before sending the credential.
 
-| Source | Description |
-|--------|-------------|
-| `cloud-agent-runs` | Recent agent run execution records |
-| `cloud-agent-steps` | Per-step execution telemetry |
-| `cloud-agent-usage` | Aggregated model usage and cost attribution |
-| `cloud-agent-audit-log` | Administrative audit trail entries |
-| `cloud-agent-sandboxes` | Active sandbox instances and their health |
-| `cloud-agent-conversations` | Recent agent conversation records |
-| `cloud-agent-measurements` | Operational profiling measurements |
-| `cloud-agent-settings` | Current service configuration (non-secret fields only) |
+With validated bindings, the adapter can return an exact run record, bounded step metadata, and allowlisted numeric usage for a run ID first observed in the same Agents tab. It does not expose broad run lists, conversations, audit exports, settings, or sandbox inventories. A health response does not count as run correlation or proof of task success.
 
-If Cloud Agent runs on a different machine, use an SSH tunnel:
+## Decision and application adapters
 
-```sh
-ssh -f -N -L 18000:127.0.0.1:18000 -L 13002:127.0.0.1:13002 bamn@<cloud-agent-host>
-```
+ActiveTab composes the staging browser adapter, two distinct decision-model adapters, a FreeInference workflow adapter, and the optional exact-run diagnostic adapter:
 
-The adapter queries `ACTIVETAB_CLOUD_AGENT_URL` over HTTP with the admin token and extracts per-day usage records, redacted settings definitions, and run/step/sandbox/conversation records. It reports `available` or `empty` (never fake success) and includes stable evidence IDs (`admin:<source-id>`) for correlation.
+- **Browser/CDP adapter:** attaches only to the explicitly authorized tab and keeps that browser session through authentication handoff and resume.
+- **Semantic adapter:** uses the configured OpenAI-compatible endpoint for bounded control-role annotations when fresh structural evidence leaves a target ambiguous. Its default model is FreeInference Production `GLM5.3-flash`; endpoint, provider ID, and model can be configured. It can identify the model selector but never chooses the requested task model.
+- **Jev adapter:** built into the decision runtime and pinned to `typesafe/jev-1.14`. It reviews policy-selected boundaries such as task submission using minimized structural evidence; ordinary exact-value selection and entry do not trigger a review. A service refusal or outage is recorded and falls back to deterministic local policy; a valid `needs_agent_review` prediction pauses only that proposed action.
+- **FreeInference task adapter:** `start_cloud_agent_task` requires caller-supplied model ID, task prompt, expected outcome, and diagnostic scope. It first resolves a unique native form structure, calls semantic mapping only when that observation is ambiguous, then compiles the exact caller values into the generic authorized test runner. It does not invent a task or report PASS from a submit acknowledgment.
+- **FreeInference entry primitive:** `enter_cloud_agent` follows the visible Agents/Cloud Agents route from the explicitly attached staging tab and verifies the task composer on that same target. It can suspend for human authentication and never submits a task; the coding agent then supplies exact values to `start_cloud_agent_task`.
+- **Diagnostic adapter:** after the exact Cloud Agent run ID is visible in fresh evidence from the same Agents tab, `collect_cloud_agent_run_evidence` may request only its bound run/step/usage metadata. Independent evidence must still establish the expected outcome.
+
+Semantic and Jev predictions, policy decisions, dispatches, and later observations are appended to the same owner-only decision episode with stable run, step, decision, and observation references. Their credentials remain private to their adapters. Model predictions never authorize a browser action, and training export requires independent labels.
 
 To run only the extension vertical slice visibly, use:
 
@@ -143,6 +136,14 @@ Only fully verified tasks are recorded. Version 2 replay resolves each saved cli
 ## Optional model planner
 
 The default local planner uses deterministic label overlap for simple tasks. An OpenAI-compatible endpoint can be selected with `ACTIVETAB_MODEL_ENDPOINT`, `ACTIVETAB_MODEL`, optional `ACTIVETAB_MODEL_API_KEY`, and `ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT=1`. The last setting is required before page titles, headings, labels, and candidate facts are sent to that endpoint. Without it, the deterministic planner stays local even if endpoint details are configured.
+
+## Built-in decision review and telemetry
+
+Browser execution records a private, append-only decision episode in `.activetab/telemetry/decision-events.sqlite`. It links observed control resolution, semantic annotation when needed, Jev review or explicit review skips, deterministic policy decisions, dispatch receipts, and later observed state. Jev is built into the runtime and pinned to `typesafe/jev-1.14`; its private credential is read from `JEV.txt` (or the path in `ACTIVETAB_JEV_KEY_FILE`) and is never written to telemetry or logs. If Jev is unavailable, ActiveTab records that failure and ordinary local navigation continues.
+
+For semantic control mapping, configure `ACTIVETAB_SEMANTIC_ENDPOINT` (or reuse `ACTIVETAB_MODEL_ENDPOINT`) and optionally `ACTIVETAB_SEMANTIC_API_KEY` / `ACTIVETAB_MODEL_API_KEY`. The default model is FreeInference Production `GLM5.3-flash`; `ACTIVETAB_SEMANTIC_MODEL` can select another OpenAI-compatible model. This annotation role sends a bounded projection of observed roles, tags, candidate references, accessible control names, and nearby headings to that explicitly configured endpoint. Those labels are untrusted page data and are not stored in decision telemetry; form values and URL data remain excluded by the observation contract. The optional planner above is a separate role with its own page-content opt-in.
+
+Predictions remain advisory and do not grant permission. Telemetry copies of inputs and outputs stay in the owner-only event store. It captures semantic structural inputs before each request, including the exact candidate projection when page labels are off. If page labels are explicitly enabled, their text is not retained and that semantic input is excluded from training export. Jev input projections are recorded before review. Dataset export still requires an independently approved label, and ActiveTab does not train models automatically.
 
 ## Investigation
 

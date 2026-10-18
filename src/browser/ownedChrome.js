@@ -1,11 +1,10 @@
 /**
  * Owned Chrome lifecycle component (P0-1).
  *
- * A single Node.js invocation owns the entire browser lifetime: child
- * Chrome, the CDP connection, ActiveTab execution, and cleanup. This is
- * the common foundation for sandbox-safe qualification — no reliance on
- * background processes surviving between command invocations, no fixed
- * CDP port, no blanket process cleanup.
+ * Qualification invocations own the browser lifetime: child Chrome, the
+ * CDP connection, ActiveTab execution, and cleanup. The explicit manual
+ * open-only path can detach after launch and leave its persistent Chrome
+ * profile available for authentication without keeping a command alive.
  *
  * Launch contract:
  *   --remote-debugging-port=0   (Chrome assigns a free loopback port)
@@ -19,7 +18,10 @@
  * the owned process is alive, the assigned port is reachable, the
  * browser reports a usable CDP version, page targets are enumerated, and
  * only the target owned by this invocation is selected — never an
- * unrelated pre-existing tab, never port 9222.
+ * unrelated pre-existing tab, never port 9222. Open-only reuse attaches
+ * at browser level and does not select or navigate a page. A qualification
+ * may reattach to an existing target only when its exact ID is supplied and
+ * its current origin is in the caller's allowlist; that path never navigates.
  *
  * Cleanup is idempotent: stop admission, cancel in-progress actions,
  * flush receipts/diagnostics, close the CDP session, request graceful
@@ -37,6 +39,61 @@ import { existsSync } from "node:fs";
 import { listTargets, resolveAuthorizedTarget } from "./targets.js";
 import { BrowserSession } from "./session.js";
 import { CdpClient } from "../cdp/client.js";
+import { readChromeDebugEndpoint } from "./chrome-autoconnect.js";
+
+export async function chromeProfileLockPresent(profileDir) {
+  try {
+    await lstat(join(profileDir, "SingletonLock"));
+    return true;
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function connectExistingChrome(profileDir) {
+  const portFile = join(profileDir, "DevToolsActivePort");
+  const portFileStat = await lstat(portFile).catch(error => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  const profileLocked = await chromeProfileLockPresent(profileDir);
+
+  if (!portFileStat) {
+    if (profileLocked) {
+      throw new Error("Chrome already owns this profile, but its DevTools endpoint is missing. Refusing to launch another Chrome or forward a startup URL into the open browser.");
+    }
+    return null;
+  }
+
+  // Parse and validate the handoff before considering it stale. Malformed or
+  // symlinked endpoint metadata is never removed as part of launch recovery.
+  const endpointInfo = await readChromeDebugEndpoint(profileDir);
+  const client = await new CdpClient(endpointInfo.webSocketDebuggerUrl, { commandTimeoutMs: 5_000 }).connect().catch(() => null);
+  if (client) {
+    const version = await client.send("Browser.getVersion").catch(() => null);
+    if (version) {
+      const endpointUrl = new URL(endpointInfo.webSocketDebuggerUrl);
+      const existing = {
+        client,
+        endpoint: `http://127.0.0.1:${endpointUrl.port}`,
+        browserVersion: version.product ?? version.revision ?? null,
+        close: () => client.close()
+      };
+      if (existing.browserVersion) return existing;
+    }
+    await client.close().catch(() => {});
+  }
+
+  if (profileLocked) {
+    throw new Error("Chrome owns this profile but its DevTools endpoint is not reachable. Refusing to remove live profile metadata or launch a second Chrome.");
+  }
+
+  // A validly shaped endpoint with no owning Chrome is stale. Only this
+  // confirmed inactive case may clear it before a fresh launch.
+  await rm(portFile, { force: true });
+  return null;
+}
 
 function findChromeBinary(env = process.env) {
   if (env.CHROME_PATH) return env.CHROME_PATH;
@@ -105,6 +162,10 @@ async function waitForAssignedPort(profileDir, timeoutMs, chromeProcess, signal)
  * @param {AbortSignal} [options.signal] - Cancellation during launch.
  * @param {string|null} [options.userDataDir] - Optional explicit Chrome profile directory.
  * @param {boolean} [options.preserveProfile=false] - Keep an explicit profile for later runs.
+ * @param {boolean} [options.reuseExisting=false] - Allow a live profile to be reused without page control.
+ * @param {boolean} [options.keepBrowserOpen=false] - Detach after startup while preserving the explicit profile and Chrome process.
+ * @param {string|null} [options.attachExistingTargetId=null] - Explicit exact page target to reattach without navigation.
+ * @param {string[]} [options.allowedExistingOrigins=[]] - Exact origins authorized for an existing target.
  */
 export async function launchOwnedChrome({
   initialUrl,
@@ -112,7 +173,11 @@ export async function launchOwnedChrome({
   displayMode = "current-display",
   signal,
   userDataDir = null,
-  preserveProfile = false
+  preserveProfile = false,
+  reuseExisting = false,
+  keepBrowserOpen = false,
+  attachExistingTargetId = null,
+  allowedExistingOrigins = []
 } = {}) {
   if (typeof initialUrl !== "string" || !initialUrl) {
     throw new Error("launchOwnedChrome requires an initialUrl (the validated application entry, not a diagnostic endpoint).");
@@ -132,6 +197,24 @@ export async function launchOwnedChrome({
   if (preserveProfile && !userDataDir) {
     throw new Error("preserveProfile requires an explicit userDataDir.");
   }
+  if (keepBrowserOpen && (!userDataDir || !preserveProfile)) {
+    throw new Error("keepBrowserOpen requires an explicit persistent profile.");
+  }
+  if (attachExistingTargetId !== null && (typeof attachExistingTargetId !== "string" || !attachExistingTargetId.trim())) {
+    throw new Error("attachExistingTargetId must be a non-empty exact page target ID.");
+  }
+  if (attachExistingTargetId !== null && (reuseExisting || !userDataDir || !preserveProfile || !Array.isArray(allowedExistingOrigins) || allowedExistingOrigins.length === 0)) {
+    throw new Error("Attaching an existing target requires a persistent profile, an exact target ID, and an origin allowlist; it cannot be combined with open-only reuse.");
+  }
+  const existingOriginAllowlist = new Set();
+  for (const value of allowedExistingOrigins) {
+    let parsed;
+    try { parsed = new URL(value); } catch { throw new Error("Existing target origin allowlists must contain exact HTTP(S) origins."); }
+    if (!["http:", "https:"].includes(parsed.protocol) || parsed.origin !== value || parsed.username || parsed.password) {
+      throw new Error("Existing target origin allowlists must contain exact HTTP(S) origins.");
+    }
+    existingOriginAllowlist.add(parsed.origin);
+  }
   let profileDir;
   if (userDataDir) {
     profileDir = resolve(userDataDir);
@@ -147,9 +230,104 @@ export async function launchOwnedChrome({
   } else {
     profileDir = await mkdtemp(join(tmpdir(), "activetab-owned-chrome-"));
   }
-  // Persistent profiles retain files across runs. Remove the previous
-  // instance's CDP handoff before starting Chrome, or startup could read
-  // a stale port and attach to the wrong (or already closed) browser.
+  const existingChrome = await connectExistingChrome(profileDir);
+  if (existingChrome) {
+    if (attachExistingTargetId !== null) {
+      let session = null;
+      try {
+        const targets = await listTargets(existingChrome.endpoint);
+        const existingTarget = targets.find(target => target.id === attachExistingTargetId && target.type === "page") ?? null;
+        if (!existingTarget) throw new Error(`The exact existing page target '${attachExistingTargetId}' is unavailable.`);
+        let origin = null;
+        try { origin = new URL(existingTarget.url).origin; } catch { /* rejected below */ }
+        if (!origin || !existingOriginAllowlist.has(origin)) {
+          throw new Error(`The exact existing page target is outside the authorized origin allowlist (${origin ?? "unavailable"}).`);
+        }
+        const target = await resolveAuthorizedTarget(existingChrome.endpoint, attachExistingTargetId, attachExistingTargetId);
+        target.browserClient = existingChrome.client;
+        target.ownsBrowserClient = true;
+        session = await new BrowserSession(target).attach();
+        session.persistent = true;
+
+        // Recheck after CDP attachment to close the target-list/attach race.
+        const observation = await session.observe();
+        let observedOrigin = null;
+        try { observedOrigin = new URL(observation?.page?.url ?? "").origin; } catch { /* rejected below */ }
+        if (!observedOrigin || !existingOriginAllowlist.has(observedOrigin)) {
+          throw new Error(`The existing page changed to an unauthorized origin while attaching (${observedOrigin ?? "unavailable"}).`);
+        }
+        let closed = false;
+        let closeResult = null;
+        return {
+          session,
+          endpoint: existingChrome.endpoint,
+          targetId: attachExistingTargetId,
+          chromeProcess: null,
+          browserVersion: existingChrome.browserVersion,
+          launchMode: "reattached to exact existing headed Chrome target",
+          displayMode,
+          profileDir,
+          readiness: { phase: "reattached-existing-target", targetId: attachExistingTargetId, origin: observedOrigin },
+          reusedExisting: false,
+          attachedExisting: true,
+          signal,
+          async close() {
+            if (closed) return closeResult;
+            closed = true;
+            await session.close().catch(() => {});
+            closeResult = { graceful: true, forced: false, exitCode: null, profileRemoved: false, profilePreserved: true, browserPreserved: true, error: null };
+            return closeResult;
+          }
+        };
+      } catch (error) {
+        if (session) await session.close().catch(() => {});
+        else await existingChrome.close().catch(() => {});
+        throw error;
+      }
+    }
+    if (!reuseExisting) {
+      await existingChrome.close().catch(() => {});
+      throw new Error("Chrome is already running with this profile. Refusing to navigate or replace the open browser; select its exact authorized page with attachExistingTargetId, or use open-only reuse.");
+    }
+    let pageTargets;
+    try { pageTargets = await listTargets(existingChrome.endpoint); }
+    catch (error) {
+      await existingChrome.close().catch(() => {});
+      throw error;
+    }
+    let closed = false;
+    let closeResult = null;
+    return {
+      session: null,
+      endpoint: existingChrome.endpoint,
+      targetId: null,
+      chromeProcess: null,
+      browserVersion: existingChrome.browserVersion,
+      launchMode: "reused existing headed Chrome",
+      displayMode,
+      profileDir,
+      readiness: { phase: "reused-existing-browser" },
+      reusedExisting: true,
+      pageTargets,
+      signal,
+      async close() {
+        if (closed) return closeResult;
+        closed = true;
+        await existingChrome.close().catch(() => {});
+        closeResult = { graceful: true, forced: false, exitCode: null, profileRemoved: false, profilePreserved: true, browserPreserved: true, error: null };
+        return closeResult;
+      }
+    };
+  }
+
+  if (attachExistingTargetId !== null) {
+    throw new Error("The requested exact target is not running in the selected persistent profile. Refusing to launch a replacement browser or apply its startup URL.");
+  }
+
+  // connectExistingChrome has proved the profile is inactive before stale
+  // DevTools metadata is cleared. Never unlink an endpoint belonging to a
+  // running Chrome: its process-singleton would otherwise forward the
+  // startup URL into that browser and exit without publishing a new port.
   await rm(join(profileDir, "DevToolsActivePort"), { force: true });
   let chromeProcess = null;
   let session = null;
@@ -178,7 +356,11 @@ export async function launchOwnedChrome({
   let readiness = { phase: "launch" };
 
   try {
-    chromeProcess = spawn(chromePath, args, { stdio: ["ignore", "ignore", "pipe"] });
+    chromeProcess = spawn(chromePath, args, {
+      stdio: keepBrowserOpen ? ["ignore", "ignore", "ignore"] : ["ignore", "ignore", "pipe"],
+      ...(keepBrowserOpen ? { detached: true } : {})
+    });
+    if (keepBrowserOpen) chromeProcess.unref();
     chromeProcess.stderr?.setEncoding("utf8");
     chromeProcess.stderr?.on("data", chunk => {
       stderrTail = (stderrTail + chunk).slice(-4000);
@@ -306,11 +488,15 @@ export async function launchOwnedChrome({
   async function close() {
     if (closed) return closeResult;
     closed = true;
-    const outcome = { graceful: false, forced: false, exitCode: null, profileRemoved: false, profilePreserved: preserveProfile, error: null };
+    const outcome = { graceful: false, forced: false, exitCode: null, profileRemoved: false, profilePreserved: preserveProfile, browserPreserved: false, error: null };
     try {
       // Close the CDP session first (this also detaches owned targets).
       if (session) await session.close().catch(() => {});
-      if (chromeProcess && chromeProcess.exitCode === null) {
+      if (keepBrowserOpen) {
+        chromeProcess?.unref();
+        outcome.graceful = true;
+        outcome.browserPreserved = true;
+      } else if (chromeProcess && chromeProcess.exitCode === null) {
         chromeProcess.kill("SIGTERM");
         const gracefulDeadline = Date.now() + 5_000;
         while (Date.now() < gracefulDeadline && chromeProcess.exitCode === null) {
@@ -349,6 +535,7 @@ export async function launchOwnedChrome({
     displayMode,
     profileDir,
     readiness,
+    reusedExisting: false,
     signal,
     close
   };

@@ -30,7 +30,7 @@ import { TestRunner } from "./runner.js";
 import { TestReceipt } from "./receipts.js";
 import { InterventionStore, InterventionWatcher } from "../runtime/interventions.js";
 import { loadEnvironmentBinding } from "./profiles.js";
-import { verifyObservedUrl, isLoopbackUrl } from "../environments/model.js";
+import { verifyObservedUrl } from "../environments/model.js";
 import { classifyHumanHandoff } from "../navigation/handoff.js";
 import { RUN_STATUS, isWaitingRunStatus } from "./schema.js";
 
@@ -43,6 +43,11 @@ const QUALIFICATION_STATES = Object.freeze({
   CANCELED: "CANCELED"
 });
 
+/** Owned qualification Chrome stays available until the operator stops it. */
+export function shouldKeepOwnedBrowserOpen(mode, report, signal) {
+  return mode === "owned" && Boolean(report) && signal?.aborted !== true;
+}
+
 const MANDATORY_GATES = Object.freeze([
   "environment_identity_verified",
   "real_staging_site_reached",
@@ -53,14 +58,82 @@ const MANDATORY_GATES = Object.freeze([
 ]);
 
 
-const DIAGNOSTIC_SURFACE_HINT = /\b(?:admin|diagnostic|logs?|history|requests?|activity|events?|audit|analytics|usage|metrics?|traces?|monitor(?:ing)?|observability|executions?|runs?|reports?|errors?|failures?|workers?|queues?)\b/i;
-const TASK_HISTORY_HINT = /\b(?:tasks?|jobs?)\b/i;
-const SAFE_SURFACE_TERMS = /\b(?:admin|console|dashboard|diagnostics?|logs?|history|requests?|activity|events?|audit|analytics|usage|metrics?|traces?|monitor(?:ing)?|observability|executions?|runs?|reports?|errors?|failures?|workers?|queues?|tasks?|jobs?|recent|completed|failed|view|page|panel)\b/ig;
+const DIAGNOSTIC_SURFACE_HINTS = new Set([
+  "admin", "diagnostic", "diagnostics", "log", "logs", "history", "request", "requests", "activity", "event", "events",
+  "audit", "analytics", "usage", "metric", "metrics", "trace", "traces", "monitor", "monitoring", "observability",
+  "execution", "executions", "run", "runs", "report", "reports", "error", "errors", "failure", "failures", "worker", "workers", "queue", "queues"
+]);
+const TASK_HISTORY_TERMS = new Set(["history", "recent", "past", "completed", "failed", "run", "runs"]);
+const SAFE_SURFACE_TERMS = new Set([
+  ...DIAGNOSTIC_SURFACE_HINTS, "console", "dashboard", "task", "tasks", "job", "jobs", "recent", "completed", "failed", "view", "page", "panel"
+]);
+
+function isAsciiLetterOrDigit(code) {
+  return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+function structuralTokens(value) {
+  const tokens = [];
+  let word = "";
+  const flush = () => {
+    if (!word) return;
+    tokens.push({ value: word, normalized: word.toLowerCase() });
+    word = "";
+  };
+  for (const character of String(value ?? "").normalize("NFKC")) {
+    const code = character.charCodeAt(0);
+    if (character.length === 1 && isAsciiLetterOrDigit(code)) word += character;
+    else flush();
+  }
+  flush();
+  return tokens;
+}
+
+function structuralWords(value) {
+  return structuralTokens(value).map(token => token.normalized);
+}
+
+function compactLabel(value, maxLength = 120) {
+  let result = "";
+  let pendingSpace = false;
+  for (const character of String(value ?? "").normalize("NFKC")) {
+    if (character.trim() === "") {
+      pendingSpace = result.length > 0;
+      continue;
+    }
+    if (pendingSpace) result += " ";
+    result += character;
+    pendingSpace = false;
+    if (result.length >= maxLength) break;
+  }
+  return result.slice(0, maxLength);
+}
+
+function hasAnyWord(words, allowed) {
+  return words.some(word => allowed.has(word));
+}
+
+function looksLikeUuid(value) {
+  if (value.length !== 36 || value[8] !== "-" || value[13] !== "-" || value[18] !== "-" || value[23] !== "-") return false;
+  for (let index = 0; index < value.length; index++) {
+    if ([8, 13, 18, 23].includes(index)) continue;
+    const code = value.charCodeAt(index);
+    const isHex = (code >= 48 && code <= 57) || (code >= 65 && code <= 70) || (code >= 97 && code <= 102);
+    if (!isHex) return false;
+  }
+  return true;
+}
+
+function isLongNumericSegment(value) {
+  if (value.length < 4) return false;
+  for (const character of value) if (character < "0" || character > "9") return false;
+  return true;
+}
 
 function redactPath(pathname) {
   return pathname.split("/").map(segment => {
     if (!segment) return segment;
-    if (/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(segment) || /^\d{4,}$/.test(segment) || segment.length > 64) return ":id";
+    if (looksLikeUuid(segment) || isLongNumericSegment(segment) || segment.length > 64) return ":id";
     return segment;
   }).join("/");
 }
@@ -111,7 +184,9 @@ export function discoverVisibleDiagnosticSurfaces(observation, environment) {
   const surfaces = [];
   for (const candidate of observation?.candidates ?? []) {
     if (candidate.visible !== true || (!candidate.href && String(candidate.role).toLowerCase() !== "link")) continue;
-    const label = String(candidate.name ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
+    const label = compactLabel(candidate.name);
+    const labelTokens = structuralTokens(label);
+    const labelWords = labelTokens.map(token => token.normalized);
     let destination = null;
     let pathname = "";
     if (candidate.href) {
@@ -122,11 +197,12 @@ export function discoverVisibleDiagnosticSurfaces(observation, environment) {
         destination = `${url.origin}${redactPath(pathname)}`;
       } catch { continue; }
     }
-    const taskHistoryLabel = TASK_HISTORY_HINT.test(label) && /\b(?:history|recent|past|completed|failed|runs?)\b/i.test(label);
-    if (!label || (!DIAGNOSTIC_SURFACE_HINT.test(label) && !DIAGNOSTIC_SURFACE_HINT.test(pathname) && !taskHistoryLabel)) continue;
-    const safeTerms = [...label.matchAll(SAFE_SURFACE_TERMS)].map(match => match[0]);
-    const pathTerms = [...pathname.matchAll(SAFE_SURFACE_TERMS)].map(match => match[0]);
-    const reportedLabel = (safeTerms.length ? safeTerms : pathTerms).join(" ").slice(0, 120);
+    const pathWords = structuralWords(pathname);
+    const taskHistoryLabel = hasAnyWord(labelWords, new Set(["task", "tasks", "job", "jobs"])) && hasAnyWord(labelWords, TASK_HISTORY_TERMS);
+    if (!label || (!hasAnyWord(labelWords, DIAGNOSTIC_SURFACE_HINTS) && !hasAnyWord(pathWords, DIAGNOSTIC_SURFACE_HINTS) && !taskHistoryLabel)) continue;
+    const safeTerms = labelTokens.filter(token => SAFE_SURFACE_TERMS.has(token.normalized)).map(token => token.value);
+    const safePathTerms = structuralTokens(pathname).filter(token => SAFE_SURFACE_TERMS.has(token.normalized)).map(token => token.value);
+    const reportedLabel = (safeTerms.length ? safeTerms : safePathTerms).join(" ").slice(0, 120);
     const key = `${label.toLowerCase()}|${destination ?? "no-href"}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -143,7 +219,7 @@ export function discoverVisibleDiagnosticSurfaces(observation, environment) {
       label: reportedLabel || "diagnostic candidate",
       role: String(candidate.role ?? "link").slice(0, 32),
       destination,
-      category: /\badmin\b/i.test(`${label} ${pathname}`) ? "admin-entry" : "diagnostic-candidate",
+      category: hasAnyWord([...labelWords, ...pathWords], new Set(["admin"])) ? "admin-entry" : "diagnostic-candidate",
       action: "not opened"
     });
     if (surfaces.length >= 20) break;
@@ -185,7 +261,8 @@ export function verifyCloudAgentReady(observation, environment, expectedOrigin) 
   if (expectedOrigin && identity.origin !== expectedOrigin) {
     return { ok: false, reason: `Observed application origin '${identity.origin}' does not match the profile's Cloud Agent identity hint.` };
   }
-  if (!/\bagent\b/i.test(String(observation?.page?.title ?? ""))) {
+  const titleWords = structuralWords(observation?.page?.title);
+  if (!titleWords.includes("agent") && !titleWords.includes("agents")) {
     return { ok: false, reason: "The observed page title does not identify the Cloud Agent application." };
   }
   if (!hasCloudAgentTaskComposer(observation)) {
@@ -197,9 +274,11 @@ export function verifyCloudAgentReady(observation, environment, expectedOrigin) 
 /** Positive UI evidence that the protected task application, not its login page, is ready. */
 export function hasCloudAgentTaskComposer(observation) {
   const candidates = observation?.candidates ?? [];
-  const hasNewTaskControl = candidates.some(candidate =>
-    candidate.visible !== false && /\bnew task\b/i.test(String(candidate.name ?? ""))
-  );
+  const hasNewTaskControl = candidates.some(candidate => {
+    if (candidate.visible === false) return false;
+    const words = structuralWords(candidate.name);
+    return words.some((word, index) => word === "new" && words[index + 1] === "task");
+  });
   const hasTaskInput = candidates.some(candidate =>
     candidate.visible !== false && candidate.disabled !== true &&
     String(candidate.role ?? "").toLowerCase() === "textbox"
@@ -208,12 +287,12 @@ export function hasCloudAgentTaskComposer(observation) {
 }
 
 /** Build a workflow that follows visible UI navigation and never auto-navigates to candidate_entry. */
-export function createCloudAgentEntryWorkflow(environment, observation) {
+export function createCloudAgentEntryWorkflow(environment, observation, { forceEntryStep = false } = {}) {
   const agentEntry = resolveCloudAgentEntry(environment);
   if (!agentEntry) return null;
   const alreadyAtComposer = verifyCloudAgentReady(observation, environment, agentEntry.origin).ok;
   const steps = [];
-  if (!alreadyAtComposer) {
+  if (!alreadyAtComposer || forceEntryStep) {
     steps.push({
       type: "goal",
       id: "follow-visible-agents-route",
@@ -265,6 +344,7 @@ export async function qualifyCloudAgent({
   profileId = null,
   reportDir: reportDirOption = null,
   diagnostics = null,
+  decisionRuntime = null,
   mode = "test",
   onHumanIntervention = null,
   signal,
@@ -289,7 +369,7 @@ export async function qualifyCloudAgent({
       resumeError = String(error?.message ?? error);
     }
   }
-  const backendCorrelationRef = { value: null };
+  const diagnosticHealthRef = { value: null };
   const gates = {};
   const evidence = [];
   const steps = [];
@@ -410,7 +490,7 @@ export async function qualifyCloudAgent({
     }
 
     // ── 4. Profile route is an identity hint only; never navigate to it ──
-    const entryFlow = createCloudAgentEntryWorkflow(environment, observation);
+    const entryFlow = createCloudAgentEntryWorkflow(environment, observation, { forceEntryStep: Boolean(resumeRunState) });
     if (!entryFlow) {
       finalState = QUALIFICATION_STATES.BLOCKED;
       reason = "The environment profile has no authorized Cloud Agent identity hint.";
@@ -422,7 +502,15 @@ export async function qualifyCloudAgent({
     if (entryFlow.alreadyAtComposer) emit("The task composer is already visible; skipping goal navigation and performing read-only verification.");
 
     // ── 5. Follow the visible route, hand off for login, then verify and resume ──
-    const runner = new TestRunner({ session, interventions, environment, signal });
+    const runner = new TestRunner({
+      session, interventions, environment, signal, decisionRuntime,
+      ...(runStore && runState ? {
+        runStateStore: runStore,
+        existingRunStateId: runState.runId,
+        profileId: profileId ?? runState.profileId ?? null,
+        policyVersion: runState.policyVersion ?? "active_policy_v1"
+      } : {})
+    });
     runner.onRunSuspended = async (suspendedReceipt, record) => {
       if (!runState) return;
       const suspendedStatus = {
@@ -442,19 +530,11 @@ export async function qualifyCloudAgent({
         target: session.target?.id ? { targetId: session.target.id, attached: true } : runState.target
       });
     };
-    let activeWorkflow = workflow;
     if (resumeReceipt) {
       const suspendedStepId = resumeRunState.suspendedStepId;
       if (suspendedStepId !== "follow-visible-agents-route") {
         return finalize(QUALIFICATION_STATES.BLOCKED, { reason: "The persisted Cloud Agent suspension is not at the supported visible-entry step.", receipt: resumeReceipt });
       }
-      activeWorkflow = {
-        ...workflow,
-        steps: [
-          { id: suspendedStepId, type: "goal", goal: "Resume after the verified Cloud Agent task composer predicate." },
-          ...workflow.steps.filter(step => step.id !== suspendedStepId)
-        ]
-      };
     }
     let receipt = resumeReceipt ?? await runner.run(workflow, { runId });
 
@@ -510,7 +590,7 @@ export async function qualifyCloudAgent({
           });
           if (shouldResume === false) break;
           const resumed = await runner.resume(receipt, {
-            workflow: activeWorkflow,
+            workflow,
             verify,
             completedStepIds: record.stepId === "follow-visible-agents-route" ? [record.stepId] : []
           });
@@ -572,39 +652,26 @@ export async function qualifyCloudAgent({
     // ── 6. Backend diagnostic correlation (optional; exact identifiers) ──
     const diagUrl = process.env.ACTIVETAB_CLOUD_AGENT_URL;
     const diagToken = process.env.ACTIVETAB_CLOUD_AGENT_ADMIN_TOKEN;
-    let backendCorrelation = null;
     if (diagUrl && diagToken) {
-      const { CloudAgentDiagnosticAdapter } = await import("../diagnostics/adapters/cloudAgentApi.js");
-      const adapter = new CloudAgentDiagnosticAdapter({
-        baseUrl: diagUrl,
-        adminToken: diagToken,
-        diagnosticTransport: process.env.ACTIVETAB_CLOUD_AGENT_TRANSPORT ?? null,
-        remoteTarget: process.env.ACTIVETAB_CLOUD_AGENT_REMOTE_TARGET ?? null,
-        environmentBinding: environment
-      });
-      if (!isLoopbackUrl(diagUrl) || adapter.diagnosticTransport === "ssh_tunnel") {
-        const health = await adapter.healthCheck().catch(error => ({ healthy: false, reason: String(error?.message ?? error) }));
-        if (health.healthy) {
-          backendCorrelation = { healthy: true, transport: health.transport ?? "direct" };
-          emit(`Diagnostic adapter healthy (${health.transport ?? "direct"})`);
-          // Correlation REQUIRES an exact operation identifier from the
-          // browser workflow; without one, no correlation claim is made.
-          const runIdFromBrowser = process.env.ACTIVETAB_CLOUD_AGENT_TEST_RUN_ID ?? null;
-          if (typeof runIdFromBrowser === "string" && runIdFromBrowser) {
-            const detail = await adapter.getRunDetail(runIdFromBrowser).catch(() => null);
-            backendCorrelation.runDetail = detail ? { httpStatus: detail.httpStatus ?? null, status: detail.status ?? null } : null;
-            backendCorrelation.correlatedRunId = runIdFromBrowser;
-            emit(`Correlated browser operation with backend run ${runIdFromBrowser}`);
-          } else {
-            limitations.push("No test-owned Cloud Agent operation identifier was captured in the browser workflow; backend correlation by exact identifier is unavailable.");
-            emit("No operation identifier captured; backend correlation skipped.");
-          }
-        } else {
-          limitations.push(`Diagnostic adapter unreachable: ${health.reason}`);
-          emit(`Diagnostic adapter unreachable: ${health.reason}`);
-        }
+      const { cloudAgentAdapterFromEnv } = await import("../diagnostics/adapters/cloudAgentApi.js");
+      const adapter = cloudAgentAdapterFromEnv(process.env, { environmentBinding: environment });
+      if (!adapter) {
+        limitations.push("Diagnostic credentials or endpoint were configured, but they do not match a diagnostic service explicitly bound by the active environment profile; no backend request was made.");
+        emit("Diagnostic service is not bound by the active profile; backend request skipped.");
       } else {
-        limitations.push("Diagnostic endpoint is loopback without an explicitly configured, verified SSH tunnel; rejected.");
+        const health = await adapter.healthCheck().catch(error => ({ healthy: false, reason: String(error?.message ?? error) }));
+        if (health.adminAuthority === "not_probed") {
+          limitations.push("Diagnostic credentials were configured, but the profile has no validated diagnostic endpoint binding; no backend request was made.");
+          emit("No profile-validated diagnostic route is configured; backend request skipped.");
+        } else if (health.healthy) {
+          diagnosticHealthRef.value = { status: "healthy", transport: health.transport ?? "direct", adminAuthority: health.adminAuthority ?? "not_probed" };
+          limitations.push("The diagnostic health endpoint was checked, but this qualification run did not submit a Cloud Agent task or capture its exact run ID; no backend run correlation is claimed.");
+          emit(`Diagnostic health checked (${health.transport ?? "direct"}); run correlation remains unavailable.`);
+        } else {
+          diagnosticHealthRef.value = { status: "unavailable", reason: health.reason ?? "no validated endpoint response" };
+          limitations.push(`Diagnostic health check unavailable: ${health.reason ?? "no validated endpoint response"}`);
+          emit(`Diagnostic health check unavailable: ${health.reason ?? "no validated endpoint response"}`);
+        }
       }
     } else {
       limitations.push("No diagnostic endpoint configured; backend correlation is unavailable for this run and is reported as such.");
@@ -617,10 +684,7 @@ export async function qualifyCloudAgent({
     // independently verified application-level result and verified
     // cleanup has NOT been executed in this run: no operation identifier
     // exists, so the mandatory operation/verification/cleanup gates fail.
-    const opId = backendCorrelation?.correlatedRunId ?? null;
-    gate("cloud_agent_operation_executed", false, opId
-      ? `Backend run ${opId} observed, but the operation was not executed through the browser application by this run.`
-      : "No test-owned Cloud Agent operation was executed through the Agents application.");
+    gate("cloud_agent_operation_executed", false, "No test-owned Cloud Agent operation was executed through the Agents application.");
     gate("operation_result_independently_verified", false, "No verified application-level result exists for a test-owned operation.");
     cleanupResult = { performed: false, reason: "No test-owned resources were created by this run; nothing to clean up." };
     gate("cleanup_verified", true, cleanupResult.reason);
@@ -665,10 +729,11 @@ export async function qualifyCloudAgent({
       authenticationStatus: gates.real_staging_site_reached && !(gates.environment_identity_verified && false) ? "entry page observed; realm-specific verification via interventions" : "not established",
       workflowSteps: steps,
       receipt: receipt ? receipt.toObject?.() ?? receipt : null,
-      verifiedBackendOperations: backendCorrelationRef.value,
+      verifiedBackendOperations: null,
+      diagnosticHealth: diagnosticHealthRef.value,
       diagnosticEvidence: evidence,
       discoveries,
-      correlation: backendCorrelationRef.value,
+      correlation: null,
       screenshotPath,
       pendingInterventions: interventionId ? [interventionId] : [],
       finalState: state,

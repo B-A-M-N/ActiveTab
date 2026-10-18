@@ -246,14 +246,21 @@ export class DeterministicPlanner {
     if (expected.searchQuery) {
       if (expected.searchQuery.length > 500) return { status: "ambiguous", reason: "Search text exceeds the 500-character local input limit." };
       const candidates = observation.candidates.filter(candidate => !excludedIdentities.includes(candidate.identity) && !candidate.disabled && candidate.visible === true);
-      const searchFields = candidates.filter(candidate => !candidate.frameTargetId && candidate.tag === "input" && String(candidate.type).toLowerCase() === "search");
+      const searchFields = observation.candidates.filter(candidate => !candidate.frameTargetId && candidate.tag === "input" && String(candidate.type).toLowerCase() === "search" && candidate.visible === true && candidate.disabled !== true);
       if (searchFields.length > 1) return { status: "ambiguous", reason: "More than one visible search field is available." };
       if (searchFields.length === 1) {
-        return { status: "planned", action: { type: "type", target: searchFields[0], value: expected.searchQuery }, expected, confidence: 1, reasoning: "The caller explicitly supplied a search phrase; native input will place it only in the unique visible search field." };
-      }
-      const submitControls = candidates.filter(candidate => candidate.submitsForm && /\bsearch\b/i.test(candidate.name));
-      if (submitControls.length === 1) {
-        return { status: "planned", action: { type: "click", target: submitControls[0] }, expected, confidence: 1, reasoning: "The search phrase was entered locally; submit the unique matching search control." };
+        if (!excludedIdentities.includes(searchFields[0].identity)) {
+          return { status: "planned", action: { type: "type", target: searchFields[0], value: expected.searchQuery }, expected, confidence: 1, reasoning: "The caller explicitly supplied a search phrase; native input will place it only in the unique visible search field." };
+        }
+        const field = searchFields[0];
+        const submitControls = candidates.filter(candidate => candidate.submitsForm === true
+          && candidate.formIdentity
+          && candidate.formIdentity === field.formIdentity
+          && candidate.formMethod === "get");
+        if (submitControls.length === 1) {
+          return { status: "planned", action: { type: "click", target: submitControls[0] }, expected, confidence: 1, reasoning: "The exact caller query was entered; submit the same-origin GET form observed to own the unique search field." };
+        }
+        return { status: "ambiguous", reason: "The search field has no unique observed same-origin GET submit control." };
       }
       return { status: "ambiguous", reason: "A unique visible search field or matching submit control was not found." };
     }
@@ -295,7 +302,9 @@ export class OpenAICompatiblePlanner {
   constructor({ endpoint = process.env.ACTIVETAB_MODEL_ENDPOINT, apiKey = process.env.ACTIVETAB_MODEL_API_KEY, model = process.env.ACTIVETAB_MODEL, allowPageContent = process.env.ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT === "1", fetchImpl = fetch, timeoutMs, maxTokens = process.env.ACTIVETAB_MODEL_MAX_TOKENS, provider } = {}) {
     if (!allowPageContent) throw new Error("Explicitly set ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT=1 before sending browser page evidence to a model endpoint.");
     this.allowPageContent = true;
-    this.maxTokens = Number.isInteger(maxTokens) && maxTokens > 0 ? maxTokens : null;
+    this.plannerRole = "standalone_action_proposer";
+    const parsedMaxTokens = typeof maxTokens === "string" && maxTokens.trim() ? Number(maxTokens) : maxTokens;
+    this.maxTokens = Number.isInteger(parsedMaxTokens) && parsedMaxTokens > 0 && parsedMaxTokens <= 32_768 ? parsedMaxTokens : null;
     this.provider = provider ?? new OpenAICompatibleProvider({ endpoint, apiKey, model, fetchImpl, ...(timeoutMs !== undefined ? { timeoutMs } : {}) });
     this.model = this.provider.model;
     this.usage = { calls: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
@@ -331,8 +340,11 @@ export class OpenAICompatiblePlanner {
   }
 }
 
-export function configuredPlanner() {
-  return process.env.ACTIVETAB_MODEL_ENDPOINT && process.env.ACTIVETAB_MODEL && process.env.ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT === "1"
-    ? new OpenAICompatiblePlanner({ allowPageContent: true })
-    : new DeterministicPlanner();
+export function configuredPlanner({ executionMode = "agent_directed", plannerMode = "deterministic" } = {}) {
+  if (!["agent_directed", "agent_assisted", "standalone"].includes(executionMode)) throw new Error("Execution mode must be agent_directed, agent_assisted, or standalone.");
+  if (!["deterministic", "model"].includes(plannerMode)) throw new Error("Planner mode must be deterministic or model.");
+  if (executionMode !== "standalone" || plannerMode !== "model") return new DeterministicPlanner();
+  if (!process.env.ACTIVETAB_MODEL_ENDPOINT || !process.env.ACTIVETAB_MODEL) throw new Error("Standalone model planning requires ACTIVETAB_MODEL_ENDPOINT and ACTIVETAB_MODEL.");
+  if (process.env.ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT !== "1") throw new Error("Standalone model planning requires ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT=1.");
+  return new OpenAICompatiblePlanner({ allowPageContent: true });
 }

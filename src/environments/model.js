@@ -41,6 +41,7 @@ export function buildEnvironmentBinding(profile = {}) {
   const env = profile.environment ?? {};
   const environmentId = String(env.environment_id ?? profile.profile_id ?? "");
   if (!environmentId) throw new Error("Environment binding requires an environment_id.");
+  const profileId = typeof profile.profile_id === "string" ? profile.profile_id : environmentId;
 
   const applicationEntryUrl = String(env.application_entry_url ?? "");
   if (!applicationEntryUrl) throw new Error(`Environment '${environmentId}' requires an application_entry_url.`);
@@ -61,6 +62,17 @@ export function buildEnvironmentBinding(profile = {}) {
     status: app.status ?? "candidate",
     ...(app.final_origin ? { finalOrigin: app.final_origin } : {})
   }));
+  const authenticationRealms = (profile.authentication_realms ?? []).map(realm => {
+    if (!realm || typeof realm !== "object" || typeof realm.realm_id !== "string" || !realm.realm_id
+      || !Array.isArray(realm.scope) || realm.scope.some(scope => typeof scope !== "string" || !scope)) {
+      throw new Error(`Environment '${environmentId}' contains an invalid authentication realm binding.`);
+    }
+    return Object.freeze({
+      realmId: realm.realm_id,
+      scope: Object.freeze([...new Set(realm.scope)].sort()),
+      separateCredentials: realm.separate_credentials === true
+    });
+  }).sort((left, right) => left.realmId.localeCompare(right.realmId));
 
   const authorizedOrigins = new Set(
     (env.authorized_origins ?? [entryOrigin]).map(normalizeOrigin).filter(Boolean)
@@ -70,6 +82,9 @@ export function buildEnvironmentBinding(profile = {}) {
   const diagnosticTransport = env.diagnostic_transport ?? null;
   const diagnosticEndpoint = env.diagnostic_endpoint ?? null;
   const remoteTarget = env.remote_target ?? null;
+  const diagnosticEndpointBindings = Object.freeze(Array.isArray(env.diagnostic_endpoint_bindings)
+    ? env.diagnostic_endpoint_bindings.map(binding => Object.freeze({ ...binding }))
+    : []);
   if (diagnosticEndpoint) {
     if (!diagnosticTransport) {
       throw new Error(`Environment '${environmentId}': diagnostic_endpoint requires an explicit diagnostic_transport.`);
@@ -88,13 +103,16 @@ export function buildEnvironmentBinding(profile = {}) {
   }
 
   return Object.freeze({
+    profileId,
     environmentId,
     applicationEntryUrl,
     entryOrigin,
     browserControlEndpoint: env.browser_control_endpoint ?? null,
     ...(diagnosticEndpoint ? { diagnosticEndpoint, diagnosticTransport, remoteTarget } : {}),
+    diagnosticEndpointBindings,
     authorizedOrigins: Object.freeze([...authorizedOrigins]),
     applications: Object.freeze(applications),
+    authenticationRealms: Object.freeze(authenticationRealms),
     platform: env.platform ?? null
   });
 }

@@ -122,7 +122,30 @@ function createRealRunner({ journalDir, outputDir }) {
 
           // Run the navigation engine with the goal
           const journal = new TaskJournal(join(journalDir, `${taskId}.json`));
-          const engine = new NavigationEngine(session, { journal, maxActions: 3 });
+          // This button exists only in the disposable fixture. Keep its test
+          // capability exact and independent from ordinary product policy.
+          const fixtureButtonAuthorizer = {
+            operationId: "test.local_fixture_archive_button",
+            authorize({ action, candidate, observation }) {
+              let fixtureOrigin = null;
+              let observedOrigin = null;
+              try {
+                fixtureOrigin = new URL(input.url).origin;
+                observedOrigin = new URL(observation?.page?.url).origin;
+              } catch {}
+              const fresh = (observation?.candidates ?? []).some(item =>
+                item.identity === candidate?.identity && item.role === "button" && item.visible === true);
+              const allowed = action === "click"
+                && fixtureOrigin === observedOrigin
+                && candidate?.tag === "button"
+                && candidate?.name === "Open archive"
+                && fresh;
+              return allowed
+                ? { allowed: true, category: "test_local_fixture_archive" }
+                : { allowed: false, reason: "The test capability is limited to the fresh Open archive button on its own fixture." };
+            }
+          };
+          const engine = new NavigationEngine(session, { journal, maxActions: 3, operationAuthorizer: fixtureButtonAuthorizer });
           const navResult = await engine.run(goal);
           console.log(`[CDP Test] Result: ${navResult.status} attempts=${navResult.attempts}`);
 

@@ -1,11 +1,13 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { configuredPlanner, DeterministicPlanner, goalExpectation } from "./planner.js";
-import { searchPhraseFromGoal } from "./search.js";
+import { createSearchSubmitAuthorizer, searchPhraseFromGoal, SEARCH_SUBMIT_OPERATION_ID } from "./search.js";
 import { authorizePlannedAction } from "./actionPolicy.js";
 import { classifyHumanHandoff } from "./handoff.js";
 import { newTaskState, taskGoalFingerprint, updateTaskJournal } from "../state/journal.js";
 import { normalizeOrigin } from "../environments/model.js";
 import { isOperatorProhibitedNavigation } from "../runtime/controlRestrictions.js";
+import { executeAuthorizedAction } from "../runtime/authorizedExecutor.js";
+import { adjudicatePreActionReview } from "../decisions/adjudication.js";
 import { matchesScrollTargetSignature, matchesTargetSignature, observationSemanticFingerprint, observationStateFingerprint, routeFingerprint, scrollPositionFraction, scrollPositionMatches, scrollTargetSignature, targetSignature, visibleCandidatesFingerprint } from "../state/workflows.js";
 
 function pageChangeWaitBaseline(observation, scrollTarget) {
@@ -15,6 +17,37 @@ function pageChangeWaitBaseline(observation, scrollTarget) {
     lifecycleEventCount: observation.lifecycleEventCount,
     ...(scrollTarget ? { scrollTarget } : {})
   };
+}
+
+function environmentBindingFingerprint(environment) {
+  if (!environment) return null;
+  const origins = [...new Set((environment.authorizedOrigins ?? []).map(normalizeOrigin).filter(Boolean))].sort();
+  const applications = (environment.applications ?? [])
+    .map(application => ({
+      applicationId: String(application.applicationId ?? ""),
+      authenticationRealm: String(application.authenticationRealm ?? ""),
+      candidateEntry: String(application.candidateEntry ?? ""),
+      finalOrigin: String(application.finalOrigin ?? ""),
+      status: String(application.status ?? "")
+    }))
+    .sort((left, right) => left.applicationId.localeCompare(right.applicationId));
+  const authenticationRealms = (environment.authenticationRealms ?? [])
+    .map(realm => ({
+      realmId: String(realm.realmId ?? ""),
+      scope: [...new Set(realm.scope ?? [])].map(String).sort(),
+      separateCredentials: realm.separateCredentials === true
+    }))
+    .sort((left, right) => left.realmId.localeCompare(right.realmId));
+  return createHash("sha256")
+    .update(JSON.stringify({
+      profileId: String(environment.profileId ?? ""),
+      environmentId: String(environment.environmentId ?? ""),
+      applicationEntryUrl: String(environment.applicationEntryUrl ?? ""),
+      origins,
+      applications,
+      authenticationRealms
+    }))
+    .digest("hex");
 }
 
 function pageLabelEntries(observation) {
@@ -77,6 +110,16 @@ function handoffResult(goal, reason, authorizationRequired, attempts, recoveries
   return { status: "needs_human", goal, reason, authorizationRequired, attempts, recoveries, evidenceId };
 }
 
+async function dispatchThroughAuthorizedExecutor(session, options) {
+  const result = await executeAuthorizedAction({ session, ...options });
+  if (result.dispatched) return result;
+  const error = new Error(result.reason ?? "The authorized executor refused the browser operation.");
+  error.kind = result.authorized ? "dispatch_uncertain" : "authorization_refused";
+  error.dispatchStatus = result.authorized ? "uncertain" : "refused";
+  error.authorizationCategory = result.category ?? null;
+  throw error;
+}
+
 function unchangedAfterFailedClick(attempt) {
   return attempt?.action === "click" && Boolean(attempt.error) &&
     (attempt.sameTargetRemained === true || attempt.observationUnavailable === true ||
@@ -84,15 +127,22 @@ function unchangedAfterFailedClick(attempt) {
 }
 
 export class NavigationEngine {
-  constructor(session, { planner = configuredPlanner(), journal, workflowStore, maxActions = 8, maxRecoveries = 1, maxScrolls = 5, signal, environment = null } = {}) {
+  constructor(session, { planner = null, executionMode = "agent_directed", plannerMode = "deterministic", journal, workflowStore, decisionRuntime = null, decisionContext = null, operationAuthorizer = null, maxActions = 8, maxRecoveries = 1, maxScrolls = 5, signal, environment = null, localFixture = false } = {}) {
     this.signal = signal;
     this.session = session;
-    this.planner = planner;
+    if (!["agent_directed", "agent_assisted", "standalone"].includes(executionMode)) throw new Error("Execution mode must be agent_directed, agent_assisted, or standalone.");
+    if (planner?.plannerRole === "standalone_action_proposer" && executionMode !== "standalone") throw new Error("The model action planner is available only in explicit standalone mode.");
+    this.executionMode = executionMode;
+    this.planner = planner ?? configuredPlanner({ executionMode, plannerMode });
     // Optional verified environment binding. When present, the engine refuses
     // to count a navigation onto a non-authorized origin as goal progress.
     this.environment = environment;
+    this.localFixture = localFixture === true;
     this.journal = journal;
     this.workflowStore = workflowStore;
+    this.decisionRuntime = decisionRuntime;
+    this.decisionContext = decisionContext;
+    this.operationAuthorizer = operationAuthorizer;
     this.maxActions = Math.max(1, Math.min(maxActions, 10));
     this.maxRecoveries = Math.max(0, Math.min(maxRecoveries, 3));
     this.maxScrolls = Math.max(0, Math.min(maxScrolls, 8));
@@ -110,7 +160,13 @@ export class NavigationEngine {
     };
     throwIfAborted();
     const searchPhrase = searchPhraseFromGoal(goal);
+    const searchSubmitAuthorizer = searchPhrase ? createSearchSubmitAuthorizer(searchPhrase) : null;
     const state = resumeState ?? newTaskState(goal, this.session.target, this.session.target.endpoint ?? "local-cdp");
+    const currentEnvironmentFingerprint = environmentBindingFingerprint(this.environment);
+    if (resumeState && (resumeState.environmentFingerprint ?? null) !== currentEnvironmentFingerprint) {
+      throw new Error("Resume state environment binding does not match the current authorized profile.");
+    }
+    state.environmentFingerprint = currentEnvironmentFingerprint;
     const resumedHandoff = resumeState?.status === "needs_human" ? resumeState.interventionRequired : undefined;
     if (resumeState?.requiresGoalInput && !resumeState.goalFingerprint) {
       throw new Error("This legacy task journal redacts its goal without a fingerprint and cannot safely resume; start a new task.");
@@ -163,6 +219,145 @@ export class NavigationEngine {
     const planner = searchPhrase ? new DeterministicPlanner() : this.planner;
 
     const updateJournal = async () => { if (this.journal) await updateTaskJournal(this.journal, state); };
+    let decisionEpisodeId = null;
+    const decisionRunId = this.decisionContext?.runId ?? state.taskId;
+    if (this.decisionRuntime) {
+      const envId = String(this.environment?.environmentId ?? "").toLowerCase();
+      const environmentClass = this.environment?.environmentClass
+        ?? (envId.includes("production") ? "production" : envId.includes("staging") ? "staging" : envId ? "local" : "unknown");
+      const episode = this.decisionRuntime.startEpisode({
+        episodeId: this.decisionContext?.episodeId ?? state.decisionEpisodeId,
+        runId: decisionRunId,
+        workflowId: this.decisionContext?.workflowId ?? "navigation_goal",
+        applicationId: this.environment?.applications?.[0]?.applicationId ?? "unknown",
+        environmentClass,
+        executionMode: this.executionMode,
+        policyVersion: "active_policy_v1",
+        workflowKind: "browser_workflow"
+      });
+      decisionEpisodeId = episode.episodeId;
+      state.decisionEpisodeId = decisionEpisodeId;
+      await updateJournal();
+    }
+    const decisionStepId = () => this.decisionContext?.stepPrefix
+      ? `${this.decisionContext.stepPrefix}_a${Math.min(999, state.attempts.length + 1)}`
+      : `step_${Math.min(999, state.attempts.length + 1)}`;
+    const prepareTelemetryDecision = async (attempt, actionType, target, authorized = true, operationId = null) => {
+      if (!this.decisionRuntime || !decisionEpisodeId) return { allowed: true, grantsAuthority: false };
+      attempt.decisionId ??= randomUUID();
+      attempt.decisionStepId ??= decisionStepId();
+      attempt.operationId ??= randomUUID();
+      const operationContext = this.operationAuthorizer?.decisionContext?.(operationId ?? attempt.operationId) ?? null;
+      const targetIsLink = actionType === "click" && (target?.tag === "a" || target?.role === "link") && typeof target?.href === "string";
+      const reviewRequired = operationContext?.reviewRequired === true
+        || actionType === "navigate"
+        || actionType === "upload"
+        || actionType === "toggle"
+        || target?.submitsForm === true
+        || targetIsLink;
+      const reviewInput = {
+        episodeId: decisionEpisodeId,
+        runId: decisionRunId,
+        stepId: attempt.decisionStepId,
+        decisionId: attempt.decisionId,
+        observation: latest,
+        operation: actionType,
+        operationClass: operationContext?.operationClass ?? (targetIsLink ? "navigation" : target?.submitsForm ? "form_submission" : "browser_interaction"),
+        targetRole: operationContext?.targetRole ?? (targetIsLink ? "navigation_link" : "browser_control"),
+        expectedOutcomeClass: targetIsLink ? "destination_observed" : "browser_state_change",
+        candidate: target,
+        ...(operationContext?.semanticAnnotation ? { semanticAnnotation: operationContext.semanticAnnotation } : {}),
+        ...(operationContext?.semanticEventIds?.length ? { semanticEventIds: operationContext.semanticEventIds } : {}),
+        signal: abortSignal
+      };
+      let review;
+      if (reviewRequired) {
+        // The semantic model is invoked only by an explicit ambiguity resolver
+        // (for example, the FreeInference adapter). A selected target does not
+        // need a second model to repeat the coding agent's intent.
+        review = await this.decisionRuntime.reviewBeforeAction(reviewInput);
+      } else {
+        await this.decisionRuntime.recordReviewSkipped({
+          ...reviewInput,
+          reasonCode: "policy_boundary_not_triggered"
+        });
+        review = { decisionId: attempt.decisionId, authorizesOperation: false };
+      }
+      const adjudication = adjudicatePreActionReview(review);
+      await this.decisionRuntime.recordPolicy({
+        episodeId: decisionEpisodeId,
+        runId: decisionRunId,
+        stepId: attempt.decisionStepId,
+        decisionId: attempt.decisionId,
+        observationId: latest.evidenceId,
+        disposition: authorized && adjudication.allowed ? "allow" : "deny",
+        reasonCode: !authorized ? "action_policy_refused" : adjudication.allowed ? "action_policy_admitted" : "jev_review_required",
+        policyVersion: "active_policy_v1"
+      });
+      return adjudication;
+    };
+    const suspendForDecisionReview = async (attempt, adjudication) => {
+      state.status = "needs_human";
+      state.terminationReason = adjudication.reason ?? "Independent review requested additional agent review; no browser effect was dispatched.";
+      state.authorizationRequired = {
+        category: adjudication.category ?? "independent_review_required",
+        targetIdentity: attempt.targetIdentity ?? null,
+        evidenceId: attempt.beforeEvidenceId ?? latest.evidenceId
+      };
+      await updateJournal();
+      return resultWithWorkflow(handoffResult(goal, state.terminationReason, state.authorizationRequired, state.attempts.length, recoveries, latest.evidenceId));
+    };
+    const reserveTelemetryOperation = async (attempt, actionType) => {
+      if (!this.decisionRuntime || !decisionEpisodeId || !attempt.decisionId) return;
+      await this.decisionRuntime.reserveExecution({
+        episodeId: decisionEpisodeId,
+        runId: decisionRunId,
+        stepId: attempt.decisionStepId,
+        decisionId: attempt.decisionId,
+        observationId: attempt.beforeEvidenceId,
+        operation: actionType,
+        targetRole: "browser_target",
+        operationId: attempt.operationId
+      });
+    };
+    const recordTelemetryDispatch = async (attempt, actionType, dispatchStatus) => {
+      if (!this.decisionRuntime || !decisionEpisodeId || !attempt.decisionId) return;
+      await this.decisionRuntime.recordDispatch({
+        episodeId: decisionEpisodeId,
+        runId: decisionRunId,
+        stepId: attempt.decisionStepId,
+        decisionId: attempt.decisionId,
+        observationId: attempt.beforeEvidenceId,
+        operation: actionType,
+        targetRole: "browser_target",
+        operationId: attempt.operationId,
+        dispatchStatus
+      });
+    };
+    const recordTelemetryObservation = async (attempt, changed, outcomeClass = "browser_state_observed") => {
+      if (!this.decisionRuntime || !decisionEpisodeId || !attempt.decisionId || !attempt.afterEvidenceId) return;
+      await this.decisionRuntime.recordObserved({
+        episodeId: decisionEpisodeId,
+        runId: decisionRunId,
+        stepId: attempt.decisionStepId,
+        decisionId: attempt.decisionId,
+        observationId: attempt.afterEvidenceId,
+        outcomeClass,
+        changed,
+        evidenceRefs: [attempt.beforeEvidenceId, attempt.afterEvidenceId]
+      });
+    };
+    const completeDecisionEpisode = status => {
+      if (!this.decisionRuntime || !decisionEpisodeId || this.decisionContext?.sharedEpisode || state.decisionEpisodeCompleted === true) return;
+      const normalized = status === "succeeded" ? "passed"
+        : status === "canceled" ? "canceled"
+          : status === "needs_human" ? "suspended"
+            : status === "unresolved" ? "uncertain"
+              : "failed";
+      if (normalized === "suspended") return;
+      this.decisionRuntime.completeEpisode({ episodeId: decisionEpisodeId, runId: decisionRunId, status: normalized, cleanupStatus: "not_required" });
+      state.decisionEpisodeCompleted = true;
+    };
     const isAbortError = error => error?.name === "AbortError" || error?.code === 20;
     // Cancellation after input dispatch keeps the action uncertain: the
     // dispatch receipt exists but the outcome was never observed, so the
@@ -173,6 +368,7 @@ export class NavigationEngine {
       attempt.uncertainOutcome = true;
       attempt.canceled = true;
       attempt.completedAt = new Date().toISOString();
+      await recordTelemetryDispatch(attempt, attempt.action, "uncertain");
       if (attempt.action === "click") recordFailedTargetPresence(attempt, latest);
       finishAction(attempt);
       state.status = "canceled";
@@ -194,11 +390,14 @@ export class NavigationEngine {
       delete state.pendingAction;
       state.attempts.push(attempt);
     };
-    const resultWithWorkflow = result => ({
-      ...result,
-      goal: "[redacted task goal]",
-      ...(this.workflowStore ? { workflowReplay: { ...workflowReplay } } : {})
-    });
+    const resultWithWorkflow = result => {
+      completeDecisionEpisode(result.status);
+      return {
+        ...result,
+        goal: "[redacted task goal]",
+        ...(this.workflowStore ? { workflowReplay: { ...workflowReplay } } : {})
+      };
+    };
     const stopAfterObservationLoss = async (attempt, error) => {
       const observationError = { name: error?.name ?? "Error", message: String(error?.message ?? error).slice(0, 400) };
       attempt.error ??= observationError;
@@ -260,6 +459,12 @@ export class NavigationEngine {
         afterEvidenceId: latest.evidenceId,
         completedAt: new Date().toISOString()
       };
+      if (pending.operationId && pending.decisionId) {
+        await recordTelemetryDispatch(interrupted, interrupted.action, "uncertain");
+        await recordTelemetryObservation(interrupted,
+          observationStateFingerprint(latest) !== pending.beforeStateFingerprint,
+          "interrupted_action_reconciled_from_browser_state");
+      }
       if (pending.action === "click") recordFailedTargetPresence(interrupted, latest);
       if (pending.action === "scroll") {
         const currentTarget = (latest.scrollTargets ?? []).find(target => target.identity === pending.targetIdentity);
@@ -337,15 +542,26 @@ export class NavigationEngine {
                 beforeEvidenceId: latest.evidenceId,
                 startedAt: new Date().toISOString()
               };
+              const review = await prepareTelemetryDecision(attempt, "scroll", target, true);
+              if (!review.allowed) return await suspendForDecisionReview(attempt, review);
               await beginAction(attempt);
+              await reserveTelemetryOperation(attempt, "scroll");
               try {
                 throwIfAborted();
-                await this.session.scroll(target);
+                await dispatchThroughAuthorizedExecutor(this.session, {
+                  environment: this.environment,
+                  localFixture: this.localFixture,
+                  goal,
+                  action: "scroll",
+                  candidate: target
+                });
               }
               catch (error) {
                 if (isAbortError(error)) return await canceledWithPendingAction(attempt);
                 attempt.error = { name: error.name, message: String(error.message).slice(0, 400) };
+                attempt.dispatchStatus = error.dispatchStatus ?? "failed";
               }
+              await recordTelemetryDispatch(attempt, "scroll", attempt.error ? (attempt.dispatchStatus ?? "failed") : "dispatched");
               try {
                 await this.session.waitForChange(1_500, waitBaseline);
                 latest = await this.session.observe();
@@ -368,6 +584,7 @@ export class NavigationEngine {
               attempt.afterRouteFingerprint = routeFingerprint(latest.page.url);
               attempt.afterEvidenceId = latest.evidenceId;
               attempt.completedAt = new Date().toISOString();
+              await recordTelemetryObservation(attempt, moved, attempt.error ? "scroll_failed_state_observed" : moved ? "scroll_progress_observed" : "scroll_no_progress_observed");
               finishAction(attempt);
               workflowReplay.actions++;
               scrollActionsUsed++;
@@ -427,14 +644,25 @@ export class NavigationEngine {
               beforeEvidenceId: latest.evidenceId,
               startedAt: new Date().toISOString()
             };
+            const review = await prepareTelemetryDecision(attempt, "click", target, true);
+            if (!review.allowed) return await suspendForDecisionReview(attempt, review);
             await beginAction(attempt);
+            await reserveTelemetryOperation(attempt, "click");
             try {
               throwIfAborted();
-              await this.session.click(target);
+              await dispatchThroughAuthorizedExecutor(this.session, {
+                environment: this.environment,
+                localFixture: this.localFixture,
+                goal,
+                action: "click",
+                candidate: target
+              });
             } catch (error) {
               if (isAbortError(error)) return await canceledWithPendingAction(attempt);
               attempt.error = { name: error.name, message: String(error.message).slice(0, 400) };
+              attempt.dispatchStatus = error.dispatchStatus ?? "failed";
             }
+            await recordTelemetryDispatch(attempt, "click", attempt.error ? (attempt.dispatchStatus ?? "failed") : "dispatched");
             excludedIdentities.add(target.identity);
             try {
               await this.session.waitForChange(2_000, waitBaseline);
@@ -459,6 +687,8 @@ export class NavigationEngine {
             attempt.afterRouteFingerprint = routeFingerprint(latest.page.url);
             attempt.afterEvidenceId = latest.evidenceId;
             attempt.completedAt = new Date().toISOString();
+            await recordTelemetryObservation(attempt, afterStateFingerprint !== beforeStateFingerprint,
+              attempt.error ? "click_failed_state_observed" : "click_state_observed");
             finishAction(attempt);
             workflowReplay.actions++;
             await updateJournal();
@@ -499,7 +729,7 @@ export class NavigationEngine {
       const planningObservation = {
         ...latest,
         candidates: (latest.candidates ?? []).filter(candidate =>
-          !excludedIdentities.has(candidate.identity) &&
+          (!excludedIdentities.has(candidate.identity) || (searchPhrase && candidate.tag === "input" && String(candidate.type).toLowerCase() === "search")) &&
           !excludedTargetSignatures.some(signature => matchesTargetSignature(candidate, signature))
         ),
         scrollTargets: (latest.scrollTargets ?? []).filter(target => !excludedScrollIdentities.has(target.identity))
@@ -566,8 +796,34 @@ export class NavigationEngine {
         await updateJournal();
         return resultWithWorkflow({ status: state.status, goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: latest.evidenceId });
       }
-      const authorization = authorizePlannedAction(goal, selectedTarget, actionType);
+      let operationId = this.operationAuthorizer?.operationId ?? null;
+      let operationAuthorizer = this.operationAuthorizer;
+      if (searchPhrase && searchSubmitAuthorizer && (
+        (actionType === "type" && selectedTarget.tag === "input" && String(selectedTarget.type).toLowerCase() === "search")
+        || (actionType === "click" && selectedTarget.submitsForm === true)
+      )) {
+        operationId = SEARCH_SUBMIT_OPERATION_ID;
+        operationAuthorizer = searchSubmitAuthorizer;
+      }
+      let authorization = authorizePlannedAction(goal, selectedTarget, actionType);
+      if (!authorization.authorized
+        && ["unclassified_form_submission", "unknown_control_effect"].includes(authorization.category)
+        && operationAuthorizer && typeof operationId === "string" && operationId) {
+        const typedOperation = await operationAuthorizer.authorize({
+          operationId, action: actionType, candidate: selectedTarget, value: plan.action.value ?? null, observation: latest
+        });
+        if (typedOperation?.allowed === true) {
+          authorization = { authorized: true, category: typedOperation.category ?? "typed_operation" };
+        }
+      }
       if (!authorization.authorized) {
+        const deniedAttempt = {
+          action: actionType,
+          targetIdentity: selectedTarget.identity,
+          beforeEvidenceId: latest.evidenceId,
+          startedAt: new Date().toISOString()
+        };
+        await prepareTelemetryDecision(deniedAttempt, actionType, selectedTarget, false, operationId);
         state.status = "needs_human";
         state.terminationReason = authorization.reason;
         state.authorizationRequired = {
@@ -595,21 +851,29 @@ export class NavigationEngine {
         beforeEvidenceId: latest.evidenceId,
         startedAt: new Date().toISOString()
       };
+      const review = await prepareTelemetryDecision(attempt, actionType, selectedTarget, authorization.authorized, operationId);
+      if (authorization.authorized && !review.allowed) return await suspendForDecisionReview(attempt, review);
       await beginAction(attempt);
+      await reserveTelemetryOperation(attempt, actionType);
       let dispatchOutcome = "dispatched";
       try {
         throwIfAborted(); // canceled before dispatch: no browser input was sent
-        if (actionType === "type") await this.session.typeSearchPhrase(selectedTarget, plan.action.value);
-        else if (actionType === "click") await this.session.click(selectedTarget);
-        else if (actionType === "fill") await this.session.fillField(selectedTarget, plan.action.value ?? "");
-        else if (actionType === "select") await this.session.selectOption(selectedTarget, plan.action.value ?? "");
-        else if (actionType === "toggle") await this.session.click(selectedTarget); // checkbox/radio toggles via click
-        else if (actionType === "upload") await this.session.uploadFile(selectedTarget, plan.action.filePaths ?? []);
-        else if (actionType === "scroll" && plan.action.direction === "down") await this.session.scroll(selectedTarget);
-        else throw new Error("Unsupported browser action.");
+        if (actionType === "scroll" && plan.action.direction !== "down") throw new Error("Only downward scroll actions are supported.");
+        await dispatchThroughAuthorizedExecutor(this.session, {
+          environment: this.environment,
+          localFixture: this.localFixture,
+          goal,
+          action: actionType,
+          candidate: selectedTarget,
+          value: plan.action.value ?? null,
+          filePaths: plan.action.filePaths ?? null,
+          operationId,
+          operationAuthorizer
+        });
         if (actionType !== "scroll") excludedIdentities.add(selectedTarget.identity);
       } catch (error) {
         if (isAbortError(error)) return await canceledWithPendingAction(attempt);
+        dispatchOutcome = error.dispatchStatus ?? "failed";
         // Stale element recovery: if the failure is specifically a staleness
         // error and recovery budget allows, reobserve and retry once with a
         // freshly resolved target. Do not count this against maxRecoveries.
@@ -626,20 +890,26 @@ export class NavigationEngine {
             excludedIdentities.delete(selectedTarget.identity);
             try {
               throwIfAborted();
-              if (actionType === "type") await this.session.typeSearchPhrase(selectedTarget, plan.action.value);
-              else if (actionType === "click") await this.session.click(selectedTarget);
-              else if (actionType === "fill") await this.session.fillField(selectedTarget, plan.action.value ?? "");
-              else if (actionType === "select") await this.session.selectOption(selectedTarget, plan.action.value ?? "");
-              else if (actionType === "toggle") await this.session.click(selectedTarget);
-              else if (actionType === "scroll" && plan.action.direction === "down") await this.session.scroll(selectedTarget);
-              else throw new Error("Unsupported browser action.");
+              if (actionType === "scroll" && plan.action.direction !== "down") throw new Error("Only downward scroll actions are supported.");
+              await dispatchThroughAuthorizedExecutor(this.session, {
+                environment: this.environment,
+                localFixture: this.localFixture,
+                goal,
+                action: actionType,
+                candidate: selectedTarget,
+                value: plan.action.value ?? null,
+                filePaths: plan.action.filePaths ?? null,
+                operationId,
+                operationAuthorizer
+              });
               dispatchOutcome = "dispatched";
               delete attempt.error;
               attempt.recoveredFromStale = true;
             } catch (retryError) {
               if (isAbortError(retryError)) return await canceledWithPendingAction(attempt);
-              dispatchOutcome = "failed";
+              dispatchOutcome = retryError.dispatchStatus ?? "failed";
               attempt.error = { name: retryError.name, message: String(retryError.message).slice(0, 400) };
+              attempt.dispatchStatus = retryError.dispatchStatus ?? "failed";
             }
           } else {
             dispatchOutcome = "failed";
@@ -651,6 +921,7 @@ export class NavigationEngine {
         }
         excludedIdentities.add(selectedTarget.identity);
       }
+      await recordTelemetryDispatch(attempt, actionType, dispatchOutcome);
       try {
         await this.session.waitForChange(actionType === "type" ? 500 : actionType === "scroll" ? 1_500 : 2_000, waitBaseline);
         latest = await this.session.observe();
@@ -769,7 +1040,14 @@ export class NavigationEngine {
           excludedIdentities.add(selectedTarget.identity);
           if (workflowTraceSafe) workflowTraceSafe = false;
           try {
-            await this.session.client.send("Page.navigate", { url: recoveryUrl });
+          await dispatchThroughAuthorizedExecutor(this.session, {
+            environment: this.environment,
+            localFixture: this.localFixture,
+            recovery: true,
+            goal,
+            action: "navigate",
+            url: recoveryUrl
+          });
             await this.session.waitForChange(2_500, waitBaseline).catch(() => {});
             latest = await this.session.observe();
           } catch (error) {
@@ -786,6 +1064,8 @@ export class NavigationEngine {
       attempt.afterRouteFingerprint = routeFingerprint(latest.page.url);
       attempt.afterEvidenceId = latest.evidenceId;
       attempt.completedAt = new Date().toISOString();
+      await recordTelemetryObservation(attempt, afterStateFingerprint !== beforeStateFingerprint,
+        dispatchOutcome === "dispatched" ? "browser_state_observed" : "dispatch_failed_state_observed");
       finishAction(attempt);
       await updateJournal();
       const actionHandoff = await handoffIfNeeded(latest);

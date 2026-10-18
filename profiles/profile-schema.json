@@ -34,6 +34,22 @@
           "description": "How the diagnostic endpoint is reached. A loopback endpoint requires 'ssh_tunnel' plus a verified remote_target."
         },
         "remote_target": { "type": ["string", "null"], "description": "Verified remote staging destination for a tunnel." },
+        "diagnostic_endpoint_bindings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "method", "pathTemplate", "observedStatus", "contentType", "sourceEvidenceId"],
+            "properties": {
+              "name": { "type": "string", "enum": ["health", "runDetail", "runActivity"] },
+              "method": { "type": "string", "const": "GET" },
+              "pathTemplate": { "type": "string" },
+              "observedStatus": { "type": "integer", "const": 200 },
+              "contentType": { "type": "string", "const": "application/json" },
+              "sourceEvidenceId": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        },
         "authorized_origins": {
           "type": "array",
           "items": { "type": "string" },

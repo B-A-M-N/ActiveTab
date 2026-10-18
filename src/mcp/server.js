@@ -17,14 +17,26 @@ import { cloudAgentAdapterFromEnv } from "../diagnostics/adapters/cloudAgentApi.
 import { DiagnosticCorrelator } from "../diagnostics/correlator.js";
 import { DiagnosticReport, FINDING_LEVEL, INVESTIGATION_STATUS } from "../diagnostics/report.js";
 import { TestRunner } from "../testing/runner.js";
+import { receiptFromRunState } from "../testing/receipts.js";
+import { RunStateStore } from "../testing/runState.js";
 import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
 import { InvestigationEngine } from "../investigation/engine.js";
 import { InterventionStore, InterventionWatcher } from "../runtime/interventions.js";
 import { createInterventionTools } from "../api/intervention-tools.js";
 import { AuthorizationGrantStore } from "../runtime/approvals.js";
+import { createDecisionRuntime } from "../decisions/runtime.js";
+import { trackRunResult } from "../runtime/runTracker.js";
+import { ProfileLoader } from "../testing/profiles.js";
+import { buildEnvironmentBinding, verifyObservedUrl } from "../environments/model.js";
+import { createCloudAgentEntryWorkflow, resolveCloudAgentEntry, verifyCloudAgentReady } from "../testing/qualifyCloudAgent.js";
+import { prepareCloudAgentTask } from "../integrations/freeinference/prepareCloudAgentTask.js";
+import { verifyCloudAgentRunOutcome } from "../integrations/freeinference/cloudAgentWorkflow.js";
+import { eventIdsForEvidence } from "../telemetry/evidenceRefs.js";
+import { randomUUID } from "node:crypto";
 
 const endpoint = process.env.ACTIVETAB_CDP_ENDPOINT ?? "http://127.0.0.1:9222";
 const sessions = new Map();
+const decisionRuntime = createDecisionRuntime();
 let chromeConnection;
 const autoConnect = process.env.ACTIVETAB_AUTO_CONNECT === "1";
 const extensionMode = process.env.ACTIVETAB_EXTENSION === "1";
@@ -41,27 +53,48 @@ let interventionTools = null;
 let interventionWatcher = null;
 
 const interventionStore = new InterventionStore(process.env.ACTIVETAB_INTERVENTION_DIR ?? join(process.cwd(), ".activetab", "interventions"));
+const runStateStore = new RunStateStore(process.env.ACTIVETAB_RUN_STATE_DIR ?? join(process.cwd(), ".activetab", "runs"));
 const grantStore = new AuthorizationGrantStore({ trustedIssuer: process.env.ACTIVETAB_TRUSTED_ISSUER ?? "activetab-mcp" });
 const interventionCtx = {
   grantStore,
   issueGrant: (...args) => grantStore.issue(...args),
   // Attachment verification: a caller-provided target ID alone is never proof.
-  hasAttachmentGrant: async targetId => sessions.has(targetId)
-    ? { ok: true }
-    : { ok: false, reason: `No authorized attachment grant for target '${targetId}'. Authorize the tab through the ActiveTab extension.` },
-  // Authentication verification: supplied by the operator/integration; the
-  // default refuses to treat a disappeared login form as proof.
-  verifyAuthentication: async realm => ({ authenticated: false, reason: `No authentication verifier configured for realm '${realm ?? "unknown"}'.` }),
-  observe: async () => {
-    const session = [...sessions.values()][0];
-    return session ? await session.observe() : null;
+  hasAttachmentGrant: async (targetId, intervention) => {
+    const run = intervention?.runId ? testRuns.get(intervention.runId) : null;
+    if (!run || run.session?.target?.id !== targetId) {
+      return { ok: false, reason: "The intervention is not bound to this browser target and run." };
+    }
+    return sessions.has(targetId)
+      ? { ok: true }
+      : { ok: false, reason: `No authorized attachment grant for target '${targetId}'. Authorize the tab through the ActiveTab extension.` };
+  },
+  // Resume predicates receive their durable intervention and resolve the
+  // verifier/session bound to that exact run. Never borrow the first attached
+  // tab when multiple browser targets exist.
+  verifyAuthentication: async (realm, intervention) => {
+    const run = intervention?.runId ? testRuns.get(intervention.runId) : null;
+    if (typeof run?.verifyAuthentication !== "function") {
+      return { authenticated: false, reason: `No authentication verifier configured for realm '${realm ?? "unknown"}'.` };
+    }
+    return await run.verifyAuthentication(realm);
+  },
+  verifyEnvironment: async (url, intervention) => {
+    const run = intervention?.runId ? testRuns.get(intervention.runId) : null;
+    if (typeof run?.verifyEnvironment === "function") return await run.verifyEnvironment(url);
+    if (!run?.environment) return { ok: false, reason: "No environment binding is available for this run." };
+    return verifyObservedUrl(run.environment, url);
+  },
+  observe: async intervention => {
+    const run = intervention?.runId ? testRuns.get(intervention.runId) : null;
+    return run?.session ? await run.session.observe().catch(() => null) : null;
   }
 };
 
 // Explicit startup: a failed intervention-store initialization must not
 // leave the server claiming durable resumability.
 await interventionStore.init();
-interventionTools = createInterventionTools({ store: interventionStore, runs: testRuns, ctx: interventionCtx });
+await runStateStore.init();
+interventionTools = createInterventionTools({ store: interventionStore, runs: testRuns, runStateStore, ctx: interventionCtx });
 interventionWatcher = new InterventionWatcher({ store: interventionStore, ctx: interventionCtx, pollIntervalMs: 5_000 });
 interventionWatcher.onResume = async (record) => {
   const run = testRuns.get(record.runId);
@@ -71,10 +104,76 @@ interventionWatcher.start();
 
 function createBrowserDiagnosticSources(session, collector) {
   registerBrowserDiagnosticSources(session, collector);
-  const cloudAgent = cloudAgentAdapterFromEnv();
-  if (cloudAgent) cloudAgent.registerSources(collector);
   return collector;
 }
+
+async function loadEnvironmentProfile(profileId) {
+  if (profileId === undefined || profileId === null) return null;
+  if (typeof profileId !== "string" || profileId.length === 0) throw new Error("profileId must select a local ActiveTab environment profile.");
+  const profile = await new ProfileLoader(join(process.cwd(), "profiles")).loadProfile(profileId);
+  if (!profile) throw new Error(`No local environment profile '${profileId}' exists.`);
+  return { profile, environment: buildEnvironmentBinding(profile) };
+}
+
+function startWorkflowRun({ session, workflow, environment = null, operationAuthorizer = null, runId = null, controller = new AbortController(), verifyAuthentication = null, verifyEnvironment = null, profileId = null, principalId = null, existingRunStateId = null, resumeReceipt = null } = {}) {
+  const effectiveRunId = runId ?? `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const collector = new DiagnosticCollector({ runId: effectiveRunId });
+  createBrowserDiagnosticSources(session, collector);
+  const correlator = new DiagnosticCorrelator();
+  const runner = new TestRunner({
+    session, collector, correlator, signal: controller.signal, interventions: interventionStore,
+    decisionRuntime, environment, operationAuthorizer, runStateStore, existingRunStateId,
+    profileId,
+    principalId: principalId ?? session?.principalId ?? session?.authorizationPrincipalId ?? "local_mcp_automation"
+  });
+  const runCtx = {
+    ...interventionCtx,
+    hasAttachmentGrant: async targetId => sessions.has(targetId)
+      ? { ok: true }
+      : { ok: false, reason: `No authorized attachment grant for target '${targetId}'.` },
+    observe: async () => await session.observe().catch(() => null),
+    ...(typeof verifyAuthentication === "function" ? { verifyAuthentication } : {}),
+    ...(typeof verifyEnvironment === "function" ? { verifyEnvironment } : environment ? { verifyEnvironment: url => verifyObservedUrl(environment, url) } : {})
+  };
+  const runPromise = resumeReceipt
+    ? runner.resume(resumeReceipt, { verify: runCtx, workflow }).then(result => {
+        if (!result.receipt) throw new Error(result.reason ?? "The durable intervention was not independently verified.");
+        return result.receipt;
+      })
+    : runner.run(workflow, { runId: effectiveRunId });
+  const runState = trackRunResult(runPromise);
+  testRuns.set(effectiveRunId, {
+    collector, correlator, controller, runState, runPromise, session, runner, workflow, environment,
+    ...(typeof verifyAuthentication === "function" ? { verifyAuthentication } : {}),
+    ...(typeof verifyEnvironment === "function" ? { verifyEnvironment } : {}),
+    startedAt: new Date().toISOString(),
+    resume: async () => {
+      if (!runState.settled) return { resumed: false, reason: "Run is still executing." };
+      if (!runState.receipt) return { resumed: false, reason: "Run did not produce a receipt.", error: String(runState.error?.message ?? runState.error ?? "unknown failure").slice(0, 300) };
+      runState.status = "RUNNING";
+      runState.settled = false;
+      try {
+        const result = await runner.resume(runState.receipt, { verify: runCtx, workflow });
+        if (result.receipt) runState.receipt = result.receipt;
+        runState.status = runState.receipt?.status ?? "UNKNOWN";
+        return result;
+      } catch (error) {
+        runState.status = runState.receipt?.status ?? "UNCERTAIN";
+        runState.error = error;
+        throw error;
+      } finally {
+        runState.settled = true;
+      }
+    },
+    getState: async () => runState.status,
+    cancel: async () => {
+      await runStateStore.requestCancellation(effectiveRunId).catch(() => {});
+      controller.abort();
+    }
+  });
+  return { status: "started", runId: effectiveRunId };
+}
+
 const tools = [
   { name: "list_tabs", description: "List page targets on the configured loopback CDP endpoint. ACTIVETAB_AUTO_CONNECT=1 uses Chrome's opt-in debugging bridge. ACTIVETAB_EXTENSION=1 lists tabs individually attached from the ActiveTab toolbar popup. Listing alone does not grant control.", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
   { name: "attach_tab", description: "Adopt the exact tab authorized out of band, by a Chrome permission prompt, or by a separate ActiveTab toolbar Attach click on that tab. An MCP argument alone never grants consent; attaching another authorized tab preserves existing sessions.", inputSchema: { type: "object", properties: { targetId: { type: "string" } }, required: ["targetId"], additionalProperties: false } },
@@ -86,10 +185,14 @@ const tools = [
   { name: "inspect_network_response", description: "Inspect one response selected from a retained networkActivity facet. No response body is fetched or returned unless includeSensitive is explicitly true; page responses may contain credentials or personal data. Output is capped at 256 KiB. Request and response headers are never returned.", inputSchema: { type: "object", properties: { ...targetIdOptional, evidenceId: { type: "string" }, requestId: { type: "string" }, includeSensitive: { type: "boolean" }, includeSensitiveUrlData: { type: "boolean" }, maxBytes: { type: "integer", minimum: 1, maximum: 262144 } }, required: ["evidenceId", "requestId"], additionalProperties: false } },
   { name: "discover_application", description: "Run bounded autonomous discovery on an attached tab. Builds an application capability map from passive observations and safe same-origin link navigation. Returns discoveries and the capability map.", inputSchema: { type: "object", properties: { ...targetIdOptional, maxSteps: { type: "integer", minimum: 1, maximum: 16 }, maxLinksPerStep: { type: "integer", minimum: 1, maximum: 6 } }, additionalProperties: false } },
   { name: "investigate_failure", description: "Run a bounded bug-isolation investigation after a failed step or run. Classifies the failure, generates hypotheses, executes safe discriminating checks, and returns a qualified report.", inputSchema: { type: "object", properties: { ...targetIdOptional, runId: { type: "string" }, subject: { type: "string" }, reason: { type: "string" } }, required: ["subject", "reason"], additionalProperties: false } },
-  { name: "start_test_run", description: "Start a declarative test workflow on an authorized attached tab. Requires a workflow object with id, name, and steps. Returns runId for status polling.", inputSchema: { type: "object", properties: { ...targetIdOptional, workflow: { type: "object" } }, required: ["workflow"], additionalProperties: false } },
+  { name: "start_test_run", description: "Start a declarative workflow on an authorized attached tab. Select a local profileId whenever the workflow navigates or follows links; the profile is resolved from ActiveTab's local profiles directory and bound to run/resume. Returns runId for status polling.", inputSchema: { type: "object", properties: { ...targetIdOptional, profileId: { type: "string", minLength: 1, maxLength: 128 }, workflow: { type: "object" } }, required: ["workflow"], additionalProperties: false } },
+  { name: "resume_test_run", description: "Continue a durable DAG after restart using the exact original workflow, run binding, and reattached target. This refuses changed workflow/authority bindings and unresolved dispatched effects; suspended human handoffs must pass their stored completion predicate first.", inputSchema: { type: "object", properties: { runId: { type: "string", minLength: 1, maxLength: 160 }, targetId: { type: "string", minLength: 1, maxLength: 256 }, profileId: { type: "string", minLength: 1, maxLength: 128 }, workflow: { type: "object" } }, required: ["runId", "targetId", "workflow"], additionalProperties: false } },
+  { name: "enter_cloud_agent", description: "On an explicitly attached FreeInference staging tab, follow the visible Agents/Cloud Agents UI path and verify the real Cloud Agent task composer. Uses the same browser session, never navigates to a guessed destination, and suspends for human authentication when needed. This entry primitive does not create or submit a Cloud Agent task; use start_cloud_agent_task afterward with exact caller-supplied values.", inputSchema: { type: "object", properties: { ...targetIdOptional }, additionalProperties: false } },
+  { name: "start_cloud_agent_task", description: "Compile and start a caller-authored task in the already-open, authenticated FreeInference staging Cloud Agent. Does not navigate, invent a prompt, choose a model, or infer the expected result. Requires exact modelId, prompt, and expectedOutcome. Control mapping and every browser effect use ActiveTab's semantic, Jev, policy, and authorized-executor adapters; the result stays UNCERTAIN until independent run evidence is correlated.", inputSchema: { type: "object", properties: { ...targetIdOptional, request: { type: "object", properties: { requestId: { type: "string", minLength: 1, maxLength: 128 }, environmentId: { type: "string", const: "freeinference-staging" }, modelId: { type: "string", minLength: 1, maxLength: 500 }, prompt: { type: "string", minLength: 1, maxLength: 2000 }, expectedOutcome: { type: "object", minProperties: 1 }, diagnosticSources: { type: "array", maxItems: 6, items: { type: "string", enum: ["cloud-agent-runs", "cloud-agent-steps", "cloud-agent-usage"] } } }, required: ["requestId", "environmentId", "modelId", "prompt", "expectedOutcome"], additionalProperties: false } }, required: ["request"], additionalProperties: false } },
   { name: "get_test_run", description: "Get the receipt for a started test run by runId.", inputSchema: { type: "object", properties: { runId: { type: "string" } }, required: ["runId"], additionalProperties: false } },
   { name: "cancel_test_run", description: "Cancel a running test run by runId. Cancellation takes effect at the next step boundary.", inputSchema: { type: "object", properties: { runId: { type: "string" } }, required: ["runId"], additionalProperties: false } },
   { name: "collect_diagnostics", description: "Collect from registered diagnostic sources for a test run. Uses contract-validated, run-scoped, metadata-first retrieval.", inputSchema: { type: "object", properties: { runId: { type: "string" } }, required: ["runId"], additionalProperties: false } },
+  { name: "collect_cloud_agent_run_evidence", description: "Collect metadata for one exact Cloud Agent run. Requires the completed ActiveTab run, its latest browser evidence visibly showing the exact Cloud Agent run ID, and configured diagnostic credentials. Only the exact run record, bounded step metadata, and numeric usage fields are returned; this does not by itself verify the task's expected outcome.", inputSchema: { type: "object", properties: { runId: { type: "string", minLength: 1, maxLength: 128 }, cloudAgentRunId: { type: "string", minLength: 1, maxLength: 128 }, browserEvidenceId: { type: "string", minLength: 1, maxLength: 128 } }, required: ["runId", "cloudAgentRunId", "browserEvidenceId"], additionalProperties: false } },
   { name: "get_test_report", description: "Generate a qualified diagnostic report for a completed test run. Returns findings, correlation summary, source access log, and limitations.", inputSchema: { type: "object", properties: { runId: { type: "string" } }, required: ["runId"], additionalProperties: false } },
   { name: "list_pending_interventions", description: "List durable, resumable human interventions (waiting or acknowledged) across runs, with their exact completion conditions.", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
   { name: "get_pending_intervention", description: "Get one intervention record including its verified resume predicate.", inputSchema: { type: "object", properties: { interventionId: { type: "string" } }, required: ["interventionId"], additionalProperties: false } },
@@ -99,7 +202,7 @@ const tools = [
   { name: "resume_run", description: "Resume a suspended run: verifies the exact completion predicate (grant scope/expiry, authenticated session, attachment grant, or outcome reconciliation) with fresh evidence before admitting execution.", inputSchema: { type: "object", properties: { interventionId: { type: "string" } }, required: ["interventionId"], additionalProperties: false } },
   { name: "get_run_state", description: "Get the resumable state of a run (including suspended/waiting states).", inputSchema: { type: "object", properties: { runId: { type: "string" } }, required: ["runId"], additionalProperties: false } },
   { name: "cancel_run", description: "Cancel a run or intervention. Cancellation is permitted during suspension.", inputSchema: { type: "object", properties: { runId: { type: "string" }, interventionId: { type: "string" } }, additionalProperties: false } },
-  { name: "run_goal", description: "Run a natural-language navigation goal with bounded actions and scrolling, outcome verification, one recovery by default, and a policy gate that refuses sensitive actions not explicitly requested by the caller. Task continuation is stored locally using only a goal fingerprint and bounded continuation state; repeating the same goal on the same target resumes an incomplete task. A completed task is returned idempotently; set newTask=true to explicitly start it again. Tied targets stop unresolved and return evidence-linked backend/frame handles for caller inspection; select one with click_observed_element, which revalidates it before dispatch. Set reuseWorkflows=true to replay or record verified workflows; scroll-driven traces are not persisted until they have freshness checks. Configure ACTIVETAB_WORKFLOW_STORE first.", inputSchema: { type: "object", properties: { ...targetIdOptional, goal: { type: "string" }, maxActions: { type: "integer", minimum: 1, maximum: 10 }, maxScrolls: { type: "integer", minimum: 0, maximum: 8 }, reuseWorkflows: { type: "boolean" }, newTask: { type: "boolean" } }, required: ["goal"], additionalProperties: false } }
+  { name: "run_goal", description: "Run a bounded standalone natural-language task. Select profileId from ActiveTab's local profiles directory whenever navigation or link following is needed; the selected environment is bound to resumable state. Without a profile, only non-navigation interactions within the attached tab's observed origin are eligible. The deterministic planner is the default. A configured model endpoint never selects the action planner automatically; set plannerMode=model to explicitly choose it, and separately enable ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT=1 before page evidence can be sent. Task continuation is stored locally using only a goal fingerprint and bounded continuation state. Repeating the same goal on the same target and environment resumes an incomplete task; completed tasks are returned idempotently. Set newTask=true to explicitly start it again. Tied targets stop unresolved and return evidence-linked backend/frame handles for caller inspection; select one with click_observed_element, which revalidates it before dispatch. Set reuseWorkflows=true to replay or record verified workflows; configure ACTIVETAB_WORKFLOW_STORE first.", inputSchema: { type: "object", properties: { ...targetIdOptional, profileId: { type: "string", minLength: 1, maxLength: 128 }, goal: { type: "string" }, maxActions: { type: "integer", minimum: 1, maximum: 10 }, maxScrolls: { type: "integer", minimum: 0, maximum: 8 }, plannerMode: { type: "string", enum: ["deterministic", "model"] }, reuseWorkflows: { type: "boolean" }, newTask: { type: "boolean" } }, required: ["goal"], additionalProperties: false } }
 ];
 for (const tool of tools) {
   if (Object.hasOwn(tool.inputSchema.properties, "targetId") && tool.name !== "attach_tab" && tool.name !== "detach_tab") {
@@ -146,48 +249,157 @@ async function callTool(name, args) {
   if (name === "start_test_run") {
     const session = selectBrowserSession(sessions, args.targetId);
     if (!session) throw new Error("No attached browser session available.");
-    const runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const collector = new DiagnosticCollector({ runId });
-    createBrowserDiagnosticSources(session, collector);
-    const correlator = new DiagnosticCorrelator();
-    const controller = new AbortController();
-    const runner = new TestRunner({ session, collector, correlator, signal: controller.signal, interventions: interventionStore });
-    // The watcher stays bound to the run's exact session and realm-specific
-    // verification, not to the first available session (P0-5).
-    const runCtx = {
-      ...interventionCtx,
-      hasAttachmentGrant: async targetId => sessions.has(targetId)
-        ? { ok: true }
-        : { ok: false, reason: `No authorized attachment grant for target '${targetId}'.` },
-      observe: async () => await session.observe().catch(() => null)
-    };
-    const runPromise = runner.run(args.workflow, { runId });
-    testRuns.set(runId, {
-      collector, correlator, controller, runPromise, session, runner,
-      startedAt: new Date().toISOString(),
-      resume: async (record) => {
-        const receipt = await Promise.race([runPromise, Promise.resolve(null)]).catch(() => null);
-        if (!receipt) return { resumed: false, reason: "Run receipt unavailable." };
-        return await runner.resume(receipt, {
-          verify: runCtx,
-          workflow: args.workflow
-        });
-      },
-      getState: async () => {
-        const receipt = await Promise.race([runPromise, Promise.resolve(null)]).catch(() => null);
-        return receipt?.status ?? "RUNNING";
-      },
-      cancel: async () => { controller.abort(); }
+    const selectedProfile = await loadEnvironmentProfile(args.profileId);
+    return startWorkflowRun({ session, workflow: args.workflow, environment: selectedProfile?.environment ?? null, profileId: selectedProfile?.profile.profile_id ?? null });
+  }
+  if (name === "resume_test_run") {
+    const state = await runStateStore.getFresh(args.runId);
+    if (!state) throw new Error(`No durable test run found for runId '${args.runId}'.`);
+    if (testRuns.get(args.runId)?.runState?.settled === false) throw new Error("This run already has an active worker.");
+    if (["passed", "failed", "blocked", "canceled", "expired"].includes(state.status)) throw new Error(`Run is already terminal (${state.status}).`);
+    const unresolved = (state.pendingOperations ?? []).filter(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status));
+    if (unresolved.length) return { runId: args.runId, status: "UNCERTAIN", reason: "The DAG is suspended until every dispatched operation is independently reconciled.", operationIds: unresolved.map(operation => operation.operationId) };
+    const session = sessions.get(args.targetId);
+    if (!session || session.attached !== true || session.target?.id !== state.target?.targetId) {
+      throw new Error("Resume requires an explicitly attached session for the exact target bound to this run.");
+    }
+    const selectedProfile = await loadEnvironmentProfile(args.profileId);
+    const environment = selectedProfile?.environment ?? null;
+    const profileId = selectedProfile?.profile.profile_id ?? null;
+    const principalId = session.principalId ?? session.authorizationPrincipalId ?? "local_mcp_automation";
+    const authenticationRealm = environment?.applications?.[0]?.authenticationRealm ?? null;
+    if ((environment?.environmentId ?? null) !== state.environmentId
+      || profileId !== state.profileId
+      || principalId !== state.principalId
+      || authenticationRealm !== state.authenticationRealm) {
+      throw new Error("The selected profile, principal, environment, or authentication realm differs from the durable run binding.");
+    }
+    const intervention = state.pendingInterventionId ? interventionStore.get(state.pendingInterventionId) : null;
+    if (state.pendingInterventionId && (!intervention || intervention.runId !== state.runId)) {
+      throw new Error("The durable intervention required by this run is missing or mismatched.");
+    }
+    const resumeReceipt = intervention ? receiptFromRunState(state, intervention) : null;
+    return startWorkflowRun({
+      session,
+      workflow: args.workflow,
+      environment,
+      profileId,
+      principalId,
+      runId: args.runId,
+      existingRunStateId: args.runId,
+      ...(resumeReceipt ? { resumeReceipt } : {})
     });
-    return { status: "started", runId };
+  }
+  if (name === "enter_cloud_agent") {
+    const session = selectBrowserSession(sessions, args.targetId);
+    if (!session) throw new Error("No attached browser session available.");
+    const selectedProfile = await loadEnvironmentProfile("cloud-agent-staging");
+    const profile = selectedProfile?.profile;
+    const environment = selectedProfile?.environment;
+    if (!profile || !environment) throw new Error("The cloud-agent-staging profile is unavailable.");
+    if (environment.environmentId !== "freeinference-staging") throw new Error("Cloud Agent entry is limited to the FreeInference staging environment.");
+    const observation = await session.observe();
+    if (!observation?.evidenceId || observation.targetId !== session.target.id || !observation.page?.url) {
+      throw new Error("Cloud Agent entry requires a fresh observation from the selected attached tab.");
+    }
+    const identity = verifyObservedUrl(environment, observation.page.url);
+    if (!identity.ok) throw new Error(`The attached tab is outside the authorized staging environment: ${identity.reason}`);
+    const entry = createCloudAgentEntryWorkflow(environment, observation);
+    if (!entry) throw new Error("The staging profile has no declared Cloud Agent application identity.");
+    if (entry.alreadyAtComposer) {
+      return {
+        status: "ready",
+        targetId: session.target.id,
+        environmentId: environment.environmentId,
+        applicationId: entry.agentEntry.applicationId,
+        evidenceId: observation.evidenceId,
+        taskSubmitted: false
+      };
+    }
+    const verifyAuthentication = async realm => {
+      if (realm !== entry.agentEntry.authenticationRealm) {
+        return { authenticated: false, reason: `Unexpected authentication realm '${realm ?? "unknown"}'.` };
+      }
+      const current = await session.observe().catch(() => null);
+      const ready = verifyCloudAgentReady(current, environment, entry.agentEntry.origin);
+      return ready.ok
+        ? { authenticated: true, identity: "Cloud Agent task composer", evidenceId: ready.evidenceId }
+        : { authenticated: false, reason: ready.reason };
+    };
+    const started = startWorkflowRun({
+      session,
+      workflow: entry.workflow,
+      environment,
+      profileId: profile.profile_id,
+      verifyAuthentication,
+      verifyEnvironment: url => verifyObservedUrl(environment, url),
+      runId: `cloud-agent-entry-${randomUUID()}`
+    });
+    testRuns.get(started.runId).integration = Object.freeze({
+      adapterId: "freeinference-cloud-agent-entry",
+      targetId: session.target.id,
+      environmentId: environment.environmentId,
+      applicationId: entry.agentEntry.applicationId,
+      authenticationRealm: entry.agentEntry.authenticationRealm,
+      taskSubmitted: false
+    });
+    return { ...started, targetId: session.target.id, environmentId: environment.environmentId, taskSubmitted: false };
+  }
+  if (name === "start_cloud_agent_task") {
+    const session = selectBrowserSession(sessions, args.targetId);
+    if (!session) throw new Error("No attached browser session available.");
+    const selectedProfile = await loadEnvironmentProfile("cloud-agent-staging");
+    const profile = selectedProfile?.profile;
+    if (!profile) throw new Error("The cloud-agent-staging profile is unavailable.");
+    const runId = `cloud-agent-${randomUUID()}`;
+    const controller = new AbortController();
+    const plan = await prepareCloudAgentTask({
+      session, profile, request: args.request, decisionRuntime, runId, signal: controller.signal
+    });
+    const started = startWorkflowRun({
+      session,
+      workflow: plan.workflow,
+      environment: plan.environment,
+      operationAuthorizer: plan.operationAuthorizer,
+      profileId: profile.profile_id,
+      runId,
+      controller
+    });
+    testRuns.get(runId).integration = Object.freeze({
+      adapterId: "freeinference-cloud-agent",
+      requestId: plan.requestId,
+      decisionEpisodeId: plan.episodeId,
+      semanticMappingDecisionId: plan.semanticMappingDecisionId,
+      semanticMappingSource: plan.semanticMappingSource,
+      semanticMappingEventIds: plan.semanticMappingEventIds,
+      targetResolutionEventId: plan.targetResolutionEventId,
+      observationId: plan.observationId,
+      targetId: session.target.id,
+      environmentId: plan.environment.environmentId,
+      diagnosticEndpoint: plan.environment.diagnosticEndpoint ?? null,
+      diagnosticTransport: plan.environment.diagnosticTransport ?? null,
+      remoteTarget: plan.environment.remoteTarget ?? null,
+      agentOrigin: new URL(plan.observation.page.url).origin,
+      expectedOutcome: plan.expectedOutcome,
+      diagnosticSources: plan.diagnosticSources,
+      diagnosticEndpointBindings: plan.diagnosticEndpointBindings,
+      verificationRequired: true
+    });
+    return { ...started, requestId: plan.requestId, verificationStatus: "pending_independent_evidence" };
   }
   if (name === "get_test_run") {
     const run = testRuns.get(args.runId);
-    if (!run) throw new Error(`No test run found for runId '${args.runId}'.`);
-    let receipt;
-    try { receipt = await Promise.race([run.runPromise, Promise.resolve(null)]); } catch { receipt = null; }
-    if (receipt) return receipt.toObject();
-    return { runId: args.runId, status: "RUNNING", startedAt: run.startedAt };
+    if (!run) {
+      const durable = await runStateStore.getFresh(args.runId);
+      if (!durable) throw new Error(`No test run found for runId '${args.runId}'.`);
+      return receiptFromRunState(durable).toObject();
+    }
+    const runState = run.runState;
+    if (runState.receipt) return runState.receipt.toObject();
+    if (runState.error) {
+      return { runId: args.runId, status: "FAILED", reason: String(runState.error.message ?? runState.error).slice(0, 300), startedAt: run.startedAt };
+    }
+    return { runId: args.runId, status: runState.status, startedAt: run.startedAt };
   }
   if (name === "cancel_test_run") {
     const run = testRuns.get(args.runId);
@@ -204,12 +416,105 @@ async function callTool(name, args) {
     ]);
     return { runId: args.runId, results };
   }
+  if (name === "collect_cloud_agent_run_evidence") {
+    const run = testRuns.get(args.runId);
+    if (!run) throw new Error(`No test run found for runId '${args.runId}'.`);
+    const integration = run.integration;
+    if (integration?.adapterId !== "freeinference-cloud-agent") throw new Error("Cloud Agent run evidence can only be collected for a Cloud Agent task started by ActiveTab.");
+    if (!run.runState.settled || !run.runState.receipt) throw new Error("Wait for the ActiveTab Cloud Agent workflow to finish before collecting backend evidence.");
+    const submit = run.runState.receipt.steps.find(step => step.stepId === "submit-authorized-test-task");
+    if (!submit || !["PASS", "UNCERTAIN"].includes(submit.status)
+      || submit.details?.dispatchStatus !== "dispatched"
+      || typeof submit.details?.beforeEvidenceId !== "string") {
+      throw new Error("The ActiveTab receipt does not confirm a dispatched Cloud Agent submit with its pre-dispatch evidence.");
+    }
+    const { verifyCloudAgentRunIdentifierEvidence } = await import("../integrations/freeinference/browserRunIdentifier.js");
+    const browserMatch = verifyCloudAgentRunIdentifierEvidence({
+      session: run.session,
+      evidenceId: args.browserEvidenceId,
+      beforeEvidenceId: submit.details.beforeEvidenceId,
+      cloudAgentRunId: args.cloudAgentRunId,
+      agentOrigin: integration.agentOrigin,
+      startedAt: run.startedAt
+    });
+    if (!browserMatch.verified) throw new Error(`Cloud Agent run ID is not linked to current task evidence: ${browserMatch.reason}`);
+    if (run.cloudAgentEvidenceBinding && run.cloudAgentEvidenceBinding.cloudAgentRunId !== args.cloudAgentRunId) {
+      throw new Error("This ActiveTab task is already bound to a different Cloud Agent run ID.");
+    }
+    if (!run.cloudAgentEvidenceBinding) {
+      const adapter = cloudAgentAdapterFromEnv(process.env, {
+        environmentBinding: {
+          environmentId: integration.environmentId,
+          diagnosticEndpoint: integration.diagnosticEndpoint,
+          diagnosticTransport: integration.diagnosticTransport,
+          remoteTarget: integration.remoteTarget,
+          diagnosticEndpointBindings: integration.diagnosticEndpointBindings
+        }
+      });
+      if (!adapter) throw new Error("Cloud Agent backend diagnostics are not configured. Set the diagnostic endpoint and admin credential explicitly.");
+      adapter.registerRunScopedSources(run.collector, {
+        activeTabRunId: args.runId,
+        cloudAgentRunId: args.cloudAgentRunId,
+        sourceIds: integration.diagnosticSources
+      });
+      run.cloudAgentEvidenceBinding = {
+        cloudAgentRunId: args.cloudAgentRunId,
+        browserEvidenceId: args.browserEvidenceId,
+        browserMatchLocation: browserMatch.location
+      };
+      run.cloudAgentEvidencePromise = run.collector.collectAll(integration.diagnosticSources.map(sourceId => ({
+        sourceId,
+        operation: OPERATION.READ_SCOPED
+      })));
+    } else if (run.cloudAgentEvidenceBinding.browserEvidenceId !== args.browserEvidenceId) {
+      throw new Error("The exact Cloud Agent run evidence is already bound to a different browser observation.");
+    }
+    const results = await run.cloudAgentEvidencePromise;
+    const runResult = results.find(result => result.sourceId === "cloud-agent-runs");
+    const backendRun = runResult?.snapshot?.data?.records?.[0];
+    if (runResult?.status !== "ok" || runResult.snapshot?.data?.status !== "available" || backendRun?.id !== args.cloudAgentRunId) {
+      const outcome = {
+        status: "UNCERTAIN",
+        reasonCode: "exact_run_record_unavailable",
+        reason: "The exact backend run record could not be confirmed."
+      };
+      const review = await recordCloudAgentOutcome(run, submit, integration, args, outcome, "unavailable", null);
+      return {
+        runId: args.runId,
+        cloudAgentRunId: args.cloudAgentRunId,
+        correlation: { strength: "unknown", reason: "The exact backend run record could not be confirmed." },
+        verificationStatus: outcome.status,
+        verificationReason: outcome.reason,
+        ...(review ? { jevReview: review } : {}),
+        results
+      };
+    }
+    const browserEventId = `browser:${args.runId}:${args.browserEvidenceId}`;
+    const backendEventId = `backend:${args.runId}:${args.cloudAgentRunId}`;
+    run.correlator.addEvent({ eventId: browserEventId, sourceType: "browser_ui", executionId: args.cloudAgentRunId, observedAt: run.startedAt });
+    run.correlator.addEvent({ eventId: backendEventId, sourceType: "cloud_agent_backend", executionId: args.cloudAgentRunId });
+    const correlation = run.correlator.correlate(browserEventId, backendEventId);
+    const outcome = verifyCloudAgentRunOutcome(integration.expectedOutcome, backendRun);
+    const backendEvidenceRef = runResult.snapshot.snapshotId ?? runResult.snapshot.evidenceId ?? backendEventId;
+    const review = await recordCloudAgentOutcome(run, submit, integration, args, outcome, backendRun.status ?? "unavailable", backendEvidenceRef);
+    return {
+      runId: args.runId,
+      requestId: integration.requestId,
+      cloudAgentRunId: args.cloudAgentRunId,
+      correlation,
+      verificationStatus: outcome.status,
+      verificationReason: outcome.reason,
+      ...(review ? { jevReview: review } : {}),
+      results
+    };
+  }
   if (name === "discover_application") {
     const session = selectBrowserSession(sessions, args.targetId);
     const engine = new ApplicationDiscoveryEngine({
       session,
       maxSteps: args.maxSteps ?? 8,
-      maxLinksPerStep: args.maxLinksPerStep ?? 4
+      maxLinksPerStep: args.maxLinksPerStep ?? 4,
+      decisionRuntime
     });
     return await engine.discover();
   }
@@ -244,12 +549,70 @@ async function callTool(name, args) {
   if (name === "observe_page") return await session.observe({ includeScreenshot: args.includeScreenshot !== false });
   if (name === "get_evidence") return session.observer.getEvidence(args.evidenceId, { facets: args.facets, backendNodeId: args.backendNodeId, frameTargetId: args.frameTargetId, includeSensitiveFormValues: args.includeSensitiveFormValues === true, includeSensitivePageText: args.includeSensitivePageText === true, includeSensitiveUrlData: args.includeSensitiveUrlData === true, includeSensitiveRuntimeValues: args.includeSensitiveRuntimeValues === true, includeScreenshot: args.includeScreenshot === true });
   if (name === "inspect_runtime_state") return await session.observer.inspectRuntimeState(args.evidenceId, { path: args.path, frameTargetId: args.frameTargetId ?? null, includeSensitiveValues: args.includeSensitiveValues === true });
-  if (name === "click_observed_element") return await clickObservedElement(session, { goal: args.goal, evidenceId: args.evidenceId, backendNodeId: args.backendNodeId, frameTargetId: args.frameTargetId ?? null });
+  if (name === "click_observed_element") return await clickObservedElement(session, { goal: args.goal, evidenceId: args.evidenceId, backendNodeId: args.backendNodeId, frameTargetId: args.frameTargetId ?? null, decisionRuntime });
   if (name === "inspect_network_response") return await session.observer.inspectNetworkResponse(args.evidenceId, { requestId: args.requestId, includeSensitive: args.includeSensitive === true, includeSensitiveUrlData: args.includeSensitiveUrlData === true, maxBytes: args.maxBytes });
   if (name === "run_goal") {
-    return await runMcpGoal(session, args, { journalStore: taskJournalStore, workflowStore });
+    const selectedProfile = await loadEnvironmentProfile(args.profileId);
+    return await runMcpGoal(session, args, { journalStore: taskJournalStore, workflowStore, decisionRuntime, environment: selectedProfile?.environment ?? null });
   }
   throw new Error(`Unknown tool: ${name}`);
+}
+
+async function recordCloudAgentOutcome(run, submit, integration, args, outcome, backendOutcome, backendEvidenceRef) {
+  const episodeId = run.runner?.decisionEpisodeId;
+  if (!episodeId) return null;
+  const decisionId = submit.details?.decisionId ?? randomUUID();
+  const stepId = submit.stepId;
+  const evidenceRefs = [...new Set([args.browserEvidenceId, backendEvidenceRef].filter(value => typeof value === "string"))];
+  let verificationEvent = null;
+  try {
+    verificationEvent = decisionRuntime.recordVerification({
+      episodeId,
+      runId: args.runId,
+      stepId,
+      decisionId,
+      observationId: args.browserEvidenceId,
+      status: outcome.status === "VERIFIED" ? "verified_pass" : outcome.status === "FAILED" ? "verified_fail" : "uncertain",
+      oracleType: "correlated_backend",
+      reasonCode: outcome.reasonCode,
+      evidenceRefs
+    });
+  } catch { /* preserve the outcome if local telemetry is unavailable */ }
+  let review = null;
+  try {
+    const inputEventIds = eventIdsForEvidence(decisionRuntime.eventStore, {
+      episodeId,
+      decisionId,
+      evidenceIds: [submit.details?.afterEvidenceId, args.browserEvidenceId],
+      eventTypes: ["execution.observed", "verification.completed"]
+    });
+    if (verificationEvent?.eventId && !inputEventIds.includes(verificationEvent.eventId)) inputEventIds.push(verificationEvent.eventId);
+    review = await decisionRuntime.reviewOutcome({
+      episodeId,
+      runId: args.runId,
+      stepId,
+      decisionId,
+      observationId: args.browserEvidenceId,
+      expectedOutcomeClass: `status_expected_${integration.expectedOutcome.value}`,
+      browserOutcomeClass: "run_id_observed",
+      backendOutcomeClass: backendOutcome,
+      inputEventIds
+    });
+  } catch { /* Jev is an advisory; refusal or failure cannot alter deterministic verification. */ }
+  const stepStatus = outcome.status === "VERIFIED" ? "PASS" : outcome.status === "FAILED" ? "FAIL" : "UNCERTAIN";
+  run.runState.receipt.reconcileStep("submit-authorized-test-task", {
+    status: stepStatus,
+    reason: outcome.reason,
+    evidenceIds: evidenceRefs,
+    details: {
+      ...submit.details,
+      verificationStatus: outcome.status,
+      verificationReasonCode: outcome.reasonCode,
+      backendRunId: args.cloudAgentRunId
+    }
+  });
+  run.runState.status = run.runState.receipt.status;
+  return review;
 }
 
 function write(message) { process.stdout.write(`${JSON.stringify(message)}\n`); }
@@ -288,5 +651,6 @@ for await (const line of rl) {
 }
 interventionWatcher?.stop();
 await Promise.all([...sessions.values()].map(session => session.close()));
+decisionRuntime.close();
 await chromeConnection?.close();
 await extensionBroker?.close();

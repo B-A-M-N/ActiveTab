@@ -10,13 +10,17 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 
 ## Local Contracts
 
-- Dispatch, observed effects, and verified postconditions are separate states.
+- Dispatch, observed effects, and verified postconditions are separate states. An unresolved dispatched effect yields run status `UNCERTAIN` until independent evidence reconciles it; it is not silently converted to `FAILED` or replayed.
+- Diagnostic `api_call` receipts preserve typed refusal/error/unavailable statuses and explicitly record that collection alone did not verify an application outcome.
 - Only an independent verified postcondition may report PASS.
 - A page fingerprint change alone is not outcome success.
 - Cleanup is a verifiable obligation for every test-owned resource.
 - Every interaction type in the schema must have a dispatch implementation or fail validation before execution.
 - Unsupported actions fail validation before the test starts.
 - Workflow input is untrusted; it cannot elevate permissions or redefine the environment.
+- A profile adapter may inject a process-local typed operation authorizer into `TestRunner`; serialized workflow fields alone never establish that authority.
+- Exact form-value checks may return only a boolean verification result. Raw task values must stay out of receipts, task journals, and decision telemetry.
+- A submitted Cloud Agent task remains `UNCERTAIN` until its run identifier is proven absent before submit, observed afterward on the same authorized tab, and matched to the exact scoped backend run record. Only an exact caller-requested run-status match may reconcile the task to PASS.
 
 ## Work Guidance
 
@@ -26,7 +30,13 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 - A test-owned resource must be created and identified durably before cleanup verification is meaningful.
 - Staging qualification begins at the profile's real application entry and follows visible navigation to Cloud Agent; a profile candidate URL is an identity hint and never an automatic destination.
 - Authentication handoff keeps the same run and browser alive until fresh evidence verifies the Cloud Agent task composer.
+- An owned qualification browser remains open for operator authentication or inspection after any returned qualification state. The manual `--open-only` command releases its CDP connection and exits while leaving Chrome open; explicit operator closure controls browser lifetime.
+- The staging qualification entrypoint shares the built-in decision telemetry runtime with declarative and navigation steps. Jev remains pinned and advisory; missing reviewer credentials are recorded without interrupting local browser operation.
+- Jev review is event-driven: review task submissions, uncertain or privileged boundaries, navigation transitions, and other policy-selected events. Do not call Jev for ordinary exact-value field entry or selection without a trusted policy reason; append an explicit skipped-review telemetry event for such a step.
+- A Jev `needs_agent_review` result pauses navigation, declarative interaction, direct observed-element actions, and discovery before dispatch. A positive Jev result never grants permission; deterministic policy remains authoritative.
 - Owned browser profiles and qualification run state persist independently. Restart resume requires the explicit run ID, matching profile/mode/environment, the same owned profile or exact attached target, and fresh Cloud Agent task-composer evidence. A verified authentication predicate completes the suspended visible-entry step without replaying it.
+- `--open-only` is a browser-lifecycle operation, not a qualification run. It must not read, create, or modify qualification run/intervention records. It may launch a new dedicated browser or reuse an already-running profile through CDP, but reuse must preserve the current page without navigation. The command exits with Chrome and its persistent profile still open. Resume and discard options are invalid in this mode; actual qualification keeps the unresolved-run guard.
+- When the owned browser is already open, a fresh qualification requires the exact page target ID printed by `--open-only`; a suspended-run resume uses its persisted exact target ID. Reattachment validates the current origin, preserves the current page and browser process, and never substitutes another tab or reloads the staging entry.
 - Qualification run-state cursors contain bounded step/intervention references only; they omit raw goals and browser evidence. Unfinished runs block replacement runs until explicitly resumed or marked abandoned.
 - Ordinary qualification only inventories visible diagnostic links. The separate Admin discovery entrypoint is profile-driven and may follow an exact visible same-origin Admin link, inspect one row disclosure, and restore its state. It remains separate from Cloud Agent task execution and never creates a task.
 - Main account-dashboard discovery requires the exact profile-declared `/dashboard` route and inventories visible model labels plus exact Agents, Settings, and Admin Console link destinations. This recipe does not follow those links or read form values, response bodies, or infer Cloud Agent task-selector choices from the account catalog. Admin Console content is handled only through a separate operator-directed walkthrough.
@@ -36,7 +46,8 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 - The operator reports that Admin Console → Overview → Providers has Overview and Performance subtabs, with dropdowns and a filter text field on Performance. Inventory labels and choices only; do not type or change selections. `Manage`, `Edit`, `Add`, and `Delete Keys` are prohibited controls in the Providers surface.
 - Audit Log purpose is unknown and the operator prohibited interaction. Do not open that surface or use its dropdowns; preserve its controls as unknown without probing.
 - The Cloud Agent Admin Audit page is separate from the account Admin Console Audit Log. The former has its own operator-directed category recipe; the latter is prohibited and its route is blocked from direct navigation.
-- Admin Console Settings and Config may be inventoried read-only after the operator opens the exact surface. Use `discover:staging-admin-config` to record visible control labels and non-sensitive current values, redact secrets, and do not operate controls or change settings without explicit FreeInference authorization.
+- Admin Console Settings and Config may be inventoried read-only after the operator opens the exact surface. Use `discover:staging-admin-config` to record visible control labels, select option labels, and toggle states. Never read input or textarea contents; do not operate controls or change settings without explicit FreeInference authorization. Reports must identify whether evidence came from a live browser, screenshot, or synthetic fixture.
+- Synthetic Cloud Agent observations in unit tests validate adapter logic only. Their control labels and shapes are not evidence about the live product and must not be presented as a live UI inventory.
 - Admin inventory reports include control names and native select choices, checkbox/switch state, table headers and row counts, and same-origin GET route shapes. They omit free-text field values, table cells, response bodies, and query strings; they do not submit forms, modify settings, or query database tables.
 - Staging qualification does not create Agent jobs or mutate admin resources. Such operations require a separately scoped PR test request.
 

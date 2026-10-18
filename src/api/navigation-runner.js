@@ -68,7 +68,7 @@ export function createNavigationRunner({
      * @param {object} [context.inputSchema] - Template input schema (for redacted exports)
      * @param {boolean} [context.ownerAuthorizedExport] - Run owner explicitly authorized a full export
      */
-    async run(goal, { signal, input, templateId, taskId: providedTaskId, inputSchema, ownerAuthorizedExport } = {}) {
+    async run(goal, { signal, input, templateId, taskId: providedTaskId, inputSchema, ownerAuthorizedExport, plannerMode } = {}) {
       let abortError = abortedMarker(signal);
 
       let session;
@@ -89,6 +89,8 @@ export function createNavigationRunner({
         const journal = new TaskJournal(journalPath);
 
         const engine = new NavigationEngine(session, {
+          executionMode: engineOptions.executionMode ?? "standalone",
+          plannerMode: plannerMode ?? engineOptions.plannerMode ?? "deterministic",
           journal,
           maxActions: engineOptions.maxActions ?? 8,
           maxRecoveries: engineOptions.maxRecoveries ?? 1,

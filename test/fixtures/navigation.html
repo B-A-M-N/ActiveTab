@@ -5,12 +5,19 @@
   <main>
     <h1>Shop</h1>
     <label>Test password <input type="password" value="fixture-secret" /></label>
-    <section><h2>Shipping history</h2><button type="button" onclick="document.querySelector('h1').textContent='Shipping history';document.title='Shipping history'">Continue</button></section>
-    <section><h2>Billing history</h2><button type="button" onclick="document.querySelector('h1').textContent='Billing history';document.title='Billing history'">Continue</button></section>
-    <section><h2>Ambiguous route</h2><button type="button" onclick="document.querySelector('h1').textContent='Primary route';document.title='Primary route'">Continue</button><button type="button" onclick="document.querySelector('h1').textContent='Alternate route';document.title='Alternate route'">Continue</button></section>
+    <section><h2>Shipping history</h2><a href="#shipping-history" onclick="event.preventDefault();document.querySelector('h1').textContent='Shipping history';document.title='Shipping history'">Continue</a></section>
+    <section><h2>Billing history</h2><a href="#billing-history" onclick="event.preventDefault();document.querySelector('h1').textContent='Billing history';document.title='Billing history'">Continue</a></section>
+    <section><h2>Ambiguous route</h2><a href="#primary-route" onclick="event.preventDefault();document.querySelector('h1').textContent='Primary route';document.title='Primary route'">Continue</a><a href="#alternate-route" onclick="event.preventDefault();document.querySelector('h1').textContent='Alternate route';document.title='Alternate route'">Continue</a></section>
     <section><h2>Invoices</h2><div id="invoice-list" role="list" aria-label="Invoice list" style="height:168px;overflow-y:auto;position:relative;border:1px solid #999"><div id="invoice-spacer" style="height:1120px;position:relative"></div></div></section>
-    <button id="account" type="button">Open account</button>
+    <a id="account" href="/account">Open account</a>
     <button id="obstructed" type="button" onclick="document.title='Obstructed action ran'">Open obstructed controls</button>
+    <section aria-label="Custom task controls">
+      <button id="model-picker" type="button" role="combobox" aria-label="Model" aria-expanded="false">Choose model</button>
+      <div id="model-options" role="listbox" hidden>
+        <div role="option">GLM5.3-flash</div>
+      </div>
+      <div id="task-editor" role="textbox" aria-label="Task instructions" contenteditable="true"></div>
+    </section>
     <div id="cover" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.2)"></div>
     <p id="status">Waiting</p>
     <section id="resource-section">
@@ -30,6 +37,18 @@
     <div id="shadow-host"></div>
   </main>
   <script>
+    const modelPicker = document.querySelector("#model-picker");
+    const modelOptions = document.querySelector("#model-options");
+    modelPicker.addEventListener("click", () => {
+      modelOptions.hidden = false;
+      modelPicker.setAttribute("aria-expanded", "true");
+    });
+    modelOptions.querySelector('[role="option"]').addEventListener("click", event => {
+      modelPicker.textContent = event.currentTarget.textContent;
+      modelOptions.hidden = true;
+      modelPicker.setAttribute("aria-expanded", "false");
+      modelPicker.setAttribute("aria-valuetext", event.currentTarget.textContent);
+    });
     const invoiceList = document.querySelector("#invoice-list");
     const invoiceSpacer = document.querySelector("#invoice-spacer");
     const invoiceRows = Array.from({ length: 6 }, () => {
@@ -69,13 +88,16 @@
       }
     });
     let attempts = 0;
-    document.querySelector("#account").addEventListener("click", () => {
+    document.querySelector("#account").addEventListener("click", event => {
+      event.preventDefault();
       attempts += 1;
       if (attempts === 1) {
-        document.querySelector("#account").replaceWith(Object.assign(document.createElement("button"), {
+        document.querySelector("#account").replaceWith(Object.assign(document.createElement("a"), {
           id: "account-retry",
+          href: "/account",
           textContent: "Continue to account",
-          onclick() {
+          onclick(event) {
+            event.preventDefault();
             fetch("/api/account?session=network-query-token")
               .then(response => response.json())
               .then(() => {

@@ -26,7 +26,10 @@ function element(tagName, properties = {}) {
     tagName: tagName.toUpperCase(),
     type: properties.type ?? "",
     name: properties.name ?? "",
-    value: properties.value ?? "",
+    get value() {
+      if (properties.onValueRead) return properties.onValueRead();
+      return properties.value ?? "";
+    },
     checked: properties.checked ?? false,
     disabled: properties.disabled ?? false,
     innerText: properties.text ?? "",
@@ -126,15 +129,15 @@ test("account Admin Console Audit Log is refused before page metadata is read", 
   assert.equal(isOperatorProhibitedNavigation("https://agents-staging.freeinference.org/admin/audit"), false);
 });
 
-test("account Settings inventory redacts secrets and never operates controls", async () => {
+test("account Settings inventory never reads field values or operates controls", async () => {
   const toggle = element("input", {
     type: "checkbox", checked: true, attrs: { type: "checkbox", "aria-label": "User Auth Enabled" }
   });
   const token = element("input", {
-    type: "password", value: "staging-secret-value", attrs: { type: "password", "aria-label": "Admin API token" }
+    type: "password", onValueRead() { throw new Error("password field value was read"); }, attrs: { type: "password", "aria-label": "Admin API token" }
   });
   const field = element("input", {
-    type: "text", value: "maintainer@example.test", attrs: { type: "text", "aria-label": "Contact email" }
+    type: "text", onValueRead() { throw new Error("text field value was read"); }, attrs: { type: "text", "aria-label": "Contact email" }
   });
   const document = fixtureDocument({
     'h1,h2,h3': [element("h1", { text: "Settings" })],
@@ -142,15 +145,18 @@ test("account Settings inventory redacts secrets and never operates controls", a
   });
   const session = runtimeSession({ url: "https://staging.freeinference.org/dashboard/admin/settings", document });
 
-  const report = await discoverStagingAdminConfig({ session, environment, profile: accountProfile });
+  const report = await discoverStagingAdminConfig({ session, environment, profile: accountProfile, evidenceSource: "synthetic_fixture" });
 
   assert.equal(report.status, "COMPLETE");
+  assert.equal(report.evidence.source, "synthetic_fixture");
   assert.equal(report.surface, "Settings");
   assert.deepEqual(report.controls.map(control => control.label), ["User Auth Enabled", "Admin API token", "Contact email"]);
   assert.equal(report.controls[0].checked, true);
-  assert.equal(report.controls[1].currentValue, "[redacted]");
-  assert.equal(report.controls[2].currentValue, "[redacted-email]");
-  assert.equal(JSON.stringify(report).includes("staging-secret-value"), false);
+  assert.equal(Object.hasOwn(report.controls[1], "currentValue"), false);
+  assert.equal(Object.hasOwn(report.controls[2], "currentValue"), false);
+  assert.equal(report.controls[1].sensitiveControl, true);
+  assert.equal(report.privacy.freeTextControlValuesRead, false);
+  assert.equal(report.privacy.sensitiveControlValuesRead, false);
   assert.equal(report.privacy.controlsOperated, false);
   assert.deepEqual(session.calls.map(call => call.method), ["Runtime.evaluate", "Runtime.evaluate", "Runtime.evaluate"]);
 });
@@ -161,10 +167,22 @@ test("Settings inventory refuses the account Audit Log before reading controls",
     document: fixtureDocument({})
   });
 
-  const report = await discoverStagingAdminConfig({ session, environment, profile: accountProfile });
+  const report = await discoverStagingAdminConfig({ session, environment, profile: accountProfile, evidenceSource: "synthetic_fixture" });
 
   assert.equal(report.status, "BLOCKED");
   assert.equal(session.calls.length, 1);
+});
+
+test("Settings inventory refuses to produce a report without evidence provenance", async () => {
+  const session = runtimeSession({
+    url: "https://staging.freeinference.org/dashboard/admin/settings",
+    document: fixtureDocument({ 'h1,h2,h3': [element("h1", { text: "Settings" })] })
+  });
+
+  const report = await discoverStagingAdminConfig({ session, environment, profile: accountProfile });
+
+  assert.equal(report.status, "BLOCKED");
+  assert.equal(session.calls.length, 0);
 });
 
 test("Cloud Agent Admin inventory records dropdown schemas and scoped GET route shapes", async () => {
@@ -214,13 +232,14 @@ test("Cloud Agent Audit disclosure opens for inspection and restores its origina
   const clicks = [];
   const candidate = {
     name: "View row details", role: "button", visible: true, disabled: false,
-    submitsForm: false, backendNodeId: 44,
+    submitsForm: false, backendNodeId: 44, tag: "button",
+    get attributes() { return { "aria-expanded": expanded }; },
     documentUrl: "https://agents-staging.freeinference.org/admin/audit"
   };
   const session = {
     attached: true,
     async observe() {
-      return { page: { url: candidate.documentUrl }, candidates: [{ ...candidate }] };
+      return { page: { url: candidate.documentUrl }, candidates: [{ ...candidate, attributes: candidate.attributes }] };
     },
     async click(target) {
       clicks.push(target.backendNodeId);

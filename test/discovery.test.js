@@ -111,15 +111,24 @@ test("discovery engine navigates safe same-origin links", async () => {
     }
   ];
   const mockSession = {
-    async observe() { return pages[Math.min(navigationCount, 1)]; },
-    async waitForChange() {},
-    client: {
-      async send(method, params) {
-        if (method !== "Page.navigate") throw new Error(`Unexpected ${method}`);
-        navigationCount++;
-        return {};
-      }
-    }
+    target: { id: "fixture-tab", url: "http://fixture.local/" },
+    attached: true,
+    async observe() {
+      const page = structuredClone(pages[Math.min(navigationCount, 1)]);
+      return {
+        ...page,
+        targetId: this.target.id,
+        candidates: page.candidates.map((candidate, index) => ({
+          ...candidate,
+          identity: `candidate-${index}`,
+          targetId: this.target.id,
+          documentGeneration: navigationCount + 1,
+          backendNodeId: index + 1
+        }))
+      };
+    },
+    async click() { navigationCount++; },
+    async waitForChange() {}
   };
   const engine = new ApplicationDiscoveryEngine({ session: mockSession, maxSteps: 3, maxLinksPerStep: 2 });
   const result = await engine.discover();

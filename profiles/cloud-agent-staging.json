@@ -11,6 +11,7 @@
     "diagnostic_endpoint": null,
     "diagnostic_transport": null,
     "remote_target": null,
+    "diagnostic_endpoint_bindings": [],
     "authorized_origins": ["https://staging.freeinference.org", "https://agents-staging.freeinference.org"],
     "applications": [
       {

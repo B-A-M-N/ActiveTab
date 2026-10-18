@@ -21,7 +21,7 @@ import { join, resolve } from "node:path";
 import { open } from "node:fs/promises";
 import { TaskStore } from "./task-store.js";
 import { RunLifecycle } from "./run-lifecycle.js";
-import { checkHost, checkOrigin, createMutationAuthorizer } from "./security.js";
+import { checkHost, checkOrigin, createMutationAuthorizer, createOperatorAuthenticator } from "./security.js";
 import { OFFICIAL_TEMPLATES, REGIONS, findTemplate, validateInput, renderGoal } from "./templates.js";
 import { projectInput } from "./input-projection.js";
 import { sendJson, sendError, readBody, parseQuery } from "./http-utils.js";
@@ -30,15 +30,17 @@ import { logger } from "../runtime/logger.js";
 import { DiagnosticCollector } from "../diagnostics/collector.js";
 import { createDiagnosticContract, AUTHORITY, OPERATION, SENSITIVITY } from "../diagnostics/contracts.js";
 import { registerBrowserDiagnosticSources } from "../diagnostics/adapters/browserSources.js";
-import { cloudAgentAdapterFromEnv } from "../diagnostics/adapters/cloudAgentApi.js";
 import { DiagnosticCorrelator } from "../diagnostics/correlator.js";
 import { DiagnosticReport, FINDING_LEVEL, INVESTIGATION_STATUS } from "../diagnostics/report.js";
 import { TestRunner } from "../testing/runner.js";
+import { receiptFromRunState } from "../testing/receipts.js";
+import { RunStateStore } from "../testing/runState.js";
 import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
 import { InvestigationEngine } from "../investigation/engine.js";
 import { InterventionStore } from "../runtime/interventions.js";
 import { createInterventionTools } from "./intervention-tools.js";
 import { AuthorizationGrantStore } from "../runtime/approvals.js";
+import { trackRunResult } from "../runtime/runTracker.js";
 import { randomUUID } from "node:crypto";
 
 const DEFAULT_PORT = 9377;
@@ -51,36 +53,129 @@ const OUTPUT_EXTENSIONS = new Set(["json", "md", "csv", "xml"]);
 // the run as finished.
 const TERMINAL = new Set(["finished", "failed", "canceled"]);
 
-export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationRunner, apiToken, host = "127.0.0.1", maxTasks = MAX_TASK_RECORDS, executorName, reportDir, testSessionResolver = null } = {}) {
+export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationRunner, decisionRuntime = null, apiToken, operatorToken = process.env.ACTIVETAB_OPERATOR_TOKEN ?? null, operatorId = process.env.ACTIVETAB_OPERATOR_ID ?? null, operatorAuthenticator = null, host = "127.0.0.1", maxTasks = MAX_TASK_RECORDS, executorName, reportDir, testSessionResolver = null, testEnvironmentResolver = null, testProfileIdResolver = null, testPrincipalResolver = null, runStateStore: suppliedRunStateStore = null } = {}) {
   const store = new TaskStore(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"));
   const lifecycle = new RunLifecycle({ store, navigationRunner, executorName, reportDir });
   const token = apiToken ?? process.env.ACTIVETAB_API_TOKEN ?? null;
   const authorizeMutation = createMutationAuthorizer(token);
+  const authenticateOperator = operatorAuthenticator ?? createOperatorAuthenticator(operatorToken, operatorId);
   const maxTaskRecords = Number.isInteger(maxTasks) && maxTasks >= 1 ? Math.min(maxTasks, 10_000) : MAX_TASK_RECORDS;
   const diagnostics = createDiagnostics();
   const testRuns = new Map();
+  const runStateStore = suppliedRunStateStore ?? new RunStateStore(
+    process.env.ACTIVETAB_RUN_STATE_DIR ?? join(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"), "..", "runs")
+  );
+  let runStateStoreReady = null;
   const interventionStore = new InterventionStore(join(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"), "..", "interventions"));
   interventionStore.init().catch(() => {}); // lazy init; durable records reload on first use
   const grantStore = new AuthorizationGrantStore({ trustedIssuer: process.env.ACTIVETAB_TRUSTED_ISSUER ?? "activetab-api" });
   const interventionTools = createInterventionTools({
     store: interventionStore,
     runs: testRuns,
+    runStateStore,
     ctx: {
       grantStore,
-      issueGrant: (...args) => grantStore.issue(...args)
+      issueGrant: (...args) => grantStore.issue(...args),
+      revokeGrant: grantId => grantStore.revoke(grantId)
     }
   });
 
   function createBrowserDiagnosticSources(session, collector) {
     registerBrowserDiagnosticSources(session, collector);
-    const cloudAgent = cloudAgentAdapterFromEnv();
-    if (cloudAgent) cloudAgent.registerSources(collector);
     return collector;
+  }
+
+  function createTestVerificationContext(session) {
+    return {
+      observe: async intervention => {
+        if (intervention?.targetId && session.target?.id !== intervention.targetId) return null;
+        return await session.observe().catch(() => null);
+      },
+      hasAttachmentGrant: async targetId => {
+        if (session.target?.id !== targetId || typeof session.hasAttachmentGrant !== "function") return { ok: false, reason: "No independently verified attachment grant for the intervention target." };
+        return await session.hasAttachmentGrant(targetId);
+      },
+      verifyAuthentication: async (realm, intervention) => {
+        if (intervention?.targetId && session.target?.id !== intervention.targetId) return { authenticated: false, reason: "The authenticated target does not match the suspended run." };
+        if (typeof session.verifyAuthentication !== "function") return { authenticated: false, reason: "No authenticated-session verifier is bound to this run." };
+        return await session.verifyAuthentication(realm, intervention);
+      },
+      verifyEnvironment: async (url, intervention) => {
+        if (intervention?.targetId && session.target?.id !== intervention.targetId) return { ok: false, reason: "The observed target does not match the suspended run." };
+        if (typeof session.verifyEnvironment !== "function") return { ok: false, reason: "No environment verifier is bound to this run." };
+        return await session.verifyEnvironment(url, intervention);
+      },
+      verifyApprovalGrant: async (grantId, intervention) => {
+        const condition = intervention?.completionCondition;
+        const effects = condition?.allowedEffects;
+        const operatorId = intervention?.approvalResolution?.operatorId;
+        if (!Array.isArray(effects) || effects.length === 0 || !operatorId || !condition?.inputHash) return { ok: false, reason: "The exact approval scope is unavailable." };
+        return grantStore.verify(grantId, {
+          principal: operatorId,
+          environmentId: intervention.environmentId,
+          authenticationRealm: intervention.authenticationRealm,
+          resource: condition.resource ?? intervention.applicationId ?? intervention.runId,
+          operation: condition.operation,
+          inputHash: condition.inputHash,
+          effect: effects[0]
+        });
+      }
+    };
+  }
+
+  async function resolveTestRunBinding(req, workflow, session, continuation = null) {
+    let environment = null;
+    let profileId = null;
+    let principalId = "local_api_automation";
+    const resolverContext = { workflow, session, ...(continuation ? { continuation } : {}) };
+    if (typeof testEnvironmentResolver === "function") environment = await testEnvironmentResolver(resolverContext);
+    if (typeof testProfileIdResolver === "function") profileId = await testProfileIdResolver({ ...resolverContext, environment });
+    if (typeof testPrincipalResolver === "function") principalId = await testPrincipalResolver({ req, ...resolverContext }) ?? null;
+    if (environment !== null && (!environment || typeof environment !== "object")) throw new Error("Environment resolver did not return a verified binding.");
+    if (profileId !== null && typeof profileId !== "string") throw new Error("Profile resolver did not return a stable profile identifier.");
+    if (principalId !== null && typeof principalId !== "string") throw new Error("Principal resolver did not return a stable principal identifier.");
+    return { environment, profileId, principalId };
+  }
+
+  async function ensureRunStateStore() {
+    runStateStoreReady ??= runStateStore.init();
+    await runStateStoreReady;
+  }
+
+  function installTestRun({ runId, session, workflow, binding, controller, collector, correlator, runner, runPromise, runCtx }) {
+    const runState = trackRunResult(runPromise);
+    testRuns.set(runId, {
+      collector, correlator, controller, runPromise, runState, session, runner, workflow,
+      startedAt: new Date().toISOString(),
+      resume: async () => {
+        if (!runState.settled) return { resumed: false, reason: "Run is still executing." };
+        if (!runState.receipt) return { resumed: false, reason: "Run did not produce a receipt." };
+        runState.status = "RUNNING";
+        runState.settled = false;
+        try {
+          const result = await runner.resume(runState.receipt, { verify: runCtx, workflow });
+          if (result.receipt) runState.receipt = result.receipt;
+          runState.status = runState.receipt?.status ?? "UNKNOWN";
+          return result;
+        } catch (error) {
+          runState.status = runState.receipt?.status ?? "UNCERTAIN";
+          runState.error = error;
+          throw error;
+        } finally { runState.settled = true; }
+      },
+      getState: async () => runState.status,
+      getVerificationContext: () => runCtx,
+      cancel: async () => {
+        await runStateStore.requestCancellation(runId).catch(() => {});
+        controller.abort();
+      }
+    });
+    return runState;
   }
 
   async function handleStartTestRun(req, res) {
     const body = await readBody(req);
-    const workflow = body?.workflow;
+    const workflow = body?.workflow && structuredClone(body.workflow);
     if (!workflow || typeof workflow !== "object" || !workflow.id || !Array.isArray(workflow.steps)) {
       sendError(res, 400, 99001, "workflow with id and steps is required.");
       return;
@@ -95,40 +190,142 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
       sendError(res, 400, 99002, "An attached browser session is required for test runs.");
       return;
     }
+    try { await ensureRunStateStore(); }
+    catch (error) {
+      sendError(res, 503, 99503, `Durable run-state storage is unavailable: ${String(error?.message ?? error).slice(0, 200)}`);
+      return;
+    }
+    let binding;
+    try {
+      binding = await resolveTestRunBinding(req, workflow, session);
+    } catch (error) {
+      sendError(res, 400, 99003, `Test-run identity or environment could not be verified: ${String(error?.message ?? error).slice(0, 200)}`);
+      return;
+    }
     const runId = `test-${Date.now()}-${randomUUID().slice(0, 8)}`;
     const collector = new DiagnosticCollector({ runId });
     createBrowserDiagnosticSources(session, collector);
     const correlator = new DiagnosticCorrelator();
     const controller = new AbortController();
-    const runner = new TestRunner({ session, collector, correlator, signal: controller.signal, interventions: interventionStore });
-    const runPromise = runner.run(workflow, { runId });
-    testRuns.set(runId, {
-      collector, correlator, controller, runPromise, session, runner,
-      startedAt: new Date().toISOString(),
-      resume: async () => {
-        const receipt = await Promise.race([runPromise, Promise.resolve(null)]);
-        if (!receipt) return { resumed: false, reason: "Run is still executing." };
-        return await runner.resume(receipt);
-      },
-      cancel: async () => { controller.abort(); }
+    const runner = new TestRunner({
+      session, collector, correlator, signal: controller.signal, interventions: interventionStore,
+      decisionRuntime, runStateStore, ...binding
     });
+    const runCtx = createTestVerificationContext(session);
+    const runPromise = runner.run(workflow, { runId });
+    installTestRun({ runId, session, workflow, binding, controller, collector, correlator, runner, runPromise, runCtx });
     sendJson(res, 200, { status: "started", runId });
+  }
+
+  async function handleResumeTestRun(req, res, runId) {
+    const body = await readBody(req) ?? {};
+    const workflow = body?.workflow && structuredClone(body.workflow);
+    if (!workflow || typeof workflow !== "object" || !workflow.id || !Array.isArray(workflow.steps)) {
+      sendError(res, 400, 99001, "The exact original workflow is required to resume a durable run.");
+      return;
+    }
+    try { await ensureRunStateStore(); }
+    catch (error) { sendError(res, 503, 99503, `Durable run-state storage is unavailable: ${String(error?.message ?? error).slice(0, 200)}`); return; }
+    const state = await runStateStore.getFresh(runId);
+    if (!state) { sendError(res, 404, 99404, `No durable test run found for runId '${runId}'.`); return; }
+    const existing = testRuns.get(runId);
+    if (existing && !existing.runState.settled) { sendError(res, 409, 99409, "The run already has an active local worker."); return; }
+    if (["passed", "failed", "blocked", "canceled", "expired"].includes(state.status)) {
+      sendError(res, 409, 99409, `Run is already terminal (${state.status}).`);
+      return;
+    }
+    const unresolved = (state.pendingOperations ?? []).filter(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status));
+    if (unresolved.length) {
+      sendJson(res, 409, { runId, status: "UNCERTAIN", reason: "An operation is awaiting independent reconciliation; workflow dispatch is suspended.", operationIds: unresolved.map(operation => operation.operationId) });
+      return;
+    }
+    let session = null;
+    if (typeof testSessionResolver === "function") {
+      try {
+        session = await testSessionResolver({
+          workflow,
+          input: body?.input ?? {},
+          continuation: { runId, targetId: state.target?.targetId ?? null, environmentId: state.environmentId, profileId: state.profileId, principalId: state.principalId }
+        });
+      } catch { session = null; }
+    }
+    if (!session || typeof session.observe !== "function" || typeof session.client?.send !== "function"
+      || session.attached !== true || session.target?.id !== state.target?.targetId) {
+      sendError(res, 409, 99409, "Resume requires a fresh attachment to the exact browser target bound to this run.");
+      return;
+    }
+    let binding;
+    try {
+      binding = await resolveTestRunBinding(req, workflow, session, state);
+      const authenticationRealm = binding.environment?.applications?.[0]?.authenticationRealm ?? null;
+      if ((binding.environment?.environmentId ?? null) !== state.environmentId
+        || (binding.profileId ?? null) !== state.profileId
+        || (binding.principalId ?? null) !== state.principalId
+        || authenticationRealm !== state.authenticationRealm) {
+        throw new Error("The resolved environment, profile, principal, or authentication realm differs from the durable run binding.");
+      }
+    } catch (error) {
+      sendError(res, 409, 99409, `Run continuation identity could not be verified: ${String(error?.message ?? error).slice(0, 200)}`);
+      return;
+    }
+    await interventionStore.init();
+    const intervention = state.pendingInterventionId ? interventionStore.get(state.pendingInterventionId) : null;
+    if (state.pendingInterventionId && (!intervention || intervention.runId !== runId)) {
+      sendError(res, 409, 99409, "The durable intervention required by this run is unavailable or mismatched.");
+      return;
+    }
+    const collector = new DiagnosticCollector({ runId });
+    createBrowserDiagnosticSources(session, collector);
+    const correlator = new DiagnosticCorrelator();
+    const controller = new AbortController();
+    const runner = new TestRunner({
+      session, collector, correlator, signal: controller.signal, interventions: interventionStore,
+      decisionRuntime, runStateStore, existingRunStateId: runId, ...binding
+    });
+    const runCtx = createTestVerificationContext(session);
+    const runPromise = intervention
+      ? runner.resume(receiptFromRunState(state, intervention), { verify: runCtx, workflow }).then(result => {
+          if (!result.receipt) throw new Error(result.reason ?? "The run resume predicate was not independently verified.");
+          return result.receipt;
+        })
+      : runner.run(workflow, { runId });
+    installTestRun({ runId, session, workflow, binding, controller, collector, correlator, runner, runPromise, runCtx });
+    sendJson(res, 202, { status: "resuming", runId });
   }
 
   async function handleGetTestRun(req, res, runId) {
     const run = testRuns.get(runId);
-    if (!run) { sendError(res, 404, 99404, `No test run found for runId '${runId}'.`); return; }
-    let receipt;
-    try { receipt = await Promise.race([run.runPromise, Promise.resolve(null)]); } catch { receipt = null; }
-    if (receipt) { sendJson(res, 200, receipt.toObject()); return; }
-    sendJson(res, 200, { runId, status: "RUNNING", startedAt: run.startedAt });
+    if (!run) {
+      try {
+        await ensureRunStateStore();
+        const state = await runStateStore.getFresh(runId);
+        if (state) {
+          sendJson(res, 200, receiptFromRunState(state).toObject());
+          return;
+        }
+      } catch (error) {
+        sendError(res, 503, 99503, `Durable run-state lookup failed: ${String(error?.message ?? error).slice(0, 200)}`);
+        return;
+      }
+      sendError(res, 404, 99404, `No test run found for runId '${runId}'.`); return;
+    }
+    if (!run.runState.settled) { sendJson(res, 200, { runId, status: "RUNNING", startedAt: run.startedAt }); return; }
+    if (run.runState.receipt) { sendJson(res, 200, run.runState.receipt.toObject()); return; }
+    sendJson(res, 200, { runId, status: "FAILED", startedAt: run.startedAt, error: String(run.runState.error?.message ?? "Run failed.").slice(0, 300) });
   }
 
   async function handleCancelTestRun(req, res, runId) {
     const run = testRuns.get(runId);
-    if (!run) { sendError(res, 404, 99404, `No test run found for runId '${runId}'.`); return; }
-    run.controller.abort();
-    sendJson(res, 200, { status: "cancel_requested", runId });
+    try {
+      await ensureRunStateStore();
+      const state = await runStateStore.getFresh(runId);
+      if (!run && !state) { sendError(res, 404, 99404, `No test run found for runId '${runId}'.`); return; }
+      if (state) await runStateStore.requestCancellation(runId);
+      if (run) { run.controller.abort(); await run.cancel?.(); }
+      sendJson(res, 200, { status: "cancel_requested", runId, requiresReconciliation: (state?.pendingOperations ?? []).some(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status)) });
+    } catch (error) {
+      sendError(res, 503, 99503, `Cancellation could not be persisted: ${String(error?.message ?? error).slice(0, 200)}`);
+    }
   }
 
   async function handleCollectTestRunDiagnostics(req, res, runId) {
@@ -144,7 +341,9 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
   async function handleGetTestReport(req, res, runId) {
     const run = testRuns.get(runId);
     if (!run) { sendError(res, 404, 99404, `No test run found for runId '${runId}'.`); return; }
-    const receipt = await run.runPromise;
+    if (!run.runState.settled) { sendError(res, 409, 99409, "The test run has not settled; a report is not available yet."); return; }
+    const receipt = run.runState.receipt;
+    if (!receipt) { sendError(res, 409, 99409, "The test run failed without a receipt; a report is unavailable."); return; }
     const report = new DiagnosticReport({ runId, title: `Test run: ${receipt.workflowName}` });
     report.setCorrelationSummary(run.correlator.summary());
     for (const step of receipt.steps) {
@@ -182,7 +381,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
         ...(requestOrigin ? { "Access-Control-Allow-Origin": requestOrigin } : {}),
         "Vary": "Origin",
         "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization"
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-ActiveTab-Operator-Token"
       });
       res.end();
       return;
@@ -214,6 +413,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
           session,
           maxSteps: body?.maxSteps ?? 8,
           maxLinksPerStep: body?.maxLinksPerStep ?? 4,
+          decisionRuntime,
           ...(body?.knowledgeDir ? { knowledgeDir: body.knowledgeDir } : {})
         });
         const result = await engine.discover();
@@ -232,6 +432,27 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
 
       // ── Intervention lifecycle (P0-6): status/ack/approval/resume/cancel ──
       if (path === "/v1/interventions" || path.startsWith("/v1/interventions/")) {
+        const resolveMatch = path.match(/^\/v1\/interventions\/([^/]+)\/resolve$/);
+        if (method === "POST" && resolveMatch) {
+          const authenticatedOperator = await authenticateOperator(req);
+          if (!authenticatedOperator) { sendError(res, 403, 99403, "Independent operator authentication required."); return; }
+          const body = await readBody(req) ?? {};
+          if (typeof body !== "object" || Array.isArray(body)) { sendError(res, 400, 99001, "Approval resolution must be a JSON object."); return; }
+          if (Object.hasOwn(body, "authenticatedOperator")) { sendError(res, 400, 99001, "Operator identity is derived from the authenticated operator session."); return; }
+          if (body.decision !== undefined && !["approve", "reject"].includes(body.decision)) { sendError(res, 400, 99001, "decision must be approve or reject."); return; }
+          if (!Number.isInteger(body.expectedRevision)) { sendError(res, 400, 99001, "expectedRevision is required."); return; }
+          try {
+            sendJson(res, 200, await interventionTools.resolve_operation_approval({
+              interventionId: decodeURIComponent(resolveMatch[1]),
+              authenticatedOperator,
+              decision: body.decision ?? "approve",
+              expectedRevision: body.expectedRevision
+            }));
+          } catch (error) {
+            sendError(res, 409, 99409, String(error?.message ?? error).slice(0, 300));
+          }
+          return;
+        }
         if (!authorizeMutation(req)) { sendError(res, 401, 99401, "Authentication required."); return; }
         try {
           if (method === "GET" && path === "/v1/interventions") {
@@ -245,14 +466,8 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
             if (method === "GET" && action === "get") { sendJson(res, 200, await interventionTools.get_pending_intervention({ interventionId })); return; }
             if (method === "POST" && action === "acknowledge") { const body = await readBody(req); sendJson(res, 200, await interventionTools.acknowledge_human_action({ interventionId, ...(body ?? {}) })); return; }
             if (method === "POST" && action === "approve") { const body = await readBody(req); sendJson(res, 200, await interventionTools.request_operation_approval({ interventionId, ...(body ?? {}) })); return; }
-            if (method === "POST" && action === "resolve") {
-              const body = await readBody(req) ?? {};
-              const operatorToken = req.headers["x-activetab-operator-token"];
-              if (!operatorToken || operatorToken !== process.env.ACTIVETAB_OPERATOR_TOKEN) { sendError(res, 403, 99403, "Operator authentication required."); return; }
-              sendJson(res, 200, await interventionTools.resolve_operation_approval({ interventionId, authenticatedOperator: body.authenticatedOperator ?? "operator", decision: body.decision ?? "approve", expectedRevision: body.expectedRevision ?? null })); return;
-            }
             if (method === "POST" && action === "reject") { const body = await readBody(req); sendJson(res, 200, await interventionTools.reject_operation({ interventionId, ...(body ?? {}) })); return; }
-            if (method === "POST" && action === "resume") { const body = await readBody(req); sendJson(res, 200, await interventionTools.resume_run({ interventionId, ...(body ?? {}) })); return; }
+            if (method === "POST" && action === "resume") { sendJson(res, 200, await interventionTools.resume_run({ interventionId })); return; }
             if (method === "POST" && action === "cancel") { sendJson(res, 200, await interventionTools.cancel_run({ interventionId })); return; }
           }
           if (method === "GET" && path === "/v1/interventions/run-state") {
@@ -272,12 +487,13 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
         await handleStartTestRun(req, res);
         return;
       }
-      const testRunMatch = path.match(/^\/v1\/test\/runs\/([^/]+)(?:\/(status|cancel|diagnostics|report))?$/);
+      const testRunMatch = path.match(/^\/v1\/test\/runs\/([^/]+)(?:\/(status|cancel|diagnostics|report|resume))?$/);
       if (testRunMatch) {
         if (!authorizeMutation(req)) { sendError(res, 401, 99401, "Authentication required."); return; }
         const runId = testRunMatch[1];
         const action = testRunMatch[2] ?? "status";
         if (method === "GET" && action === "status") { await handleGetTestRun(req, res, runId); return; }
+        if (method === "POST" && action === "resume") { await handleResumeTestRun(req, res, runId); return; }
         if (method === "POST" && action === "cancel") { await handleCancelTestRun(req, res, runId); return; }
         if (method === "POST" && action === "diagnostics") { await handleCollectTestRunDiagnostics(req, res, runId); return; }
         if (method === "GET" && action === "report") { await handleGetTestReport(req, res, runId); return; }
@@ -437,7 +653,10 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
     async stop() {
       for (const run of testRuns.values()) run.controller.abort();
       await lifecycle.stopAll();
-      return new Promise(resolvePromise => server.close(resolvePromise));
+      return new Promise(resolvePromise => server.close(() => {
+        decisionRuntime?.close();
+        resolvePromise();
+      }));
     }
   };
 }
@@ -508,7 +727,8 @@ async function handlePeerRun(req, res, { store, lifecycle, executorReady, diagno
     signal: ctrl.signal,
     input: (body.input && typeof body.input === "object" && !Array.isArray(body.input)) ? body.input : {},
     templateId: "remote-peer-run",
-    taskId: task.task_id
+    taskId: task.task_id,
+    plannerMode: body.plannerMode
   }));
 
   // Await-style peer response: heartbeats keep the socket responsive on

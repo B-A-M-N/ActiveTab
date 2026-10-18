@@ -85,6 +85,31 @@ test("native CDP recursively attaches, observes, and controls nested out-of-proc
     assert.ok(attached.every(frame => frame.status === "ready"));
     const nestedFrameSession = attached.find(frame => frame.targetId !== iframeTarget.targetId);
     assert.ok(nestedFrameSession, "the nested OOPIF is attached as a child target");
+    // These operation contracts authorize only the named buttons created by
+    // this local fixture. They do not model or grant product-wide behavior.
+    const fixtureButtons = new Map([
+      ["Open OOPIF preferences", childFrameSession.targetId],
+      ["Open nested preferences", nestedFrameSession.targetId],
+      ["Close nested frame", nestedFrameSession.targetId],
+      ["Open account", null]
+    ]);
+    const fixtureOperationAuthorizer = {
+      operationId: "test.oopif_fixture_button",
+      authorize({ action, candidate, observation }) {
+        const expectedFrameTargetId = fixtureButtons.get(candidate?.name);
+        const fresh = observation?.candidates?.some(item => item.identity === candidate?.identity
+          && item.name === candidate?.name && item.visible === true && item.disabled !== true);
+        const allowed = action === "click"
+          && fixtureButtons.has(candidate?.name)
+          && (candidate?.frameTargetId ?? null) === expectedFrameTargetId
+          && candidate?.tag === "button"
+          && candidate?.role === "button"
+          && fresh;
+        return allowed
+          ? { allowed: true, category: "test_oopif_fixture_action" }
+          : { allowed: false, reason: "Only named, freshly observed OOPIF fixture buttons are allowed." };
+      }
+    };
     const observation = await session.observe();
     const frameRuntime = await session.observer.inspectRuntimeState(observation.evidenceId, { path: ["__activetabFrameState__", "frameLabel"], frameTargetId: childFrameSession.targetId });
     assert.equal(frameRuntime.status, "available", JSON.stringify(frameRuntime));
@@ -114,10 +139,10 @@ test("native CDP recursively attaches, observes, and controls nested out-of-proc
     assert.equal(childLinkDetail.selectedElement.attributes.href, `http://localhost:${childPort}/child-destination`, "relative OOPIF links resolve against their own frame URL");
     assert.equal(JSON.stringify(childLinkDetail).includes("child-url-secret"), false, "OOPIF selected-element URLs redact query values");
     await childFrameSession.client.send("Runtime.evaluate", { expression: "fetch('/api?session=oopif-network-secret').then(response=>response.json())", returnByValue: true, awaitPromise: true });
-    const childResult = await new NavigationEngine(session, { maxActions: 2, maxRecoveries: 1 }).run("Open OOPIF preferences page");
+    const childResult = await new NavigationEngine(session, { operationAuthorizer: fixtureOperationAuthorizer, maxActions: 2, maxRecoveries: 1 }).run("Open OOPIF preferences page");
     assert.equal(childResult.status, "succeeded", `the frame-target session can click the direct OOPIF control and verify its parent-page result: ${JSON.stringify(childResult)}`);
     assert.equal(childResult.page.title, "OOPIF preferences");
-    const result = await new NavigationEngine(session, { maxActions: 2, maxRecoveries: 1 }).run("Open nested preferences page");
+    const result = await new NavigationEngine(session, { operationAuthorizer: fixtureOperationAuthorizer, maxActions: 2, maxRecoveries: 1 }).run("Open nested preferences page");
     assert.equal(result.status, "succeeded", `recursive frame sessions can click a nested OOPIF control and verify its parent-page result: ${JSON.stringify(result)}`);
     assert.equal(result.page.title, "Nested preferences");
     const activity = session.observer.getEvidence(result.evidenceId, { facets: ["networkActivity", "domMutations"] });
@@ -172,7 +197,7 @@ test("native CDP recursively attaches, observes, and controls nested out-of-proc
       }
     };
     const detachJournal = { value: undefined, async write(value) { this.value = structuredClone(value); } };
-    const detachRun = await new NavigationEngine(session, { planner: detachPlanner, journal: detachJournal, maxActions: 3, maxRecoveries: 1 }).run("Open the account page");
+    const detachRun = await new NavigationEngine(session, { operationAuthorizer: fixtureOperationAuthorizer, planner: detachPlanner, journal: detachJournal, maxActions: 3, maxRecoveries: 1 }).run("Open the account page");
     session.click = nativeSessionClick;
     assert.equal(detachRun.status, "succeeded", JSON.stringify(detachRun));
     assert.equal(detachRun.attempts, 2);

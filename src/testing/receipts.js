@@ -61,6 +61,17 @@ export class TestReceipt {
         ...(typeof item.resumedAt === "string" ? { resumedAt: item.resumedAt } : {})
       };
     });
+    receipt.cleanup = (Array.isArray(value.cleanup) ? value.cleanup : []).map(item => {
+      if (!item || typeof item.stepId !== "string" || typeof item.status !== "string") {
+        throw new Error("Cannot restore a durable receipt with an invalid cleanup obligation.");
+      }
+      return {
+        stepId: item.stepId,
+        status: item.status,
+        reason: String(item.reason ?? "Restored cleanup obligation."),
+        recordedAt: typeof item.recordedAt === "string" ? item.recordedAt : receipt.startedAt
+      };
+    });
     return receipt;
   }
 
@@ -79,7 +90,10 @@ export class TestReceipt {
   }
 
   recordCleanup({ stepId, status, reason }) {
-    this.cleanup.push({ stepId, status, reason, recordedAt: new Date().toISOString() });
+    const existingPending = this.cleanup.findLast(item => item.stepId === stepId && item.status === "pending");
+    const entry = { stepId, status, reason: String(reason ?? "").slice(0, 500), recordedAt: new Date().toISOString() };
+    if (existingPending) Object.assign(existingPending, entry);
+    else this.cleanup.push(entry);
     return this;
   }
 
@@ -118,6 +132,22 @@ export class TestReceipt {
     return true;
   }
 
+  /** Reconcile a dispatched step only after independent evidence arrives. */
+  reconcileStep(stepId, { status, reason, evidenceIds = [], details = null } = {}) {
+    if (![STEP_STATUS.PASS, STEP_STATUS.FAIL, STEP_STATUS.UNCERTAIN].includes(status)) {
+      throw new Error("An uncertain step can only reconcile to PASS, FAIL, or UNCERTAIN.");
+    }
+    const step = this.steps.findLast(item => item.stepId === stepId && item.status === STEP_STATUS.UNCERTAIN);
+    if (!step) return false;
+    step.status = status;
+    step.reason = String(reason ?? "Uncertain step reconciled from independent evidence.");
+    step.finishedAt = new Date().toISOString();
+    step.evidenceIds = [...new Set(evidenceIds.filter(id => typeof id === "string"))].slice(0, 20);
+    if (details && typeof details === "object" && !Array.isArray(details)) step.details = details;
+    this.finish(deriveRunStatus(this.steps));
+    return true;
+  }
+
   addLimitation(text) {
     this.limitations.push(String(text));
     return this;
@@ -147,10 +177,52 @@ export class TestReceipt {
   }
 }
 
+/** Rebuild the bounded receipt shell needed to resume from durable checkpoints. */
+export function receiptFromRunState(runState, intervention = null) {
+  if (!runState || typeof runState.runId !== "string" || !Array.isArray(runState.completedSteps)) {
+    throw new Error("Cannot restore a receipt from invalid durable run state.");
+  }
+  const workflowId = runState.executionContract?.workflowId ?? runState.workflowId;
+  const receipt = new TestReceipt({
+    runId: runState.runId,
+    workflowId,
+    workflowName: runState.workflowName ?? workflowId
+  });
+  receipt.startedAt = typeof runState.createdAt === "string" ? runState.createdAt : receipt.startedAt;
+  for (const checkpoint of runState.completedSteps) {
+    if (!checkpoint || typeof checkpoint.stepId !== "string" || typeof checkpoint.status !== "string") continue;
+    if (![...Object.values(STEP_STATUS), STEP_SUSPENDED].includes(checkpoint.status)) continue;
+    receipt.recordStep({
+      stepId: checkpoint.stepId,
+      type: checkpoint.type ?? "checkpoint",
+      status: checkpoint.status,
+      reason: "Restored from a durable workflow checkpoint.",
+      evidenceIds: checkpoint.evidenceIds ?? []
+    });
+  }
+  if (intervention) {
+    if (intervention.runId !== runState.runId || intervention.intervention_id !== runState.pendingInterventionId) {
+      throw new Error("Durable intervention does not belong to the run's pending intervention binding.");
+    }
+    receipt.recordIntervention({
+      stepId: intervention.stepId,
+      interventionId: intervention.intervention_id,
+      type: intervention.type,
+      state: intervention.state,
+      reason: "Restored from the durable intervention record.",
+      externalState: intervention.externalState
+    });
+  }
+  const normalizedStatus = String(runState.status ?? "running").toUpperCase();
+  receipt.status = Object.values(RUN_STATUS).includes(normalizedStatus) ? normalizedStatus : RUN_STATUS.RUNNING;
+  if (isWaitingRunStatus(receipt.status)) receipt.finishedAt = null;
+  return receipt;
+}
+
 /**
  * Derive final run status from step statuses.
- * A suspended run (any SUSPENDED step) stays in a resumable waiting state;
- * CANCELED takes precedence, then FAILED/BLOCKED, then PASSED.
+ * A suspended run (any SUSPENDED step) stays in a resumable waiting state.
+ * Uncertain effects remain distinct from definitive failure and cancellation.
  */
 export const STEP_STATUS_EXTENDED = Object.freeze({ ...STEP_STATUS, SUSPENDED: STEP_SUSPENDED });
 
@@ -160,7 +232,8 @@ export function deriveRunStatus(steps) {
   if (statuses.includes(STEP_STATUS_EXTENDED.SUSPENDED)) return RUN_STATUS.WAITING_FOR_HUMAN_DECISION;
   if (statuses.includes(STEP_STATUS.FAIL)) return RUN_STATUS.FAILED;
   if (statuses.includes(STEP_STATUS.BLOCKED)) return RUN_STATUS.BLOCKED;
-  if (statuses.includes(STEP_STATUS.UNCERTAIN)) return RUN_STATUS.FAILED;
-  if (statuses.every(status => status === STEP_STATUS.PASS)) return RUN_STATUS.PASSED;
+  if (statuses.includes(STEP_STATUS.UNCERTAIN)) return RUN_STATUS.UNCERTAIN;
+  if (statuses.some(status => status === STEP_STATUS.PASS)
+    && statuses.every(status => status === STEP_STATUS.PASS || status === STEP_STATUS.SKIPPED)) return RUN_STATUS.PASSED;
   return RUN_STATUS.FAILED;
 }

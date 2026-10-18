@@ -9,7 +9,8 @@ import { NavigationEngine } from "../src/navigation/engine.js";
 function makeHangingSession() {
   const evidence = { evidenceId: "ev-0", page: { url: "https://example.test", title: "Home" }, headings: [{ level: 1, text: "Home" }], candidates: [], scrollTargets: [] };
   return {
-    target: { id: "t1", endpoint: "test" },
+    target: { id: "t1", endpoint: "test", url: "https://example.test/" },
+    attached: true,
     observeCalls: 0,
     releaseClick: null,
     async observe() {
@@ -37,7 +38,18 @@ function makeHangingSession() {
 test("cancellation during an in-flight action yields canceled with the action preserved as uncertain", async () => {
   const session = makeHangingSession();
   const controller = new AbortController();
-  const engine = new NavigationEngine(session, { maxActions: 3, signal: controller.signal, planner: {
+  const fixtureAction = {
+    operationId: "test.hanging_fixture_button",
+    authorize({ action, candidate, observation }) {
+      const fresh = observation?.candidates?.some(item => item.identity === candidate?.identity && item.name === "Open settings" && item.visible === true);
+      let observedOrigin = null;
+      try { observedOrigin = new URL(observation?.page?.url).origin; } catch {}
+      return action === "click" && candidate?.identity === "c1" && observedOrigin === "https://example.test" && fresh
+        ? { allowed: true, category: "test_fixture_action" }
+        : { allowed: false, reason: "Only the fresh scripted fixture button is allowed." };
+    }
+  };
+  const engine = new NavigationEngine(session, { maxActions: 3, signal: controller.signal, operationAuthorizer: fixtureAction, planner: {
     async plan() { return { status: "planned", action: { type: "click", target: { identity: "c1", tag: "button", role: "button", name: "Open settings", visible: true, disabled: false } } }; }
   } });
   const pending = engine.run("Open the settings page");
@@ -46,7 +58,7 @@ test("cancellation during an in-flight action yields canceled with the action pr
   controller.abort();
   session.releaseClick?.();
   const result = await pending;
-  assert.equal(result.status, "canceled");
+  assert.equal(result.status, "canceled", JSON.stringify(result));
   assert.equal(result.uncertain, true, "post-dispatch cancellation preserves uncertainty");
   assert.match(result.reason, /unknown outcome/);
 });

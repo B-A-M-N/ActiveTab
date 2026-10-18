@@ -2,6 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { configuredPlanner, DeterministicPlanner, OpenAICompatiblePlanner } from "../src/navigation/planner.js";
 
+const jsonResponse = body => new Response(JSON.stringify(body), {
+  status: 200,
+  headers: { "content-type": "application/json" }
+});
+
 test("OpenAI-compatible planner strips URL user-info, query, and fragment before sending compact evidence", async () => {
   let request;
   const planner = new OpenAICompatiblePlanner({
@@ -11,7 +16,7 @@ test("OpenAI-compatible planner strips URL user-info, query, and fragment before
     allowPageContent: true,
     fetchImpl: async (_url, options) => {
       request = { url: _url, headers: options.headers, body: JSON.parse(options.body) };
-      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ action: "click", identity: "candidate-1" }) } }] }) };
+      return jsonResponse({ choices: [{ message: { content: JSON.stringify({ action: "click", identity: "candidate-1" }) } }] });
     }
   });
   const observation = {
@@ -43,7 +48,7 @@ test("OpenAI-compatible planner can select only a currently observed scroll regi
     fetchImpl: async (_url, options) => {
       const body = JSON.parse(options.body);
       assert.ok(body.messages[1].content.includes("invoice-list"));
-      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ action: "scroll", identity: "invoice-list", direction: "down" }) } }] }) };
+      return jsonResponse({ choices: [{ message: { content: JSON.stringify({ action: "scroll", identity: "invoice-list", direction: "down" }) } }] });
     }
   });
   const target = { identity: "invoice-list", kind: "container", name: "Invoice list", visible: true, canScrollDown: true };
@@ -54,7 +59,7 @@ test("OpenAI-compatible planner can select only a currently observed scroll regi
   assert.equal(result.action.target, target);
 });
 
-test("configured planner keeps page content local unless its explicit transmission opt-in is set", () => {
+test("model action planning requires standalone mode plus a separate explicit selection", () => {
   const previous = {
     endpoint: process.env.ACTIVETAB_MODEL_ENDPOINT,
     model: process.env.ACTIVETAB_MODEL,
@@ -65,9 +70,12 @@ test("configured planner keeps page content local unless its explicit transmissi
     process.env.ACTIVETAB_MODEL = "test-model";
     delete process.env.ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT;
     assert.ok(configuredPlanner() instanceof DeterministicPlanner);
+    assert.throws(() => configuredPlanner({ executionMode: "standalone", plannerMode: "model" }), /ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT=1/);
     assert.throws(() => new OpenAICompatiblePlanner({ endpoint: "https://model.example.test/v1", model: "test-model" }), /Explicitly set ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT/);
     process.env.ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT = "1";
-    assert.ok(configuredPlanner() instanceof OpenAICompatiblePlanner);
+    assert.ok(configuredPlanner() instanceof DeterministicPlanner, "endpoint configuration does not change the planner role");
+    assert.ok(configuredPlanner({ executionMode: "standalone", plannerMode: "model" }) instanceof OpenAICompatiblePlanner);
+    assert.ok(configuredPlanner({ executionMode: "agent_directed", plannerMode: "model" }) instanceof DeterministicPlanner);
   } finally {
     if (previous.endpoint === undefined) delete process.env.ACTIVETAB_MODEL_ENDPOINT;
     else process.env.ACTIVETAB_MODEL_ENDPOINT = previous.endpoint;
@@ -82,8 +90,8 @@ test("local planner fills a unique searchbox and then selects its matching submi
   const planner = new DeterministicPlanner();
   const observation = {
     candidates: [
-      { identity: "query-field", tag: "input", type: "search", role: "searchbox", name: "Search products", visible: true },
-      { identity: "submit-search", tag: "button", role: "button", name: "Search", submitsForm: true, visible: true }
+      { identity: "query-field", tag: "input", type: "search", role: "searchbox", name: "Search products", formIdentity: "search-form", visible: true },
+      { identity: "submit-search", tag: "button", role: "button", name: "Search", submitsForm: true, formIdentity: "search-form", formMethod: "get", visible: true }
     ]
   };
   const fill = await planner.plan("Search for blue shoes", observation);

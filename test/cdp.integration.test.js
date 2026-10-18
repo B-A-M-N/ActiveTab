@@ -32,6 +32,7 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
   let crossOriginServer;
   let profileDir;
   let journalDir;
+  let fixtureButtonAuthorizer;
   try {
     crossOriginServer = createServer((_request, response) => {
       response.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
@@ -108,6 +109,26 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     assert.ok(browserTargets.some(item => item.id === fixtureTarget.id), "browser-level CDP enumerates the same authorized Chrome page");
     const authorizedTarget = await resolveChromeTarget(chromeConnection, fixtureTarget.id, fixtureTarget.id);
     session = await new BrowserSession(authorizedTarget).attach();
+    fixtureButtonAuthorizer = {
+      operationId: "test.local_fixture_button",
+      authorize({ action, candidate, observation }) {
+        let localFixture = false;
+        try { localFixture = new URL(observation?.page?.url).hostname === "127.0.0.1"; } catch {}
+        const observedItems = action === "scroll" ? observation?.scrollTargets : observation?.candidates;
+        const freshlyObserved = (observedItems ?? []).some(item =>
+          item.identity === candidate?.identity && item.visible === true
+          && (action === "scroll" || item.role === "button"));
+        if (!localFixture || !freshlyObserved) {
+          return { allowed: false, reason: "The test capability requires a fresh target on its loopback fixture." };
+        }
+        if (action === "scroll" && ["container", "viewport"].includes(candidate?.kind) && candidate.canScrollDown === true) {
+          return { allowed: true, category: "test_local_fixture_scroll" };
+        }
+        return action === "click"
+          ? { allowed: true, category: "test_local_fixture_button" }
+          : { allowed: false, reason: "The test capability is limited to downward scroll or a fresh button on its loopback fixture." };
+      }
+    };
     let first;
     const loadDeadline = Date.now() + 10_000;
     while (Date.now() < loadDeadline) {
@@ -117,6 +138,7 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
       await new Promise(resolve => setTimeout(resolve, 100));
     }
     assert.equal(first.page.title, "Demo shop");
+    assert.equal(first.targetId, session.target.id, "each real CDP observation is bound to its selected browser target");
     await session.client.send("Runtime.evaluate", {
       expression: "globalThis.__activetabGetterRuns = 0; globalThis.__activetabRuntimeState__ = { publicLabel: 'runtime fixture', nested: { apiToken: 'runtime-fixture-secret' }, largeValue: 'x'.repeat(5000) }; Object.defineProperty(globalThis.__activetabRuntimeState__, 'lazyValue', { enumerable: true, get() { globalThis.__activetabGetterRuns++; return 'getter-must-not-run'; } }); void 0;",
       returnByValue: true
@@ -197,30 +219,31 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     const frameCandidate = first.candidates.find(candidate => candidate.name === "Open frame controls");
     assert.ok(frameCandidate, "the compact observation exposes a same-origin iframe candidate");
     assert.equal(frameCandidate.frameId, frameEvidence.strings[frameDocument.frameId]);
-    const frameRun = await new NavigationEngine(session, { maxActions: 2, maxRecoveries: 1 }).run("Open frame controls");
+    const frameRun = await new NavigationEngine(session, { operationAuthorizer: fixtureButtonAuthorizer, maxActions: 2, maxRecoveries: 1 }).run("Open frame controls");
     assert.equal(frameRun.status, "succeeded", `goal-driven navigation can click and verify a same-origin iframe action: ${JSON.stringify(frameRun)}`);
     assert.equal(frameRun.page.title, "Frame controls");
     const crossFrameCandidate = first.candidates.find(candidate => candidate.name === "Open cross-origin controls");
     assert.ok(crossFrameCandidate, "a cross-origin button from the native snapshot becomes a frame-tagged candidate");
     assert.equal(crossFrameCandidate.frameId, capturedDom.strings[crossFrameDocument.frameId]);
-    const crossFrameRun = await new NavigationEngine(session, { maxActions: 2, maxRecoveries: 1 }).run("Open cross-origin controls");
-    assert.equal(crossFrameRun.status, "succeeded", `goal-driven navigation can click and verify this cross-origin iframe action: ${JSON.stringify(crossFrameRun)}`);
+    const crossFrameRun = await new NavigationEngine(session, { operationAuthorizer: fixtureButtonAuthorizer, maxActions: 2, maxRecoveries: 1 }).run("Open cross-origin controls");
+    assert.equal(crossFrameRun.status, "succeeded", `a test-only scoped capability admits this exact loopback fixture action: ${JSON.stringify(crossFrameRun)}`);
     assert.equal(crossFrameRun.page.title, "Cross-origin controls");
-    const shadowCandidate = first.candidates.find(candidate => candidate.name === "Open shadow preferences");
+    const shadowObservation = await session.observe();
+    const shadowCandidate = shadowObservation.candidates.find(candidate => candidate.name === "Open shadow preferences");
     assert.ok(shadowCandidate, "the compact observation exposes an actionable control inside an open Shadow DOM");
-    const shadowEvidence = session.observer.getEvidence(first.evidenceId, { facets: ["domSnapshot"] }).domSnapshot;
+    const shadowEvidence = session.observer.getEvidence(shadowObservation.evidenceId, { facets: ["domSnapshot"] }).domSnapshot;
     const shadowDocument = shadowEvidence.documents.find(document => document.nodes?.backendNodeId?.includes(shadowCandidate.backendNodeId));
     const shadowButtonIndex = shadowDocument?.nodes.backendNodeId.findIndex(id => id === shadowCandidate.backendNodeId) ?? -1;
     assert.ok(shadowDocument && shadowButtonIndex >= 0, "the native DOMSnapshot retains the open-shadow candidate's backend identity");
     assert.equal(shadowEvidence.strings[shadowDocument.nodes.nodeName[shadowButtonIndex]], "BUTTON");
-    const shadowRun = await new NavigationEngine(session, { maxActions: 2, maxRecoveries: 1 }).run("Open shadow preferences page");
+    const shadowRun = await new NavigationEngine(session, { operationAuthorizer: fixtureButtonAuthorizer, maxActions: 2, maxRecoveries: 1 }).run("Open shadow preferences page");
     assert.equal(shadowRun.status, "succeeded", "goal-driven navigation can click and verify a control inside an open Shadow DOM");
     assert.equal(shadowRun.page.title, "Shadow preferences");
     await session.client.send("Runtime.evaluate", { expression: "document.querySelector('#cover').style.display='block'" });
     const coveredObservation = await session.observe();
     assert.ok(coveredObservation.candidates.some(candidate => candidate.name === "Open obstructed controls"), "the covered target remains observable for an explicit interaction check");
     const coveredJournal = new TaskJournal(join(journalDir, "covered-task.json"));
-    const coveredRun = await new NavigationEngine(session, { journal: coveredJournal, maxActions: 2, maxRecoveries: 1 }).run("Open obstructed controls");
+    const coveredRun = await new NavigationEngine(session, { operationAuthorizer: fixtureButtonAuthorizer, journal: coveredJournal, maxActions: 2, maxRecoveries: 1 }).run("Open obstructed controls");
     const coveredState = await coveredJournal.read();
     assert.equal(coveredRun.status, "needs_human", "the navigation engine hands off when an overlay blocks the selected target");
     assert.match(coveredState.attempts[0].error.message, /occluded/);
@@ -304,7 +327,7 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     assert.notEqual(resumedState.attempts[0].targetIdentity, resumedState.attempts[1].targetIdentity, "resume acts on the replacement node instead of reusing the target whose dispatch result was lost");
     await session.client.send("Runtime.evaluate", { expression: "fetch('/api/account?session=network-query-token').then(response=>response.json())", returnByValue: true, awaitPromise: true });
     await session.waitForChange();
-    const archiveResult = await new NavigationEngine(session, { maxActions: 2, maxRecoveries: 1 }).run("Open the archive page");
+    const archiveResult = await new NavigationEngine(session, { operationAuthorizer: fixtureButtonAuthorizer, maxActions: 2, maxRecoveries: 1 }).run("Open the archive page");
     assert.equal(archiveResult.status, "succeeded", "native CDP scrolls an off-screen target into view before clicking it");
     assert.equal(archiveResult.page.title, "Archive");
     const scrollState = await session.client.send("Runtime.evaluate", { expression: "window.scrollY", returnByValue: true });
@@ -322,9 +345,19 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     assert.ok(activity.lifecycleEvents.length > 0, "native CDP retained page and DOM lifecycle events");
     assert.ok(activity.domMutations.length > 0, "native CDP retained real DOM mutation events from the fixture navigation");
     assert.ok(activity.domMutations.some(mutation => mutation.event === "DOM.childNodeInserted" || mutation.event === "DOM.childNodeRemoved"), "the verified archive action changed the DOM and emitted structural mutation evidence");
-    const searchResult = await new NavigationEngine(session, { maxActions: 2, maxRecoveries: 1 }).run("Search page");
+    const searchResult = await new NavigationEngine(session, { maxActions: 2, maxRecoveries: 1 }).run("Search for invoices");
     assert.equal(searchResult.status, "succeeded", "explicit search intent can submit a matching native form");
     assert.equal(searchResult.page.title, "Search results");
+    const customControls = await session.observe();
+    const modelControl = customControls.candidates.find(candidate => candidate.role === "combobox" && candidate.name === "Model");
+    const taskEditor = customControls.candidates.find(candidate => candidate.role === "textbox" && candidate.name === "Task instructions");
+    assert.ok(modelControl, "the observer exposes the fixture's custom ARIA combobox");
+    assert.ok(taskEditor, "the observer exposes the fixture's contenteditable textbox");
+    const modelSelection = await session.selectOption(modelControl, "GLM5.3-flash");
+    assert.equal(modelSelection.selectionStatus, "selected", "the browser opens the combobox and selects one exact visible option");
+    assert.equal((await session.verifyControlValue(modelControl, "GLM5.3-flash")).matches, true, "custom model selection is verified without returning the selected value");
+    await session.fillField(taskEditor, "caller-authored fixture task");
+    assert.equal((await session.verifyControlValue(taskEditor, "caller-authored fixture task")).matches, true, "contenteditable text entry is verified in-process");
     await session.client.send("Page.reload", { ignoreCache: true });
     await session.waitForChange(5_000);
     const resetObservation = await session.observe();
@@ -332,7 +365,7 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     const sectionRun = await new NavigationEngine(session, { maxActions: 1, maxRecoveries: 0 }).run("Open the billing history page");
     assert.equal(sectionRun.status, "succeeded", "native observations and deterministic planning resolve repeated labels from their section context");
     assert.equal(sectionRun.page.title, "Billing history");
-    const virtualizedRun = await new NavigationEngine(session, { maxActions: 10, maxScrolls: 8, maxRecoveries: 0 }).run("Open invoice 24 page");
+    const virtualizedRun = await new NavigationEngine(session, { operationAuthorizer: fixtureButtonAuthorizer, maxActions: 10, maxScrolls: 8, maxRecoveries: 0 }).run("Open invoice 24 page");
     assert.equal(virtualizedRun.status, "succeeded", `native wheel input reveals and opens an item rendered only after scrolling: ${JSON.stringify(virtualizedRun)}`);
     assert.equal(virtualizedRun.page.title, "Invoice 24");
     assert.ok(virtualizedRun.attempts >= 2 && virtualizedRun.attempts <= 9, "the task uses bounded scrolls followed by a native click");

@@ -9,10 +9,21 @@ import {
   verifyCloudAgentReady,
   discoverVisibleDiagnosticSurfaces,
   createCloudAgentEntryWorkflow,
+  shouldKeepOwnedBrowserOpen,
   qualifyCloudAgent
 } from "../src/testing/qualifyCloudAgent.js";
 import { InterventionStore } from "../src/runtime/interventions.js";
-import { RunStateStore } from "../src/testing/runState.js";
+import { RunStateStore, blockingQualificationRuns } from "../src/testing/runState.js";
+
+test("replacement qualification remains blocked by unresolved runs unless one is explicitly abandoned", () => {
+  const runs = [
+    { runId: "waiting-auth", status: "waiting_for_authentication" },
+    { runId: "running", status: "running" }
+  ];
+
+  assert.deepEqual(blockingQualificationRuns(runs), runs);
+  assert.deepEqual(blockingQualificationRuns(runs, { selectedDiscardId: "waiting-auth" }), [runs[1]]);
+});
 
 const environment = {
   applicationEntryUrl: "https://staging.freeinference.org",
@@ -36,6 +47,15 @@ test("Cloud Agent profile entry is only an identity hint and must be authorized"
     ...environment,
     applications: [{ ...environment.applications[0], candidateEntry: "https://untrusted.example/" }]
   }), /not authorized/);
+});
+
+test("owned staging browser stays open after a blocked or uncertain result until explicit stop", () => {
+  const signal = new AbortController().signal;
+  assert.equal(shouldKeepOwnedBrowserOpen("owned", { qualificationState: "BLOCKED" }, signal), true);
+  assert.equal(shouldKeepOwnedBrowserOpen("owned", { qualificationState: "UNCERTAIN" }, signal), true);
+  assert.equal(shouldKeepOwnedBrowserOpen("owned", { qualificationState: "PASSED" }, signal), true);
+  assert.equal(shouldKeepOwnedBrowserOpen("owned", { qualificationState: "BLOCKED" }, { aborted: true }), false);
+  assert.equal(shouldKeepOwnedBrowserOpen("attached", { qualificationState: "BLOCKED" }, signal), false);
 });
 
 test("Cloud Agent auth resumes only when the protected task composer is visible", () => {

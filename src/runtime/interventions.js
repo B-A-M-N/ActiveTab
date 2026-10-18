@@ -69,6 +69,65 @@ export function externalRunState(intervention) {
 
 const MAX_RECORD_BYTES = 64 * 1024;
 const DEFAULT_TTL_MS = 30 * 60 * 1000;
+const INTERVENTION_COPY = Object.freeze({
+  [INTERVENTION_TYPE.TAB_AUTHORIZATION]: ["Browser tab authorization is required.", "Authorize this exact tab using the ActiveTab extension."],
+  [INTERVENTION_TYPE.AUTHENTICATION]: ["Authentication is required.", "Complete sign-in in the attached browser tab."],
+  [INTERVENTION_TYPE.MFA]: ["Multi-factor authentication is required.", "Complete the requested MFA step in the attached browser tab."],
+  [INTERVENTION_TYPE.HUMAN_APPROVAL]: ["A scoped operation approval is required.", "Review the exact operation, target, environment, and effect before deciding."],
+  [INTERVENTION_TYPE.EXTERNAL_AUTHORIZATION]: ["External authorization is required.", "Obtain authorization through the application's approved process."],
+  [INTERVENTION_TYPE.HUMAN_DECISION]: ["A human decision is required.", "Review the current evidence and resolve the ambiguity." ]
+});
+const INTERVENTION_REASON_COPY = Object.freeze({
+  [INTERVENTION_TYPE.HUMAN_DECISION]: Object.freeze({
+    environment_identity_mismatch: "The observed page is not authorized for the selected environment."
+  })
+});
+
+function normalizeCompletionCondition(condition) {
+  const fieldsByType = {
+    tab_attachment: ["targetId"],
+    authenticated_session_check: ["realm"],
+    challenge_cleared: [],
+    approval_grant: ["grantId", "operation", "resource", "inputHash", "allowedEffects", "reversible"],
+    ambiguity_resolved: ["resolutionId"]
+  };
+  const fields = fieldsByType[condition?.type];
+  if (!fields) throw new Error("Intervention requires a supported typed completion condition.");
+  if (!condition || typeof condition !== "object" || Array.isArray(condition)) throw new Error("Intervention completion condition must be a typed object.");
+  const allowed = new Set(["type", ...fields]);
+  if (Object.keys(condition).some(key => !allowed.has(key))) throw new Error("Intervention completion condition contains an unsupported field.");
+  const normalized = { type: condition.type };
+  for (const key of fields) {
+    if (!Object.hasOwn(condition, key)) continue;
+    const value = condition[key];
+    if (["realm", "targetId", "grantId", "operation", "resource", "resolutionId"].includes(key)) {
+      if (value === null && key === "realm") { normalized[key] = null; continue; }
+      if (typeof value !== "string" || value.length === 0 || value.length > 256) throw new Error(`Intervention completion condition '${key}' must be a bounded string.`);
+      normalized[key] = value;
+    } else if (key === "inputHash") {
+      if (!isLowercaseDigest(value)) throw new Error("Approval inputHash must be a lowercase SHA-256 digest.");
+      normalized[key] = value;
+    } else if (key === "allowedEffects") {
+      if (!Array.isArray(value) || value.length < 1 || value.length > 32 || value.some(effect => typeof effect !== "string" || effect.length === 0 || effect.length > 128)) {
+        throw new Error("Approval allowedEffects must contain 1–32 bounded effect codes.");
+      }
+      normalized[key] = [...value];
+    } else if (key === "reversible") {
+      if (typeof value !== "boolean") throw new Error("Approval reversibility must be boolean.");
+      normalized[key] = value;
+    }
+  }
+  return normalized;
+}
+
+function isLowercaseDigest(value) {
+  if (typeof value !== "string" || value.length !== 64) return false;
+  for (const character of value) {
+    const code = character.charCodeAt(0);
+    if (!((code >= 48 && code <= 57) || (code >= 97 && code <= 102))) return false;
+  }
+  return true;
+}
 
 export class InterventionStore {
   constructor(baseDir) {
@@ -90,7 +149,13 @@ export class InterventionStore {
       if (!entry.isFile() || !/^[0-9a-f-]{36}\.json$/.test(entry.name)) continue;
       try {
         const record = JSON.parse(await readFile(join(this.baseDir, entry.name), "utf8"));
-        if (record?.intervention_id) this.records.set(record.intervention_id, record);
+        if (record?.intervention_id) {
+          // Revision is a monotonic compare-and-set fence for operator
+          // decisions. Older intervention files start at revision one.
+          if (!Number.isInteger(record.revision) || record.revision < 1) record.revision = 1;
+          if (!Object.hasOwn(record, "approvalResolution")) record.approvalResolution = null;
+          this.records.set(record.intervention_id, record);
+        }
       } catch { /* Unreadable records are left for explicit local inspection. */ }
     }
   }
@@ -112,29 +177,35 @@ export class InterventionStore {
    * and the completion predicate used on resume.
    */
   async create({
-    runId, stepId, type, reason, requiredHumanAction, completionCondition,
+    runId, stepId, type, reason, reasonCode = null, requiredHumanAction, completionCondition,
     environmentId = null, authenticationRealm = null, targetId = null,
     applicationId = null, ttlMs = DEFAULT_TTL_MS, resumePolicy = "verify_before_continue"
   }) {
     if (!Object.values(INTERVENTION_TYPE).includes(type)) throw new Error(`Unknown intervention type '${type}'.`);
-    if (typeof completionCondition?.type !== "string" || !completionCondition.type) {
-      throw new Error("Intervention requires a completion condition with an explicit type.");
-    }
+    const safeCondition = normalizeCompletionCondition(completionCondition);
+    const safeReason = reasonCode === null
+      ? INTERVENTION_COPY[type][0]
+      : INTERVENTION_REASON_COPY[type]?.[reasonCode];
+    if (!safeReason) throw new Error("Intervention reasonCode is unsupported for this intervention type.");
+    const safeRequiredHumanAction = INTERVENTION_COPY[type][1];
     const now = Date.now();
     const record = {
       schemaVersion: 1,
       intervention_id: randomUUID(),
+      revision: 1,
       runId: String(runId),
       stepId: String(stepId),
       type,
       state: INTERVENTION_STATE.WAITING,
+      ...(reasonCode ? { reasonCode } : {}),
       environmentId,
       authenticationRealm,
       targetId,
       applicationId,
-      reason: String(reason).slice(0, 500),
-      requiredHumanAction: String(requiredHumanAction).slice(0, 500),
-      completionCondition,       // e.g. { type: "authenticated_session_check", realm: "agents-session" }
+      reason: safeReason,
+      requiredHumanAction: safeRequiredHumanAction,
+      completionCondition: safeCondition,
+      approvalResolution: null,
       resumePolicy,
       generation: randomBytes(8).toString("hex"),  // fencing token for continuation ownership
       createdAt: new Date(now).toISOString(),
@@ -144,16 +215,6 @@ export class InterventionStore {
       resumedAt: null,
       resumeEvidence: null       // bounded evidence reference, never raw credentials
     };
-    // Never persist secrets: neither as fields nor inside prose values.
-    const serialized = JSON.stringify(record).toLowerCase();
-    for (const forbidden of ["password", "mfacode", "credential", "secret"]) {
-      if (new RegExp(`"${forbidden}"|${forbidden} is `).test(serialized)) {
-        throw new Error(`Intervention record must not persist '${forbidden}'.`);
-      }
-    }
-    if (/"token":"(?!null)/.test(serialized) || /bearer [a-z0-9._-]{6,}/i.test(serialized)) {
-      throw new Error("Intervention record must not persist tokens or bearer credentials.");
-    }
     this.records.set(record.intervention_id, record);
     await this.#writeAtomic(record);
     return record;
@@ -173,10 +234,51 @@ export class InterventionStore {
   }
 
   async #transition(record, patch) {
-    Object.assign(record, patch, { updatedAt: new Date().toISOString() });
+    Object.assign(record, patch, {
+      revision: (Number.isInteger(record.revision) ? record.revision : 1) + 1,
+      updatedAt: new Date().toISOString()
+    });
     this.records.set(record.intervention_id, record);
     await this.#writeAtomic(record);
     return record;
+  }
+
+  /** Reserve one exact human decision against the current intervention revision. */
+  async reserveApprovalResolution(interventionId, expectedRevision, operatorId, decision) {
+    const record = this.get(interventionId);
+    if (!record) throw new Error(`No intervention '${interventionId}'.`);
+    if (record.type !== INTERVENTION_TYPE.HUMAN_APPROVAL) throw new Error("This intervention is not an operation-approval request.");
+    if (record.state !== INTERVENTION_STATE.WAITING && record.state !== INTERVENTION_STATE.ACKNOWLEDGED) {
+      throw new Error(`Intervention '${interventionId}' is '${record.state}'; approval is no longer pending.`);
+    }
+    if (!Number.isInteger(expectedRevision) || record.revision !== expectedRevision) {
+      throw new Error("Approval request revision is stale; reload the exact pending request before resolving it.");
+    }
+    if (record.approvalResolution) throw new Error("This approval request already has a resolution in progress or recorded.");
+    if (decision !== "approve" && decision !== "reject") throw new Error("Approval decision must be approve or reject.");
+    const resolution = {
+      status: decision === "approve" ? "resolving" : "rejected",
+      decision,
+      operatorId: String(operatorId).slice(0, 160),
+      decidedAt: new Date().toISOString()
+    };
+    return await this.#transition(record, {
+      approvalResolution: resolution,
+      ...(decision === "reject" ? { state: INTERVENTION_STATE.CANCELED } : {})
+    });
+  }
+
+  /** Bind the issued grant to the reserved approval decision. */
+  async completeApprovalResolution(interventionId, expectedRevision, grant) {
+    const record = this.get(interventionId);
+    if (!record || record.revision !== expectedRevision || record.approvalResolution?.status !== "resolving") {
+      throw new Error("Approval resolution reservation changed before the grant could be bound.");
+    }
+    if (!grant?.grantId) throw new Error("Approval resolution requires the issued grant identity.");
+    return await this.#transition(record, {
+      approvalResolution: { ...record.approvalResolution, status: "approved", grantId: grant.grantId, expiresAt: grant.expiresAt },
+      completionCondition: { ...record.completionCondition, grantId: grant.grantId }
+    });
   }
 
   /** Operator acknowledgement: NOT a resume. */
@@ -280,7 +382,7 @@ export const RESUME_PREDICATES = Object.freeze({
     if (!targetId || typeof ctx.hasAttachmentGrant !== "function") {
       return { satisfied: false, reason: "No attachment verifier available." };
     }
-    const grant = await ctx.hasAttachmentGrant(targetId);
+    const grant = await ctx.hasAttachmentGrant(targetId, intervention);
     if (!grant?.ok) return { satisfied: false, reason: grant?.reason ?? "No valid attachment grant for the expected browser target." };
     return { satisfied: true, summary: `Attachment grant verified for target ${targetId}.` };
   },
@@ -291,7 +393,7 @@ export const RESUME_PREDICATES = Object.freeze({
     if (typeof ctx.verifyAuthentication !== "function") {
       return { satisfied: false, reason: "No authentication verifier available." };
     }
-    const result = await ctx.verifyAuthentication(realm);
+    const result = await ctx.verifyAuthentication(realm, intervention);
     if (!result?.authenticated) {
       return { satisfied: false, reason: result?.reason ?? `Realm '${realm}' is not verifiably authenticated.` };
     }
@@ -302,7 +404,7 @@ export const RESUME_PREDICATES = Object.freeze({
   async challenge_cleared(args) {
     const observe = args?.ctx?.observe;
     if (typeof observe !== "function") return { satisfied: false, reason: "No observation source available." };
-    const observation = await observe();
+    const observation = await observe(args?.intervention);
     const { classifyHumanHandoff } = await import("../navigation/handoff.js");
     const handoff = classifyHumanHandoff(observation);
     if (handoff?.category === "anti_automation") {
@@ -310,7 +412,7 @@ export const RESUME_PREDICATES = Object.freeze({
     }
     const verifyEnvironment = args?.ctx?.verifyEnvironment;
     if (typeof verifyEnvironment === "function") {
-      const env = await verifyEnvironment(observation.page?.url);
+      const env = await verifyEnvironment(observation.page?.url, args?.intervention);
       if (!env?.ok) return { satisfied: false, reason: env?.reason ?? "Application identity not verified after challenge." };
     }
     return { satisfied: true, summary: "Challenge cleared and application identity verified.", evidenceId: observation.evidenceId ?? null };
@@ -375,7 +477,7 @@ export class InterventionWatcher {
     this.signal = signal;
     this.disposers = [];
     this.timer = null;
-    this.onResume = null; // async (intervention, evaluation) => {}
+    this.onResume = null; // async continuation owner; it acquires the resume lease.
     this.#checking = new Set();
   }
 
@@ -425,20 +527,15 @@ export class InterventionWatcher {
     if (this.signal?.aborted) return;
     await this.store.expireStale();
     for (const intervention of this.store.listPending()) {
+      if (typeof this.onResume !== "function") continue;
       if (this.#checking.has(intervention.intervention_id)) continue; // one checker per run
       this.#checking.add(intervention.intervention_id);
       try {
-        // 1. Fresh observation and 2. exact condition re-evaluation.
+        // This is only a trigger. The continuation owner re-evaluates under
+        // its own fencing lease before committing satisfaction.
         const evaluation = await evaluateCompletion(intervention, this.ctx);
         if (!evaluation.satisfied) continue;
-        // 3. Continuation ownership + 4. persisted resume decision.
-        const { record, lease } = await this.store.acquireResume(intervention.intervention_id);
-        const reevaluated = await evaluateCompletion(record, this.ctx);
-        if (!reevaluated.satisfied) { await this.store.releaseResume(record.intervention_id, lease); continue; }
-        await this.store.completeResume(record.intervention_id, lease, { evidenceId: reevaluated.evidenceId ?? null, note: reevaluated.summary });
-        if (typeof this.onResume === "function") {
-          await this.onResume(this.store.get(record.intervention_id), reevaluated);
-        }
+        await this.onResume(intervention, evaluation);
       } catch { /* A failed check leaves the intervention pending. */ }
       finally { this.#checking.delete(intervention.intervention_id); }
     }

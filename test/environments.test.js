@@ -40,6 +40,24 @@ test("a tunnel diagnostic endpoint requires explicit ssh_tunnel transport and ve
   assert.equal(ok.applicationEntryUrl, "https://staging.example.org");
 });
 
+test("environment bindings preserve exact diagnostic route evidence from the profile", () => {
+  const bindings = [{ name: "runDetail", method: "GET", pathTemplate: "/api/admin/agent/runs/{runId}", observedStatus: 200, contentType: "application/json", sourceEvidenceId: "route-evidence-1" }];
+  const environment = buildEnvironmentBinding({
+    profile_id: "x",
+    environment: {
+      environment_id: "x",
+      application_entry_url: "https://staging.example.org",
+      diagnostic_endpoint: "https://diagnostics.example.org",
+      diagnostic_transport: "direct",
+      diagnostic_endpoint_bindings: bindings
+    }
+  });
+  assert.equal(environment.diagnosticEndpoint, "https://diagnostics.example.org");
+  assert.deepEqual(environment.diagnosticEndpointBindings, bindings);
+  assert.equal(Object.isFrozen(environment.diagnosticEndpointBindings), true);
+  assert.equal(Object.isFrozen(environment.diagnosticEndpointBindings[0]), true);
+});
+
 test("authorized_origins always includes the entry origin", () => {
   const binding = buildEnvironmentBinding({
     profile_id: "x",
@@ -57,6 +75,34 @@ test("verifyObservedUrl rejects unrelated origins (untrusted redirects)", () => 
   const bad = verifyObservedUrl(binding, "https://evil.example.org/phish");
   assert.ok(!bad.ok);
   assert.match(bad.reason, /not authorized/);
+});
+
+test("environment bindings retain profile and authentication-realm identity for resume fencing", () => {
+  const profile = {
+    profile_id: "staging-app",
+    authentication_realms: [
+      { realm_id: "agent-session", scope: ["agents"], separate_credentials: true },
+      { realm_id: "dashboard-session", scope: ["dashboard", "admin"], separate_credentials: true }
+    ],
+    environment: {
+      environment_id: "shared-staging",
+      application_entry_url: "https://staging.example.org",
+      applications: [{ application_id: "agent", authentication_realm: "agent-session", candidate_entry: "https://agents-staging.example.org/" }]
+    }
+  };
+  const binding = buildEnvironmentBinding(profile);
+  assert.equal(binding.profileId, "staging-app");
+  assert.deepEqual(binding.authenticationRealms, [
+    { realmId: "agent-session", scope: ["agents"], separateCredentials: true },
+    { realmId: "dashboard-session", scope: ["admin", "dashboard"], separateCredentials: true }
+  ]);
+  const otherProfile = buildEnvironmentBinding({
+    ...profile,
+    profile_id: "other-staging-surface",
+    authentication_realms: [{ realm_id: "other-session", scope: ["other"], separate_credentials: true }]
+  });
+  assert.notEqual(binding.profileId, otherProfile.profileId);
+  assert.notDeepEqual(binding.authenticationRealms, otherProfile.authenticationRealms);
 });
 
 test("staging profiles bind to the real FreeInference website with distinct realms", async () => {
