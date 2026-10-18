@@ -15,7 +15,7 @@ import { createDiagnosticContract, AUTHORITY, OPERATION, SENSITIVITY } from "../
 import { registerBrowserDiagnosticSources } from "../diagnostics/adapters/browserSources.js";
 import { cloudAgentAdapterFromEnv } from "../diagnostics/adapters/cloudAgentApi.js";
 import { DiagnosticCorrelator } from "../diagnostics/correlator.js";
-import { DiagnosticReport, FINDING_LEVEL, INVESTIGATION_STATUS } from "../diagnostics/report.js";
+import { DiagnosticReport, FINDING_LEVEL, deriveRunInvestigationStatus } from "../diagnostics/report.js";
 import { TestRunner } from "../testing/runner.js";
 import { receiptFromRunState } from "../testing/receipts.js";
 import { RunStateStore } from "../testing/runState.js";
@@ -33,6 +33,7 @@ import { prepareCloudAgentTask } from "../integrations/freeinference/prepareClou
 import { verifyCloudAgentRunOutcome } from "../integrations/freeinference/cloudAgentWorkflow.js";
 import { eventIdsForEvidence } from "../telemetry/evidenceRefs.js";
 import { randomUUID } from "node:crypto";
+import { assertRedactedEvidenceOnly } from "../diagnostics/evidenceReleasePolicy.js";
 
 const endpoint = process.env.ACTIVETAB_CDP_ENDPOINT ?? "http://127.0.0.1:9222";
 const sessions = new Map();
@@ -178,11 +179,11 @@ const tools = [
   { name: "list_tabs", description: "List page targets on the configured loopback CDP endpoint. ACTIVETAB_AUTO_CONNECT=1 uses Chrome's opt-in debugging bridge. ACTIVETAB_EXTENSION=1 lists tabs individually attached from the ActiveTab toolbar popup. Listing alone does not grant control.", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
   { name: "attach_tab", description: "Adopt the exact tab authorized out of band, by a Chrome permission prompt, or by a separate ActiveTab toolbar Attach click on that tab. An MCP argument alone never grants consent; attaching another authorized tab preserves existing sessions.", inputSchema: { type: "object", properties: { targetId: { type: "string" } }, required: ["targetId"], additionalProperties: false } },
   { name: "detach_tab", description: "Close ActiveTab's session for one explicitly attached tab. This releases its extension lease or native transport; it does not close the Chrome tab.", inputSchema: { type: "object", properties: { targetId: { type: "string" } }, required: ["targetId"], additionalProperties: false } },
-  { name: "observe_page", description: "Capture current URL, frame tree, DOMSnapshot, accessibility, layout, bounded lifecycle, network metadata and DOM mutation deltas, screenshot, compact interactable candidates, and visible scroll regions. Sensitive URL components, form values, and mutation text are omitted from compact output.", inputSchema: { type: "object", properties: { ...targetIdOptional, includeScreenshot: { type: "boolean" } }, additionalProperties: false } },
-  { name: "get_evidence", description: "Retrieve retained browser instrumentation facets by evidence id. OOPIF snapshots are selected with the outOfProcessFrames facet; scrollTargets describes bounded observed page and nested scroll regions; selectedElement accepts frameTargetId to distinguish target-scoped node ids. Runtime values stay redacted unless includeSensitiveRuntimeValues is explicitly true. URL query/fragment/user-info, form values, and mutation text stay redacted unless their matching explicit true flag is supplied; request bodies and headers are never captured, and selected response bodies require `inspect_network_response` with explicit opt-in.", inputSchema: { type: "object", properties: { ...targetIdOptional, evidenceId: { type: "string" }, facets: { type: "array", items: { type: "string", enum: ["page", "domSnapshot", "accessibilityTree", "frameTree", "outOfProcessFrames", "scrollTargets", "selectedElement", "networkActivity", "lifecycleEvents", "domMutations", "runtimeState"] } }, backendNodeId: { type: "integer" }, frameTargetId: { type: "string" }, includeSensitiveFormValues: { type: "boolean" }, includeSensitivePageText: { type: "boolean" }, includeSensitiveUrlData: { type: "boolean" }, includeSensitiveRuntimeValues: { type: "boolean" }, includeScreenshot: { type: "boolean" } }, required: ["evidenceId"], additionalProperties: false } },
-  { name: "inspect_runtime_state", description: "Read one selected JavaScript-exposed value from the page or an attached out-of-process iframe through an exact own-property path. This never accepts or evaluates caller JavaScript; path traversal uses V8 side-effect checking and reports accessors without reading them. Selecting an object returns its type; specify a deeper path to inspect a child value. Sensitive primitive values are omitted unless includeSensitiveValues is explicitly true. Same-process child-frame execution contexts are not yet selectable.", inputSchema: { type: "object", properties: { ...targetIdOptional, evidenceId: { type: "string" }, path: { type: "array", maxItems: 8, items: { type: "string", maxLength: 128 } }, frameTargetId: { type: "string" }, includeSensitiveValues: { type: "boolean" } }, required: ["evidenceId"], additionalProperties: false } },
+  { name: "observe_page", description: "Capture a redacted current URL, frame tree, DOMSnapshot, accessibility, layout, bounded lifecycle, network metadata and DOM mutation deltas, compact interactable candidates, and visible scroll regions. MCP does not release screenshots or sensitive page content.", inputSchema: { type: "object", properties: { ...targetIdOptional }, additionalProperties: false } },
+  { name: "get_evidence", description: "Retrieve redacted retained browser instrumentation facets by evidence id. OOPIF snapshots are selected with the outOfProcessFrames facet; scrollTargets describes bounded observed page and nested scroll regions; selectedElement accepts frameTargetId to distinguish target-scoped node ids. Sensitive content and screenshots require a separately authenticated evidence grant and are not released through MCP.", inputSchema: { type: "object", properties: { ...targetIdOptional, evidenceId: { type: "string" }, facets: { type: "array", items: { type: "string", enum: ["page", "domSnapshot", "accessibilityTree", "frameTree", "outOfProcessFrames", "scrollTargets", "selectedElement", "networkActivity", "lifecycleEvents", "domMutations", "runtimeState"] } }, backendNodeId: { type: "integer" }, frameTargetId: { type: "string" } }, required: ["evidenceId"], additionalProperties: false } },
+  { name: "inspect_runtime_state", description: "Read one redacted JavaScript-exposed value from the page or an attached out-of-process iframe through an exact own-property path. This never accepts or evaluates caller JavaScript; path traversal uses V8 side-effect checking and reports accessors without reading them. Selecting an object returns its type; specify a deeper path to inspect a child value. Sensitive primitive values require a separately authenticated evidence grant and are not released through MCP. Same-process child-frame execution contexts are not yet selectable.", inputSchema: { type: "object", properties: { ...targetIdOptional, evidenceId: { type: "string" }, path: { type: "array", maxItems: 8, items: { type: "string", maxLength: 128 } }, frameTargetId: { type: "string" } }, required: ["evidenceId"], additionalProperties: false } },
   { name: "click_observed_element", description: "Perform one click on a target selected from retained evidence. The target must still appear in a fresh observation; current human-handoff and caller-intent policy are checked. Returns a post-action observation and requires the caller to verify the task outcome; it never reports task success.", inputSchema: { type: "object", properties: { ...targetIdOptional, goal: { type: "string", minLength: 1, maxLength: 2000 }, evidenceId: { type: "string" }, backendNodeId: { type: "integer", minimum: 0 }, frameTargetId: { type: "string" } }, required: ["goal", "evidenceId", "backendNodeId"], additionalProperties: false } },
-  { name: "inspect_network_response", description: "Inspect one response selected from a retained networkActivity facet. No response body is fetched or returned unless includeSensitive is explicitly true; page responses may contain credentials or personal data. Output is capped at 256 KiB. Request and response headers are never returned.", inputSchema: { type: "object", properties: { ...targetIdOptional, evidenceId: { type: "string" }, requestId: { type: "string" }, includeSensitive: { type: "boolean" }, includeSensitiveUrlData: { type: "boolean" }, maxBytes: { type: "integer", minimum: 1, maximum: 262144 } }, required: ["evidenceId", "requestId"], additionalProperties: false } },
+  { name: "inspect_network_response", description: "Inspect redacted metadata for one response selected from a retained networkActivity facet. Response bodies, sensitive URLs, and headers are not released through MCP without a separately authenticated evidence grant. Output is capped at 256 KiB.", inputSchema: { type: "object", properties: { ...targetIdOptional, evidenceId: { type: "string" }, requestId: { type: "string" }, maxBytes: { type: "integer", minimum: 1, maximum: 262144 } }, required: ["evidenceId", "requestId"], additionalProperties: false } },
   { name: "discover_application", description: "Run bounded autonomous discovery on an attached tab. Builds an application capability map from passive observations and safe same-origin link navigation. Returns discoveries and the capability map.", inputSchema: { type: "object", properties: { ...targetIdOptional, maxSteps: { type: "integer", minimum: 1, maximum: 16 }, maxLinksPerStep: { type: "integer", minimum: 1, maximum: 6 } }, additionalProperties: false } },
   { name: "investigate_failure", description: "Run a bounded bug-isolation investigation after a failed step or run. Classifies the failure, generates hypotheses, executes safe discriminating checks, and returns a qualified report.", inputSchema: { type: "object", properties: { ...targetIdOptional, runId: { type: "string" }, subject: { type: "string" }, reason: { type: "string" } }, required: ["subject", "reason"], additionalProperties: false } },
   { name: "start_test_run", description: "Start a declarative workflow on an authorized attached tab. Select a local profileId whenever the workflow navigates or follows links; the profile is resolved from ActiveTab's local profiles directory and bound to run/resume. Returns runId for status polling.", inputSchema: { type: "object", properties: { ...targetIdOptional, profileId: { type: "string", minLength: 1, maxLength: 128 }, workflow: { type: "object" } }, required: ["workflow"], additionalProperties: false } },
@@ -470,6 +471,8 @@ async function callTool(name, args) {
       throw new Error("The exact Cloud Agent run evidence is already bound to a different browser observation.");
     }
     const results = await run.cloudAgentEvidencePromise;
+    run.cloudAgentEvidenceResults = results;
+    run.cloudAgentRunId = args.cloudAgentRunId;
     const runResult = results.find(result => result.sourceId === "cloud-agent-runs");
     const backendRun = runResult?.snapshot?.data?.records?.[0];
     if (runResult?.status !== "ok" || runResult.snapshot?.data?.status !== "available" || backendRun?.id !== args.cloudAgentRunId) {
@@ -478,6 +481,7 @@ async function callTool(name, args) {
         reasonCode: "exact_run_record_unavailable",
         reason: "The exact backend run record could not be confirmed."
       };
+      run.cloudAgentOutcome = outcome;
       const review = await recordCloudAgentOutcome(run, submit, integration, args, outcome, "unavailable", null);
       return {
         runId: args.runId,
@@ -496,6 +500,8 @@ async function callTool(name, args) {
     const correlation = run.correlator.correlate(browserEventId, backendEventId);
     const outcome = verifyCloudAgentRunOutcome(integration.expectedOutcome, backendRun);
     const backendEvidenceRef = runResult.snapshot.snapshotId ?? runResult.snapshot.evidenceId ?? backendEventId;
+    run.cloudAgentCorrelation = correlation;
+    run.cloudAgentOutcome = outcome;
     const review = await recordCloudAgentOutcome(run, submit, integration, args, outcome, backendRun.status ?? "unavailable", backendEvidenceRef);
     return {
       runId: args.runId,
@@ -530,6 +536,7 @@ async function callTool(name, args) {
     const run = testRuns.get(args.runId);
     if (!run) throw new Error(`No test run found for runId '${args.runId}'.`);
     const receipt = await run.runPromise;
+    const durableState = await runStateStore.getFresh(args.runId).catch(() => null);
     const report = new DiagnosticReport({ runId: args.runId, title: `Test run: ${receipt.workflowName}` });
     report.setCorrelationSummary(run.correlator.summary());
     for (const step of receipt.steps) {
@@ -539,18 +546,55 @@ async function callTool(name, args) {
         : FINDING_LEVEL.INSUFFICIENT;
       report.addFinding({ level, subject: `Step ${step.stepId} (${step.type})`, description: step.reason, evidenceIds: step.evidenceIds });
     }
+    const cloudDiagnosticSources = new Set((run.cloudAgentEvidenceResults ?? []).map(result => result.sourceId));
     for (const entry of run.collector.getSnapshots()) {
+      if (cloudDiagnosticSources.has(entry.sourceId)) continue;
       report.logSourceAccess({ sourceId: entry.sourceId, operation: entry.operation, status: "ok" });
     }
-    report.setInvestigationStatus(receipt.status === "PASSED" ? INVESTIGATION_STATUS.COMPLETE : INVESTIGATION_STATUS.COMPLETE);
+    for (const result of run.cloudAgentEvidenceResults ?? []) {
+      report.logSourceAccess({
+        sourceId: result.sourceId,
+        operation: OPERATION.READ_SCOPED,
+        status: result.status,
+        ...(result.status === "error" ? { error: result.error } : {})
+      });
+    }
+    const assessment = deriveRunInvestigationStatus({
+      receipt: receipt.toObject(),
+      durableStateAvailable: durableState !== null,
+      durableRunStatus: durableState?.status ?? null,
+      unresolvedOperations: (durableState?.pendingOperations ?? []).filter(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status)),
+      testOwnedResources: durableState?.testOwnedResources ?? [],
+      integration: run.integration?.verificationRequired ? {
+        ...run.integration,
+        outcomeStatus: run.cloudAgentOutcome?.status,
+        cloudAgentRunId: run.cloudAgentRunId,
+        correlationStrength: run.cloudAgentCorrelation?.strength
+      } : null,
+      diagnosticResults: run.cloudAgentEvidenceResults ?? []
+    });
+    report.setInvestigationStatus(assessment.status);
+    for (const limitation of assessment.limitations) report.addLimitation(limitation);
     return report.redacted();
   }
   const session = selectBrowserSession(sessions, args.targetId);
-  if (name === "observe_page") return await session.observe({ includeScreenshot: args.includeScreenshot !== false });
-  if (name === "get_evidence") return session.observer.getEvidence(args.evidenceId, { facets: args.facets, backendNodeId: args.backendNodeId, frameTargetId: args.frameTargetId, includeSensitiveFormValues: args.includeSensitiveFormValues === true, includeSensitivePageText: args.includeSensitivePageText === true, includeSensitiveUrlData: args.includeSensitiveUrlData === true, includeSensitiveRuntimeValues: args.includeSensitiveRuntimeValues === true, includeScreenshot: args.includeScreenshot === true });
-  if (name === "inspect_runtime_state") return await session.observer.inspectRuntimeState(args.evidenceId, { path: args.path, frameTargetId: args.frameTargetId ?? null, includeSensitiveValues: args.includeSensitiveValues === true });
+  if (name === "observe_page") {
+    assertRedactedEvidenceOnly(args, ["includeScreenshot"]);
+    return await session.observe({ includeScreenshot: false });
+  }
+  if (name === "get_evidence") {
+    assertRedactedEvidenceOnly(args, ["includeSensitiveFormValues", "includeSensitivePageText", "includeSensitiveUrlData", "includeSensitiveRuntimeValues", "includeScreenshot"]);
+    return session.observer.getEvidence(args.evidenceId, { facets: args.facets, backendNodeId: args.backendNodeId, frameTargetId: args.frameTargetId, includeScreenshot: false });
+  }
+  if (name === "inspect_runtime_state") {
+    assertRedactedEvidenceOnly(args, ["includeSensitiveValues"]);
+    return await session.observer.inspectRuntimeState(args.evidenceId, { path: args.path, frameTargetId: args.frameTargetId ?? null, includeSensitiveValues: false });
+  }
   if (name === "click_observed_element") return await clickObservedElement(session, { goal: args.goal, evidenceId: args.evidenceId, backendNodeId: args.backendNodeId, frameTargetId: args.frameTargetId ?? null, decisionRuntime });
-  if (name === "inspect_network_response") return await session.observer.inspectNetworkResponse(args.evidenceId, { requestId: args.requestId, includeSensitive: args.includeSensitive === true, includeSensitiveUrlData: args.includeSensitiveUrlData === true, maxBytes: args.maxBytes });
+  if (name === "inspect_network_response") {
+    assertRedactedEvidenceOnly(args, ["includeSensitive", "includeSensitiveUrlData"]);
+    return await session.observer.inspectNetworkResponse(args.evidenceId, { requestId: args.requestId, includeSensitive: false, includeSensitiveUrlData: false, maxBytes: args.maxBytes });
+  }
   if (name === "run_goal") {
     const selectedProfile = await loadEnvironmentProfile(args.profileId);
     return await runMcpGoal(session, args, { journalStore: taskJournalStore, workflowStore, decisionRuntime, environment: selectedProfile?.environment ?? null });
@@ -560,26 +604,52 @@ async function callTool(name, args) {
 
 async function recordCloudAgentOutcome(run, submit, integration, args, outcome, backendOutcome, backendEvidenceRef) {
   const episodeId = run.runner?.decisionEpisodeId;
-  if (!episodeId) return null;
+  let finalOutcome = outcome;
   const decisionId = submit.details?.decisionId ?? randomUUID();
   const stepId = submit.stepId;
   const evidenceRefs = [...new Set([args.browserEvidenceId, backendEvidenceRef].filter(value => typeof value === "string"))];
+  const operationId = submit.details?.operationId;
+  if (typeof operationId !== "string" || !operationId) {
+    finalOutcome = {
+      status: "UNCERTAIN",
+      reasonCode: "durable_operation_identity_missing",
+      reason: "The submit operation has no durable identity for outcome reconciliation."
+    };
+  } else {
+    try {
+      await runStateStore.reconcileOperation(args.runId, {
+        operationId,
+        status: outcome.status === "VERIFIED" ? "VERIFIED" : outcome.status === "FAILED" ? "FAILED" : "UNCERTAIN",
+        evidenceIds: evidenceRefs,
+        summary: outcome.reasonCode ?? outcome.reason ?? "Cloud Agent outcome reconciliation"
+      });
+    } catch {
+      finalOutcome = {
+        status: "UNCERTAIN",
+        reasonCode: "durable_outcome_reconciliation_failed",
+        reason: "Independent evidence was collected, but the outcome could not be durably reconciled."
+      };
+    }
+  }
+  run.cloudAgentOutcome = finalOutcome;
   let verificationEvent = null;
   try {
+    if (!episodeId) throw new Error("Decision episode is unavailable.");
     verificationEvent = decisionRuntime.recordVerification({
       episodeId,
       runId: args.runId,
       stepId,
       decisionId,
       observationId: args.browserEvidenceId,
-      status: outcome.status === "VERIFIED" ? "verified_pass" : outcome.status === "FAILED" ? "verified_fail" : "uncertain",
+      status: finalOutcome.status === "VERIFIED" ? "verified_pass" : finalOutcome.status === "FAILED" ? "verified_fail" : "uncertain",
       oracleType: "correlated_backend",
-      reasonCode: outcome.reasonCode,
+      reasonCode: finalOutcome.reasonCode,
       evidenceRefs
     });
   } catch { /* preserve the outcome if local telemetry is unavailable */ }
   let review = null;
   try {
+    if (!episodeId) throw new Error("Decision episode is unavailable.");
     const inputEventIds = eventIdsForEvidence(decisionRuntime.eventStore, {
       episodeId,
       decisionId,
@@ -599,19 +669,26 @@ async function recordCloudAgentOutcome(run, submit, integration, args, outcome, 
       inputEventIds
     });
   } catch { /* Jev is an advisory; refusal or failure cannot alter deterministic verification. */ }
-  const stepStatus = outcome.status === "VERIFIED" ? "PASS" : outcome.status === "FAILED" ? "FAIL" : "UNCERTAIN";
+  const stepStatus = finalOutcome.status === "VERIFIED" ? "PASS" : finalOutcome.status === "FAILED" ? "FAIL" : "UNCERTAIN";
   run.runState.receipt.reconcileStep("submit-authorized-test-task", {
     status: stepStatus,
-    reason: outcome.reason,
+    reason: finalOutcome.reason,
     evidenceIds: evidenceRefs,
     details: {
       ...submit.details,
-      verificationStatus: outcome.status,
-      verificationReasonCode: outcome.reasonCode,
+      verificationStatus: finalOutcome.status,
+      verificationReasonCode: finalOutcome.reasonCode,
       backendRunId: args.cloudAgentRunId
     }
   });
   run.runState.status = run.runState.receipt.status;
+  if (finalOutcome.status !== "UNCERTAIN" && ["PASSED", "FAILED"].includes(run.runState.receipt.status)) {
+    const current = await runStateStore.getFresh(args.runId).catch(() => null);
+    const unresolved = (current?.pendingOperations ?? []).some(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status));
+    if (current && !unresolved) {
+      await runStateStore.update(args.runId, { status: run.runState.receipt.status.toLowerCase(), currentStepId: null }).catch(() => {});
+    }
+  }
   return review;
 }
 

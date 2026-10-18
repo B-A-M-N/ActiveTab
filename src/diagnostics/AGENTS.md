@@ -24,6 +24,8 @@ ActiveTab's diagnostic evidence plane. Browser instrumentation and privileged ba
 - Enforce byte limits while streaming, not after reading the full response.
 - Browser evidence and backend evidence must remain distinguishable.
 - Never present a temporal match as exact correlation.
+- A run report is complete only when its durable terminal state matches the receipt, no effect or cleanup obligation remains unresolved, and every profile-required diagnostic source is available. Cloud Agent reports also require the exact correlated backend run record.
+- MCP only releases redacted browser evidence. Caller-supplied booleans do not authorize sensitive values, response bodies, or screenshots.
 
 ## Verification
 

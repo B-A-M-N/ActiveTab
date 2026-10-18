@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { createDiagnosticContract, validateAccess, SENSITIVITY, AUTHORITY, OPERATION } from "../src/diagnostics/contracts.js";
 import { DiagnosticCollector } from "../src/diagnostics/collector.js";
 import { DiagnosticCorrelator, CORRELATION_STRENGTH } from "../src/diagnostics/correlator.js";
-import { DiagnosticReport, FINDING_LEVEL, INVESTIGATION_STATUS } from "../src/diagnostics/report.js";
+import { DiagnosticReport, FINDING_LEVEL, INVESTIGATION_STATUS, deriveRunInvestigationStatus } from "../src/diagnostics/report.js";
+import { assertRedactedEvidenceOnly } from "../src/diagnostics/evidenceReleasePolicy.js";
 
 test("diagnostic contract requires id, authority, scope, sensitivity", () => {
   assert.throws(() => createDiagnosticContract({}), /requires an id/);
@@ -28,6 +29,14 @@ test("validateAccess denies operations not in the contract", () => {
   assert.equal(validateAccess(contract, OPERATION.READ), null);
   const denial = validateAccess(contract, OPERATION.READ_SCOPED);
   assert.match(denial, /does not permit/);
+});
+
+test("MCP evidence release rejects caller-set sensitive retrieval flags", () => {
+  assert.doesNotThrow(() => assertRedactedEvidenceOnly({ includeSensitive: false }, ["includeSensitive"]));
+  assert.throws(
+    () => assertRedactedEvidenceOnly({ includeSensitive: true }, ["includeSensitive"]),
+    error => error.message === "Sensitive browser evidence cannot be released through MCP without a separately authenticated evidence grant."
+  );
 });
 
 test("collector registers sources and enforces contracts", async () => {
@@ -142,6 +151,77 @@ test("report supports findings, limitations, and redaction", () => {
   const redacted = report.redacted();
   assert.equal(redacted.findings[0].level, "confirmed");
   assert.equal(redacted.sourceAccessLog[1].error, undefined);
+});
+
+test("run report status requires durable terminal state, reconciled effects, and verified cleanup", () => {
+  const receipt = {
+    status: "PASSED",
+    finishedAt: "2026-10-17T12:00:00.000Z",
+    steps: [{ stepId: "submit", status: "PASS" }],
+    cleanup: []
+  };
+  assert.equal(deriveRunInvestigationStatus({
+    receipt,
+    durableRunStatus: "passed"
+  }).status, INVESTIGATION_STATUS.COMPLETE);
+
+  assert.equal(deriveRunInvestigationStatus({
+    receipt: { ...receipt, status: "UNCERTAIN" },
+    durableRunStatus: "reconciling"
+  }).status, INVESTIGATION_STATUS.INCONCLUSIVE);
+  assert.equal(deriveRunInvestigationStatus({
+    receipt: { ...receipt, status: "BLOCKED" },
+    durableRunStatus: "blocked"
+  }).status, INVESTIGATION_STATUS.BLOCKED);
+  assert.equal(deriveRunInvestigationStatus({
+    receipt,
+    durableRunStatus: "resume_validation"
+  }).status, INVESTIGATION_STATUS.INCONCLUSIVE);
+  assert.equal(deriveRunInvestigationStatus({
+    receipt,
+    durableRunStatus: "passed",
+    testOwnedResources: [{ resourceId: "fixture-1", cleanupStatus: "observed" }]
+  }).status, INVESTIGATION_STATUS.INCONCLUSIVE);
+});
+
+test("Cloud Agent report remains inconclusive until exact backend correlation and requested sources are present", () => {
+  const receipt = {
+    status: "PASSED",
+    finishedAt: "2026-10-17T12:00:00.000Z",
+    steps: [{ stepId: "submit", status: "PASS" }],
+    cleanup: []
+  };
+  const integration = {
+    verificationRequired: true,
+    outcomeStatus: "VERIFIED",
+    correlationStrength: "direct",
+    cloudAgentRunId: "agent-run-42",
+    diagnosticSources: ["cloud-agent-steps", "cloud-agent-usage"]
+  };
+  const diagnosticResults = [
+    { sourceId: "cloud-agent-runs", status: "ok", snapshot: { data: { status: "available", records: [{ id: "agent-run-42" }] } } },
+    { sourceId: "cloud-agent-steps", status: "ok", snapshot: { data: { status: "available", records: [] } } },
+    { sourceId: "cloud-agent-usage", status: "ok", snapshot: { data: { status: "available", records: [] } } }
+  ];
+  const assess = extra => deriveRunInvestigationStatus({
+    receipt,
+    durableRunStatus: "passed",
+    integration,
+    diagnosticResults,
+    ...extra
+  });
+
+  assert.equal(assess({}).status, INVESTIGATION_STATUS.COMPLETE);
+  assert.equal(assess({ diagnosticResults: diagnosticResults.slice(0, 2) }).status, INVESTIGATION_STATUS.INCONCLUSIVE);
+  assert.equal(assess({
+    integration: { ...integration, diagnosticSources: [] },
+    diagnosticResults: diagnosticResults.slice(0, 1)
+  }).status, INVESTIGATION_STATUS.INCONCLUSIVE);
+  assert.equal(assess({ integration: { ...integration, correlationStrength: "temporal" } }).status, INVESTIGATION_STATUS.INCONCLUSIVE);
+  assert.equal(assess({ diagnosticResults: [
+    { ...diagnosticResults[0], snapshot: { data: { status: "available", records: [{ id: "another-run" }] } } },
+    ...diagnosticResults.slice(1)
+  ] }).status, INVESTIGATION_STATUS.INCONCLUSIVE);
 });
 
 test("report rejects unknown finding levels", () => {

@@ -52,11 +52,11 @@ test("MCP stdio server initializes and advertises bounded browser tools", async 
     assert.ok(evidenceSchema.properties.facets.items.enum.includes("scrollTargets"));
     assert.ok(evidenceSchema.properties.facets.items.enum.includes("runtimeState"));
     assert.equal(evidenceSchema.properties.frameTargetId.type, "string");
-    assert.equal(evidenceSchema.properties.includeSensitiveUrlData.type, "boolean");
-    assert.equal(evidenceSchema.properties.includeSensitiveRuntimeValues.type, "boolean");
-    assert.equal(evidenceSchema.properties.includeSensitivePageText.type, "boolean");
-    assert.equal(evidenceSchema.properties.includeScreenshot.type, "boolean", "MCP callers can explicitly retrieve retained visual evidence");
-    assert.match(responses[1].result.tools.find(tool => tool.name === "get_evidence").description, /selected response bodies require `inspect_network_response`/);
+    assert.equal(evidenceSchema.properties.includeSensitiveUrlData, undefined);
+    assert.equal(evidenceSchema.properties.includeSensitiveRuntimeValues, undefined);
+    assert.equal(evidenceSchema.properties.includeSensitivePageText, undefined);
+    assert.equal(evidenceSchema.properties.includeScreenshot, undefined);
+    assert.match(responses[1].result.tools.find(tool => tool.name === "get_evidence").description, /Sensitive content and screenshots require a separately authenticated evidence grant/);
     const runtimeSchema = responses[1].result.tools.find(tool => tool.name === "inspect_runtime_state").inputSchema;
     assert.deepEqual(runtimeSchema.required, ["evidenceId"]);
     assert.deepEqual(runtimeSchema.properties.path, { type: "array", maxItems: 8, items: { type: "string", maxLength: 128 } });
@@ -66,7 +66,8 @@ test("MCP stdio server initializes and advertises bounded browser tools", async 
     assert.equal(visualActionSchema.properties.frameTargetId.type, "string");
     const networkResponseSchema = responses[1].result.tools.find(tool => tool.name === "inspect_network_response").inputSchema;
     assert.deepEqual(networkResponseSchema.required, ["evidenceId", "requestId"]);
-    assert.equal(networkResponseSchema.properties.includeSensitive.type, "boolean");
+    assert.equal(networkResponseSchema.properties.includeSensitive, undefined);
+    assert.equal(networkResponseSchema.properties.includeSensitiveUrlData, undefined);
     assert.deepEqual(networkResponseSchema.properties.maxBytes, { type: "integer", minimum: 1, maximum: 262144 });
     const runGoalSchema = responses[1].result.tools.find(tool => tool.name === "run_goal").inputSchema;
     assert.deepEqual(runGoalSchema.properties.maxScrolls, { type: "integer", minimum: 0, maximum: 8 });

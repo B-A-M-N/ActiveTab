@@ -31,7 +31,7 @@ import { DiagnosticCollector } from "../diagnostics/collector.js";
 import { createDiagnosticContract, AUTHORITY, OPERATION, SENSITIVITY } from "../diagnostics/contracts.js";
 import { registerBrowserDiagnosticSources } from "../diagnostics/adapters/browserSources.js";
 import { DiagnosticCorrelator } from "../diagnostics/correlator.js";
-import { DiagnosticReport, FINDING_LEVEL, INVESTIGATION_STATUS } from "../diagnostics/report.js";
+import { DiagnosticReport, FINDING_LEVEL, deriveRunInvestigationStatus } from "../diagnostics/report.js";
 import { TestRunner } from "../testing/runner.js";
 import { receiptFromRunState } from "../testing/receipts.js";
 import { RunStateStore } from "../testing/runState.js";
@@ -344,6 +344,11 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
     if (!run.runState.settled) { sendError(res, 409, 99409, "The test run has not settled; a report is not available yet."); return; }
     const receipt = run.runState.receipt;
     if (!receipt) { sendError(res, 409, 99409, "The test run failed without a receipt; a report is unavailable."); return; }
+    let durableState = null;
+    try {
+      await ensureRunStateStore();
+      durableState = await runStateStore.getFresh(runId);
+    } catch { /* A missing durable snapshot must keep the report inconclusive. */ }
     const report = new DiagnosticReport({ runId, title: `Test run: ${receipt.workflowName}` });
     report.setCorrelationSummary(run.correlator.summary());
     for (const step of receipt.steps) {
@@ -356,7 +361,15 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
     for (const entry of run.collector.getSnapshots()) {
       report.logSourceAccess({ sourceId: entry.sourceId, operation: entry.operation, status: "ok" });
     }
-    report.setInvestigationStatus(INVESTIGATION_STATUS.COMPLETE);
+    const assessment = deriveRunInvestigationStatus({
+      receipt: receipt.toObject(),
+      durableStateAvailable: durableState !== null,
+      durableRunStatus: durableState?.status ?? null,
+      unresolvedOperations: (durableState?.pendingOperations ?? []).filter(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status)),
+      testOwnedResources: durableState?.testOwnedResources ?? []
+    });
+    report.setInvestigationStatus(assessment.status);
+    for (const limitation of assessment.limitations) report.addLimitation(limitation);
     sendJson(res, 200, report.redacted());
   }
 
