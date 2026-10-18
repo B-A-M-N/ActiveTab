@@ -16,6 +16,7 @@ import { executeAuthorizedAction } from "../runtime/authorizedExecutor.js";
 import { createHash } from "node:crypto";
 import { RunDecisionRecorder } from "./telemetry/runDecisionRecorder.js";
 import { RunStateCoordinator } from "./lifecycle/runStateCoordinator.js";
+import { ControlFlowStepHandler } from "./steps/controlFlowStepHandler.js";
 import {
   deriveWorkflowRunStatus,
   estimateWorkflowExecutionCost,
@@ -119,6 +120,15 @@ export class TestRunner {
       session,
       signal,
       getTargetFencingToken: () => this.targetLease?.fencingToken ?? null
+    });
+    this.controlFlowStepHandler = new ControlFlowStepHandler({
+      maxSteps: this.maxSteps,
+      signal,
+      collector,
+      correlator,
+      observe: () => this.#observe(),
+      executeWorkflowSteps: (...args) => this.#executeWorkflowSteps(...args),
+      getWorkflow: workflowRef => this.#registeredWorkflow(workflowRef)
     });
     this.existingRunStateId = existingRunStateId;
     this.principalId = principalId;
@@ -395,9 +405,9 @@ export class TestRunner {
         case "cleanup": return await this.#executeCleanup(step, receipt, startedAt, context);
         case "goal": return await this.#executeGoal(step, receipt, startedAt);
         case "qualify": return await this.#executeQualification(step, receipt, startedAt, context);
-        case "set_variable": return this.#executeSetVariable(step, receipt, startedAt, context, stepStatuses);
-        case "repeat": return await this.#executeRepeat(step, receipt, startedAt, context);
-        case "subworkflow": return await this.#executeSubworkflow(step, receipt, startedAt, context);
+        case "set_variable": return this.controlFlowStepHandler.executeSetVariable(step, receipt, startedAt, context, stepStatuses);
+        case "repeat": return await this.controlFlowStepHandler.executeRepeat(step, receipt, startedAt, context);
+        case "subworkflow": return await this.controlFlowStepHandler.executeSubworkflow(step, receipt, startedAt, context);
         default: {
           const message = `Unsupported step type '${step.type}'.`;
           receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason: message, startedAt });
@@ -471,170 +481,6 @@ export class TestRunner {
     return await this.session.observe();
   }
 
-  #resolveWorkflowValue(value, context, stepStatuses = context?.stepStatuses) {
-    if (value && typeof value === "object" && !Array.isArray(value)) {
-      if (Object.keys(value).length === 1 && typeof value.variable === "string") {
-        return context?.variables?.get(value.variable);
-      }
-      if (Object.keys(value).length === 1 && typeof value.stepStatus === "string") {
-        return stepStatuses?.get(value.stepStatus);
-      }
-    }
-    return value;
-  }
-
-  #executeSetVariable(step, receipt, startedAt, context, stepStatuses) {
-    const resolved = this.#resolveWorkflowValue(step.value, context, stepStatuses);
-    if (resolved === undefined || !(resolved === null || ["string", "number", "boolean"].includes(typeof resolved))) {
-      const reason = "Variable assignment source is unavailable or is not a scalar value.";
-      receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason, startedAt });
-      return { status: STEP_STATUS.BLOCKED, reason };
-    }
-    if (!context?.variables) {
-      const reason = "No scoped workflow variable context is available.";
-      receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason, startedAt });
-      return { status: STEP_STATUS.BLOCKED, reason };
-    }
-    context.variables.set(step.name, resolved);
-    const reason = "Scoped workflow variable assigned in memory.";
-    receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.PASS, reason, startedAt });
-    return { status: STEP_STATUS.PASS, reason };
-  }
-
-  async #executeRepeat(step, receipt, startedAt, parentContext) {
-    const context = parentContext ?? { variables: new Map(), workflowStack: new Set(), depth: 0 };
-    for (let iteration = 1; iteration <= step.maxIterations; iteration++) {
-      if (this.signal?.aborted) {
-        const reason = "Run was canceled before the next bounded loop iteration.";
-        receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.CANCELED, reason, startedAt });
-        return { status: STEP_STATUS.CANCELED, reason };
-      }
-      const iterationContext = {
-        variables: new Map(context.variables),
-        workflowStack: new Set(context.workflowStack),
-        depth: context.depth + 1,
-        stepStatuses: new Map(),
-        completedStatuses: context.completedStatuses,
-        budget: context.budget
-      };
-      const result = await this.#executeWorkflowSteps(
-        { id: `${step.id}-body`, name: "bounded repeat body", steps: step.body },
-        receipt,
-        iterationContext,
-        { stepIdPrefix: `${step.id}/iteration-${iteration}` }
-      );
-      if (result.suspension) {
-        return {
-          status: STEP_STATUS_EXTENDED.SUSPENDED,
-          externalState: result.suspension.externalState,
-          reason: `Bounded loop suspended at '${result.suspension.stepId}'.`
-        };
-      }
-      const bodyStatuses = [...result.stepStatuses.values()];
-      const failedBodyStatus = bodyStatuses.find(status => status !== STEP_STATUS.PASS);
-      if (failedBodyStatus) {
-        const reason = `Bounded loop body ended with ${failedBodyStatus}; no further iteration was dispatched.`;
-        return { status: failedBodyStatus, reason };
-      }
-      const until = evaluateAssertion(step.until, {
-        observation: await this.#observe(),
-        collector: this.collector,
-        correlator: this.correlator
-      });
-      if (until.status === STEP_STATUS.PASS) {
-        const reason = `Loop condition verified after ${iteration} bounded iteration${iteration === 1 ? "" : "s"}.`;
-        receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.PASS, reason, startedAt, evidenceIds: until.evidenceIds ?? [] });
-        return { status: STEP_STATUS.PASS, reason };
-      }
-      if (until.status === STEP_STATUS.UNCERTAIN) {
-        const reason = `Loop condition could not be verified after iteration ${iteration}; execution stopped without another retry.`;
-        receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.UNCERTAIN, reason, startedAt, evidenceIds: until.evidenceIds ?? [] });
-        return { status: STEP_STATUS.UNCERTAIN, reason };
-      }
-      if (until.status === STEP_STATUS.BLOCKED || until.status === STEP_STATUS.CANCELED) {
-        const reason = until.status === STEP_STATUS.CANCELED
-          ? "The bounded loop was canceled after its current iteration."
-          : "The bounded loop condition is blocked; no further iteration was dispatched.";
-        receipt.recordStep({ stepId: step.id, type: step.type, status: until.status, reason, startedAt, evidenceIds: until.evidenceIds ?? [] });
-        return { status: until.status, reason };
-      }
-    }
-    const reason = `Loop condition remained false after the declared maximum of ${step.maxIterations} iterations.`;
-    receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.FAIL, reason, startedAt });
-    return { status: STEP_STATUS.FAIL, reason };
-  }
-
-  async #executeSubworkflow(step, receipt, startedAt, parentContext) {
-    const workflow = this.#registeredWorkflow(step.workflowRef);
-    if (!workflow) {
-      const reason = `Trusted workflow registry has no subworkflow '${step.workflowRef}'.`;
-      receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason, startedAt });
-      return { status: STEP_STATUS.BLOCKED, reason };
-    }
-    const parent = parentContext ?? { variables: new Map(), workflowStack: new Set(), depth: 0 };
-    if (parent.depth >= 8 || parent.workflowStack.has(workflow.id)) {
-      const reason = "Subworkflow nesting exceeded its depth limit or formed a recursive reference.";
-      receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason, startedAt });
-      return { status: STEP_STATUS.BLOCKED, reason };
-    }
-    const validation = validateWorkflow(workflow, { maxSteps: this.maxSteps });
-    if (!validation.valid) {
-      const reason = "Registered subworkflow failed schema validation.";
-      receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason, startedAt });
-      return { status: STEP_STATUS.BLOCKED, reason };
-    }
-    const inputs = step.inputs ?? {};
-    const allowedInputs = new Set(workflow.inputNames ?? []);
-    if (Object.keys(inputs).some(name => !allowedInputs.has(name))
-      || [...allowedInputs].some(name => !Object.hasOwn(inputs, name) && !Object.hasOwn(workflow.inputs ?? {}, name))) {
-      const reason = "Subworkflow inputs do not satisfy the registered workflow interface.";
-      receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason, startedAt });
-      return { status: STEP_STATUS.BLOCKED, reason };
-    }
-    const variables = new Map(Object.entries(workflow.inputs ?? {}));
-    for (const [name, value] of Object.entries(inputs)) {
-      const resolved = this.#resolveWorkflowValue(value, parent);
-      if (resolved === undefined || !(resolved === null || ["string", "number", "boolean"].includes(typeof resolved))) {
-        const reason = `Subworkflow input '${name}' could not be resolved to a scalar.`;
-        receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason, startedAt });
-        return { status: STEP_STATUS.BLOCKED, reason };
-      }
-      variables.set(name, resolved);
-    }
-    const workflowStack = new Set(parent.workflowStack);
-    workflowStack.add(workflow.id);
-    const childContext = { variables, workflowStack, depth: parent.depth + 1, stepStatuses: new Map(), completedStatuses: parent.completedStatuses, budget: parent.budget };
-    const childResult = await this.#executeWorkflowSteps(workflow, receipt, childContext, { stepIdPrefix: step.id });
-    if (isWaitingRunStatus(receipt.status)) {
-      const reason = `Registered subworkflow '${step.workflowRef}' suspended at its child step.`;
-      return {
-        status: STEP_STATUS_EXTENDED.SUSPENDED,
-        externalState: childResult.suspension?.externalState ?? "waiting_for_human_decision",
-        reason
-      };
-    }
-    const childStatus = deriveWorkflowRunStatus(workflow, childResult.stepStatuses);
-    if (childStatus === RUN_STATUS.PASSED) {
-      for (const [from, to] of Object.entries(step.outputs ?? {})) {
-        if (!variables.has(from)) {
-          const reason = "Registered subworkflow output was not defined in its private scope.";
-          receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.UNCERTAIN, reason, startedAt });
-          return { status: STEP_STATUS.UNCERTAIN, reason };
-        }
-        parent.variables.set(to, variables.get(from));
-      }
-      const reason = `Registered subworkflow '${step.workflowRef}' completed its declared steps.`;
-      receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.PASS, reason, startedAt });
-      return { status: STEP_STATUS.PASS, reason };
-    }
-    const status = childStatus === RUN_STATUS.UNCERTAIN ? STEP_STATUS.UNCERTAIN
-      : childStatus === RUN_STATUS.BLOCKED ? STEP_STATUS.BLOCKED
-        : childStatus === RUN_STATUS.CANCELED ? STEP_STATUS.CANCELED : STEP_STATUS.FAIL;
-    const reason = `Registered subworkflow '${step.workflowRef}' ended ${status}.`;
-    receipt.recordStep({ stepId: step.id, type: step.type, status, reason, startedAt });
-    return { status, reason };
-  }
-
   async #executeSetup(step, receipt, startedAt) {
     const preconditions = Array.isArray(step.preconditions) ? step.preconditions : [];
     if (preconditions.length === 0) {
@@ -665,7 +511,7 @@ export class TestRunner {
       receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason, startedAt });
       return { status: STEP_STATUS.BLOCKED, reason };
     }
-    const url = this.#resolveWorkflowValue(step.url, context);
+    const url = this.controlFlowStepHandler.resolveWorkflowValue(step.url, context);
     if (typeof url !== "string" || url.length === 0) {
       const reason = "Navigation URL is unavailable in the current scoped workflow inputs.";
       receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason, startedAt });
@@ -759,7 +605,7 @@ export class TestRunner {
       receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.UNCERTAIN, reason, startedAt, evidenceIds: [observation?.evidenceId ?? ""].filter(Boolean) });
       return { status: STEP_STATUS.UNCERTAIN, reason };
     }
-    const action = { ...step.action, value: this.#resolveWorkflowValue(step.action.value, context) };
+    const action = { ...step.action, value: this.controlFlowStepHandler.resolveWorkflowValue(step.action.value, context) };
     if (step.action.value !== undefined && action.value === undefined) {
       const reason = "Interaction value is unavailable in the current scoped workflow inputs.";
       receipt.recordStep({ stepId: step.id, type: step.type, status: STEP_STATUS.BLOCKED, reason, startedAt, evidenceIds: [observation.evidenceId] });

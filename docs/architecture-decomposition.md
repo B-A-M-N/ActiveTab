@@ -6,7 +6,7 @@ ActiveTab is being decomposed through behavior-preserving extractions. One appli
 
 | Area | Current entrypoint | Current responsibility pressure |
 | --- | --- | --- |
-| Declarative workflows | `src/testing/runner.js` (1,470 lines after lifecycle and telemetry extractions) | Step dispatch, continuation, verification, and integration calls |
+| Declarative workflows | `src/testing/runner.js` (1,316 lines after lifecycle, telemetry, and control-flow extractions) | Step dispatch, continuation, verification, and integration calls |
 | Navigation | `src/navigation/engine.js` (1,219 lines) | Planning, browser coordination, recovery, replay, and outcome checks |
 | MCP transport | `src/mcp/server.js` (766 lines) | Protocol handling mixed with application orchestration |
 | HTTP transport | `src/api/local-server.js` (825 lines) | Routes mixed with run lifecycle and process-local service state |
@@ -27,7 +27,7 @@ These are extraction targets. Size alone is not evidence of a defect.
 
 ## Stage 2 — TestRunner orchestration
 
-Two collaborator extractions are in place. `src/testing/telemetry/runDecisionRecorder.js` owns the workflow runner's episode lifecycle, policy/review event hooks, durable operation reservations, dispatch receipts, and verification linkage. `src/testing/lifecycle/runStateCoordinator.js` owns durable run bindings, leases, checkpoints, and durable run status. `TestRunner` retains workflow ownership, receipt progression, and step dispatch; neither collaborator authorizes or dispatches effects. Existing workflow and lifecycle suites verify these boundaries against the same review, fencing, cancellation, resume, uncertainty, and verification contracts.
+Three collaborator extractions are in place. `src/testing/telemetry/runDecisionRecorder.js` owns the workflow runner's episode lifecycle, policy/review event hooks, durable operation reservations, dispatch receipts, and verification linkage. `src/testing/lifecycle/runStateCoordinator.js` owns durable run bindings, leases, checkpoints, and durable run status. `src/testing/steps/controlFlowStepHandler.js` owns scalar variable assignment, bounded repetition, and trusted subworkflow composition, re-entering the same runner through an injected callback. `TestRunner` retains workflow ownership, receipt progression, scheduling, cancellation, and effect dispatch; the collaborators do not authorize effects or receive direct browser/application execution methods.
 
 Target boundaries:
 
