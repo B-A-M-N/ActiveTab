@@ -9,7 +9,7 @@ import { ApplicationDiscoveryEngine } from "../src/discovery/engine.js";
 import { clickObservedElement } from "../src/navigation/observedAction.js";
 
 function fixtureSession() {
-  const candidate = { identity: "open-account", backendNodeId: 1, name: "Open account", role: "link", tag: "a", href: "/account", visible: true };
+  const candidate = { identity: "open-account", targetId: "telemetry-test-target", documentGeneration: 1, backendNodeId: 1, name: "Open account", role: "link", tag: "a", href: "/account", visible: true };
   return {
     target: { id: "telemetry-test-target", endpoint: "local-cdp", url: "https://shop.example.test/" },
     attached: true,
@@ -22,7 +22,7 @@ function fixtureSession() {
     observations: 0,
     clicks: 0,
     async observe() {
-      return { evidenceId: `observation_${++this.observations}`, ...structuredClone(this.current) };
+      return { evidenceId: `observation_${++this.observations}`, targetId: this.target.id, documentGeneration: 1, ...structuredClone(this.current) };
     },
     async click() {
       this.clicks++;
@@ -291,7 +291,8 @@ test("goal substeps share their declarative workflow episode and run identity", 
     assert.ok(events.length > 5);
     assert.ok(events.every(event => event.runId === "test_run_goal_telemetry"));
     assert.equal(events.filter(event => event.eventType === "episode.started").length, 1);
-    assert.equal(events.at(-1).eventType, "episode.completed");
+    assert.equal(events.some(event => event.eventType === "episode.completed"), false);
+    assert.equal(episodes[0].status, "active");
     assert.equal(store.verifyEpisodeChain(episodes[0].episode_id).ok, true);
   } finally {
     runtime.close();

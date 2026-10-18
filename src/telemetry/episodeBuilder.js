@@ -1,3 +1,5 @@
+import { isValidApprovedLabel } from "./labelProvenance.js";
+
 /** Rebuild decision examples without leaking information learned after prediction. */
 export function buildEpisode(store, episodeId) {
   const episode = store.getEpisode(episodeId);
@@ -28,9 +30,8 @@ export function buildEpisode(store, episodeId) {
       && inputMatchesPrediction(event));
     const later = events.filter(event => event.sequence > prediction.sequence && event.decisionId === prediction.decisionId);
     const rubricId = prediction.payload.rubricId ?? prediction.payload.annotationKind;
-    const approvedLabel = events.find(event => event.eventType === "label.approved" && event.decisionId === prediction.decisionId
-      && event.payload.rubricId === rubricId && event.payload.labelEventId
-      && events.some(candidate => candidate.eventId === event.payload.labelEventId && candidate.decisionId === prediction.decisionId));
+    const approvedLabel = events.find(event => event.decisionId === prediction.decisionId
+      && event.payload.rubricId === rubricId && isValidApprovedLabel(events, event, prediction));
     return {
       decisionId: prediction.decisionId,
       stepId: prediction.stepId ?? null,

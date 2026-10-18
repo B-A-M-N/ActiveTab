@@ -689,7 +689,7 @@ export class TestRunner {
         if (!runtime || !observation?.evidenceId || !beforeEvidenceId) return;
         await runtime.recordObserved({ episodeId, runId: receipt.runId, stepId, decisionId, observationId: observation.evidenceId, outcomeClass, changed, evidenceRefs: [beforeEvidenceId, observation.evidenceId] });
       },
-      async recordVerification({ status, oracleType, reasonCode, observation, evidenceIds = [] } = {}) {
+      async recordVerification({ status, oracleType, reasonCode, verifiedCode, observation, evidenceIds = [] } = {}) {
         if (thisRunner.runStateStore) {
           await thisRunner.runStateStore.reconcileOperation(receipt.runId, {
             operationId,
@@ -708,6 +708,7 @@ export class TestRunner {
                 : status === STEP_STATUS.CANCELED ? "not_run" : "uncertain",
             oracleType: oracleType ?? "unavailable",
             reasonCode: reasonCode ?? "verification_unresolved",
+            ...(verifiedCode !== undefined ? { verifiedCode } : {}),
             evidenceRefs: [...new Set([beforeEvidenceId, ...evidenceIds].filter(Boolean))]
           });
         }

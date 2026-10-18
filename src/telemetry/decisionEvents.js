@@ -20,10 +20,10 @@ const EVENT_FIELDS = Object.freeze({
   "execution.reserved": ["operation", "targetRole", "operationId"],
   "execution.dispatched": ["operation", "targetRole", "dispatchStatus", "operationId"],
   "execution.observed": ["outcomeClass", "changed", "evidenceRefs"],
-  "verification.completed": ["status", "oracleType", "reasonCode", "evidenceRefs"],
-  "correction.recorded": ["correctionType", "sourceClass", "supersedesDecisionId", "correctedCode"],
+  "verification.completed": ["status", "oracleType", "reasonCode", "verifiedCode", "evidenceRefs"],
+  "correction.recorded": ["correctionType", "sourceClass", "supersedesDecisionId", "correctedCode", "evidenceRefs"],
   "label.proposed": ["rubricId", "labelCode", "sourceClass", "evidenceRefs"],
-  "label.approved": ["labelEventId", "rubricId", "labelCode", "sourceClass", "evidenceRefs", "reviewerId"],
+  "label.approved": ["labelEventId", "rubricId", "labelCode", "sourceClass", "evidenceRefs", "reviewerId", "approvalDigest"],
   "episode.completed": ["status", "cleanupStatus"]
 });
 
@@ -263,6 +263,9 @@ function normalizePayload(eventType, payload) {
     } else if (field === "rubricHash") {
       if (!isSha256Digest(value)) throw new Error("Telemetry rubricHash must be a SHA-256 digest.");
       out[field] = value.toLowerCase();
+    } else if (field === "approvalDigest") {
+      if (!isSha256Digest(value)) throw new Error("Telemetry approvalDigest must be a SHA-256 digest.");
+      out[field] = value.toLowerCase();
     } else if (field === "inputEventIds") {
       if (!Array.isArray(value) || value.length > 64) throw new Error("Telemetry inputEventIds must be a bounded event reference list.");
       out[field] = [...new Set(value.map(item => safeCode(item, field, 96)))];
@@ -335,7 +338,7 @@ function normalizePayload(eventType, payload) {
     "verification.completed": ["status", "oracleType", "reasonCode", "evidenceRefs"],
     "correction.recorded": ["correctionType", "sourceClass", "correctedCode"],
     "label.proposed": ["rubricId", "labelCode", "sourceClass", "evidenceRefs"],
-    "label.approved": ["labelEventId", "rubricId", "labelCode", "sourceClass", "evidenceRefs", "reviewerId"],
+    "label.approved": ["labelEventId", "rubricId", "labelCode", "sourceClass", "evidenceRefs", "reviewerId", "approvalDigest"],
     "episode.completed": ["status", "cleanupStatus"]
   }[eventType];
   for (const field of required) if (out[field] === undefined) throw new Error(`Telemetry event '${eventType}' requires '${field}'.`);

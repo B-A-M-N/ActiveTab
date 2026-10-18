@@ -3,6 +3,7 @@ import { chmodSync, lstatSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { canonicalJson, createDecisionEvent, DECISION_EVENT_SCHEMA_VERSION, TRAINING_ELIGIBILITY } from "./decisionEvents.js";
+import { findPredictionForLabel, hasIndependentLabelEvidence, labelApprovalDigest } from "./labelProvenance.js";
 import { isSafeTelemetryCode } from "./privacy.js";
 
 const ZERO_HASH = "0".repeat(64);
@@ -28,9 +29,12 @@ function ensurePrivateDatabasePath(databasePath) {
 }
 
 export class DecisionEventStore {
-  constructor({ databasePath = resolve(process.cwd(), ".activetab", "telemetry", "decision-events.sqlite"), busyTimeoutMs = 5000 } = {}) {
+  #authenticateTrainingApprover;
+
+  constructor({ databasePath = resolve(process.cwd(), ".activetab", "telemetry", "decision-events.sqlite"), busyTimeoutMs = 5000, authenticateTrainingApprover } = {}) {
     if (typeof databasePath !== "string" || !databasePath) throw new Error("DecisionEventStore requires a database path.");
     this.databasePath = databasePath === ":memory:" ? databasePath : ensurePrivateDatabasePath(databasePath);
+    this.#authenticateTrainingApprover = authenticateTrainingApprover;
     this.db = new DatabaseSync(this.databasePath);
     this.db.exec(`
       PRAGMA foreign_keys = ON;
@@ -72,6 +76,8 @@ export class DecisionEventStore {
       );
       CREATE INDEX IF NOT EXISTS decision_events_decision_idx ON decision_events(episode_id, decision_id, sequence);
       CREATE INDEX IF NOT EXISTS decision_events_type_idx ON decision_events(episode_id, event_type, sequence);
+      CREATE UNIQUE INDEX IF NOT EXISTS decision_events_one_label_approval_idx
+        ON decision_events(parent_event_id) WHERE event_type = 'label.approved' AND parent_event_id IS NOT NULL;
       CREATE TRIGGER IF NOT EXISTS decision_events_no_update BEFORE UPDATE ON decision_events
       BEGIN SELECT RAISE(ABORT, 'decision events are append-only'); END;
       CREATE TRIGGER IF NOT EXISTS decision_events_no_delete BEFORE DELETE ON decision_events
@@ -104,6 +110,7 @@ export class DecisionEventStore {
   }
 
   append(input) {
+    if (input?.eventType === "label.approved") throw new Error("Training-label approvals must pass through the authenticated approval boundary.");
     const event = createDecisionEvent(input);
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -114,6 +121,63 @@ export class DecisionEventStore {
         this.db.prepare("UPDATE episodes SET status = ?, completed_at = ? WHERE episode_id = ?")
           .run(event.payload.status, event.occurredAt, event.episodeId);
       }
+      this.db.exec("COMMIT");
+      return stored;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async approveTrainingLabel({ episodeId, runId, labelEventId }) {
+    if (typeof this.#authenticateTrainingApprover !== "function") throw new Error("Training-label export requires an independently authenticated reviewer.");
+    const events = this.getEvents(episodeId);
+    const proposed = events.find(event => event.eventId === labelEventId && event.eventType === "label.proposed");
+    if (!proposed) throw new Error("The proposed training label was not found in this episode.");
+    if (proposed.runId !== runId) throw new Error("Training label run identity mismatch.");
+    if (events.some(event => event.eventType === "label.approved" && event.parentEventId === proposed.eventId)) {
+      throw new Error("This training-label proposal has already been approved.");
+    }
+    const prediction = findPredictionForLabel(events, proposed);
+    if (!prediction) throw new Error("Training label rubric does not match a recorded semantic or Jev prediction.");
+    if (!hasIndependentLabelEvidence(events, proposed, prediction)) {
+      throw new Error("Training labels require matching, independently verified evidence for the same decision and step.");
+    }
+    const approvalDigest = labelApprovalDigest(proposed);
+    const request = {
+      episodeId: proposed.episodeId,
+      runId: proposed.runId,
+      stepId: proposed.stepId ?? null,
+      decisionId: proposed.decisionId,
+      labelEventId: proposed.eventId,
+      ...proposed.payload,
+      approvalDigest
+    };
+    const authorization = await this.#authenticateTrainingApprover({ request });
+    if (!authorization || authorization.authenticated !== true
+      || typeof authorization.principalId !== "string"
+      || authorization.approvalDigest !== approvalDigest) {
+      throw new Error("Reviewer authentication must approve the exact label proposal and evidence scope.");
+    }
+    const approval = createDecisionEvent({
+      episodeId, runId, stepId: proposed.stepId, decisionId: proposed.decisionId,
+      parentEventId: proposed.eventId, eventType: "label.approved",
+      trainingEligibility: TRAINING_ELIGIBILITY.ELIGIBLE,
+      payload: {
+        labelEventId: proposed.eventId,
+        rubricId: proposed.payload.rubricId,
+        labelCode: proposed.payload.labelCode,
+        sourceClass: proposed.payload.sourceClass,
+        evidenceRefs: proposed.payload.evidenceRefs,
+        reviewerId: authorization.principalId,
+        approvalDigest
+      }
+    });
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = this.db.prepare("SELECT event_id FROM decision_events WHERE event_type = 'label.approved' AND parent_event_id = ?").get(proposed.eventId);
+      if (existing) throw new Error("This training-label proposal has already been approved.");
+      const stored = this.#appendInTransaction(approval);
       this.db.exec("COMMIT");
       return stored;
     } catch (error) {

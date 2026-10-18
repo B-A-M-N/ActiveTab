@@ -109,5 +109,6 @@ Run `npm test` in a disposable environment. The CDP integration suite launches i
 | `src/browser/` | CDP transport, target authorization, and session lifecycle |
 | `src/testing/` | Declarative workflows, receipts, and verification semantics |
 | `src/diagnostics/` | Diagnostic contracts, evidence collection, and correlation |
+| `src/telemetry/` | Append-only decision events, privacy projections, and reviewed training labels |
 | `profiles/` | Application/environment identity and authorization scope |
 | `scripts/` | Staging qualification and separately selected Admin discovery entrypoints |

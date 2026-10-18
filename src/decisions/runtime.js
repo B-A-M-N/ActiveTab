@@ -14,10 +14,14 @@ export function createDecisionRuntime({
   jevClient = null,
   semanticAnalyzer = undefined,
   databasePath,
+  authenticateTrainingApprover,
   jevOptions,
   semanticOptions
 } = {}) {
-  const store = eventStore ?? new DecisionEventStore(databasePath ? { databasePath } : {});
+  const store = eventStore ?? new DecisionEventStore({
+    ...(databasePath ? { databasePath } : {}),
+    ...(authenticateTrainingApprover ? { authenticateTrainingApprover } : {})
+  });
   let client = jevClient;
   if (!client) {
     try { client = new JevDecisionClient(jevOptions); }
@@ -174,11 +178,11 @@ export function createDecisionRuntime({
         payload: { outcomeClass, changed, evidenceRefs }
       });
     },
-    recordVerification({ episodeId, runId, stepId, decisionId, observationId, status, oracleType, reasonCode, evidenceRefs = [] }) {
+    recordVerification({ episodeId, runId, stepId, decisionId, observationId, status, oracleType, reasonCode, verifiedCode, evidenceRefs = [] }) {
       return store.append({
         episodeId, runId, stepId, decisionId, observationId,
         eventType: "verification.completed", trainingEligibility: "pending",
-        payload: { status, oracleType, reasonCode, evidenceRefs }
+        payload: { status, oracleType, reasonCode, ...(verifiedCode !== undefined ? { verifiedCode } : {}), evidenceRefs }
       });
     },
     close() {

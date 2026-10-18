@@ -12,6 +12,18 @@ import { SemanticPageAnalyzer } from "../src/navigation/semanticAnalyzer.js";
 import { DecisionCoordinator } from "../src/decisions/decisionCoordinator.js";
 import { createDecisionRuntime } from "../src/decisions/runtime.js";
 
+function createStore(options = {}) {
+  return new DecisionEventStore({
+    databasePath: ":memory:",
+    authenticateTrainingApprover: async ({ request }) => ({
+      authenticated: true,
+      principalId: "local_reviewer_1",
+      approvalDigest: request.approvalDigest
+    }),
+    ...options
+  });
+}
+
 function fixture(store, { applicationId = "fixture_app", runId = `run_${applicationId}` } = {}) {
   const episode = store.startEpisode({ runId, workflowId: "smoke_workflow", applicationId, environmentClass: "local", executionMode: "agent_directed", policyVersion: "policy_v1" });
   const decisionId = `decision_${applicationId}`;
@@ -53,9 +65,9 @@ function fixture(store, { applicationId = "fixture_app", runId = `run_${applicat
   });
   store.append({
     episodeId: episode.episodeId, runId, stepId: "submit_task", decisionId,
-    eventType: "verification.completed", payload: { status: "verified_pass", oracleType: "correlated_backend", reasonCode: "exact_run_match", evidenceRefs: [`backend_${applicationId}`] }
+    eventType: "verification.completed", payload: { status: "verified_pass", oracleType: "correlated_backend", reasonCode: "exact_run_match", verifiedCode: "yes", evidenceRefs: [`backend_${applicationId}`] }
   });
-  const labeler = new TrainingLabeler({ store, authenticateApprover: async reviewerId => reviewerId === "local_reviewer_1" });
+  const labeler = new TrainingLabeler({ store });
   const proposed = labeler.propose({ episodeId: episode.episodeId, runId, stepId: "submit_task", decisionId, rubricId: "intent_alignment", labelCode: "yes", sourceClass: "correlated_backend", evidenceRefs: [`backend_${applicationId}`] });
   return { ...episode, decisionId, labelEventId: proposed.eventId, labeler };
 }
@@ -63,10 +75,15 @@ function fixture(store, { applicationId = "fixture_app", runId = `run_${applicat
 test("decision event log is private, ordered, append-only, and hash-verifiable", async () => {
   const root = mkdtempSync(join(tmpdir(), "active-tab-telemetry-"));
   const path = join(root, "private", "events.sqlite");
-  const store = new DecisionEventStore({ databasePath: path });
+  const store = createStore({ databasePath: path });
   try {
     const item = fixture(store);
-    await item.labeler.approve({ episodeId: item.episodeId, runId: item.runId, labelEventId: item.labelEventId, reviewerId: "local_reviewer_1" });
+    const approvals = await Promise.allSettled([
+      item.labeler.approve({ episodeId: item.episodeId, runId: item.runId, labelEventId: item.labelEventId }),
+      item.labeler.approve({ episodeId: item.episodeId, runId: item.runId, labelEventId: item.labelEventId })
+    ]);
+    assert.equal(approvals.filter(result => result.status === "fulfilled").length, 1);
+    assert.equal(approvals.filter(result => result.status === "rejected").length, 1);
     const events = store.getEvents(item.episodeId);
     assert.deepEqual(events.map(event => event.sequence), events.map((_, index) => index + 1));
     assert.equal(store.verifyEpisodeChain(item.episodeId).ok, true);
@@ -79,8 +96,72 @@ test("decision event log is private, ordered, append-only, and hash-verifiable",
   }
 });
 
+test("training labels require same-decision verified evidence and the private approval boundary", async () => {
+  const store = createStore();
+  try {
+    const item = fixture(store);
+    const unrelatedEvidence = item.labeler.propose({
+      episodeId: item.episodeId, runId: item.runId, stepId: "submit_task", decisionId: item.decisionId,
+      rubricId: "intent_alignment", labelCode: "yes", sourceClass: "correlated_backend", evidenceRefs: ["invented_backend_ref"]
+    });
+    await assert.rejects(
+      item.labeler.approve({ episodeId: item.episodeId, runId: item.runId, labelEventId: unrelatedEvidence.eventId }),
+      error => error.message.includes("independently verified evidence")
+    );
+    const unsupportedCode = item.labeler.propose({
+      episodeId: item.episodeId, runId: item.runId, stepId: "submit_task", decisionId: item.decisionId,
+      rubricId: "intent_alignment", labelCode: "no", sourceClass: "correlated_backend", evidenceRefs: ["backend_fixture_app"]
+    });
+    await assert.rejects(
+      item.labeler.approve({ episodeId: item.episodeId, runId: item.runId, labelEventId: unsupportedCode.eventId }),
+      error => error.message.includes("independently verified evidence")
+    );
+    assert.throws(() => store.append({
+      episodeId: item.episodeId, runId: item.runId, stepId: "submit_task", decisionId: item.decisionId,
+      eventType: "label.approved", trainingEligibility: "eligible",
+      payload: {
+        labelEventId: item.labelEventId, rubricId: "intent_alignment", labelCode: "yes",
+        sourceClass: "correlated_backend", evidenceRefs: ["backend_fixture_app"], reviewerId: "local_reviewer_1", approvalDigest: "a".repeat(64)
+      }
+    }), error => error.message.includes("authenticated approval boundary"));
+    assert.equal(buildTrainingDataset(store, { split: { kind: "workflow", holdout: ["smoke_workflow"] } }).eligibleExampleCount, 0);
+  } finally { store.close(); }
+});
+
+test("reviewer approval is bound to the exact label proposal", async () => {
+  const store = createStore({
+    authenticateTrainingApprover: async ({ request }) => ({
+      authenticated: true,
+      principalId: "local_reviewer_1",
+      approvalDigest: "0".repeat(64)
+    })
+  });
+  try {
+    const item = fixture(store);
+    await assert.rejects(
+      item.labeler.approve({ episodeId: item.episodeId, runId: item.runId, labelEventId: item.labelEventId }),
+      error => error.message.includes("exact label proposal")
+    );
+    assert.equal(store.getEvents(item.episodeId).some(event => event.eventType === "label.approved"), false);
+  } finally { store.close(); }
+});
+
+test("verification events can retain a typed code for later independent labeling", () => {
+  const store = createStore();
+  const runtime = createDecisionRuntime({ eventStore: store, jevClient: { async decide() { throw new Error("No decision request is expected."); } }, semanticAnalyzer: null });
+  try {
+    const episode = runtime.startEpisode({ runId: "run_verified_code", workflowId: "verification_fixture", applicationId: "fixture_app" });
+    const event = runtime.recordVerification({
+      episodeId: episode.episodeId, runId: episode.runId, stepId: "assert_outcome", decisionId: "decision_verified_code",
+      status: "verified_pass", oracleType: "correlated_backend", reasonCode: "exact_fixture_run", verifiedCode: "task_succeeded",
+      evidenceRefs: ["backend_run_fixture"]
+    });
+    assert.equal(event.payload.verifiedCode, "task_succeeded");
+  } finally { runtime.close(); }
+});
+
 test("telemetry rejects unstructured content by schema shape, without scanning text", () => {
-  const store = new DecisionEventStore({ databasePath: ":memory:" });
+  const store = createStore();
   try {
     const item = store.startEpisode({ workflowId: "wf", applicationId: "fixture_app" });
     assert.throws(() => store.append({
@@ -110,11 +191,11 @@ test("telemetry rejects unstructured content by schema shape, without scanning t
 });
 
 test("episode reconstruction excludes future outcomes from Jev input and only exports approved independent labels", async () => {
-  const store = new DecisionEventStore({ databasePath: ":memory:" });
+  const store = createStore();
   try {
     const train = fixture(store, { applicationId: "fixture_app" });
     const holdout = fixture(store, { applicationId: "fixture_cloud_agent" });
-    for (const item of [train, holdout]) await item.labeler.approve({ episodeId: item.episodeId, runId: item.runId, labelEventId: item.labelEventId, reviewerId: "local_reviewer_1" });
+    for (const item of [train, holdout]) await item.labeler.approve({ episodeId: item.episodeId, runId: item.runId, labelEventId: item.labelEventId });
     const reconstructed = buildEpisode(store, holdout.episodeId);
     const decision = reconstructed.decisions[0];
     assert.equal(decision.inputEventIds.length, 3);
@@ -135,11 +216,11 @@ test("episode reconstruction excludes future outcomes from Jev input and only ex
 });
 
 test("Jev and coding-agent predictions cannot self-label training data", async () => {
-  const store = new DecisionEventStore({ databasePath: ":memory:" });
+  const store = createStore();
   try {
     const item = fixture(store);
-    const proposed = item.labeler.propose({ episodeId: item.episodeId, runId: item.runId, decisionId: item.decisionId, rubricId: "intent_alignment", labelCode: "yes", sourceClass: "jev_self", evidenceRefs: ["jev_answer"] });
-    await assert.rejects(item.labeler.approve({ episodeId: item.episodeId, runId: item.runId, labelEventId: proposed.eventId, reviewerId: "local_reviewer_1" }), /cannot become training ground truth/);
+    const proposed = item.labeler.propose({ episodeId: item.episodeId, runId: item.runId, stepId: "submit_task", decisionId: item.decisionId, rubricId: "intent_alignment", labelCode: "yes", sourceClass: "jev_self", evidenceRefs: ["jev_answer"] });
+    await assert.rejects(item.labeler.approve({ episodeId: item.episodeId, runId: item.runId, labelEventId: proposed.eventId }), error => error.message.includes("independently verified evidence"));
     const before = store.getEvents(item.episodeId).length;
     assert.equal(buildTrainingDataset(store, { split: { kind: "workflow", holdout: ["smoke_workflow"] } }).eligibleExampleCount, 0);
     assert.equal(store.getEvents(item.episodeId).length, before);
@@ -147,7 +228,7 @@ test("Jev and coding-agent predictions cannot self-label training data", async (
 });
 
 test("semantic annotations and Jev predictions remain distinct but share the same evidence timeline", () => {
-  const store = new DecisionEventStore({ databasePath: ":memory:" });
+  const store = createStore();
   try {
     const episode = store.startEpisode({ runId: "run_dual", workflowId: "walkthrough", applicationId: "fixture_app", environmentClass: "local" });
     store.append({ episodeId: episode.episodeId, runId: episode.runId, eventType: "observation.captured", observationId: "obs_1", payload: { surfaceClass: "task_composer", candidateCount: 3, visibleCount: 3, candidateRoles: ["button", "textbox"], evidenceRefs: ["ev_1"] } });
@@ -164,7 +245,7 @@ test("semantic annotations and Jev predictions remain distinct but share the sam
 });
 
 test("Jev outcome review records its exact pre-prediction input projection and links both predictions", async () => {
-  const store = new DecisionEventStore({ databasePath: ":memory:" });
+  const store = createStore();
   try {
     // Outcome records here are constructed from test data, even though their
     // modeled environment class is staging.
@@ -240,7 +321,7 @@ test("Jev outcome review records its exact pre-prediction input projection and l
 });
 
 test("review skips remain explicit in the ordered episode timeline", () => {
-  const store = new DecisionEventStore({ databasePath: ":memory:" });
+  const store = createStore();
   try {
     const episode = store.startEpisode({ runId: "run_skip_review", workflowId: "typed_task", applicationId: "fixture_app", environmentClass: "staging" });
     const coordinator = new DecisionCoordinator({ eventStore: store, client: { async decide() { throw new Error("Jev must not be called for a skipped review."); } } });
@@ -265,7 +346,7 @@ test("review skips remain explicit in the ordered episode timeline", () => {
 });
 
 test("trusted target resolution is appended as a validated evidence-linked event", () => {
-  const store = new DecisionEventStore({ databasePath: ":memory:" });
+  const store = createStore();
   const runtime = createDecisionRuntime({
     eventStore: store,
     jevClient: { async decide() { throw new Error("No review is requested by this target-resolution test."); } },
@@ -297,7 +378,7 @@ test("trusted target resolution is appended as a validated evidence-linked event
 });
 
 test("semantic GLM annotations and Jev review are automatically recorded against one decision and observation", async () => {
-  const store = new DecisionEventStore({ databasePath: ":memory:" });
+  const store = createStore();
   try {
     const episode = store.startEpisode({ runId: "run_dual_models", workflowId: "semantic_review", applicationId: "fixture_app", environmentClass: "local" });
     const observation = {
@@ -358,7 +439,7 @@ test("semantic GLM annotations and Jev review are automatically recorded against
 });
 
 test("semantic and Jev failures are recorded by failure class without response or error text", async () => {
-  const store = new DecisionEventStore({ databasePath: ":memory:" });
+  const store = createStore();
   try {
     const episode = store.startEpisode({ runId: "run_model_failure", workflowId: "failure_review", applicationId: "fixture_app", environmentClass: "local" });
     const observation = { evidenceId: "obs_model_failure", candidates: [] };
@@ -404,7 +485,7 @@ test("semantic and Jev failures are recorded by failure class without response o
 });
 
 test("semantic requests omit accessible page labels unless that feature is explicitly enabled", async () => {
-  const store = new DecisionEventStore({ databasePath: ":memory:" });
+  const store = createStore();
   try {
     const episode = store.startEpisode({ runId: "run_label_opt_in", workflowId: "label_privacy", applicationId: "fixture_app", environmentClass: "local" });
     const observation = {
