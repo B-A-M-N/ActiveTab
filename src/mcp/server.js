@@ -18,7 +18,7 @@ import { DiagnosticCorrelator } from "../diagnostics/correlator.js";
 import { DiagnosticReport, FINDING_LEVEL, deriveRunInvestigationStatus } from "../diagnostics/report.js";
 import { TestRunner } from "../testing/runner.js";
 import { receiptFromRunState } from "../testing/receipts.js";
-import { RunStateStore } from "../testing/runState.js";
+import { RunStateStore, requestRunCancellation } from "../testing/runState.js";
 import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
 import { InvestigationEngine } from "../investigation/engine.js";
 import { InterventionStore, InterventionWatcher } from "../runtime/interventions.js";
@@ -404,9 +404,16 @@ async function callTool(name, args) {
   }
   if (name === "cancel_test_run") {
     const run = testRuns.get(args.runId);
-    if (!run) throw new Error(`No test run found for runId '${args.runId}'.`);
-    run.controller.abort();
-    return { status: "cancel_requested", runId: args.runId };
+    const cancellation = await requestRunCancellation(runStateStore, args.runId, {
+      abort: run ? () => run.controller.abort() : undefined,
+      runPromise: run?.runPromise
+    });
+    if (!cancellation) throw new Error(`No test run found for runId '${args.runId}'.`);
+    return {
+      status: cancellation.requested ? "cancel_requested" : cancellation.run.status,
+      runId: args.runId,
+      requiresReconciliation: cancellation.requiresReconciliation
+    };
   }
   if (name === "collect_diagnostics") {
     const run = testRuns.get(args.runId);

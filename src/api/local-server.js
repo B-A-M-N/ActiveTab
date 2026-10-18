@@ -34,7 +34,7 @@ import { DiagnosticCorrelator } from "../diagnostics/correlator.js";
 import { DiagnosticReport, FINDING_LEVEL, deriveRunInvestigationStatus } from "../diagnostics/report.js";
 import { TestRunner } from "../testing/runner.js";
 import { receiptFromRunState } from "../testing/receipts.js";
-import { RunStateStore } from "../testing/runState.js";
+import { RunStateStore, requestRunCancellation } from "../testing/runState.js";
 import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
 import { InvestigationEngine } from "../investigation/engine.js";
 import { InterventionStore } from "../runtime/interventions.js";
@@ -318,11 +318,16 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
     const run = testRuns.get(runId);
     try {
       await ensureRunStateStore();
-      const state = await runStateStore.getFresh(runId);
-      if (!run && !state) { sendError(res, 404, 99404, `No test run found for runId '${runId}'.`); return; }
-      if (state) await runStateStore.requestCancellation(runId);
-      if (run) { run.controller.abort(); await run.cancel?.(); }
-      sendJson(res, 200, { status: "cancel_requested", runId, requiresReconciliation: (state?.pendingOperations ?? []).some(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status)) });
+      const cancellation = await requestRunCancellation(runStateStore, runId, {
+        abort: run ? () => run.controller.abort() : undefined,
+        runPromise: run?.runPromise
+      });
+      if (!cancellation) { sendError(res, 404, 99404, `No test run found for runId '${runId}'.`); return; }
+      sendJson(res, 200, {
+        status: cancellation.requested ? "cancel_requested" : cancellation.run.status,
+        runId,
+        requiresReconciliation: cancellation.requiresReconciliation
+      });
     } catch (error) {
       sendError(res, 503, 99503, `Cancellation could not be persisted: ${String(error?.message ?? error).slice(0, 200)}`);
     }

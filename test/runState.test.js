@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { RunStateStore } from "../src/testing/runState.js";
+import { RunStateStore, requestRunCancellation } from "../src/testing/runState.js";
 import { TaskStore, TERMINAL_STATUSES, SUSPENDED_STATUSES } from "../src/api/task-store.js";
 
 async function withRunState(fn) {
@@ -79,6 +79,26 @@ test("one durable run has a single execution owner across store instances", () =
     await release();
     const releaseAfterOwnerExit = await other.acquireExecutionLease("exclusive-run");
     await releaseAfterOwnerExit();
+  }));
+
+test("cancellation remains available from durable run state after the worker cache is gone", () =>
+  withRunState(async (store, dir) => {
+    const run = await store.create({ runId: "cancel-after-restart", workflowId: "wf", workflowName: "Cancellation recovery", environmentId: "staging", targetId: "tab-exact" });
+    await store.reserveOperation(run.runId, {
+      operationId: "submit-operation",
+      stepId: "submit",
+      action: "click",
+      effectDigest: "submit-contract",
+      environmentId: "staging",
+      targetId: "tab-exact"
+    });
+    const restarted = new RunStateStore(dir);
+    await restarted.init();
+    const cancellation = await requestRunCancellation(restarted, run.runId);
+    assert.equal(cancellation.requested, true);
+    assert.equal(cancellation.requiresReconciliation, true);
+    assert.equal(cancellation.run.cancellationRequested, true);
+    assert.equal(cancellation.run.pendingOperations[0].status, "RESERVED");
   }));
 
 test("reserved and possibly dispatched operations become uncertain across restart and cannot be replayed", () =>

@@ -47,6 +47,41 @@ export function blockingQualificationRuns(runs, { selectedDiscardId = null } = {
   return runs.filter(run => run.runId !== selectedDiscardId);
 }
 
+/** Persist cancellation even when no live worker object survived a restart. */
+export async function requestRunCancellation(store, runId, { abort, runPromise } = {}) {
+  if (!store || typeof store.getFresh !== "function" || typeof store.requestCancellation !== "function") {
+    throw new Error("Durable run cancellation requires a RunStateStore.");
+  }
+  const before = await store.getFresh(runId);
+  if (!before) {
+    if (typeof abort !== "function") return null;
+    await abort();
+    if (runPromise && typeof runPromise.then === "function") {
+      const persistAfterStartup = async () => {
+        const started = await store.getFresh(runId);
+        if (started && !["passed", "failed", "blocked", "canceled", "expired"].includes(started.status)) {
+          await store.requestCancellation(runId);
+        }
+      };
+      void Promise.resolve(runPromise)
+        .then(persistAfterStartup, persistAfterStartup)
+        .catch(() => {});
+    }
+    return { run: null, requested: true, requiresReconciliation: false, durabilityPending: true };
+  }
+  const terminal = ["passed", "failed", "blocked", "canceled", "expired"].includes(before.status);
+  if (terminal) return { run: before, requested: false, requiresReconciliation: false };
+  const run = await store.requestCancellation(runId);
+  if (!run) return null;
+  const requested = run.cancellationRequested === true;
+  if (requested && typeof abort === "function") await abort();
+  return {
+    run,
+    requested,
+    requiresReconciliation: (run.pendingOperations ?? []).some(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status))
+  };
+}
+
 export class RunStateStore {
   constructor(baseDir, { lockWaitMs = LOCK_WAIT_MS } = {}) {
     if (typeof baseDir !== "string" || !baseDir) throw new Error("RunStateStore requires a baseDir.");

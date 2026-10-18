@@ -11,6 +11,7 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 ## Local Contracts
 
 - Dispatch, observed effects, and verified postconditions are separate states. An unresolved dispatched effect yields run status `UNCERTAIN` until independent evidence reconciles it; it is not silently converted to `FAILED` or replayed.
+- Cancellation is persisted in `RunStateStore` and remains available after a worker restart. Cancellation stops future dispatches while unresolved reserved/dispatched operations remain reconciliation obligations.
 - Diagnostic `api_call` receipts preserve typed refusal/error/unavailable statuses and explicitly record that collection alone did not verify an application outcome.
 - Only an independent verified postcondition may report PASS.
 - A page fingerprint change alone is not outcome success.
