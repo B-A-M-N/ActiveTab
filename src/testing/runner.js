@@ -13,9 +13,9 @@ import { InterventionStore, evaluateCompletion, externalRunState, INTERVENTION_S
 import { isLoopbackUrl, verifyObservedUrl } from "../environments/model.js";
 import { NavigationEngine } from "../navigation/engine.js";
 import { executeAuthorizedAction } from "../runtime/authorizedExecutor.js";
-import { createHash, randomUUID } from "node:crypto";
-import { adjudicatePreActionReview } from "../decisions/adjudication.js";
+import { createHash } from "node:crypto";
 import { acquireBrowserTargetLease } from "./runState.js";
+import { RunDecisionRecorder } from "./telemetry/runDecisionRecorder.js";
 import {
   deriveWorkflowRunStatus,
   estimateWorkflowExecutionCost,
@@ -105,11 +105,18 @@ export class TestRunner {
     this.workflowRegistry = workflowRegistry;
     this.runStateStore = runStateStore;
     this.targetLease = null;
+    this.decisionRecorder = new RunDecisionRecorder({
+      decisionRuntime,
+      runStateStore,
+      environment,
+      session,
+      signal,
+      getTargetFencingToken: () => this.targetLease?.fencingToken ?? null
+    });
     this.existingRunStateId = existingRunStateId;
     this.principalId = principalId;
     this.profileId = profileId;
     this.policyVersion = policyVersion;
-    this.decisionEpisodeId = null;
     this.currentTelemetryStepId = null;
     this.currentRuntimeStepId = null;
     this.onIntervention = null; // async (record) => {}
@@ -173,8 +180,8 @@ export class TestRunner {
     const priorState = this.runStateStore
       ? await this.runStateStore.getFresh(this.existingRunStateId ?? effectiveRunId)
       : null;
-    if (priorState?.episodeId) this.decisionEpisodeId = priorState.episodeId;
-    await this.#ensureDecisionEpisode(receipt);
+    if (priorState?.episodeId) this.decisionRecorder.bindEpisode(priorState.episodeId);
+    await this.decisionRecorder.ensureEpisode(receipt);
     const context = {
       variables: new Map(Object.entries(workflow.inputs ?? {})),
       workflowStack: new Set([workflow.id]),
@@ -231,7 +238,7 @@ export class TestRunner {
 
     if (receipt.status === RUN_STATUS.RUNNING) receipt.finish(deriveWorkflowRunStatus(workflow, execution.stepStatuses));
     await this.#completeRunState(receipt);
-    this.#completeDecisionEpisode(receipt);
+    this.decisionRecorder.completeEpisode(receipt);
     return receipt;
   }
 
@@ -363,7 +370,7 @@ export class TestRunner {
         principalId: this.principalId,
         profileId: this.profileId,
         policyVersion: this.policyVersion,
-        episodeId: this.decisionEpisodeId
+        episodeId: this.decisionRecorder.episodeId
       });
       run = await this.runStateStore.getFresh(receipt.runId);
     }
@@ -379,10 +386,10 @@ export class TestRunner {
       policyVersion: this.policyVersion
     });
     run = await this.runStateStore.getFresh(receipt.runId);
-    if (this.decisionEpisodeId && !run?.episodeId) {
-      await this.runStateStore.update(receipt.runId, { episodeId: this.decisionEpisodeId });
+    if (this.decisionRecorder.episodeId && !run?.episodeId) {
+      await this.runStateStore.update(receipt.runId, { episodeId: this.decisionRecorder.episodeId });
       run = await this.runStateStore.getFresh(receipt.runId);
-    } else if (this.decisionEpisodeId && run?.episodeId !== this.decisionEpisodeId) {
+    } else if (this.decisionRecorder.episodeId && run?.episodeId !== this.decisionRecorder.episodeId) {
       throw new Error("Decision episode does not match the durable run binding.");
     }
     if (run?.pendingOperations?.some(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status))) return run;
@@ -439,198 +446,22 @@ export class TestRunner {
   }
 
   async #ensureDecisionEpisode(receipt) {
-    if (!this.decisionRuntime) return null;
-    const environmentId = String(this.environment?.environmentId ?? "").toLowerCase();
-    const environmentClass = this.environment?.environmentClass
-      ?? (environmentId.includes("production") ? "production" : environmentId.includes("staging") ? "staging" : environmentId ? "local" : "unknown");
-    const episode = this.decisionRuntime.startEpisode({
-      ...(this.decisionEpisodeId ? { episodeId: this.decisionEpisodeId } : {}),
-      runId: receipt.runId,
-      workflowId: `workflow_${createHash("sha256").update(receipt.workflowId).digest("hex").slice(0, 16)}`,
-      applicationId: this.environment?.applications?.[0]?.applicationId ?? "unknown",
-      environmentClass,
-      executionMode: "agent_directed",
-      policyVersion: "active_policy_v1",
-      workflowKind: "declarative_test"
-    });
-    this.decisionEpisodeId = episode.episodeId;
-    return episode;
+    return this.decisionRecorder.ensureEpisode(receipt);
   }
 
   #completeDecisionEpisode(receipt) {
-    if (!this.decisionRuntime || !this.decisionEpisodeId) return;
-    const status = receipt.status === RUN_STATUS.PASSED ? "passed"
-      : receipt.status === RUN_STATUS.BLOCKED ? "blocked"
-        : receipt.status === RUN_STATUS.UNCERTAIN ? "uncertain"
-        : receipt.status === RUN_STATUS.CANCELED ? "canceled"
-          : receipt.status === RUN_STATUS.WAITING_FOR_HUMAN_DECISION || isWaitingRunStatus(receipt.status) ? "suspended"
-            : "failed";
-    if (status === "suspended" || status === "uncertain") return;
-    const cleanupStatus = receipt.cleanup.length === 0 ? "not_required"
-      : receipt.cleanup.every(item => item.status === "PASS" || item.status === "verified") ? "verified"
-        : receipt.cleanup.some(item => item.status === "FAIL" || item.status === "failed") ? "failed"
-          : "unknown";
-    this.decisionRuntime.completeEpisode({ episodeId: this.decisionEpisodeId, runId: receipt.runId, status, cleanupStatus });
+    return this.decisionRecorder.completeEpisode(receipt);
   }
 
   async #telemetryHooks(receipt, action, candidate = null, decisionContext = null) {
-    if (!this.decisionRuntime && !this.runStateStore) return null;
-    if (this.decisionRuntime && !this.decisionEpisodeId) await this.#ensureDecisionEpisode(receipt);
-    const decisionId = randomUUID();
-    const stepId = this.currentTelemetryStepId ?? "step_unknown";
-    const stateStepId = this.currentRuntimeStepId ?? stepId;
-    const operationId = createHash("sha256").update(`${receipt.runId}\0${stateStepId}`).digest("hex").slice(0, 40);
-    const operationClass = decisionContext?.operationClass ?? (action === "navigate" ? "navigation" : "unknown");
-    const targetRole = decisionContext?.targetRole ?? (candidate ? "browser_target" : "navigation_destination");
-    const reviewRequired = decisionContext?.reviewRequired ?? (
-      action === "navigate" || action === "upload" || action === "toggle" || candidate?.submitsForm === true
-      || (action === "click" && (candidate?.tag === "a" || candidate?.role === "link") && typeof candidate?.href === "string")
-    );
-    const runtime = this.decisionRuntime;
-    const episodeId = this.decisionEpisodeId;
-    const signal = this.signal;
-    const thisRunner = this;
-    let beforeEvidenceId = null;
-    return {
-      decisionId,
-      operationId,
-      stepId,
-      async onAdmission({ observation } = {}) {
-        if (!runtime) return { allowed: true, grantsAuthority: false, category: "deterministic_policy_only" };
-        if (!observation?.evidenceId) throw new Error("The admitted operation has no fresh observation identity.");
-        beforeEvidenceId = observation.evidenceId;
-        let adjudication;
-        if (reviewRequired) {
-          const review = await runtime.reviewBeforeAction({
-            episodeId,
-            runId: receipt.runId,
-            stepId,
-            decisionId,
-            observation,
-            operation: action,
-            operationClass,
-            targetRole,
-            expectedOutcomeClass: "browser_state_change",
-            ...(candidate ? { candidate } : {}),
-            ...(decisionContext?.semanticAnnotation ? { semanticAnnotation: decisionContext.semanticAnnotation } : {}),
-            ...(decisionContext?.semanticEventIds?.length ? { semanticEventIds: decisionContext.semanticEventIds } : {}),
-            signal
-          });
-          adjudication = adjudicatePreActionReview(review);
-        } else {
-          await runtime.recordReviewSkipped({
-            episodeId,
-            runId: receipt.runId,
-            stepId,
-            decisionId,
-            observation,
-            operation: action,
-            operationClass,
-            targetRole,
-            expectedOutcomeClass: "browser_state_change",
-            reasonCode: "policy_boundary_not_triggered"
-          });
-          adjudication = {
-            allowed: true,
-            grantsAuthority: false,
-            category: "review_not_required",
-            reason: null
-          };
-        }
-        if (!adjudication.allowed) return adjudication;
-        await runtime.recordPolicy({
-          episodeId,
-          runId: receipt.runId,
-          stepId,
-          decisionId,
-          observationId: observation.evidenceId,
-          disposition: "allow",
-          reasonCode: reviewRequired ? "independent_review_admitted" : "review_not_required_by_boundary_policy"
-        });
-        return adjudication;
-      },
-      async onReserve({ observation } = {}) {
-        const effectDigest = createHash("sha256").update(JSON.stringify({
-          operationId,
-          stepId: stateStepId,
-          action,
-          operationClass,
-          environmentId: thisRunner.environment?.environmentId ?? null,
-          targetId: thisRunner.session?.target?.id ?? null,
-          candidateIdentity: candidate?.identity ?? null,
-          candidateKind: candidate?.kind ?? null,
-          candidateTag: candidate?.tag ?? null
-        })).digest("hex");
-        if (thisRunner.runStateStore) {
-          await thisRunner.runStateStore.reserveOperation(receipt.runId, {
-            operationId,
-            stepId: stateStepId,
-            action,
-            effectDigest,
-            environmentId: thisRunner.environment?.environmentId ?? null,
-            targetId: thisRunner.session?.target?.id ?? null,
-            targetFencingToken: thisRunner.targetLease?.fencingToken ?? null
-          });
-          await thisRunner.runStateStore.update(receipt.runId, { status: "dispatching", currentStepId: stateStepId });
-        }
-        if (runtime) {
-          await runtime.reserveExecution({ episodeId, runId: receipt.runId, stepId, decisionId, observationId: observation?.evidenceId ?? beforeEvidenceId, operation: action, targetRole, operationId });
-        }
-        return { allowed: true };
-      },
-      async onDispatch({ dispatchStatus, observation } = {}) {
-        const errors = [];
-        if (runtime) {
-          try { await runtime.recordDispatch({ episodeId, runId: receipt.runId, stepId, decisionId, observationId: beforeEvidenceId, operation: action, targetRole, operationId, dispatchStatus }); }
-          catch (error) { errors.push(error); }
-        }
-        if (thisRunner.runStateStore) {
-          try {
-            await thisRunner.runStateStore.recordOperationDispatch(receipt.runId, {
-              operationId,
-              status: dispatchStatus === "uncertain" ? "UNCERTAIN"
-                : dispatchStatus === "refused" ? "REFUSED" : "DISPATCHED",
-              receiptId: observation?.evidenceId ?? null
-            });
-          } catch (error) { errors.push(error); }
-        }
-        if (errors.length) throw errors[0];
-      },
-      async recordDenied(observation) {
-        if (!runtime || !observation?.evidenceId) return;
-        beforeEvidenceId = observation.evidenceId;
-        await runtime.recordPolicy({ episodeId, runId: receipt.runId, stepId, decisionId, observationId: observation.evidenceId, disposition: "deny", reasonCode: "authorized_executor_refused" });
-      },
-      async recordObserved(observation, changed, outcomeClass = "browser_state_observed") {
-        if (!runtime || !observation?.evidenceId || !beforeEvidenceId) return;
-        await runtime.recordObserved({ episodeId, runId: receipt.runId, stepId, decisionId, observationId: observation.evidenceId, outcomeClass, changed, evidenceRefs: [beforeEvidenceId, observation.evidenceId] });
-      },
-      async recordVerification({ status, oracleType, reasonCode, verifiedCode, observation, evidenceIds = [] } = {}) {
-        if (thisRunner.runStateStore) {
-          await thisRunner.runStateStore.reconcileOperation(receipt.runId, {
-            operationId,
-            status: status === STEP_STATUS.PASS ? "VERIFIED"
-              : status === STEP_STATUS.FAIL ? "FAILED" : "UNCERTAIN",
-            evidenceIds,
-            summary: reasonCode ?? status ?? "unresolved verification"
-          });
-        }
-        if (runtime && typeof runtime.recordVerification === "function" && observation?.evidenceId) {
-          await runtime.recordVerification({
-            episodeId, runId: receipt.runId, stepId, decisionId,
-            observationId: observation.evidenceId,
-            status: status === STEP_STATUS.PASS ? "verified_pass"
-              : status === STEP_STATUS.FAIL ? "verified_fail"
-                : status === STEP_STATUS.CANCELED ? "not_run" : "uncertain",
-            oracleType: oracleType ?? "unavailable",
-            reasonCode: reasonCode ?? "verification_unresolved",
-            ...(verifiedCode !== undefined ? { verifiedCode } : {}),
-            evidenceRefs: [...new Set([beforeEvidenceId, ...evidenceIds].filter(Boolean))]
-          });
-        }
-        return true;
-      }
-    };
+    return this.decisionRecorder.createHooks({
+      receipt,
+      action,
+      candidate,
+      decisionContext,
+      telemetryStepId: this.currentTelemetryStepId,
+      runtimeStepId: this.currentRuntimeStepId
+    });
   }
 
   async #executeStep(step, receipt, context = null, stepStatuses = new Map()) {
@@ -674,13 +505,13 @@ export class TestRunner {
       evidenceRefs: []
     });
     let result;
-    if (!this.qualificationService || !this.decisionEpisodeId) {
+    if (!this.qualificationService || !this.decisionRecorder.episodeId) {
       result = unavailable("qualification_service_unavailable");
     } else {
       try {
         result = await this.qualificationService.qualify({
           runId: receipt.runId,
-          episodeId: this.decisionEpisodeId,
+          episodeId: this.decisionRecorder.episodeId,
           stepId: this.currentTelemetryStepId ?? telemetryStepId(step.id),
           scenarioId: step.scenarioId,
           providerId: step.providerId,
@@ -1412,7 +1243,7 @@ export class TestRunner {
       ...(this.decisionRuntime ? {
         decisionContext: {
           runId: receipt.runId,
-          episodeId: this.decisionEpisodeId,
+          episodeId: this.decisionRecorder.episodeId,
           workflowId: `workflow_${createHash("sha256").update(receipt.workflowId).digest("hex").slice(0, 16)}`,
           stepPrefix: this.currentTelemetryStepId ?? telemetryStepId(step.id),
           sharedEpisode: true

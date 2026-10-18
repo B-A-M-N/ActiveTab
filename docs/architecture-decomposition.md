@@ -6,7 +6,7 @@ ActiveTab is being decomposed through behavior-preserving extractions. One appli
 
 | Area | Current entrypoint | Current responsibility pressure |
 | --- | --- | --- |
-| Declarative workflows | `src/testing/runner.js` (1,725 lines) | Scheduling, step dispatch, run lifecycle, continuation, verification, and integration calls |
+| Declarative workflows | `src/testing/runner.js` (1,556 lines after telemetry extraction) | Step dispatch, run lifecycle, continuation, verification, and integration calls |
 | Navigation | `src/navigation/engine.js` (1,219 lines) | Planning, browser coordination, recovery, replay, and outcome checks |
 | MCP transport | `src/mcp/server.js` (766 lines) | Protocol handling mixed with application orchestration |
 | HTTP transport | `src/api/local-server.js` (825 lines) | Routes mixed with run lifecycle and process-local service state |
@@ -26,6 +26,8 @@ These are extraction targets. Size alone is not evidence of a defect.
 `TestRunner` still owns run identity, durable checkpoints, cancellation, receipt updates, step execution, and continuation. It applies scheduler decisions and checkpoints them. The scheduler cannot dispatch operations or authorize effects. This extraction is in place and is covered by scheduler tests plus the existing workflow tests.
 
 ## Stage 2 — TestRunner orchestration
+
+The first collaborator extraction is in place: `src/testing/telemetry/runDecisionRecorder.js` owns the workflow runner's episode lifecycle, policy/review event hooks, durable operation reservations, dispatch receipts, and verification linkage. `TestRunner` retains run and workflow ownership and delegates telemetry construction. The recorder does not authorize or dispatch effects. The existing declarative lifecycle suite verifies the extraction against the same Jev review, operation ledger, uncertainty, and verification contracts.
 
 Target boundaries:
 
