@@ -19,8 +19,7 @@ export function resolveChromeWindowPosition({ env = process.env, position } = {}
     return parseChromeWindowPosition(explicitPosition);
   }
 
-  const display = env.ACTIVETAB_CHROME_DISPLAY;
-  if (display === undefined || display === "") return null;
+  const display = env.ACTIVETAB_CHROME_DISPLAY || "secondary";
   if (display === "main") return parseChromeWindowPosition(env.ACTIVETAB_CHROME_MAIN_POSITION ?? "0,0");
   if (display === "secondary") return parseChromeWindowPosition(env.ACTIVETAB_CHROME_SECONDARY_POSITION ?? "1440,0");
   throw new Error("ACTIVETAB_CHROME_DISPLAY must be 'main' or 'secondary'.");

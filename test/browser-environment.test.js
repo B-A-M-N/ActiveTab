@@ -75,6 +75,7 @@ test("Chrome window position accepts desktop coordinates and rejects malformed v
 });
 
 test("Chrome display selection resolves main, secondary, overrides, and launch flags", () => {
+  assert.deepEqual(resolveChromeWindowPosition({ env: {} }), { x: 1440, y: 0 });
   assert.deepEqual(resolveChromeWindowPosition({ env: { ACTIVETAB_CHROME_DISPLAY: "main" } }), { x: 0, y: 0 });
   assert.deepEqual(resolveChromeWindowPosition({ env: { ACTIVETAB_CHROME_DISPLAY: "secondary" } }), { x: 1440, y: 0 });
   assert.deepEqual(resolveChromeWindowPosition({ env: {

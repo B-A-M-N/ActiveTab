@@ -66,13 +66,13 @@ For an existing Chrome profile, first enable Remote Debugging at `chrome://inspe
 
 The integration tests launch isolated Chrome processes with temporary profiles and loopback fixtures, including direct CDP and nested OOPIF cases. They do not use a user's normal browser profile and do not contact BrowserAct SaaS. Chrome integration tests launch headed by default; `ACTIVETAB_HEADLESS=1` adds Chrome's `--headless=new` flag to disposable test launches. The visible extension integration test additionally requires `ACTIVETAB_VISIBLE_CHROME=1` and skips when headless mode is selected.
 
-To run the full suite in **visible Chrome windows** (not headless), use:
+Headed browser tests use the secondary `HDMI-1` display by default. To run the full suite in **visible Chrome windows** (not headless), use:
 
 ```sh
 npm run test:headed
 ```
 
-This starts a virtual X display (Xvfb) so that Chrome renders into a real X server (not headless mode). The latest verified run on Chrome 150.0.7871.114 passed **221 tests, 220 passed, 0 failed, 1 skipped**.
+This uses the current desktop and positions newly launched ActiveTab Chrome windows on `HDMI-1`. Owned Chrome launches and `npm test` use the same secondary-screen default. Set `ACTIVETAB_CHROME_DISPLAY=main` or run `npm run test:on-main` to switch browser launches and tests to the primary `eDP-1` display. `npm run test:headed -- --xvfb` explicitly uses a virtual X display and is not visible on either physical screen. See [docs/testing-display.md](docs/testing-display.md) for the current monitor map, coordinates, and overrides.
 
 For headed Chrome with a visible desktop display, use:
 
