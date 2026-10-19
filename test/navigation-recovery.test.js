@@ -125,7 +125,7 @@ test("BrowserSession uploadFile dispatches only a specifically staged one-use gr
   try {
   const sourcePath = join(directory, "test-file-a.txt");
   await writeFile(sourcePath, "approved local fixture");
-  const grants = new FileUploadGrantStore({ stagingDirectory: join(directory, "staged"), trustedIssuer: "unit-test-operator" });
+  const grants = new FileUploadGrantStore({ stagingDirectory: join(directory, "staged"), allowedRoots: [directory], trustedIssuer: "unit-test-operator" });
   const cdpCalls = [];
   const session = new BrowserSession({
     id: "t1", url: "http://fixture.local/",

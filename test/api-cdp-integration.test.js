@@ -21,6 +21,7 @@ import { TaskJournal } from "../src/state/journal.js";
 import { createApiServer } from "../src/api/local-server.js";
 import { generateOutputFiles } from "../src/api/output-files.js";
 import { acquireBrowserTargetLease } from "../src/testing/runState.js";
+import { chromeWindowPositionArgs } from "../src/browser/chromeWindowPlacement.js";
 
 const chromePath = process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
 const fixture = await readFile(new URL("./fixtures/navigation.html", import.meta.url));
@@ -43,6 +44,7 @@ function createRealRunner({ journalDir, outputDir }) {
       // Always start at about:blank so the engine can navigate to the target URL
       const chrome = spawn(chromePath, [
         ...(process.env.ACTIVETAB_HEADLESS === "1" ? ["--headless=new"] : []),
+        ...chromeWindowPositionArgs(),
       "--no-sandbox", "--disable-dev-shm-usage",
         "--no-first-run", "--no-default-browser-check",
         `--remote-debugging-port=${port}`,

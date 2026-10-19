@@ -29,6 +29,7 @@ import { DiagnosticCorrelator } from "../src/diagnostics/correlator.js";
 import { InvestigationEngine } from "../src/investigation/engine.js";
 import { FINDING_LEVEL, INVESTIGATION_STATUS } from "../src/diagnostics/report.js";
 import { RunStateStore, withTargetExecutionLease } from "../src/testing/runState.js";
+import { chromeWindowPositionArgs } from "../src/browser/chromeWindowPlacement.js";
 
 const chromePath = process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
 const fixture = await readFile(new URL("./fixtures/navigation.html", import.meta.url));
@@ -94,6 +95,7 @@ test("E2E vertical: attach → discover → test → collect → investigate →
     await runStateStore.init();
     chrome = spawn(chromePath, [
       ...(process.env.ACTIVETAB_HEADLESS === "1" ? ["--headless=new"] : []),
+      ...chromeWindowPositionArgs(),
       "--no-sandbox", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check",
       "--remote-debugging-port=0", `--user-data-dir=${profileDir}`, siteUrl
     ], { stdio: ["ignore", "ignore", "pipe"], detached: true });

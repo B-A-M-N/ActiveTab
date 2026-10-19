@@ -1,4 +1,4 @@
-import { normalizeFieldValue } from "./extractionContract.js";
+import { fieldResolutionState, normalizeFieldValue } from "./extractionContract.js";
 import { descendantNodeIndexes, documentIndexFor } from "../observe/documentIndex.js";
 
 const MAX_GROUP_ITEMS = 10_000;
@@ -159,14 +159,16 @@ export function resolveVisibleRecordGroupRecords(snapshot, contract, { index: su
         .filter(node => fieldSourceMatches(node, group.index, field));
       const raw = matches.length === 1 ? textUnder(group.index, matches[0]) : "";
       const normalized = normalizeFieldValue(raw, field);
-      if (!normalized.valid) valid = false;
+      const resolutionState = fieldResolutionState(raw, normalized, matches.length);
+      if (!normalized.valid || resolutionState === "ambiguous" || resolutionState === "unavailable") valid = false;
       values[field.name] = normalized.value;
       fieldEvidence[field.name] = {
         sourceKey: field.sourceKey,
         sourceTagName: field.sourceTagName,
         rowIndex,
         method: "visible_record_group_text",
-        validation: normalized.valid ? "valid" : "invalid"
+        validation: normalized.valid && resolutionState !== "ambiguous" && resolutionState !== "unavailable" ? "valid" : "invalid",
+        resolutionState
       };
     }
     records.push({ values, fieldEvidence, valid, rowIndex });

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { executeAuthorizedAction } from "../src/runtime/authorizedExecutor.js";
@@ -25,7 +25,7 @@ const scope = Object.freeze({
 test("file upload grants stage exact bytes and bind principal, target, operation, app, and expiry", async () => withDirectory(async directory => {
   const sourcePath = join(directory, "report.txt");
   await writeFile(sourcePath, "approved bytes");
-  const store = new FileUploadGrantStore({ stagingDirectory: join(directory, "stage"), trustedIssuer: "operator-authenticator" });
+  const store = new FileUploadGrantStore({ stagingDirectory: join(directory, "stage"), allowedRoots: [directory], trustedIssuer: "operator-authenticator" });
   const issued = await store.issue({ ...scope, filePath: sourcePath });
   assert.deepEqual(Object.keys(issued).sort(), ["approvalRef", "expiresAt", "grantId", "operationId", "targetId"].sort());
   assert.equal(JSON.stringify(issued).includes(sourcePath), false);
@@ -47,7 +47,7 @@ test("file upload grant refuses modified or replaced source files and symlinks",
   const replacementPath = join(directory, "replacement.txt");
   await writeFile(sourcePath, "approved bytes");
   await writeFile(replacementPath, "replacement bytes");
-  const store = new FileUploadGrantStore({ stagingDirectory: join(directory, "stage"), trustedIssuer: "operator-authenticator" });
+  const store = new FileUploadGrantStore({ stagingDirectory: join(directory, "stage"), allowedRoots: [directory], trustedIssuer: "operator-authenticator" });
   const issued = await store.issue({ ...scope, filePath: sourcePath });
   await writeFile(sourcePath, "changed bytes");
   assert.equal((await store.verify(issued.grantId, scope)).reasonCode, "upload_source_changed");
@@ -61,6 +61,24 @@ test("file upload grant refuses modified or replaced source files and symlinks",
   assert.equal((await store.verify(second.grantId, scope)).reasonCode, "upload_source_unavailable");
 
   await assert.rejects(() => store.issue({ ...scope, filePath: secondPath }), /regular file|symbolic link/u);
+}));
+
+test("file upload grants require a configured source root and reject paths outside its boundary", async () => withDirectory(async directory => {
+  const allowed = join(directory, "allowed");
+  const outside = join(directory, "outside");
+  await Promise.all([mkdir(allowed), mkdir(outside)]);
+  const insidePath = join(allowed, "inside.txt");
+  const outsidePath = join(outside, "outside.txt");
+  await writeFile(insidePath, "allowed");
+  await writeFile(outsidePath, "outside");
+  const disabled = new FileUploadGrantStore({ stagingDirectory: join(directory, "disabled-stage"), trustedIssuer: "operator-authenticator" });
+  await assert.rejects(() => disabled.issue({ ...scope, filePath: insidePath }), /disabled until an operator configures/u);
+
+  const store = new FileUploadGrantStore({ stagingDirectory: join(directory, "stage"), allowedRoots: [allowed], trustedIssuer: "operator-authenticator" });
+  await assert.rejects(() => store.issue({ ...scope, filePath: outsidePath }), /outside the configured source directories/u);
+  await assert.rejects(() => store.issue({ ...scope, filePath: join(allowed, "..", "outside", "outside.txt") }), /outside the configured source directories/u);
+  const issued = await store.issue({ ...scope, filePath: insidePath });
+  assert.equal((await store.verify(issued.grantId, scope)).ok, true);
 }));
 
 function makeEnvironment() {
@@ -119,7 +137,7 @@ test("authorized upload refuses missing grants before reservation or CDP dispatc
 test("authorized upload uses only approved staged bytes and rechecks scope immediately before dispatch", async () => withDirectory(async directory => {
   const sourcePath = join(directory, "report.txt");
   await writeFile(sourcePath, "approved bytes");
-  const grants = new FileUploadGrantStore({ stagingDirectory: join(directory, "stage"), trustedIssuer: "operator-authenticator" });
+  const grants = new FileUploadGrantStore({ stagingDirectory: join(directory, "stage"), allowedRoots: [directory], trustedIssuer: "operator-authenticator" });
   const issued = await grants.issue({ ...scope, filePath: sourcePath });
   const uploads = [];
   const session = makeSession(fileCandidate, uploads);

@@ -1,4 +1,4 @@
-import { normalizeFieldValue, normalizeHeader } from "./extractionContract.js";
+import { fieldResolutionState, normalizeFieldValue, normalizeHeader } from "./extractionContract.js";
 import { descendantNodeIndexes, documentIndexFor } from "../observe/documentIndex.js";
 
 function stringAt(strings, index) {
@@ -346,7 +346,16 @@ export function resolveVisibleTableRecords(snapshot, contract, { index: supplied
     return { status: matches.length === 0 ? "not_found" : "ambiguous", tableCount: matches.length, records: [], evidence: [] };
   }
   const table = matches[0];
-  const columnByHeader = new Map(table.headers.map((header, index) => [normalizeHeader(header), index]));
+  const columnsByHeader = new Map();
+  table.headers.forEach((header, index) => {
+    const key = normalizeHeader(header);
+    const columns = columnsByHeader.get(key) ?? [];
+    columns.push(index);
+    columnsByHeader.set(key, columns);
+  });
+  if (expectedHeaders.some(header => columnsByHeader.get(header)?.length !== 1)) {
+    return { status: "ambiguous", tableCount: matches.length, records: [], evidence: [], reasonCode: "duplicate_source_header" };
+  }
   const records = [];
   const recordLimit = contract.maxRecords + 1;
   for (let rowIndex = 0; rowIndex < table.rows.length && rowIndex < recordLimit; rowIndex++) {
@@ -355,11 +364,18 @@ export function resolveVisibleTableRecords(snapshot, contract, { index: supplied
     const fieldEvidence = {};
     let valid = true;
     for (const field of contract.fields) {
-      const column = columnByHeader.get(normalizeHeader(field.sourceHeader));
-      const normalized = normalizeFieldValue(row.values[column], field);
+      const columns = columnsByHeader.get(normalizeHeader(field.sourceHeader)) ?? [];
+      const raw = columns.length === 1 ? row.values[columns[0]] : "";
+      const normalized = normalizeFieldValue(raw, field);
+      const resolutionState = fieldResolutionState(raw, normalized, columns.length);
       if (!normalized.valid) valid = false;
       values[field.name] = normalized.value;
-      fieldEvidence[field.name] = { sourceHeader: field.sourceHeader, rowIndex, validation: normalized.valid ? "valid" : "invalid" };
+      fieldEvidence[field.name] = {
+        sourceHeader: field.sourceHeader,
+        rowIndex,
+        validation: normalized.valid ? "valid" : "invalid",
+        resolutionState
+      };
     }
     records.push({ values, fieldEvidence, valid, rowIndex });
   }

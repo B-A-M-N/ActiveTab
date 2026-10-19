@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { compileSemanticPageModel, rankInteractionCandidates } from "../src/observe/semanticPageCompiler.js";
 import { buildDocumentIndex } from "../src/observe/documentIndex.js";
+import { resolveSemanticQuery } from "../src/navigation/semanticAnalyzer.js";
 
 function buildCatalogEvidence() {
   const strings = [];
@@ -102,7 +103,7 @@ function buildCatalogEvidence() {
   };
 }
 
-function buildMicrodataCatalogEvidence({ duplicatePrice = false, sharedItemClass = false } = {}) {
+function buildMicrodataCatalogEvidence({ duplicatePrice = false, sharedItemClass = false, classless = false } = {}) {
   const strings = [];
   const stringIds = new Map();
   const stringIndex = value => {
@@ -135,20 +136,27 @@ function buildMicrodataCatalogEvidence({ duplicatePrice = false, sharedItemClass
     ["rtx", "RTX A4000", "$450"],
     ["radeon", "Radeon Pro W6600", "$300"]
   ]) {
-    const product = add("LI", list.index, {
+    const productAttributes = {
       itemscope: "",
-      itemtype: "https://schema.org/Product",
-      class: sharedItemClass ? "product-card" : `random-${slug}`
-    });
-    const title = add("H2", product.index, { itemprop: "name", class: sharedItemClass ? "product-title" : `c-${slug}-a` });
+      itemtype: "https://schema.org/Product"
+    };
+    if (!classless) productAttributes.class = sharedItemClass ? "product-card" : `random-${slug}`;
+    const product = add("LI", list.index, productAttributes);
+    const titleAttributes = { itemprop: "name" };
+    if (!classless) titleAttributes.class = sharedItemClass ? "product-title" : `c-${slug}-a`;
+    const title = add("H2", product.index, titleAttributes);
     add("#text", title.index, {}, name);
-    const cost = add("SPAN", product.index, { itemprop: "price", class: sharedItemClass ? "product-price" : `c-${slug}-b` });
+    const priceAttributes = { itemprop: "price" };
+    if (!classless) priceAttributes.class = sharedItemClass ? "product-price" : `c-${slug}-b`;
+    const cost = add("SPAN", product.index, priceAttributes);
     add("#text", cost.index, {}, price);
     if (duplicatePrice && slug === "rtx") {
       const alternate = add("SPAN", product.index, { itemprop: "price", class: "c-rtx-c" });
       add("#text", alternate.index, {}, "$499");
     }
-    const details = add("A", product.index, { href: `/products/${slug}`, itemprop: "url", class: sharedItemClass ? "product-details" : `c-${slug}-d` });
+    const detailsAttributes = { href: `/products/${slug}`, itemprop: "url" };
+    if (!classless) detailsAttributes.class = sharedItemClass ? "product-details" : `c-${slug}-d`;
+    const details = add("A", product.index, detailsAttributes);
     add("#text", details.index, {}, "Details");
     candidates.push({
       identity: `candidate:${slug}:details`,
@@ -181,6 +189,33 @@ function buildMicrodataCatalogEvidence({ duplicatePrice = false, sharedItemClass
     }]
   };
   return { snapshot, candidates };
+}
+
+function appendJsonLdScript(snapshot, value) {
+  const strings = snapshot.strings;
+  const ids = new Map(strings.map((item, index) => [item, index]));
+  const intern = item => {
+    const text = String(item);
+    if (!ids.has(text)) { ids.set(text, strings.length); strings.push(text); }
+    return ids.get(text);
+  };
+  const nodes = snapshot.documents[0].nodes;
+  const scriptIndex = nodes.nodeName.length;
+  const parent = nodes.nodeName.findIndex(index => strings[index] === "#document");
+  const maxBackendId = Math.max(...nodes.backendNodeId.filter(Number.isInteger));
+  nodes.nodeName.push(intern("SCRIPT"));
+  nodes.nodeValue.push(-1);
+  nodes.textValue.push(-1);
+  nodes.parentIndex.push(parent);
+  nodes.attributes.push([intern("type"), intern("application/ld+json")]);
+  nodes.backendNodeId.push(maxBackendId + 1);
+  const text = JSON.stringify(value);
+  nodes.nodeName.push(intern("#text"));
+  nodes.nodeValue.push(intern(text));
+  nodes.textValue.push(intern(text));
+  nodes.parentIndex.push(scriptIndex);
+  nodes.attributes.push([]);
+  nodes.backendNodeId.push(maxBackendId + 2);
 }
 
 function buildTableEvidence() {
@@ -595,6 +630,31 @@ test("structured microdata binds product fields and details controls without rel
   }
 });
 
+test("classless microdata records resolve through the local semantic query path", () => {
+  const fixture = buildMicrodataCatalogEvidence({ classless: true });
+  const page = compileSemanticPageModel({
+    observationId: "observation-classless-query",
+    targetId: "target",
+    documentGeneration: 9,
+    page: { url: "https://catalog.example/products", title: "Products" },
+    domSnapshot: fixture.snapshot,
+    candidates: fixture.candidates
+  });
+  const policyInputs = [];
+  const result = resolveSemanticQuery(page, "{ products[] { name price } }", {
+    authorizeField: field => { policyInputs.push(field); return field.origin === "https://catalog.example"; },
+    authorizeRelease: field => field.origin === "https://catalog.example"
+  });
+  assert.equal(result.status, "available");
+  assert.equal(result.completeness, "observed_partial");
+  assert.deepEqual(result.records.map(record => record.values), [
+    { name: "RTX A4000", price: "$450" },
+    { name: "Radeon Pro W6600", price: "$300" }
+  ]);
+  assert.equal(result.records[0].provenance.name.resolutionState, "observed");
+  assert.equal(policyInputs.length, 2);
+});
+
 test("duplicate structured item properties remain unknown instead of selecting an arbitrary value", () => {
   const fixture = buildMicrodataCatalogEvidence({ duplicatePrice: true });
   const page = compileSemanticPageModel({
@@ -612,6 +672,36 @@ test("duplicate structured item properties remain unknown instead of selecting a
   assert.equal(price.status, "unknown");
   assert.equal(price.evidenceRef, null);
   assert.equal(products.fields.find(field => field.name === "price").status, "unknown");
+});
+
+test("bounded JSON-LD is retained only as metadata hints and never overrides visible collection values", () => {
+  const fixture = buildCatalogEvidence();
+  appendJsonLdScript(fixture.snapshot, {
+    "@context": "https://schema.org",
+    "@graph": [{
+      "@type": "Product",
+      name: "Conflicting Widget A",
+      sku: "widget-a",
+      offers: { price: "999.00", priceCurrency: "USD" }
+    }]
+  });
+  const page = compileSemanticPageModel({
+    observationId: "observation-jsonld",
+    targetId: "target",
+    documentGeneration: 8,
+    page: { url: "https://catalog.example/products", title: "Catalog" },
+    domSnapshot: fixture.snapshot,
+    candidates: fixture.candidates
+  });
+  assert.equal(page.structuredData.status, "available");
+  const product = page.structuredData.hints.find(hint => hint.types.includes("Product"));
+  assert.equal(product.status, "metadata_only");
+  assert.ok(product.properties.some(field => field.path === "offers.price" && field.value === "999.00"));
+  assert.equal(typeof product.scriptRef, "string");
+  const visibleValues = page.collections.flatMap(collection => collection.items ?? [])
+    .flatMap(item => item.fields.map(field => field.value));
+  assert.ok(visibleValues.includes("Widget A"));
+  assert.equal(visibleValues.includes("Conflicting Widget A"), false);
 });
 
 test("explicit microdata replaces a duplicate class-derived collection for the same records", () => {

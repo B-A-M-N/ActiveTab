@@ -9,6 +9,7 @@ import { once } from "node:events";
 import { connectChromeAuto, listChromeTargets, resolveChromeTarget } from "../src/browser/chrome-autoconnect.js";
 import { BrowserSession } from "../src/browser/session.js";
 import { FixtureNavigationEngine as NavigationEngine } from "../test-support/fixtureNavigationEngine.js";
+import { chromeWindowPositionArgs } from "../src/browser/chromeWindowPlacement.js";
 
 const chromePath = process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
 
@@ -47,6 +48,7 @@ test("native CDP recursively attaches, observes, and controls nested out-of-proc
     profileDir = await mkdtemp(join(tmpdir(), "activetab-oopif-profile-"));
     chrome = spawn(chromePath, [
       ...(process.env.ACTIVETAB_HEADLESS === "1" ? ["--headless=new"] : []),
+      ...chromeWindowPositionArgs(),
       "--no-sandbox", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check", "--site-per-process",
       "--remote-debugging-port=0", `--user-data-dir=${profileDir}`, `http://127.0.0.1:${parentPort}/`
     ], { stdio: ["ignore", "ignore", "pipe"] });

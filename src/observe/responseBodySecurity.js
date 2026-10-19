@@ -1,6 +1,7 @@
 /** Credential discovery, safe metadata, and redaction for selected bodies. */
 import { REDACTED, SENSITIVE_URL_KEY, safeJsonWrite, lineCount, valueType, isSensitiveField, jsonPathKey, extractBalancedValue } from "./responseBodyShared.js";
 export const MAX_CREDENTIAL_DETAILS = 256;
+const CREDENTIAL_TEXT_HINT = /pass(word)?|secret|token|api.?key|credential|authorization|cookie|session|private.?key|client.?secret|csrf|xsrf|(?:^|[^A-Za-z])auth(?:entication)?(?:[^A-Za-z]|$)|\b(?:Bearer|Basic)\s|-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:eyJ|AKIA|github_pat|glpat|xox[baprs]|AIza|sk-|rk-|gh[pousr]_)/i;
 export function credentialKind(key = "") {
   const name = String(key).toLocaleLowerCase().replaceAll("-", "_");
   if (/pass(word|wd|phrase)?/.test(name)) return "password";
@@ -100,8 +101,8 @@ export function credentialDetailsFor(text, parsedValue) {
       }
     }
     detailsMayBeIncomplete = details.length >= MAX_CREDENTIAL_DETAILS && stack.length > 0;
-  } else {
-    const assignment = /(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|([A-Za-z_$][\w$.-]*))\s*[:=]\s*(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([^\s,;&}\]]+))/g;
+  } else if (CREDENTIAL_TEXT_HINT.test(text)) {
+    const assignment = /(?:"((?:\\.|[^"\\]){1,160})"|'((?:\\.|[^'\\]){1,160})'|([A-Za-z_$][\w$.-]{0,159}))\s*[:=]\s*(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([^\s,;&}\]]+))/g;
     let match;
     while ((match = assignment.exec(text)) && details.length < MAX_CREDENTIAL_DETAILS) {
       const key = match[1] ?? match[2] ?? match[3];
@@ -181,7 +182,8 @@ export function credentialDetailsFor(text, parsedValue) {
 }
 
 export function redactSensitiveContainers(source) {
-  const keyAndSeparator = /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[A-Za-z_$][\w$.-]*)\s*[:=]\s*/g;
+  if (!CREDENTIAL_TEXT_HINT.test(source) || !/[:=]/u.test(source) || !/[{[]/u.test(source)) return { text: source, count: 0 };
+  const keyAndSeparator = /("(?:\\.|[^"\\]){1,160}"|'(?:\\.|[^'\\]){1,160}'|[A-Za-z_$][\w$.-]{0,159})\s*[:=]\s*/g;
   let result = "";
   let cursor = 0;
   let count = 0;
@@ -203,6 +205,7 @@ export function redactSensitiveContainers(source) {
 }
 
 export function redactText(value) {
+  if (!CREDENTIAL_TEXT_HINT.test(value)) return { text: value, count: 0 };
   const containers = redactSensitiveContainers(value);
   let text = containers.text;
   let count = containers.count;
@@ -216,7 +219,7 @@ export function redactText(value) {
 
   replace(/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]");
   replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, (_match, scheme) => `${scheme} ${REDACTED}`);
-  replace(/(?:(["'])([A-Za-z_$][\w$.-]*)\1|([A-Za-z_$][\w$.-]*))(\s*[:=]\s*)(?:(Bearer|Basic)\s+(?:[A-Za-z0-9._~+/=-]+|\[REDACTED\])|(\[REDACTED\])|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;&}\]]+))/gi, (_match, keyQuote, quotedKey, bareKey, separator, authValue, markedValue, quotedValue) => {
+  replace(/(?:(["'])([A-Za-z_$][\w$.-]{0,159})\1|([A-Za-z_$][\w$.-]{0,159}))(\s*[:=]\s*)(?:(Bearer|Basic)\s+(?:[A-Za-z0-9._~+/=-]+|\[REDACTED\])|(\[REDACTED\])|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;&}\]]+))/gi, (_match, keyQuote, quotedKey, bareKey, separator, authValue, markedValue, quotedValue) => {
     const key = quotedKey ?? bareKey;
     if (!isSensitiveField(key, authValue ?? markedValue ?? quotedValue ?? "")) return _match;
     if (markedValue || authValue?.endsWith(REDACTED)) return _match;

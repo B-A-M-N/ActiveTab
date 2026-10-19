@@ -13,6 +13,7 @@ import { DeterministicPlanner } from "../src/navigation/planner.js";
 import { TaskJournal } from "../src/state/journal.js";
 import { WorkflowStore } from "../src/state/workflows.js";
 import { startBenchmarkSites } from "./fixtures/benchmark-sites.js";
+import { chromeWindowPositionArgs } from "../src/browser/chromeWindowPlacement.js";
 
 const chromePath = process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
 const projectRoot = new URL("../", import.meta.url).pathname;
@@ -306,6 +307,7 @@ test("visible extension attaches, observes, navigates, and recovers its disposab
     broker = await new ExtensionBroker({ socketPath: join(stateDir, "extension-broker.sock"), requestTimeoutMs: 20_000 }).start();
     const displayEnv = { ...process.env, ACTIVETAB_STATE_DIR: stateDir };
     chrome = spawn(chromePath, [
+      ...chromeWindowPositionArgs({ env: displayEnv }),
       "--no-sandbox", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check", "--disable-background-networking", "--disable-default-apps",
       "--remote-debugging-pipe", "--enable-unsafe-extension-debugging", "--site-per-process", `--user-data-dir=${profileDir}`,
       siteUrl
@@ -827,6 +829,7 @@ test("visible extension attaches, observes, navigates, and recovers its disposab
     previousClient.close();
 
     chrome = spawn(chromePath, [
+      ...chromeWindowPositionArgs({ env: displayEnv }),
       "--no-sandbox", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check", "--disable-background-networking", "--disable-default-apps",
       "--remote-debugging-pipe", "--enable-unsafe-extension-debugging", "--site-per-process", `--user-data-dir=${profileDir}`,
       siteUrl

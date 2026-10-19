@@ -127,3 +127,20 @@ The GLM client request ID `53c2113c-ca2e-4868-9950-0191b15bba15` correlates to l
 On 2026-10-19, headed owned Chrome opened the live Wikipedia United Nations population table. ActiveTab's ordinary `NavigationEngine` auto path matched the caller's `country names` and `2023 population` request to the observed table, compiled canonical `country` and `population` fields, and ran one local extraction step. It made zero synthesis calls and dispatched zero browser actions after page load. The exact observed source headers remained in the per-field policy and provenance metadata.
 
 The result contained 100 rows and was marked `observed_partial`; it made no full-collection claim and did not paginate. The first rows were World (`8,091,734,930`), India (`1,438,069,596`), and China (`1,422,584,933`). Browser shutdown and disposable-profile removal both verified. This run demonstrates a real-site deterministic read through the normal engine without using a hosted fixture or calling either inference model. It does not independently validate every returned row or establish general performance on arbitrary pages.
+
+## HDMI-1 observation rerun and display verification
+
+On 2026-10-19, the fixed four-site observation benchmark ran in headed owned Chrome on `HDMI-1`. The display map is `eDP-1` main at physical `(0,0)`, `2880×1620`; `HDMI-1` secondary at physical `(2880,0)`, `2560×1440`. Chrome's device scale factor was `2`; final CDP bounds were `(1440,0)` device-independent pixels and `window.screenX * devicePixelRatio` equaled physical x=`2880`. The run made zero model calls and zero browser actions.
+
+The table combines successful per-site results from two benchmark runs: the later rerun timed out only on the Open Library navigation, so its successful sample is from the immediately preceding HDMI-1 run.
+
+| Site | Observed candidates | Task scope | Scope | Page type | Capture | Evidence |
+|---|---:|---:|---|---|---:|---:|
+| Open Library search | 362 | 250 / 250 | complete | repeated content | 1,215 ms | 1,835,564 B |
+| NASA News | 308 | 89 / 89 | complete | repeated content | 1,528 ms | 859,214 B |
+| MDN form reference | 541 | 137 / 137 | complete | article | 2,377 ms | 1,202,667 B |
+| Wikipedia neural-network article | 280 | 74 / 74 | complete | article | 1,025 ms | 1,450,776 B |
+
+The requested Open Library query redirected to `https://openlibrary.org/search` with the query removed; the page showed a 20-book microdata collection. This does not reproduce the prior 578-candidate `computer vision` task scope, and the current 250/250 scope does not prove a same-page improvement. A second identical capture later timed out during `Page.navigate` on Open Library; it dispatched no action and the disposable browser was cleaned up. NASA, MDN, and Wikipedia were observed in that second capture as well.
+
+These were observation-only runs. They do not qualify search navigation, form submission, frame interaction, virtualized scrolling, extraction correctness, or independent application outcomes. The earlier Wikipedia table read above is a separate real-site extraction, returned `observed_partial`, and did not paginate. The sample still lacks a public-site qualification for a frame-heavy workflow and a practical infinite/virtualized collection.

@@ -16,6 +16,7 @@ import { TaskJournal } from "../src/state/journal.js";
 import { CapabilityService } from "../src/capabilities/capabilityService.js";
 import { runApiShapeFixtureQualification } from "../test-lab/fixtures/api-shape-twin/oracle.js";
 import { jpegDimensions, isJevImageSizeSupported } from "../src/decisions/imagePreparation.js";
+import { chromeWindowPositionArgs, resolveChromeWindowPosition } from "../src/browser/chromeWindowPlacement.js";
 
 const fixtureLease = async () => {};
 
@@ -91,6 +92,7 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     journalDir = await mkdtemp(join(tmpdir(), "activetab-state-"));
     chrome = spawn(chromePath, [
       ...(process.env.ACTIVETAB_HEADLESS === "1" ? ["--headless=new"] : []),
+      ...chromeWindowPositionArgs(),
       "--no-sandbox", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check",
       "--remote-debugging-port=0", `--user-data-dir=${profileDir}`,
       `http://127.0.0.1:${sitePort}/`
@@ -152,6 +154,18 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     assert.ok(browserTargets.some(item => item.id === fixtureTarget.id), "browser-level CDP enumerates the same authorized Chrome page");
     const authorizedTarget = await resolveChromeTarget(chromeConnection, fixtureTarget.id, fixtureTarget.id);
     session = await new BrowserSession(authorizedTarget).attach();
+    const requestedWindowPosition = resolveChromeWindowPosition();
+    if (requestedWindowPosition && process.env.ACTIVETAB_HEADLESS !== "1") {
+      const window = await chromeConnection.client.send("Browser.getWindowForTarget", { targetId: fixtureTarget.id });
+      assert.equal(window.bounds.left, requestedWindowPosition.x);
+      assert.equal(window.bounds.top, requestedWindowPosition.y);
+      const viewport = await session.client.send("Runtime.evaluate", {
+        expression: "({screenX,screenY,devicePixelRatio})", returnByValue: true
+      });
+      assert.equal(viewport.result.value.screenX, requestedWindowPosition.x);
+      assert.equal(viewport.result.value.screenY, requestedWindowPosition.y);
+      t.diagnostic(`Direct CDP test browser placed at ${window.bounds.left},${window.bounds.top}; device scale ${viewport.result.value.devicePixelRatio}`);
+    }
     fixtureButtonAuthorizer = {
       operationId: "test.local_fixture_button",
       authorize({ action, candidate, observation }) {

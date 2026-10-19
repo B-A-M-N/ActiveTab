@@ -66,6 +66,7 @@ node --test test/targets.test.js test/approvals.test.js test/authorized-executor
 | `src/integrations/` | Application-specific workflow adapters over generic ActiveTab execution |
 | `src/capabilities/` | Capability discovery, compilation, qualification, registry, and invocation contracts |
 | `src/extraction/` | Typed record extraction, collection, provenance, verification, and release policy |
+| `src/query/` | Bounded local semantic data queries and non-authorizing target lookup |
 | `src/state/` | Bounded task journals, resumable workflow state, and separately released local result artifacts |
 | `src/observe/` | Retained browser evidence, semantic page compilation, content-aware network response inspection, credential redaction, and Markdown diagnostic views |
 | `src/environments/` | Profile-built environment bindings and exact observed application/realm resolution |

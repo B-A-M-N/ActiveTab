@@ -3,6 +3,9 @@ import { OpenAICompatibleProvider } from "./modelProvider.js";
 import { isBoundVisualEvidence, visualEvidenceProjection } from "./visualEvidence.js";
 import { isLowercaseCode, normalizeObservedRole, normalizeObservedTag } from "../telemetry/privacy.js";
 
+export { parseSemanticQuery } from "../query/queryParser.js";
+export { resolveSemanticQuery } from "../query/queryResolver.js";
+
 export const DEFAULT_SEMANTIC_MODEL = "glm-5.3-flash";
 export const DEFAULT_SEMANTIC_MAX_TOKENS = 2048;
 export const SEMANTIC_RUBRIC_VERSION = "2";

@@ -36,10 +36,14 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
-import { listTargets, resolveAuthorizedTarget } from "./targets.js";
+import { listTargets, resolveAuthorizedTarget, resolveOwnedBlankTarget } from "./targets.js";
 import { BrowserSession } from "./session.js";
 import { CdpClient } from "../cdp/client.js";
 import { readChromeDebugEndpoint } from "./chrome-autoconnect.js";
+import { createBrowserEnvironmentProfile, initializeOwnedBrowserEnvironment } from "./browserEnvironment.js";
+import { resolveChromeWindowPosition } from "./chromeWindowPlacement.js";
+
+export { parseChromeWindowPosition } from "./chromeWindowPlacement.js";
 
 export async function chromeProfileLockPresent(profileDir) {
   try {
@@ -121,6 +125,20 @@ function findChromeBinary(env = process.env) {
   return null;
 }
 
+async function applyOwnedWindowPosition(client, targetId, position) {
+  const current = await client.send("Browser.getWindowForTarget", { targetId });
+  if (!Number.isInteger(current.windowId)) throw new Error("Chrome did not expose the owned window ID for display placement.");
+  await client.send("Browser.setWindowBounds", {
+    windowId: current.windowId,
+    bounds: { left: position.x, top: position.y, windowState: "normal" }
+  });
+  const moved = await client.send("Browser.getWindowForTarget", { targetId });
+  if (moved.bounds?.left !== position.x || moved.bounds?.top !== position.y) {
+    throw new Error("Chrome did not place the owned window at the requested desktop coordinates.");
+  }
+  return moved.bounds;
+}
+
 async function waitForAssignedPort(profileDir, timeoutMs, chromeProcess, signal) {
   const portFile = join(profileDir, "DevToolsActivePort");
   const deadline = Date.now() + timeoutMs;
@@ -166,6 +184,8 @@ async function waitForAssignedPort(profileDir, timeoutMs, chromeProcess, signal)
  * @param {boolean} [options.keepBrowserOpen=false] - Detach after startup while preserving the explicit profile and Chrome process.
  * @param {string|null} [options.attachExistingTargetId=null] - Explicit exact page target to reattach without navigation.
  * @param {string[]} [options.allowedExistingOrigins=[]] - Exact origins authorized for an existing target.
+ * @param {object} [options.environmentProfile] - Explicit compatibility settings for a new owned target only.
+ * @param {string} [options.windowPosition] - Explicit Chrome desktop coordinates; otherwise uses the display environment settings.
  */
 export async function launchOwnedChrome({
   initialUrl,
@@ -177,7 +197,9 @@ export async function launchOwnedChrome({
   reuseExisting = false,
   keepBrowserOpen = false,
   attachExistingTargetId = null,
-  allowedExistingOrigins = []
+  allowedExistingOrigins = [],
+  environmentProfile: requestedEnvironmentProfile = {},
+  windowPosition: requestedWindowPosition
 } = {}) {
   if (typeof initialUrl !== "string" || !initialUrl) {
     throw new Error("launchOwnedChrome requires an initialUrl (the validated application entry, not a diagnostic endpoint).");
@@ -202,6 +224,13 @@ export async function launchOwnedChrome({
   }
   if (attachExistingTargetId !== null && (typeof attachExistingTargetId !== "string" || !attachExistingTargetId.trim())) {
     throw new Error("attachExistingTargetId must be a non-empty exact page target ID.");
+  }
+  const environmentProfile = createBrowserEnvironmentProfile(requestedEnvironmentProfile);
+  const windowPosition = resolveChromeWindowPosition({ position: requestedWindowPosition });
+  const environmentConfigured = Boolean(environmentProfile.locale || environmentProfile.timeZone
+    || environmentProfile.viewport || environmentProfile.geolocation);
+  if (environmentConfigured && (reuseExisting || attachExistingTargetId !== null || keepBrowserOpen)) {
+    throw new Error("Browser environment overrides apply only to a newly created owned target, never an attached or persistent browser.");
   }
   if (attachExistingTargetId !== null && (reuseExisting || !userDataDir || !preserveProfile || !Array.isArray(allowedExistingOrigins) || allowedExistingOrigins.length === 0)) {
     throw new Error("Attaching an existing target requires a persistent profile, an exact target ID, and an origin allowlist; it cannot be combined with open-only reuse.");
@@ -342,17 +371,22 @@ export async function launchOwnedChrome({
     "--no-default-browser-check"
   ];
   if (headed === false) args.push("--headless=new"); // explicit opt-in only
+  if (environmentProfile.locale) args.push(`--lang=${environmentProfile.locale}`);
   if (process.getuid?.() === 0 || process.env.ACTIVETAB_CHROME_NO_SANDBOX === "1") {
     // --no-sandbox only when the OS requires it (root containers) or the
     // operator explicitly opts in; never a silent default.
     args.push("--no-sandbox");
   }
-  args.push(startupUrl);
+  if (windowPosition) args.push(`--window-position=${windowPosition.x},${windowPosition.y}`);
+  // Start at an owned blank document so explicit settings take effect before
+  // the application receives its first request.
+  args.push("about:blank");
 
   const launchMode = headed === false ? "headless (explicit opt-in)" : "headed";
   let endpoint = null;
   let browserVersion = null;
   let targetId = null;
+  let windowBounds = null;
   let readiness = { phase: "launch" };
 
   try {
@@ -408,31 +442,38 @@ export async function launchOwnedChrome({
       } catch { /* not ready yet */ }
       await new Promise(r => setTimeout(r, 100));
     }
-    // Select the target that matches the intended startup URL origin.
-    // Chrome may create other page targets (e.g. NTP) during launch; the
-    // first page target is not necessarily the intended one.
+    // Select only the blank page created for this invocation. A new profile
+    // has no pre-existing application target to adopt.
     let expectedOrigin = null;
     try { expectedOrigin = new URL(startupUrl).origin; } catch { /* validated above */ }
-    const ownedTarget = targets?.find(t => t.type === "page" && (
-      (() => { try { return new URL(t.url).origin === expectedOrigin; } catch { return false; } })()
-    )) ?? targets?.find(t => t.type === "page");
+    const ownedTarget = targets?.find(t => t.type === "page" && t.url === "about:blank");
     if (!ownedTarget) {
       await browserClient.close().catch(() => {});
-      throw new Error("Chrome did not expose a page target owned by this invocation.");
+      throw new Error("Chrome did not expose the blank page target owned by this invocation.");
     }
     targetId = ownedTarget.id;
-    const targetUrlOrigin = (() => { try { return new URL(ownedTarget.url).origin; } catch { return null; } })();
-    if (expectedOrigin && targetUrlOrigin !== expectedOrigin) {
-      // Do not adopt a target that did not load the intended entry origin.
-      await browserClient.close().catch(() => {});
-      throw new Error(`Chrome launched to unexpected origin '${targetUrlOrigin ?? ownedTarget.url}' instead of '${expectedOrigin}'. No target was adopted.`);
-    }
-    const target = await resolveAuthorizedTarget(endpoint, targetId, targetId);
+    const target = await resolveOwnedBlankTarget(endpoint, targetId, chromeProcess);
     target.browserClient = browserClient;
     target.ownsBrowserClient = true;
     session = await new BrowserSession(target).attach();
     session.persistent = preserveProfile;
     readiness = { phase: "attached", targetId };
+
+    if (windowPosition && headed !== false) {
+      windowBounds = await applyOwnedWindowPosition(browserClient, targetId, windowPosition);
+      readiness = { phase: "window-positioned", targetId, windowBounds };
+    }
+
+    const browserEnvironment = await initializeOwnedBrowserEnvironment(session.client, {
+      browserVersion,
+      headed,
+      profile: environmentProfile,
+      startupOrigin: expectedOrigin
+    });
+    readiness = { phase: "environment-initialized", targetId };
+
+    const navigation = await session.client.send("Page.navigate", { url: startupUrl });
+    if (navigation?.errorText) throw new Error(`Chrome could not navigate to the validated startup URL: ${String(navigation.errorText).slice(0, 200)}`);
 
     // 7. Verify the browser actually loaded the intended URL.
     const deadline = Date.now() + 20_000;
@@ -454,7 +495,14 @@ export async function launchOwnedChrome({
     if (expectedOrigin && observedOrigin !== expectedOrigin) {
       throw new Error(`Chrome loaded unexpected origin '${observedOrigin ?? observedUrl}' instead of '${expectedOrigin}'.`);
     }
-    readiness = { phase: "loaded", url: observedUrl };
+    if (windowPosition && headed !== false) {
+      const positioned = await browserClient.send("Browser.getWindowForTarget", { targetId });
+      if (positioned.bounds?.left !== windowPosition.x || positioned.bounds?.top !== windowPosition.y) {
+        throw new Error("The owned Chrome window moved away from the requested desktop position during startup.");
+      }
+      windowBounds = positioned.bounds;
+    }
+    readiness = { phase: "loaded", url: observedUrl, environment: browserEnvironment };
 
     let processExit = null;
     chromeProcess.once("exit", (code, sig) => { processExit = { code, signal: sig }; });
@@ -471,6 +519,7 @@ export async function launchOwnedChrome({
       launchMode,
       stderrTail: stderrTail.slice(-800)
     };
+    if (session) await session.close().catch(() => {});
     try { chromeProcess?.kill("SIGKILL"); } catch { /* already dead */ }
     if (!preserveProfile) {
       try { await rm(profileDir, { recursive: true, force: true }); } catch { /* best-effort */ }
@@ -553,6 +602,8 @@ export async function launchOwnedChrome({
     targetId,
     chromeProcess,
     browserVersion,
+    windowBounds,
+    browserEnvironment: readiness.environment ?? null,
     launchMode,
     displayMode,
     profileDir,

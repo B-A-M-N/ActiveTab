@@ -72,7 +72,8 @@ export class OutputAccumulator {
           ...(typeof source.sourceKey === "string" ? { sourceKey: source.sourceKey } : {}),
           ...(typeof source.sourceTagName === "string" ? { sourceTagName: source.sourceTagName } : {}),
           method: source.method ?? "visible_html_table_cell",
-          validation: source.validation
+          validation: source.validation,
+          ...(typeof source.resolutionState === "string" ? { resolutionState: source.resolutionState } : {})
         }]))
       });
     }

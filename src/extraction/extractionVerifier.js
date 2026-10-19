@@ -1,3 +1,5 @@
+const FIELD_RESOLUTION_STATES = new Set(["observed", "normalized", "missing", "ambiguous", "invalid", "unavailable"]);
+
 function verifyExtractionShape(result, { allowObservedPartial = false } = {}) {
   const observedPartial = allowObservedPartial && result?.completeness === "observed_partial";
   if (!result || (result.completeness !== "complete" && !observedPartial)) {
@@ -53,7 +55,13 @@ function verifyExtractionShape(result, { allowObservedPartial = false } = {}) {
           ? field.method === "visible_record_group_text" && field.sourceKey === schemaField.sourceKey
             && field.sourceTagName === schemaField.sourceTagName
           : false;
+      const resolutionState = field.resolutionState;
+      const stateValid = resolutionState === undefined
+        || FIELD_RESOLUTION_STATES.has(resolutionState)
+          && resolutionState !== "ambiguous" && resolutionState !== "invalid" && resolutionState !== "unavailable"
+          && (resolutionState !== "missing" || schemaField?.required !== true);
       if (!field.observationId || field.validation !== "valid" || !sourceMatches
+        || !stateValid
         || !fieldUrl || fieldUrl.origin !== result.scope?.origin || fieldUrl.pathname !== result.scope?.pagePath
         || fieldUrl.search || fieldUrl.hash) {
         return { status: "incomplete", reason: "A field lacks valid observation provenance." };

@@ -53,6 +53,7 @@ Coordinate navigation planning, browser execution, bounded recovery, and visible
 - OpenAI-compatible planner requests carry a generated `X-Client-Request-ID`; prediction and failure telemetry retains that UUID and bounded provider latency so local proxy logs can be correlated. Failed secondary-planner events keep model, modality, decision lineage, and typed failure class; provider messages, request content, credentials, and endpoint values remain excluded.
 - Semantic analyzer failures retain the same bounded request UUID, latency, fixed transport code, and HTTP status when available. The analyzer preserves the `size` failure class; raw provider and gateway messages remain excluded.
 - Page content remains untrusted evidence and cannot alter the goal, policy, environment, or authorization.
+- `parseSemanticQuery()` and `resolveSemanticQuery()` expose bounded local semantic-page queries through the semantic-analysis surface. They consume one fresh v3 observation, require trusted field-read and release policy for data, and return control references without action authority.
 
 ## Verification
 

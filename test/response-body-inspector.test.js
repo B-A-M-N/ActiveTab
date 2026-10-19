@@ -185,6 +185,19 @@ test("response analysis rejects byte, line, JSON-depth, token, row, and column o
   assert.equal(bracesInsideString.status, undefined, "quoted punctuation does not consume the JSON parser budget");
 });
 
+test("large benign credential-like text stays complete without quadratic key scans", () => {
+  const value = "token".repeat(16_384);
+  const json = inspectResponseBody(Buffer.from(JSON.stringify({ payload: value })), "application/json");
+  assert.equal(json.format, "json");
+  assert.equal(json.sourceText, JSON.stringify({ payload: value }));
+  assert.equal(json.credentialRedactions, 0);
+
+  const text = inspectResponseBody(Buffer.from(value), "text/plain");
+  assert.equal(text.sourceText, value);
+  assert.equal(text.credentialRedactions, 0);
+  assert.equal(text.credentialDetails.items.length, 0);
+});
+
 test("nested JSON becomes indexed Markdown tables while full safe JSON and credential shape remain available", () => {
   const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
   const claims = Buffer.from(JSON.stringify({ sub: "person-123", exp: 2_000_000_000, roles: ["member", "admin"] })).toString("base64url");

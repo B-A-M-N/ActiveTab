@@ -8,7 +8,7 @@ import { discoverVisibleRecordGroups, resolveVisibleRecordGroupRecords } from ".
 import { buildDocumentIndex } from "../src/observe/documentIndex.js";
 import { buildEphemeralCurrentOriginBinding } from "../src/environments/model.js";
 import { compileSemanticPageModel } from "../src/observe/semanticPageCompiler.js";
-import { normalizeFieldValue, validateExtractionContract } from "../src/extraction/extractionContract.js";
+import { fieldResolutionState, normalizeFieldValue, validateExtractionContract } from "../src/extraction/extractionContract.js";
 import { verifyExtractionResult, verifyObservedPartialExtractionResult } from "../src/extraction/extractionVerifier.js";
 import { CapabilityRegistry } from "../src/capabilities/capabilityRegistry.js";
 import { discoverTableCapabilities } from "../src/capabilities/capabilityDiscovery.js";
@@ -1817,6 +1817,26 @@ test("visible rows normalize into typed records with observation provenance", ()
     { name: "Widget B", price: 2.5 }
   ]);
   assert.equal(resolved.records[0].fieldEvidence.price.validation, "valid");
+  assert.equal(resolved.records[0].fieldEvidence.name.resolutionState, "observed");
+  assert.equal(resolved.records[0].fieldEvidence.price.resolutionState, "normalized");
+});
+
+test("field resolution states distinguish missing, invalid, unavailable, ambiguous, and observed values", () => {
+  const stringField = { type: "string", required: false };
+  const numberField = { type: "number", required: true };
+  assert.equal(fieldResolutionState("", normalizeFieldValue("", stringField)), "missing");
+  assert.equal(fieldResolutionState("not a number", normalizeFieldValue("not a number", numberField)), "invalid");
+  assert.equal(fieldResolutionState("", normalizeFieldValue("", stringField), 0), "unavailable");
+  assert.equal(fieldResolutionState("", normalizeFieldValue("", stringField), 2), "ambiguous");
+  assert.equal(fieldResolutionState("10", normalizeFieldValue("10", numberField)), "normalized");
+
+  const snapshot = tableSnapshot([["Widget A", "1.25"]], { headers: ["Name", "Name"] });
+  const ambiguous = resolveVisibleTableRecords(snapshot, {
+    fields: [{ name: "name", sourceHeader: "Name", type: "string", required: true }],
+    maxRecords: 5
+  });
+  assert.equal(ambiguous.status, "ambiguous");
+  assert.equal(ambiguous.reasonCode, "duplicate_source_header");
 });
 
 test("observed repeated record groups compile and verify structured outputs without returning discovery values", async () => {
@@ -1835,6 +1855,7 @@ test("observed repeated record groups compile and verify structured outputs with
   assert.equal(resolved.status, "available");
   assert.deepEqual(resolved.records.map(item => item.values), records.map(({ sender, subject }) => ({ sender, subject })));
   assert.equal(resolved.records[0].fieldEvidence.sender.method, "visible_record_group_text");
+  assert.equal(resolved.records[0].fieldEvidence.sender.resolutionState, "observed");
 
   const capabilityRegistry = await qualifiedRegistry(recipe);
   const session = {
@@ -1865,12 +1886,14 @@ test("observed repeated record groups compile and verify structured outputs with
   assert.equal(output.completeness, "complete");
   assert.deepEqual(output.records, records.map(({ sender, subject }) => ({ sender, subject })));
   assert.equal(output.fieldProvenance[0].fields.sender.sourceKey, "mail-sender");
+  assert.equal(output.fieldProvenance[0].fields.sender.resolutionState, "observed");
   assert.equal(verifyExtractionResult(output).status, "complete");
 
   const drifted = recordGroupSnapshot(records, { subjectClass: "mail-subject-drift" });
   const driftedResult = resolveVisibleRecordGroupRecords(drifted, recipe.extractionContract);
   assert.equal(driftedResult.status, "available");
   assert.equal(driftedResult.records.every(record => record.valid), false);
+  assert.equal(driftedResult.records[0].fieldEvidence.subject.resolutionState, "unavailable");
 });
 
 test("repeated visible record extraction verifies exact totals across pages and rejects missing, duplicate, and drifted pages", async () => {

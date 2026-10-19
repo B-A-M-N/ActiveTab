@@ -44,3 +44,23 @@ export async function resolveAuthorizedTarget(endpoint, targetId, confirmedTarge
   if (socketUrl.protocol !== "ws:" || !LOOPBACK.has(socketUrl.hostname)) throw new Error("Target CDP socket is not loopback-only.");
   return { ...target, endpoint: base.toString(), webSocketDebuggerUrl: socketUrl.toString() };
 }
+
+/** Resolve only the blank page of the Chrome process launched by this call. */
+export async function resolveOwnedBlankTarget(endpoint, targetId, ownedProcess) {
+  if (!Number.isInteger(ownedProcess?.pid) || ownedProcess.pid < 1
+    || ownedProcess.exitCode !== null || ownedProcess.signalCode !== null
+    || typeof targetId !== "string" || !targetId) {
+    throw new Error("An owned live Chrome process and exact blank target are required.");
+  }
+  const base = validateLoopbackEndpoint(endpoint);
+  const response = await fetch(new URL("/json/list", base), { signal: AbortSignal.timeout(5_000) });
+  if (!response.ok) throw new Error(`CDP target discovery failed with HTTP ${response.status}.`);
+  const targets = await response.json();
+  const target = Array.isArray(targets) ? targets.find(item => item?.id === targetId && item?.type === "page") : null;
+  if (target?.url !== "about:blank" || typeof target.webSocketDebuggerUrl !== "string") {
+    throw new Error("The owned startup target must be the exact blank page created for this Chrome process.");
+  }
+  const socketUrl = new URL(target.webSocketDebuggerUrl);
+  if (socketUrl.protocol !== "ws:" || !LOOPBACK.has(socketUrl.hostname)) throw new Error("Target CDP socket is not loopback-only.");
+  return { id: targetId, title: "", url: "about:blank", type: "page", endpoint: base.toString(), webSocketDebuggerUrl: socketUrl.toString() };
+}

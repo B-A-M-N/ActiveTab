@@ -24,6 +24,7 @@ ActiveTab's browser control plane. Every effectful browser action ultimately dis
 - Operator-prohibited control labels must be refused inside `BrowserSession.click()`, including calls that bypass planner admission.
 - Playwright is prohibited as a control or observation dependency.
 - Direct CDP is for a caller-selected target; it never attaches to a default browser profile automatically.
+- `launchOwnedChrome()` may apply an explicit `environmentProfile` only to a newly created owned browser. It starts at `about:blank`, records the actual `Browser.getVersion` and navigator/client-hint/platform/locale/timezone/viewport/WebGL/storage-permission environment, applies only explicit locale, timezone, geolocation, viewport, and language-header settings, then navigates to the validated startup URL. It does not spoof the user agent or grant browser permissions. Environment overrides are refused for attached, reused, or persistent browser profiles.
 - Retained network activity stores bounded request/response timing, protocol, cache/reuse flags, and byte counters only. It does not retain response headers or bodies; selected body inspection reads that response from CDP on demand and redacts recognizable credentials before producing any view.
 - A newly observed HTTP 429 may surface as a URL-free, status-only rate-limit signal. Callers must suspend and hand control to the operator; they must not retry, change identity, or bypass the site's limit.
 - Loopback CDP endpoints must be validated; browser application URLs are never loopback.
@@ -34,6 +35,8 @@ ActiveTab's browser control plane. Every effectful browser action ultimately dis
 - `resolveAuthorizedTarget` requires separate `targetId` and `confirmedTargetId`; both must match, and the confirmed value must originate from an independently established grant.
 - Attached mode requires an operator-supplied `ACTIVETAB_AUTHORIZED_TARGET_ID` or extension Attach grant.
 - Owned disposable Chrome may authorize its newly created target by the explicit operator request to launch that browser.
+- The startup-only `resolveOwnedBlankTarget()` path requires the live Chrome child process from that launch and its exact `about:blank` target. It does not make blank targets controllable in attached or reused browsers.
+- For desktop qualification, set `ACTIVETAB_CHROME_DISPLAY=main|secondary` to select the configured monitor for all newly launched ActiveTab Chrome processes, including direct integration-test launches and the API runner. `ACTIVETAB_CHROME_MAIN_POSITION` and `ACTIVETAB_CHROME_SECONDARY_POSITION` override the default Chrome desktop coordinates (`0,0` and `1440,0` on the documented two-screen desktop). `ACTIVETAB_CHROME_WINDOW_POSITION=x,y` is an explicit coordinate override. Coordinates are device-independent pixels. Owned Chrome applies and verifies the bounds through CDP before startup navigation; other launches pass the same position to Chrome. No setting changes display modes or moves existing windows.
 - Owned disposable Chrome cleanup first requests browser shutdown through its browser-level CDP client, then uses bounded TERM/KILL fallback only for that owned process. A temporary profile is removed only after process exit is confirmed; cleanup is verified only when both browser shutdown and profile removal are confirmed. Closing an ordinary `BrowserSession` remains a local CDP detach and does not close the browser or revoke an extension lease.
 - Before launching with a persistent profile, probe its `DevToolsActivePort` and Chrome singleton lock. Never remove endpoint metadata while Chrome owns the profile; if the lock is live but the endpoint is unavailable, refuse without forwarding a startup URL into that browser.
 - The manual `--open-only` flow may reuse an already-running owned profile only through its live CDP endpoint. Reuse must not navigate, select, or otherwise control a page, and releasing ActiveTab's CDP connection must leave Chrome and its profile open.
@@ -54,3 +57,5 @@ Integration tests launch disposable Chrome headed by default. Test launch paths 
 | Path | Purpose |
 |------|---------|
 | `actionLimits.js` | Shared exact-value size limits for browser dispatch and planning |
+| `browserEnvironment.js` | Bounded environment configuration and pre-navigation initialization for newly owned Chromium targets |
+| `targets.js` | Loopback CDP discovery, exact target authorization, and owned startup-target resolution |

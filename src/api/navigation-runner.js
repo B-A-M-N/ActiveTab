@@ -24,6 +24,7 @@ import { existsSync } from "node:fs";
 import { RUN_STATUS } from "../testing/schema.js";
 import { isExplicitReadWorkflowRequest } from "../navigation/taskIntentResolver.js";
 import { projectExtractionOutputs } from "../extraction/outputRelease.js";
+import { chromeWindowPositionArgs } from "../browser/chromeWindowPlacement.js";
 
 function abortedMarker(signal) {
   if (!signal?.aborted) return null;
@@ -484,6 +485,7 @@ async function launchDisposableChrome({ signal, bootstrapUrl } = {}) {
     "--disable-dev-shm-usage"
   ];
   if (process.env.ACTIVETAB_HEADLESS === "1") args.push("--headless=new");
+  args.push(...chromeWindowPositionArgs());
   if (process.getuid?.() === 0 || process.env.ACTIVETAB_CHROME_NO_SANDBOX === "1") {
     // --no-sandbox is only used when the OS requires it (root containers)
     // or the operator explicitly opts in; it is never a silent default.

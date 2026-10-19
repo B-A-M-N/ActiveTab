@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, open, realpath, rm } from "node:fs/promises";
 import { constants } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 const DISPATCH_TOKENS = new WeakSet();
@@ -18,6 +18,16 @@ function metadata(stat) {
   return { dev: String(stat.dev), ino: String(stat.ino), size: stat.size, mtimeMs: stat.mtimeMs, mode: stat.mode };
 }
 
+function pathIsWithin(rootPath, candidatePath) {
+  const childPath = relative(rootPath, candidatePath);
+  return childPath !== "" && childPath !== ".." && !childPath.startsWith(`..${sep}`) && !isAbsolute(childPath);
+}
+
+export function configuredUploadRoots(value = process.env.ACTIVETAB_UPLOAD_ALLOWED_ROOTS) {
+  if (typeof value !== "string" || !value.trim()) return [];
+  return [...new Set(value.split(delimiter).map(item => item.trim()).filter(Boolean).map(item => resolve(item)))];
+}
+
 async function hashHandle(handle, maxBytes = MAX_UPLOAD_BYTES) {
   const hash = createHash("sha256");
   const buffer = Buffer.alloc(64 * 1024);
@@ -32,8 +42,14 @@ async function hashHandle(handle, maxBytes = MAX_UPLOAD_BYTES) {
   return { digest: hash.digest("hex"), size: position };
 }
 
-async function inspectSource(path) {
+async function inspectSource(path, { allowedRoots, stagingDirectory } = {}) {
+  if (!Array.isArray(allowedRoots) || allowedRoots.length === 0) {
+    throw new Error("File upload grants are disabled until an operator configures allowed source directories.");
+  }
   const fullPath = resolve(path);
+  if (!allowedRoots.some(root => pathIsWithin(root, fullPath)) || pathIsWithin(stagingDirectory, fullPath)) {
+    throw new Error("Upload source is outside the configured source directories.");
+  }
   const before = await lstat(fullPath);
   if (!before.isFile() || before.isSymbolicLink() || before.size < 0 || before.size > MAX_UPLOAD_BYTES
     || typeof process.getuid === "function" && before.uid !== process.getuid()) {
@@ -87,11 +103,13 @@ async function copyApprovedFile(sourcePath, targetPath) {
  * operation; the opaque grant ID is never accepted from model output.
  */
 export class FileUploadGrantStore {
-  constructor({ stagingDirectory, trustedIssuer, now = () => Date.now() } = {}) {
+  constructor({ stagingDirectory, allowedRoots = configuredUploadRoots(), trustedIssuer, now = () => Date.now() } = {}) {
     if (typeof stagingDirectory !== "string" || !stagingDirectory
+      || !Array.isArray(allowedRoots) || allowedRoots.some(value => typeof value !== "string" || !value)
       || typeof trustedIssuer !== "string" || !trustedIssuer
       || typeof now !== "function") throw new Error("File upload grants require a private staging directory and trusted issuer.");
     this.stagingDirectory = resolve(stagingDirectory);
+    this.allowedRoots = [...new Set(allowedRoots.map(value => resolve(value)))];
     this.trustedIssuer = trustedIssuer;
     this.now = now;
     this.grants = new Map();
@@ -103,6 +121,13 @@ export class FileUploadGrantStore {
       await mkdir(this.stagingDirectory, { recursive: true, mode: 0o700 });
       assertOwnedDirectory(await lstat(this.stagingDirectory));
       await chmod(this.stagingDirectory, 0o700);
+      for (const root of this.allowedRoots) {
+        const rootStat = await lstat(root);
+        assertOwnedDirectory(rootStat);
+        if (await realpath(root) !== root || root === resolve(root, "..")) {
+          throw new Error("Configured upload source directories must be canonical, non-symlink directories below the filesystem root.");
+        }
+      }
     })();
     await this.ready;
   }
@@ -115,14 +140,14 @@ export class FileUploadGrantStore {
       throw new Error("Upload grant requires an explicit approval reference, exact scope, and bounded expiry.");
     }
     await this.#ensureDirectory();
-    const source = await inspectSource(filePath);
+    const source = await inspectSource(filePath, { allowedRoots: this.allowedRoots, stagingDirectory: this.stagingDirectory });
     const grantId = randomUUID();
     const grantDirectory = join(this.stagingDirectory, grantId);
     await mkdir(grantDirectory, { mode: 0o700 });
     const stagedPath = join(grantDirectory, basename(source.fullPath));
     try {
       const staged = await copyApprovedFile(source.fullPath, stagedPath);
-      const afterCopy = await inspectSource(source.fullPath);
+      const afterCopy = await inspectSource(source.fullPath, { allowedRoots: this.allowedRoots, stagingDirectory: this.stagingDirectory });
       if (afterCopy.digest !== source.digest || afterCopy.size !== source.size
         || JSON.stringify(afterCopy.metadata) !== JSON.stringify(source.metadata)
         || staged.digest !== source.digest || staged.size !== source.size) {
@@ -146,7 +171,7 @@ export class FileUploadGrantStore {
   }
 
   async #checkSourceAndStage(grant) {
-    const source = await inspectSource(grant.sourcePath);
+    const source = await inspectSource(grant.sourcePath, { allowedRoots: this.allowedRoots, stagingDirectory: this.stagingDirectory });
     if (source.digest !== grant.contentDigest || source.size !== grant.size
       || JSON.stringify(source.metadata) !== JSON.stringify(grant.sourceMetadata)) return false;
     const stagedStat = await lstat(grant.stagedPath);

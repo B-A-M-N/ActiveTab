@@ -194,6 +194,17 @@ export function normalizeFieldValue(raw, field) {
   return { valid: true, value: numeric };
 }
 
+/** Describe how one observed value resolved without retaining its raw text. */
+export function fieldResolutionState(raw, normalized, sourceMatchCount = 1) {
+  if (!Number.isInteger(sourceMatchCount) || sourceMatchCount < 0) throw new Error("Field source match count must be a non-negative integer.");
+  if (sourceMatchCount > 1) return "ambiguous";
+  if (sourceMatchCount === 0) return "unavailable";
+  const observed = String(raw ?? "").trim();
+  if (!observed) return "missing";
+  if (!normalized?.valid) return "invalid";
+  return Object.is(normalized.value, observed) ? "observed" : "normalized";
+}
+
 export function fieldIsPermitted(field, authorizeField) {
   if (typeof authorizeField !== "function") return field.dataClass === "public";
   return authorizeField(Object.freeze({ ...field })) === true;
