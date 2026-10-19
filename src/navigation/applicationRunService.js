@@ -5,6 +5,7 @@ import { DiagnosticCorrelator } from "../diagnostics/correlator.js";
 import { registerBrowserDiagnosticSources } from "../diagnostics/adapters/browserSources.js";
 import { TestRunner } from "../testing/runner.js";
 import { withTargetExecutionLease } from "../testing/runState.js";
+import { createAuthorizedSameTargetReattacher, supportsAuthorizedSameTargetReattachment } from "../browser/targetReattachment.js";
 
 /** Shared authorized execution service used by the HTTP and MCP adapters. */
 export class ApplicationRunService {
@@ -79,13 +80,28 @@ export class ApplicationRunService {
       throw new Error("ApplicationRunService requires an attached, explicitly selected browser target.");
     }
     if (typeof goal !== "string" || !goal.trim()) throw new Error("ApplicationRunService requires a non-empty task goal.");
+    const reattachedSessions = new Set();
+    const reattachSameTarget = supportsAuthorizedSameTargetReattachment(session)
+      ? createAuthorizedSameTargetReattacher({
+        session,
+        environment: engineOptions.environment ?? null,
+        assertLeaseTokenCurrent: lease.assertLeaseTokenCurrent,
+        bindSession: lease.bindSession,
+        onSessionCreated: nextSession => reattachedSessions.add(nextSession)
+      })
+      : null;
     const engine = new NavigationEngine(session, {
       ...engineOptions,
+      reattachSameTarget,
       signal,
       journal,
       workflowIntent,
       assertExecutionLease: lease.assertCurrent
     });
-    return await engine.run(goal, { ...(resumeState ? { resumeState } : {}), signal, workflowIntent, inputBindings, workflowInputs });
+    try {
+      return await engine.run(goal, { ...(resumeState ? { resumeState } : {}), signal, workflowIntent, inputBindings, workflowInputs });
+    } finally {
+      for (const replacement of reattachedSessions) await replacement.close().catch(() => {});
+    }
   }
 }

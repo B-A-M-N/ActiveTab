@@ -352,7 +352,11 @@ export class NavigationEngine {
       && ((this.plannerMode === "workflow" && (!searchPhrase || Boolean(searchReadRequest)))
         || (this.plannerMode === "auto" && (explicitReadWorkflowRequest || taskRequest.compoundRequest || taskRequest.typedWorkflowIntent)));
     const searchSubmitAuthorizer = searchPhrase ? createSearchSubmitAuthorizer(searchPhrase) : null;
-    const state = _executionState ?? resumeState ?? newTaskState(goal, this.session.target, this.session.target.endpoint ?? "local-cdp");
+    const state = _executionState ?? resumeState ?? newTaskState(
+      goal,
+      this.session.target,
+      this.session.target.journalEndpoint ?? this.session.target.endpoint ?? "local-cdp"
+    );
     let effectiveWorkflowIntent = workflowIntent;
     if (!_inferenceBudgeted && typeof this.decisionRuntime?.withInferenceBudget === "function") {
       const runId = this.decisionContext?.runId ?? state.taskId;
@@ -875,7 +879,7 @@ export class NavigationEngine {
         const errorText = String(error?.message ?? error).toLocaleLowerCase();
         const detached = this.session.attached === false || ["detached", "closed"].includes(this.session.targetLifecycle)
           || /target.{0,24}(detached|closed)|(?:detached|closed).{0,24}target/u.test(errorText);
-        if (!detached || !this.sameTargetNavigation || typeof this.reattachSameTarget !== "function"
+        if (!detached || typeof this.reattachSameTarget !== "function"
           || attempt?.action !== "click" || attempt?.dispatchStatus !== "dispatched") {
           if (error && typeof error === "object") error.observationAttempts = 1;
           throw error;
@@ -886,14 +890,15 @@ export class NavigationEngine {
           const originalTarget = this.session.target;
           replacement = await this.reattachSameTarget({
             targetId: originalTarget?.id,
-            endpoint: originalTarget?.endpoint ?? "local-cdp",
-            environment: this.environment
+            endpoint: originalTarget?.reattachEndpoint ?? originalTarget?.endpoint ?? "local-cdp",
+            environment: this.environment,
+            selectionGoal: goal
           });
           const nextSession = replacement?.session;
           const observation = replacement?.observation;
           const targetId = originalTarget?.id;
-          const endpointValue = originalTarget?.endpoint ?? "local-cdp";
-          const replacementEndpointValue = nextSession?.target?.endpoint ?? "local-cdp";
+          const endpointValue = originalTarget?.reattachEndpoint ?? originalTarget?.endpoint ?? "local-cdp";
+          const replacementEndpointValue = nextSession?.target?.reattachEndpoint ?? nextSession?.target?.endpoint ?? "local-cdp";
           const endpoint = (() => { try { return new URL(endpointValue).origin; } catch { return endpointValue; } })();
           const replacementEndpoint = (() => { try { return new URL(replacementEndpointValue).origin; } catch { return replacementEndpointValue; } })();
           if (!nextSession || nextSession.attached !== true || nextSession.target?.id !== targetId
@@ -905,13 +910,20 @@ export class NavigationEngine {
           let observedUrl;
           try { observedUrl = new URL(observation.page?.url ?? ""); }
           catch { throw Object.assign(new Error("Same-target reattachment returned an invalid observed page URL."), { reattachFailureCode: "target_scope_rejected" }); }
-          const allowedOrigins = (this.environment?.authorizedOrigins ?? []).map(normalizeOrigin).filter(Boolean);
+          const allowedOriginValues = Array.isArray(this.environment?.authorizedOrigins)
+            ? this.environment.authorizedOrigins
+            : [originalTarget?.url ?? latest?.page?.url];
+          const allowedOrigins = allowedOriginValues.map(normalizeOrigin).filter(Boolean);
           if (!allowedOrigins.includes(normalizeOrigin(observedUrl.origin)) || observedUrl.username || observedUrl.password) {
             throw Object.assign(new Error("Same-target reattachment observed a page outside the authorized environment."), { reattachFailureCode: "target_scope_rejected" });
           }
           if (typeof replacement.commit === "function") await replacement.commit();
           this.session = nextSession;
-          await this.assertExecutionLease?.();
+          try { await this.assertExecutionLease?.(); }
+          catch (leaseError) {
+            if (leaseError && typeof leaseError === "object") leaseError.reattachFailureCode ??= "lease_rebind_failed";
+            throw leaseError;
+          }
           attempt.reconnectedObservation = true;
           return observation;
         } catch (reattachError) {
@@ -932,10 +944,6 @@ export class NavigationEngine {
         const stillAttached = this.session.attached !== false
           && !["detached", "closed"].includes(this.session.targetLifecycle);
         if (!stillAttached) return await reattachToSameTarget(firstError);
-        if (!this.sameTargetNavigation || !stillAttached) {
-          if (firstError && typeof firstError === "object") firstError.observationAttempts = 1;
-          throw firstError;
-        }
         await new Promise(resolve => setTimeout(resolve, 100));
         throwIfAborted();
         try {

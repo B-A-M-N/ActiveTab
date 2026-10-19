@@ -12,6 +12,7 @@ The testing layer. `RunStateCoordinator` owns persistence and execution-lease li
 
 - Bind durable state to the exact workflow version/hash, environment, target, principal, profile, and policy before execution.
 - Acquire the run lease and exact browser-target lease before execution; preserve target fencing tokens on reservations and refuse dispatch after lease loss.
+- A navigation recovery may validate the durable target-lease token while its original CDP session is detached, then rebind only an attached replacement with the exact endpoint and target identity. Rebinding retains the same fencing token; dispatch still requires a current attached session.
 - Persist step outcomes before advancing. If checkpoint persistence fails after an effect, mark that step uncertain and require reconciliation.
 - Preserve waiting and uncertain run states as resumable/reconciliation states rather than converting them to terminal failures.
 - Persist the intervention before returning control. Resume must reacquire execution ownership, evaluate fresh completion evidence, and rebind the exact workflow/environment/target/principal/policy before continuation.

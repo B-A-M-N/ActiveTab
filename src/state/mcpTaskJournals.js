@@ -9,7 +9,7 @@ export const MAX_MCP_TASK_JOURNALS = 128;
 
 function taskKey(target, goal) {
   return createHash("sha256")
-    .update(JSON.stringify([String(target?.endpoint ?? "local-cdp"), String(target?.id ?? ""), taskGoalFingerprint(goal)]))
+    .update(JSON.stringify([String(target?.journalEndpoint ?? target?.endpoint ?? "local-cdp"), String(target?.id ?? ""), taskGoalFingerprint(goal)]))
     .digest("hex");
 }
 

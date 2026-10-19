@@ -713,7 +713,7 @@ test("same-target navigation retries one transient post-action observation witho
   assert.equal(session.postDispatchObservations, 2, "one fresh observation is allowed after the transient failure");
 });
 
-test("same-target navigation can reattach the exact leased target for fresh post-action evidence without replaying the click", async () => {
+test("a dispatched click can reattach the exact leased target for fresh evidence without replaying the click", async () => {
   const targetId = "same-target-reattach";
   const endpoint = "http://127.0.0.1:9222";
   const candidate = {
@@ -751,7 +751,7 @@ test("same-target navigation can reattach the exact leased target for fresh post
   const result = await new NavigationEngine(session, {
     planner: { async plan(_goal, observation) { return { status: "planned", action: { type: "click", target: observation.candidates[0] } }; } },
     environment: { environmentId: "public-search-test", authorizedOrigins: ["https://duckduckgo.com", "https://en.wikipedia.org"] },
-    sameTargetNavigation: true,
+    sameTargetNavigation: false,
     reattachSameTarget: async ({ targetId: requestedTargetId, endpoint: requestedEndpoint }) => {
       assert.equal(requestedTargetId, targetId);
       assert.equal(requestedEndpoint, endpoint);

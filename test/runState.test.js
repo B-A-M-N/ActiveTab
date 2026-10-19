@@ -132,6 +132,22 @@ test("browser target lease is bound to the attached endpoint and target identity
     await lease.release();
   }));
 
+test("durable target lease remains checkable while a detached CDP session is being rebound", () =>
+  withRunState(async store => {
+    const session = { attached: true, target: { id: "reattach-target", endpoint: "http://127.0.0.1:9333" } };
+    const lease = await acquireBrowserTargetLease(store, session, "reattach-live-lease");
+    const fencingToken = lease.fencingToken;
+    session.attached = false;
+    await assert.rejects(lease.assertCurrent(), error => error.code === "RUN_TARGET_LEASE_LOST");
+    assert.equal(await lease.assertLeaseTokenCurrent(), fencingToken, "the durable fence can be checked independently of the detached CDP session");
+
+    const replacement = { attached: true, target: { id: "reattach-target", endpoint: "http://127.0.0.1:9333/" } };
+    assert.equal(lease.bindSession(replacement), true);
+    assert.equal(await lease.assertCurrent(), fencingToken);
+    assert.equal(lease.fencingToken, fencingToken, "reattachment keeps the original fencing token");
+    await lease.release();
+  }));
+
 test("cancellation remains available from durable run state after the worker cache is gone", () =>
   withRunState(async (store, dir) => {
     const run = await store.create({ runId: "cancel-after-restart", workflowId: "wf", workflowName: "Cancellation recovery", environmentId: "staging", targetId: "tab-exact" });

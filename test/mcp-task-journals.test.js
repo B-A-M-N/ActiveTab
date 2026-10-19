@@ -79,6 +79,20 @@ test("MCP task journals use private files and opaque keys without persisting the
   assert.equal((await readdir(join(directory, "tasks"))).length, 1);
 }));
 
+test("Chrome auto-connect keeps the existing journal key while leases use the exact loopback endpoint", async () => withDirectory(async directory => {
+  const store = new McpTaskJournalStore({ directory: join(directory, "tasks") });
+  const goal = "Open the account page";
+  const before = await store.forTask({ id: "authorized-tab", endpoint: "chrome-auto-connect" }, goal);
+  const after = await store.forTask({
+    id: "authorized-tab",
+    endpoint: "http://127.0.0.1:43127",
+    reattachEndpoint: "http://127.0.0.1:43127",
+    journalEndpoint: "chrome-auto-connect"
+  }, goal);
+  assert.equal(after.key, before.key, "adding the exact network endpoint does not orphan an unresolved task journal");
+  assert.equal(after.journal.path, before.journal.path);
+}));
+
 test("MCP partial collection checkpoints retain released rows privately and strip query URLs", async () => withDirectory(async directory => {
   const store = new McpTaskJournalStore({ directory: join(directory, "tasks") });
   const { resultArtifact } = await store.forTask({ id: "checkpoint-target", endpoint: "local-cdp" }, "list public product names");

@@ -7,6 +7,7 @@ Own bounded local task journals, resumable MCP extraction artifacts, durable run
 ## Local Contracts
 
 - MCP task journals contain bounded resume metadata only. They omit raw goals, browser evidence, form values, cookies, authentication material, extracted record values, and raw cursor URLs.
+- A target's trusted `journalEndpoint` may preserve an existing MCP journal key when its actual loopback CDP endpoint becomes available. Use the actual `endpoint` for lease and connection identity; the journal alias is only for resume-key compatibility and never grants authority.
 - Result artifacts use opaque task keys under an owner-owned `0700` directory and owner-only `0600` files. Only verified policy-released registered extraction outputs may be persisted.
 - Partial collection checkpoints remain separate from journals and complete result artifacts. They bind task, target, endpoint, goal fingerprint, principal, environment, typed intent, capability manifest, source observation, and field/release policy fingerprints. They contain released rows only, mark output incomplete, record no unresolved operations, store route/cursor identity fingerprints, and strip query strings, fragments, and credentials from provenance routes.
 - Resume revalidates exact target, endpoint, principal, environment, intent, capability binding, field/read/release policies, current route, and source observation before restoring rows. It reobserves before reconciling an uncertain action. A partial checkpoint never proves collection completeness by itself.

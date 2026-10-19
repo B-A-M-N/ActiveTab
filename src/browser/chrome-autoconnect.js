@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { CdpClient } from "../cdp/client.js";
 import { sanitizeUrl } from "./urlPrivacy.js";
+import { validateLoopbackEndpoint } from "./targets.js";
 
 const CHANNEL_DIRS = {
   stable: { linux: ".config/google-chrome", darwin: "Library/Application Support/Google/Chrome", win32: "Google/Chrome/User Data" },
@@ -37,13 +38,17 @@ export async function readChromeDebugEndpoint(userDataDir = defaultChromeUserDat
   if (!Number.isInteger(port) || port < 1 || port > 65535 || !/^\/devtools\/browser\/[A-Za-z0-9_-]+$/.test(websocketPath ?? "")) {
     throw new Error("Chrome's remote debugging endpoint file has an invalid format.");
   }
-  return { webSocketDebuggerUrl: "ws://127.0.0.1:" + port + websocketPath, filePath };
+  return {
+    webSocketDebuggerUrl: "ws://127.0.0.1:" + port + websocketPath,
+    endpoint: "http://127.0.0.1:" + port,
+    filePath
+  };
 }
 
 export async function connectChromeAuto({ userDataDir = process.env.ACTIVETAB_CHROME_USER_DATA_DIR ?? defaultChromeUserDataDir(), commandTimeoutMs = 120_000 } = {}) {
   const endpoint = await readChromeDebugEndpoint(userDataDir);
   const client = await new CdpClient(endpoint.webSocketDebuggerUrl, { commandTimeoutMs }).connect();
-  return { client, userDataDir, close: () => client.close() };
+  return { client, userDataDir, endpoint: endpoint.endpoint, close: () => client.close() };
 }
 
 function safeDisplayUrl(value) {
@@ -62,9 +67,19 @@ export async function listChromeTargets(connection) {
 
 export async function resolveChromeTarget(connection, targetId, confirmedTargetId) {
   if (!targetId || targetId !== confirmedTargetId) throw new Error("Explicit target authorization is required and must match the selected target id.");
+  const endpoint = validateLoopbackEndpoint(connection?.endpoint).origin;
   const { targetInfo } = await connection.client.send("Target.getTargetInfo", { targetId });
   if (targetInfo?.targetId !== targetId || targetInfo.type !== "page") throw new Error("The selected Chrome page target is no longer available.");
   const pageUrl = new URL(targetInfo.url);
   if (!new Set(["http:", "https:"]).has(pageUrl.protocol)) throw new Error("Only HTTP(S) page targets can be controlled.");
-  return { id: targetInfo.targetId, title: String(targetInfo.title ?? ""), url: safeDisplayUrl(targetInfo.url), type: "page", endpoint: "chrome-auto-connect", browserClient: connection.client };
+  return {
+    id: targetInfo.targetId,
+    title: String(targetInfo.title ?? ""),
+    url: safeDisplayUrl(targetInfo.url),
+    type: "page",
+    endpoint,
+    reattachEndpoint: endpoint,
+    journalEndpoint: "chrome-auto-connect",
+    browserClient: connection.client
+  };
 }

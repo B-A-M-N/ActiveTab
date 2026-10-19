@@ -17,6 +17,7 @@ test("Chrome auto-connect accepts only a local browser WebSocket endpoint file",
   await writeFile(join(dir, "DevToolsActivePort"), "43127\n/devtools/browser/AbC_123-token\n", { mode: 0o600 });
   assert.deepEqual(await readChromeDebugEndpoint(dir), {
     webSocketDebuggerUrl: "ws://127.0.0.1:43127/devtools/browser/AbC_123-token",
+    endpoint: "http://127.0.0.1:43127",
     filePath: join(dir, "DevToolsActivePort")
   });
   await writeFile(join(dir, "DevToolsActivePort"), "43127\n/devtools/browser/AbC?token\n", { mode: 0o600 });
@@ -28,6 +29,20 @@ test("Chrome page attach refuses an unconfirmed target before sending CDP comman
   const connection = { client: { send: async () => { calls++; throw new Error("should not be called"); } } };
   await assert.rejects(resolveChromeTarget(connection, "page-a", "page-b"), /authorization/);
   assert.equal(calls, 0);
+});
+
+test("Chrome auto-connect preserves the exact loopback endpoint on an authorized target", async () => {
+  const connection = {
+    endpoint: "http://127.0.0.1:43127",
+    client: { send: async () => ({ targetInfo: {
+      targetId: "page-a", type: "page", title: "Example", url: "https://example.test/path"
+    } }) }
+  };
+  assert.deepEqual(await resolveChromeTarget(connection, "page-a", "page-a"), {
+    id: "page-a", title: "Example", url: "https://example.test/path", type: "page",
+    endpoint: "http://127.0.0.1:43127", reattachEndpoint: "http://127.0.0.1:43127",
+    journalEndpoint: "chrome-auto-connect", browserClient: connection.client
+  });
 });
 
 test("tab listings omit URL credentials, query values, and fragments", async () => {

@@ -132,6 +132,9 @@ export async function acquireBrowserTargetLease(store, session, runId) {
       }
       return await lease.assertCurrent();
     },
+    async assertLeaseTokenCurrent() {
+      return await lease.assertCurrent();
+    },
     async release() { await lease.release(); }
   };
 }
@@ -142,7 +145,12 @@ export async function withTargetExecutionLease(store, session, runId, execute) {
   const lease = await acquireBrowserTargetLease(store, session, runId);
   try {
     await lease.assertCurrent();
-    return await execute({ fencingToken: lease.fencingToken, assertCurrent: () => lease.assertCurrent() });
+    return await execute({
+      fencingToken: lease.fencingToken,
+      assertCurrent: () => lease.assertCurrent(),
+      assertLeaseTokenCurrent: () => lease.assertLeaseTokenCurrent(),
+      bindSession: nextSession => lease.bindSession(nextSession)
+    });
   } finally {
     await lease.release();
   }

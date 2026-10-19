@@ -19,6 +19,7 @@ import { preflightModelCapabilities, writeModelPreflightSummary } from "./naviga
 import { CapabilityService } from "./capabilities/capabilityService.js";
 import { loadExtractionFieldPolicy } from "./capabilities/fieldPolicy.js";
 import { plannerModeFromArgs } from "./navigation/plannerMode.js";
+import { createAuthorizedSameTargetReattacher, supportsAuthorizedSameTargetReattachment } from "./browser/targetReattachment.js";
 
 const args = process.argv.slice(2);
 const command = args[0] ?? "help";
@@ -149,6 +150,7 @@ if (command === "run" || command === "resume") {
 let connection;
 let session;
 let decisionRuntime;
+const managedSessions = new Set();
 const runStateStore = command === "run" || command === "resume"
   ? new RunStateStore(resolve(process.env.ACTIVETAB_RUN_STATE_DIR ?? ".activetab/runs"))
   : null;
@@ -168,8 +170,13 @@ try {
   const resolved = connection
     ? await resolveChromeTarget(connection, targetId, targetId)
     : await resolveAuthorizedTarget(endpoint, targetId, targetId);
-  if (resumeState && resumeState.endpoint !== "local-cdp" && resumeState.endpoint !== resolved.endpoint) throw new Error("The task journal belongs to a different CDP endpoint.");
+  const resolvedJournalEndpoint = resolved.journalEndpoint ?? resolved.endpoint;
+  if (resumeState && resumeState.endpoint !== "local-cdp"
+    && resumeState.endpoint !== resolved.endpoint && resumeState.endpoint !== resolvedJournalEndpoint) {
+    throw new Error("The task journal belongs to a different CDP endpoint.");
+  }
   session = await new BrowserSession(resolved).attach();
+  managedSessions.add(session);
   if (requestedScope === "current-origin") {
     const initialObservation = await session.observe({ profile: "lightweight" });
     const observedOrigin = normalizeOrigin(initialObservation?.page?.url);
@@ -195,18 +202,48 @@ try {
     const goal = arg("--goal");
     if (!goal) throw new Error("--goal is required.");
     const taskJournal = journal ?? new TaskJournal(`.activetab/${targetId}.json`);
-    const result = await withTargetExecutionLease(runStateStore, session, `cli-run-${randomUUID()}`, lease =>
-      new NavigationEngine(session, { journal: taskJournal, workflowStore, decisionRuntime, environment, capabilityService, principalId, executionMode: "standalone", plannerMode: plannerModeFromArgs(args), assertExecutionLease: lease.assertCurrent }).run(goal));
+    const result = await withTargetExecutionLease(runStateStore, session, `cli-run-${randomUUID()}`, lease => {
+      const reattachSameTarget = supportsAuthorizedSameTargetReattachment(session)
+        ? createAuthorizedSameTargetReattacher({
+          session,
+          environment,
+          assertLeaseTokenCurrent: lease.assertLeaseTokenCurrent,
+          bindSession: lease.bindSession,
+          onSessionCreated: nextSession => managedSessions.add(nextSession),
+          onSessionCommitted: nextSession => { session = nextSession; }
+        })
+        : null;
+      return new NavigationEngine(session, {
+        journal: taskJournal, workflowStore, decisionRuntime, environment, capabilityService, principalId,
+        executionMode: "standalone", plannerMode: plannerModeFromArgs(args), assertExecutionLease: lease.assertCurrent,
+        reattachSameTarget
+      }).run(goal);
+    });
     print(result);
     if (result.status !== "succeeded") process.exitCode = 2;
   } else if (command === "resume") {
-    const result = await withTargetExecutionLease(runStateStore, session, `cli-resume-${randomUUID()}`, lease =>
-      new NavigationEngine(session, { journal, workflowStore, decisionRuntime, environment, capabilityService, principalId, executionMode: "standalone", plannerMode: plannerModeFromArgs(args), assertExecutionLease: lease.assertCurrent }).run(resumedGoal, { resumeState }));
+    const result = await withTargetExecutionLease(runStateStore, session, `cli-resume-${randomUUID()}`, lease => {
+      const reattachSameTarget = supportsAuthorizedSameTargetReattachment(session)
+        ? createAuthorizedSameTargetReattacher({
+          session,
+          environment,
+          assertLeaseTokenCurrent: lease.assertLeaseTokenCurrent,
+          bindSession: lease.bindSession,
+          onSessionCreated: nextSession => managedSessions.add(nextSession),
+          onSessionCommitted: nextSession => { session = nextSession; }
+        })
+        : null;
+      return new NavigationEngine(session, {
+        journal, workflowStore, decisionRuntime, environment, capabilityService, principalId,
+        executionMode: "standalone", plannerMode: plannerModeFromArgs(args), assertExecutionLease: lease.assertCurrent,
+        reattachSameTarget
+      }).run(resumedGoal, { resumeState });
+    });
     print(result);
     if (result.status !== "succeeded") process.exitCode = 2;
   } else throw new Error(`Unknown command: ${command}`);
 } finally {
   decisionRuntime?.close();
-  if (session) await session.close();
+  for (const managedSession of managedSessions) await managedSession.close().catch(() => {});
   await connection?.close();
 }
