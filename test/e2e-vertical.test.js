@@ -93,9 +93,13 @@ test("E2E vertical: attach → discover → test → collect → investigate →
     runStateStore = new RunStateStore(runStateDir);
     await runStateStore.init();
     chrome = spawn(chromePath, [
+      ...(process.env.ACTIVETAB_HEADLESS === "1" ? ["--headless=new"] : []),
       "--no-sandbox", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check",
       "--remote-debugging-port=0", `--user-data-dir=${profileDir}`, siteUrl
     ], { stdio: ["ignore", "ignore", "pipe"], detached: true });
+    if (process.env.ACTIVETAB_HEADLESS === "1") {
+      assert.ok(chrome.spawnargs.includes("--headless=new"), "the explicit headless opt-in reaches the vertical test browser");
+    }
     let stderr = "";
     chrome.stderr.setEncoding("utf8");
     chrome.stderr.on("data", chunk => { stderr += chunk.slice(-5000); });
@@ -124,6 +128,18 @@ test("E2E vertical: attach → discover → test → collect → investigate →
     assert.ok(fixtureTarget, "Chrome exposed the fixture page target");
     const target = await resolveAuthorizedTarget(endpoint, fixtureTarget.id, fixtureTarget.id);
     session = await new BrowserSession(target).attach();
+    const userAgentResult = await session.client.send("Runtime.evaluate", {
+      expression: "navigator.userAgent",
+      returnByValue: true
+    });
+    const browserUserAgent = userAgentResult?.result?.value ?? "";
+    if (process.env.ACTIVETAB_HEADLESS === "1") {
+      assert.match(browserUserAgent, /HeadlessChrome\//u, "CDP runtime identifies the launched browser as headless");
+      t.diagnostic(`Headless attested: --headless=new; CDP navigator.userAgent=${browserUserAgent}`);
+    } else {
+      assert.doesNotMatch(browserUserAgent, /HeadlessChrome\//u, "headed mode must not silently become headless");
+      t.diagnostic(`Headed attested: CDP navigator.userAgent=${browserUserAgent}`);
+    }
     t.diagnostic(`Attached: ${target.url}`);
 
     // ── 2. Verified identity via passive observation ──

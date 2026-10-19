@@ -8,16 +8,55 @@
 
 import { DiagnosticReport, FINDING_LEVEL, INVESTIGATION_STATUS } from "../diagnostics/report.js";
 import { CORRELATION_STRENGTH } from "../diagnostics/correlator.js";
+import { classifyFailureReasonCode, FAILURE_CLASSIFICATION } from "../diagnostics/failureTaxonomy.js";
 import { STEP_STATUS } from "../testing/schema.js";
 
-export const FAILURE_CLASSIFICATION = Object.freeze({
-  NAVIGATION: "navigation",
-  ASSERTION: "assertion",
-  NETWORK: "network",
-  AUTHORIZATION: "authorization",
-  DIAGNOSTIC: "diagnostic",
-  UNKNOWN: "unknown"
-});
+export { FAILURE_CLASSIFICATION } from "../diagnostics/failureTaxonomy.js";
+
+function safeUrlMetadata(value) {
+  if (typeof value !== "string" || value.length > 4096) return { validUrl: false, length: typeof value === "string" ? value.length : null };
+  try {
+    const url = new URL(value);
+    return {
+      validUrl: true,
+      origin: url.origin,
+      pathDepth: url.pathname.split("/").filter(Boolean).length,
+      queryParameterCount: [...url.searchParams.keys()].length,
+      hasFragment: Boolean(url.hash)
+    };
+  } catch { return { validUrl: false }; }
+}
+
+function safeRequestMetadata(request) {
+  return {
+    method: typeof request?.method === "string" && /^[A-Z]{1,16}$/iu.test(request.method) ? request.method.toUpperCase() : "UNKNOWN",
+    ...(Number.isInteger(request?.status) ? { status: request.status } : {}),
+    url: safeUrlMetadata(request?.url)
+  };
+}
+
+function summarizeSnapshot(snapshot) {
+  const data = snapshot?.data;
+  return {
+    snapshotId: snapshot?.snapshotId ?? null,
+    sourceId: snapshot?.sourceId ?? null,
+    operation: snapshot?.operation ?? null,
+    collectedAt: snapshot?.collectedAt ?? null,
+    evidenceId: snapshot?.evidenceId ?? null,
+    status: snapshot?.status ?? null,
+    ...(Array.isArray(data?.requests) ? { requestCount: data.requests.length } : {}),
+    ...(Array.isArray(data?.events) ? { eventCount: data.events.length } : {}),
+    ...(data && !Array.isArray(data) && typeof data === "object" ? { dataFieldNames: Object.keys(data).slice(0, 32) } : {})
+  };
+}
+
+function operationDisposition(status) {
+  if (status === "VERIFIED") return "reconciled_verified";
+  if (status === "FAILED") return "reconciled_failed";
+  if (status === "REFUSED") return "refused_before_dispatch";
+  if (status === "OBSERVED") return "effect_observed_but_not_verified";
+  return "may_have_dispatched_or_still_be_in_flight";
+}
 
 export const CAUSAL_CONFIDENCE = Object.freeze({
   CONFIRMED: "confirmed",
@@ -28,11 +67,11 @@ export const CAUSAL_CONFIDENCE = Object.freeze({
 });
 
 export class InvestigationEngine {
-  constructor({ collector, correlator, session, testRunner, maxHypotheses = 5, maxChecks = 8, signal } = {}) {
+  constructor({ collector, correlator, session, runStateStore = null, maxHypotheses = 5, maxChecks = 8, signal } = {}) {
     this.collector = collector;
     this.correlator = correlator;
     this.session = session;
-    this.testRunner = testRunner;
+    this.runStateStore = runStateStore;
     this.maxHypotheses = Math.max(1, Math.min(maxHypotheses, 16));
     this.maxChecks = Math.max(1, Math.min(maxChecks, 32));
     this.signal = signal;
@@ -45,6 +84,8 @@ export class InvestigationEngine {
   async investigate(failure) {
     if (!failure || typeof failure !== "object") throw new Error("Investigation requires a failure object.");
     const classification = this.#classifyFailure(failure);
+    const providedReasonCode = failure.reasonCode ?? failure.failureCode ?? null;
+    const stableReasonCodeRecognized = classifyFailureReasonCode(providedReasonCode) !== null;
     const availableEvidence = this.#identifyEvidence(failure);
     const hypotheses = this.#generateHypotheses(failure, classification, availableEvidence);
     const discriminatingChecks = this.#selectDiscriminatingChecks(hypotheses);
@@ -54,6 +95,9 @@ export class InvestigationEngine {
 
     return {
       classification,
+      classificationBasis: stableReasonCodeRecognized ? "stable_reason_code" : providedReasonCode ? "unrecognized_reason_code" : "legacy_reason_text",
+      failureCode: typeof providedReasonCode === "string" && /^[a-z][a-z0-9_:-]{0,95}$/iu.test(providedReasonCode) ? providedReasonCode.toLowerCase() : null,
+      automatedContinuationPermitted: false,
       availableEvidence,
       hypotheses: updated,
       executedChecks: executed,
@@ -62,6 +106,10 @@ export class InvestigationEngine {
   }
 
   #classifyFailure(failure) {
+    const reasonCode = failure.reasonCode ?? failure.failureCode;
+    if (typeof reasonCode === "string") {
+      return classifyFailureReasonCode(reasonCode) ?? FAILURE_CLASSIFICATION.UNKNOWN;
+    }
     const reason = String(failure.reason ?? "").toLowerCase();
     if (reason.includes("unauthorized") || reason.includes("401") || reason.includes("403") || reason.includes("permission") || reason.includes("authorized")) return FAILURE_CLASSIFICATION.AUTHORIZATION;
     if (reason.includes("network") || reason.includes("request") || reason.includes("fetch") || reason.includes("status")) return FAILURE_CLASSIFICATION.NETWORK;
@@ -80,10 +128,15 @@ export class InvestigationEngine {
       correlationLinks: []
     };
     if (this.collector) {
-      evidence.collectorSnapshots = this.collector.getSnapshots().slice(0, 20);
+      evidence.collectorSnapshots = this.collector.getSnapshots().slice(0, 20).map(summarizeSnapshot);
     }
     if (this.correlator) {
-      evidence.correlationLinks = this.correlator.getLinks().slice(0, 50);
+      evidence.correlationLinks = this.correlator.getLinks().slice(0, 50).map(link => ({
+        linkId: link.linkId,
+        strength: link.strength,
+        eventIdA: link.eventIdA,
+        eventIdB: link.eventIdB
+      }));
     }
     return evidence;
   }
@@ -127,7 +180,7 @@ export class InvestigationEngine {
       default:
         hypotheses.push(
           { id: "h1", description: "An application error or unexpected state caused the failure.", discriminatingCheck: "collect a fresh diagnostic snapshot" },
-          { id: "h2", description: "A runtime or infrastructure issue caused the failure.", discriminatingCheck: "re-run the failing step with fresh evidence" }
+          { id: "h2", description: "A runtime or infrastructure issue caused the failure.", discriminatingCheck: "inspect prior dispatch evidence without replay" }
         );
     }
     return hypotheses.slice(0, this.maxHypotheses);
@@ -189,8 +242,8 @@ export class InvestigationEngine {
           case "collect a fresh diagnostic snapshot":
             result = await this.#collectFreshSnapshot();
             break;
-          case "re-run the failing step with fresh evidence":
-            result = await this.#reRunStep(failure);
+          case "inspect prior dispatch evidence without replay":
+            result = await this.#investigatePriorDispatch(failure);
             break;
           case "report the authorization boundary and required capability":
             result = { status: STEP_STATUS.BLOCKED, reason: "Authorization boundary requires manual handoff." };
@@ -200,7 +253,7 @@ export class InvestigationEngine {
         }
         executed.push({ hypothesisId, check, ...result });
       } catch (error) {
-        executed.push({ hypothesisId, check, status: STEP_STATUS.FAIL, reason: String(error?.message ?? error).slice(0, 200) });
+        executed.push({ hypothesisId, check, status: STEP_STATUS.UNCERTAIN, reason: "The diagnostic check failed; no effect was replayed." });
       }
     }
     return executed;
@@ -208,11 +261,14 @@ export class InvestigationEngine {
 
   async #reObservePage() {
     if (this.session) {
-      const observation = await this.session.observe();
+      const observation = await this.session.observe({ profile: "lightweight" });
       return {
         status: STEP_STATUS.PASS,
-        reason: `Current page: ${observation?.page?.url ?? "unknown"}`,
-        evidence: { url: observation?.page?.url, title: observation?.page?.title },
+        reason: "A fresh lightweight page observation was captured.",
+        evidence: {
+          url: safeUrlMetadata(observation?.page?.url),
+          titleCharacterLength: typeof observation?.page?.title === "string" ? [...observation.page.title].length : null
+        },
         evidenceIds: [observation?.evidenceId ?? ""].filter(Boolean)
       };
     }
@@ -228,7 +284,7 @@ export class InvestigationEngine {
 
   async #checkLoginMarkers() {
     if (this.session) {
-      const observation = await this.session.observe();
+      const observation = await this.session.observe({ profile: "lightweight" });
       const url = String(observation?.page?.url ?? "").toLowerCase();
       const title = String(observation?.page?.title ?? "").toLowerCase();
       const hasLoginMarker = url.includes("login") || url.includes("signin") || title.includes("login") || title.includes("sign in");
@@ -263,12 +319,17 @@ export class InvestigationEngine {
   async #reObserveAfterWait() {
     if (!this.session) return { status: "UNCERTAIN", reason: "No browser session available for delayed re-observation." };
     await new Promise(resolve => setTimeout(resolve, 1000));
-    const observation = await this.session.observe();
+    const observation = await this.session.observe({ profile: "lightweight" });
     return {
       status: STEP_STATUS.PASS,
-      reason: `Delayed re-observation captured. Page: ${observation?.page?.url ?? "unknown"}`,
+      reason: "Delayed lightweight re-observation captured.",
       evidenceIds: [observation?.evidenceId ?? ""].filter(Boolean),
-      evidence: { page: observation?.page }
+      evidence: {
+        page: {
+          url: safeUrlMetadata(observation?.page?.url),
+          titleCharacterLength: typeof observation?.page?.title === "string" ? [...observation.page.title].length : null
+        }
+      }
     };
   }
 
@@ -281,10 +342,13 @@ export class InvestigationEngine {
     if (observed === undefined || observed === null) {
       return { status: "UNCERTAIN", reason: "No observedValue was provided in the failure record; cannot log a meaningful value." };
     }
+    const valueType = Array.isArray(observed) ? "array" : typeof observed;
+    const characterLength = typeof observed === "string" ? [...observed].length : null;
+    const byteLength = typeof observed === "string" && observed.length <= 1_000_000 ? Buffer.byteLength(observed, "utf8") : null;
     return {
-      status: STEP_STATUS.PASS,
-      reason: `Observed value recorded: ${String(observed).slice(0, 200)}`,
-      evidence: { observedValue: String(observed).slice(0, 200) }
+      status: STEP_STATUS.UNCERTAIN,
+      reason: "Observed value content was withheld from the investigation report; only structural metadata is included.",
+      evidence: { observedValue: { redacted: true, valueType, characterLength, byteLength } }
     };
   }
 
@@ -294,9 +358,10 @@ export class InvestigationEngine {
     if (snapshots.length < 2) return { status: "UNCERTAIN", reason: "Fewer than two network snapshots." };
     const before = new Set(snapshots[0].data.requests?.map(r => `${r.method}:${r.url}`) ?? []);
     const after = new Set(snapshots[1].data.requests?.map(r => `${r.method}:${r.url}`) ?? []);
-    const newRequests = [...after].filter(r => !before.has(r));
+    const afterRequests = snapshots[1].data.requests ?? [];
+    const newRequests = afterRequests.filter(request => !before.has(`${request.method}:${request.url}`));
     if (newRequests.length > 0) {
-      return { status: "PASS", reason: `${newRequests.length} new request(s) after the action.`, evidence: { newRequests: newRequests.slice(0, 10) } };
+      return { status: "PASS", reason: `${newRequests.length} new request(s) after the action.`, evidence: { newRequests: newRequests.slice(0, 10).map(safeRequestMetadata) } };
     }
     return { status: "FAIL", reason: "No new requests after the action." };
   }
@@ -307,7 +372,7 @@ export class InvestigationEngine {
     const requests = latest?.data?.requests ?? [];
     const non2xx = requests.filter(r => typeof r.status === "number" && r.status >= 400);
     if (non2xx.length > 0) {
-      return { status: "PASS", reason: `${non2xx.length} request(s) with status >= 400.`, evidence: { requests: non2xx.slice(0, 10).map(r => ({ url: r.url, status: r.status })) } };
+      return { status: "PASS", reason: `${non2xx.length} request(s) with status >= 400.`, evidence: { requests: non2xx.slice(0, 10).map(safeRequestMetadata) } };
     }
     return { status: "FAIL", reason: "No request with status >= 400 in latest network snapshot." };
   }
@@ -344,20 +409,64 @@ export class InvestigationEngine {
     };
   }
 
-  async #reRunStep(failure) {
-    if (!this.testRunner) return { status: "UNCERTAIN", reason: "No test runner reference available for step re-execution." };
-    if (!failure?.workflow || !failure?.stepId) return { status: "UNCERTAIN", reason: "Failure does not include workflow and stepId for re-execution." };
-    const step = failure.workflow.steps?.find(s => s.id === failure.stepId);
-    if (!step) return { status: "UNCERTAIN", reason: `Step '${failure.stepId}' not found in workflow for re-execution.` };
-    const receipt = await this.testRunner.run(
-      { ...failure.workflow, id: `reinvestigate-${failure.stepId}`, steps: [step] },
-      { runId: failure.runId }
-    );
-    const stepResult = receipt.steps.at(-1);
+  async #investigatePriorDispatch(failure) {
+    if (!failure?.runId || typeof this.runStateStore?.getFresh !== "function") {
+      return { status: STEP_STATUS.UNCERTAIN, reason: "Durable dispatch evidence is unavailable; the prior effect was not replayed." };
+    }
+    const run = await this.runStateStore.getFresh(failure.runId);
+    if (!run) return { status: STEP_STATUS.UNCERTAIN, reason: "The durable run record was not found; the prior effect was not replayed." };
+
+    const statusRank = { RESERVED: 1, DISPATCHED: 2, UNCERTAIN: 3, OBSERVED: 4, VERIFIED: 5, FAILED: 5, REFUSED: 5 };
+    const operations = new Map();
+    for (const operation of [...(run.pendingOperations ?? []), ...(run.uncertainOperations ?? [])]) {
+      if (typeof operation?.operationId !== "string") continue;
+      const previous = operations.get(operation.operationId);
+      if (!previous || (statusRank[operation.status] ?? 0) >= (statusRank[previous.status] ?? 0)) {
+        operations.set(operation.operationId, operation);
+      }
+    }
+    const matches = [...operations.values()].filter(operation =>
+      (failure.operationId ? operation.operationId === failure.operationId : true)
+      && (failure.stepId ? operation.stepId === failure.stepId : true));
+    if (matches.length !== 1) {
+      return {
+        status: STEP_STATUS.UNCERTAIN,
+        reason: matches.length ? "Multiple durable operations match this failure; no outcome was inferred and no effect was replayed." : "No exact durable operation matched this failure; no effect was replayed.",
+        evidence: { matchingOperationCount: matches.length, runStatus: run.status ?? null }
+      };
+    }
+
+    const operation = matches[0];
+    const operationEvidenceIds = [...new Set([...(operation.evidenceIds ?? []), operation.receiptId].filter(value => typeof value === "string" && value))];
+    const evidenceSet = new Set(operationEvidenceIds);
+    const relatedLinks = (this.correlator?.getLinks() ?? []).filter(link => {
+      const references = [link.eventIdA, link.eventIdB, ...(link.evidence?.evidenceRefs ?? [])];
+      return references.some(reference => evidenceSet.has(reference));
+    }).map(link => ({ linkId: link.linkId, strength: link.strength, eventIdA: link.eventIdA, eventIdB: link.eventIdB }));
+    const dispatchTime = Date.parse(operation.dispatchedAt ?? operation.reservedAt ?? "");
+    const subsequentSnapshots = Number.isFinite(dispatchTime) && this.collector
+      ? this.collector.getSnapshots().filter(snapshot => Date.parse(snapshot.collectedAt ?? "") >= dispatchTime).slice(0, 20).map(summarizeSnapshot)
+      : [];
     return {
-      status: stepResult?.status ?? STEP_STATUS.UNCERTAIN,
-      reason: stepResult?.reason ?? "Step re-execution returned no result.",
-      evidenceIds: stepResult?.evidenceIds ?? []
+      status: STEP_STATUS.UNCERTAIN,
+      reason: `Durable operation evidence reports ${operation.status ?? "unknown"}; this check only inspected the reservation and collected evidence. No effect was replayed.`,
+      evidenceIds: operationEvidenceIds,
+      evidence: {
+        effectDisposition: operationDisposition(operation.status),
+        operation: {
+          operationId: operation.operationId,
+          stepId: operation.stepId,
+          action: operation.action,
+          status: operation.status,
+          targetId: operation.targetId ?? null,
+          reservedAt: operation.reservedAt ?? null,
+          dispatchedAt: operation.dispatchedAt ?? null,
+          reconciledAt: operation.reconciledAt ?? null,
+          evidenceIds: operationEvidenceIds
+        },
+        correlatedLinks: relatedLinks,
+        subsequentSnapshots
+      }
     };
   }
 
@@ -391,7 +500,7 @@ export class InvestigationEngine {
     report.setCorrelationSummary(this.correlator?.summary() ?? null);
     const hasConfirmingEvidence = executed.some(e => e.status === "PASS" && e.evidenceIds?.length > 0);
     const hasFailures = executed.some(e => e.status === "FAIL");
-    const allBlocked = executed.length > 0 && executed.every(e => e.status === "BLOCKED" || e.status === "UNCERTAIN");
+    const allBlocked = executed.length > 0 && executed.every(e => e.status === "BLOCKED");
     const reportStatus = allBlocked ? INVESTIGATION_STATUS.BLOCKED
       : hasFailures ? INVESTIGATION_STATUS.NARROWED
       : hasConfirmingEvidence ? INVESTIGATION_STATUS.NARROWED

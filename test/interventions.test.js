@@ -9,6 +9,8 @@ import {
   InterventionStore, InterventionWatcher, evaluateCompletion, externalRunState,
   INTERVENTION_TYPE, INTERVENTION_STATE, EXTERNAL_RUN_STATE
 } from "../src/runtime/interventions.js";
+import { buildEnvironmentBinding } from "../src/environments/model.js";
+import { InterventionCoordinator } from "../src/testing/lifecycle/interventionCoordinator.js";
 
 async function withStore(fn) {
   const dir = await mkdtemp(join(tmpdir(), "activetab-interv-"));
@@ -16,6 +18,45 @@ async function withStore(fn) {
   await store.init();
   try { return await fn(store); } finally { await rm(dir, { recursive: true, force: true }); }
 }
+
+test("intervention application binding resolves the observed route instead of selecting the first matching realm", async () => {
+  const environment = buildEnvironmentBinding({
+    profile_id: "shared-realm-profile",
+    authentication_realms: [{ realm_id: "shared-realm", scope: ["application"] }],
+    environment: {
+      environment_id: "shared-realm-environment",
+      application_entry_url: "https://apps.example.test/app-a",
+      applications: [
+        { application_id: "app-a", authentication_realm: "shared-realm", candidate_entry: "/app-a" },
+        { application_id: "app-b", authentication_realm: "shared-realm", candidate_entry: "/app-b" }
+      ]
+    }
+  });
+  const created = [];
+  const coordinator = new InterventionCoordinator({
+    interventions: { async create(value) { created.push(value); return { intervention_id: `i-${created.length}`, state: "waiting" }; } },
+    environment,
+    session: { target: { id: "tab-app-b", url: "https://apps.example.test/app-b/login" } }
+  });
+  const receipt = { runId: "run-shared-realm", recordStep() {}, recordIntervention() {} };
+  const step = { id: "login", type: "interaction", intervention: {} };
+
+  await coordinator.suspend(step, receipt, new Date().toISOString(), {
+    type: INTERVENTION_TYPE.AUTHENTICATION,
+    reason: "Sign in to continue",
+    requiredHumanAction: "Sign in",
+    condition: { type: "authenticated_session_check", realm: "shared-realm" }
+  });
+  assert.equal(created[0].applicationId, "app-b");
+
+  await coordinator.suspend(step, receipt, new Date().toISOString(), {
+    type: INTERVENTION_TYPE.AUTHENTICATION,
+    reason: "Realm mismatch",
+    requiredHumanAction: "Resolve the application identity",
+    condition: { type: "authenticated_session_check", realm: "different-realm" }
+  });
+  assert.equal(created[1].applicationId, null, "unmatched realm does not bind an arbitrary same-origin application");
+});
 
 test("interventions persist before control returns and are resumable, not terminal", () =>
   withStore(async store => {
@@ -103,6 +144,8 @@ test("watcher resumes only after the verified condition holds (event-driven)", (
     let authenticated = false;
     const events = new EventEmitter();
     let resumed = null;
+    let announceResume;
+    const resumedPromise = new Promise(resolve => { announceResume = resolve; });
     const watcher = new InterventionWatcher({
       store,
       ctx: { verifyAuthentication: async () => authenticated ? { authenticated: true, evidenceId: "ev-auth" } : { authenticated: false } },
@@ -114,6 +157,7 @@ test("watcher resumes only after the verified condition holds (event-driven)", (
       const reevaluated = await evaluateCompletion(owned, watcher.ctx);
       if (!reevaluated.satisfied) { await store.releaseResume(owned.intervention_id, lease); return; }
       resumed = await store.completeResume(owned.intervention_id, lease, { evidenceId: reevaluated.evidenceId, note: reevaluated.summary });
+      announceResume();
     };
     watcher.start();
     try {
@@ -125,7 +169,13 @@ test("watcher resumes only after the verified condition holds (event-driven)", (
       // Session transition with verified authentication resumes.
       authenticated = true;
       events.emit("session-changed");
-      await new Promise(r => setTimeout(r, 50));
+      let timeoutId;
+      try {
+        await Promise.race([
+          resumedPromise,
+          new Promise((_, reject) => { timeoutId = setTimeout(() => reject(new Error("watcher did not resume within one second")), 1_000); })
+        ]);
+      } finally { clearTimeout(timeoutId); }
       assert.ok(resumed, "watcher resumed after the verified condition held");
       assert.equal(store.get(record.intervention_id).state, INTERVENTION_STATE.SATISFIED);
     } finally { watcher.stop(); }

@@ -12,10 +12,11 @@
     <a id="account" href="/account">Open account</a>
     <button id="obstructed" type="button" onclick="document.title='Obstructed action ran'">Open obstructed controls</button>
     <section aria-label="Custom task controls">
-      <button id="model-picker" type="button" role="combobox" aria-label="Model" aria-expanded="false">Choose model</button>
+      <button id="model-picker" type="button" role="combobox" aria-label="Model" aria-expanded="false" aria-controls="model-options">Choose model</button>
       <div id="model-options" role="listbox" hidden>
         <div role="option">GLM5.3-flash</div>
       </div>
+      <div id="unrelated-model-option" role="option">GLM5.3-flash</div>
       <div id="task-editor" role="textbox" aria-label="Task instructions" contenteditable="true"></div>
     </section>
     <div id="cover" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.2)"></div>
@@ -29,7 +30,7 @@
     <div style="height: 1800px" aria-hidden="true"></div>
     <button id="archive" type="button" onclick="document.querySelector('h1').textContent='Archive';document.title='Archive'">Open archive</button>
     <form onsubmit="event.preventDefault();document.querySelector('h1').textContent='Search results';document.title='Search results'">
-      <input type="search" aria-label="Search text" />
+      <input type="text" name="q" aria-label="Search text" />
       <button type="submit">Search</button>
     </form>
     <iframe title="Embedded profile" src="/same-frame.html" width="360" height="160"></iframe>
@@ -42,6 +43,9 @@
     modelPicker.addEventListener("click", () => {
       modelOptions.hidden = false;
       modelPicker.setAttribute("aria-expanded", "true");
+    });
+    document.querySelector("#unrelated-model-option").addEventListener("click", () => {
+      modelPicker.dataset.unrelatedSelection = "true";
     });
     modelOptions.querySelector('[role="option"]').addEventListener("click", event => {
       modelPicker.textContent = event.currentTarget.textContent;

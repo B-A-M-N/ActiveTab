@@ -1,10 +1,8 @@
 import { fieldIsPermitted } from "../extraction/extractionContract.js";
-import { discoverVisibleNextPage, resolveVisibleTableRecords } from "../extraction/recordResolver.js";
+import { discoverVirtualizedListScrollTarget, discoverVisibleNextPage, resolveVisibleTableRecords } from "../extraction/recordResolver.js";
 import { resolveVisibleRecordGroupRecords } from "../extraction/recordGroupResolver.js";
-
-function applicationIdFor(environment, origin) {
-  return environment?.applications?.find(application => application.origin === origin)?.applicationId ?? null;
-}
+import { resolveObservedApplication } from "../environments/model.js";
+import { createHash } from "node:crypto";
 
 /** Read a registered recipe from one fresh observation; never dispatches effects. */
 export async function executeExtractionCapability({ capabilityId, capabilityVersion = 1, registry, session, environment, principalId, authorizeField } = {}) {
@@ -20,7 +18,9 @@ export async function executeExtractionCapability({ capabilityId, capabilityVers
   catch { return { status: "blocked", reasonCode: "page_origin_unavailable", evidenceId: observation.evidenceId };
   }
   const environmentId = environment?.environmentId ?? environment?.id ?? null;
-  const applicationId = applicationIdFor(environment, url.origin);
+  const application = resolveObservedApplication(environment, url.href);
+  if (application.status !== "matched") return { status: "blocked", reasonCode: `application_identity_${application.status}`, evidenceId: observation.evidenceId };
+  const applicationId = application.applicationId;
   const manifest = registry?.resolve?.(capabilityId, { capabilityVersion, origin: url.origin, environmentId, applicationId, principalId });
   if (!manifest) return { status: "blocked", reasonCode: "capability_not_registered_for_current_scope", evidenceId: observation.evidenceId };
   if (url.pathname !== manifest.pagePath) return { status: "blocked", reasonCode: "capability_route_mismatch", evidenceId: observation.evidenceId };
@@ -46,7 +46,8 @@ export async function executeExtractionCapability({ capabilityId, capabilityVers
     capabilityVersion: manifest.capabilityVersion,
     contract: manifest.extractionContract,
     observation,
-    pageIdentity: url.href,
+    pageIdentity: pageIdentity(url.href, resolved.records),
+    cursorFingerprint: routeCursorFingerprint(url.href),
     pageUrl: url.origin + url.pathname,
     records: [],
     evidence: []
@@ -57,14 +58,32 @@ export async function executeExtractionCapability({ capabilityId, capabilityVers
     capabilityVersion: manifest.capabilityVersion,
     contract: manifest.extractionContract,
     observation,
-    pageIdentity: url.href,
+    pageIdentity: pageIdentity(url.href, resolved.records),
+    cursorFingerprint: routeCursorFingerprint(url.href),
     records: resolved.records,
     truncated: resolved.truncated === true,
     evidence: resolved.evidence,
     headers: resolved.headers,
     ...(manifest.extractionContract.pagination
-      ? { nextPage: discoverVisibleNextPage(evidence.domSnapshot, url.href) }
+      ? { nextPage: manifest.extractionContract.pagination.kind === "virtualized_list"
+          ? discoverVirtualizedListScrollTarget(observation, resolved.evidence?.[0]?.bounds)
+          : discoverVisibleNextPage(evidence.domSnapshot, url.href, {
+            kind: manifest.extractionContract.pagination.kind,
+            queryParameter: manifest.extractionContract.pagination.queryParameter
+          }) }
       : { nextPage: { status: "not_configured" } }),
     pageUrl: url.origin + url.pathname
   };
+}
+
+function pageIdentity(url, records) {
+  const digest = createHash("sha256").update(JSON.stringify((records ?? []).map(record => record.values))).digest("hex");
+  return `${url}#records-${digest}`;
+}
+
+function routeCursorFingerprint(value) {
+  try {
+    const url = new URL(value);
+    return createHash("sha256").update(JSON.stringify([url.origin, url.pathname, url.search])).digest("hex");
+  } catch { return null; }
 }

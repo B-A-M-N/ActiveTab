@@ -63,6 +63,58 @@ test("GET /health returns ok", async () => {
   assert.equal(body.service, "activetab-local-api");
 });
 
+test("API startup refuses readiness when durable intervention storage fails", async () => {
+  let initCalls = 0;
+  const unavailable = createApiServer({
+    port: 0,
+    taskStoreDir: join(tempDir, "tasks-intervention-failure"),
+    navigationRunner: MOCK_NAVIGATION_RUNNER,
+    interventionStore: { async init() { initCalls++; throw new Error("read-only storage"); } }
+  });
+  await assert.rejects(unavailable.start(), error => error?.code === "intervention_store_unavailable");
+  assert.equal(initCalls, 1, "startup and request lifecycle share one initialization attempt");
+});
+
+test("test-run status is projected from durable state rather than a process-local worker receipt", async () => {
+  const runId = "durable-authority-test";
+  const durableState = {
+    runId,
+    status: "uncertain",
+    createdAt: "2026-10-19T12:00:00.000Z",
+    workflowId: "durable-workflow",
+    completedSteps: [{ stepId: "step-a", type: "navigate", status: "PASS", evidenceIds: [] }],
+    pendingOperations: [{ operationId: "operation-uncertain", status: "UNCERTAIN" }],
+    pendingInterventionId: "intervention-pending",
+    cancellationRequested: true
+  };
+  const durableStore = {
+    async init() {},
+    async acquireTargetLease() { throw new Error("This status-only test does not acquire browser leases."); },
+    async getFresh(id) { return id === runId ? structuredClone(durableState) : null; }
+  };
+  const server = createApiServer({
+    port: 0,
+    taskStoreDir: join(tempDir, "tasks-durable-authority"),
+    navigationRunner: MOCK_NAVIGATION_RUNNER,
+    apiToken: "test-token",
+    runStateStore: durableStore
+  });
+  const { url } = await server.start();
+  try {
+    const response = await fetch(`${url}/v1/test/runs/${runId}/status`, {
+      headers: { Authorization: "Bearer test-token" }
+    });
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(body.status, "UNCERTAIN");
+    assert.equal(body.pendingInterventionId, "intervention-pending");
+    assert.deepEqual(body.unresolvedOperationIds, ["operation-uncertain"]);
+    assert.equal(body.cancellationRequested, true);
+  } finally {
+    await server.stop();
+  }
+});
+
 // ── Bots listing ─────────────────────────────────────────────────────────
 
 test("GET /v3/bots returns template list", async () => {
@@ -146,6 +198,19 @@ test("POST run with invalid input returns 99001", async () => {
   });
   assert.equal(status, 400);
   assert.equal(body.code, 99001);
+});
+
+test("POST run rejects and does not persist undeclared input fields", async () => {
+  const before = await apiCall("GET", "/v3/bots/runs");
+  const secretValue = "must-not-be-persisted-or-returned";
+  const result = await apiCall("POST", "/v3/bots/templates/local-web-reviews-scraper/runs", {
+    input: { url: "https://example.com", review_count: 2, undeclared_secret: secretValue }
+  });
+  assert.equal(result.status, 400);
+  assert.equal(result.body.code, 99001);
+  assert.equal(JSON.stringify(result.body).includes(secretValue), false);
+  const after = await apiCall("GET", "/v3/bots/runs");
+  assert.equal(after.body.total_count, before.body.total_count);
 });
 
 test("POST run with missing required field returns 99001", async () => {
@@ -263,8 +328,7 @@ test("Error responses match BrowserAct error envelope", async () => {
 // ── V2 shape compatibility ───────────────────────────────────────────────
 
 test("GET /v3/bots/runs lists tasks in V2-compatible shape", async () => {
-  // Create a task first
-  await apiCall("POST", "/v3/bots/templates/local-web-reviews-scraper/runs", {
+  const created = await apiCall("POST", "/v3/bots/templates/local-web-reviews-scraper/runs", {
     input: { url: "https://example.com/list-test", review_count: 2 }
   });
 
@@ -273,6 +337,10 @@ test("GET /v3/bots/runs lists tasks in V2-compatible shape", async () => {
   assert.ok(Array.isArray(body.items));
   assert.ok(typeof body.total_count === "number");
   assert.ok(typeof body.total_pages === "number");
+  const item = body.items.find(task => task.task_id === created.body.task_id);
+  assert.deepEqual(item.input, { url: "[redacted]", review_count: 2 });
+  assert.equal(JSON.stringify(item).includes("list-test"), false);
+  assert.equal(Object.hasOwn(item, "output"), false, "the list projection omits full run results");
 });
 
 // ── Milestone 0: execution, security, and lifecycle hardening ───────────

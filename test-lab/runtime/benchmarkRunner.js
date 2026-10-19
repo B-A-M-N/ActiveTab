@@ -12,6 +12,7 @@ export async function runBenchmarkEpisode({ provider, scenario, driver, signal, 
   assertValidScenario(scenario);
   if (typeof driver !== "function") throw new TypeError("Benchmark driver must be a function.");
   const episodeId = randomUUID();
+  let provisionAttempted = false;
   let provisioned = false;
   let driverResult = { status: "uncertain", reasonCode: "driver_not_started" };
   let oracle = null;
@@ -19,6 +20,7 @@ export async function runBenchmarkEpisode({ provider, scenario, driver, signal, 
   let cleanupError = null;
   let cleanupVerified = false;
   try {
+    provisionAttempted = true;
     await provider.provision({ episodeId, scenario, signal });
     provisioned = true;
     await provider.seed({ episodeId, scenario, signal });
@@ -45,7 +47,7 @@ export async function runBenchmarkEpisode({ provider, scenario, driver, signal, 
     // ask the provider to dispose and require explicit evidence of cleanup.
     try {
       const cleanup = await provider.dispose({ episodeId, provisioned });
-      cleanupVerified = provisioned && cleanup?.status === "verified";
+      cleanupVerified = provisionAttempted && cleanup?.status === "verified";
       if (!cleanupVerified) cleanupError = { reasonCode: provisioned ? "fixture_cleanup_unverified" : "fixture_provision_unverified" };
     } catch (error) {
       cleanupError = { errorName: error?.name ?? "Error", reasonCode: provisioned ? "fixture_cleanup_failed" : "fixture_provision_unverified" };
@@ -77,6 +79,19 @@ export async function runBenchmarkEpisode({ provider, scenario, driver, signal, 
     siteFamily: scenario.site_family,
     seed: scenario.seed,
     applicationBuild: scenario.application?.build ?? null,
+    qualification: Object.freeze({
+      level: scenario.qualification.level,
+      providerId: scenario.qualification.provider_id,
+      providerIdentity: scenario.qualification.provider_identity,
+      scenarioSeed: scenario.seed,
+      sourceRevision: scenario.qualification.source_revision,
+      oracleReference: scenario.qualification.oracle_reference,
+      independentApplicationOutcome: Boolean(oracle),
+      cleanupResult: Object.freeze({
+        status: cleanupVerified ? "verified" : provisionAttempted ? "unverified" : "not_run",
+        ...(cleanupError?.reasonCode ? { reasonCode: cleanupError.reasonCode } : {})
+      })
+    }),
     driver: {
       status: driverResult?.status ?? "uncertain",
       reportedRunId: driverResult?.reportedRunId ?? null,

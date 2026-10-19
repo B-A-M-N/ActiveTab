@@ -1,25 +1,24 @@
 import { createInterface } from "node:readline";
+import { userInfo } from "node:os";
 import { join } from "node:path";
 import { listTargets, resolveAuthorizedTarget } from "../browser/targets.js";
 import { BrowserSession } from "../browser/session.js";
 import { connectChromeAuto, listChromeTargets, resolveChromeTarget } from "../browser/chrome-autoconnect.js";
 import { clickObservedElement } from "../navigation/observedAction.js";
 import { ExtensionBroker } from "../extension/broker.js";
-import { brokerSocketPath } from "../extension/paths.js";
+import { brokerSocketPath, stateDirectory } from "../extension/paths.js";
 import { WorkflowStore } from "../state/workflows.js";
 import { McpTaskJournalStore } from "../state/mcpTaskJournals.js";
 import { selectBrowserSession } from "./session-selection.js";
 import { runMcpGoal } from "./runGoal.js";
-import { DiagnosticCollector } from "../diagnostics/collector.js";
 import { createDiagnosticContract, AUTHORITY, OPERATION, SENSITIVITY } from "../diagnostics/contracts.js";
-import { registerBrowserDiagnosticSources } from "../diagnostics/adapters/browserSources.js";
 import { cloudAgentAdapterFromEnv } from "../diagnostics/adapters/cloudAgentApi.js";
 import { DiagnosticCorrelator } from "../diagnostics/correlator.js";
 import { DiagnosticReport, FINDING_LEVEL, deriveRunInvestigationStatus } from "../diagnostics/report.js";
-import { TestRunner } from "../testing/runner.js";
 import { receiptFromRunState } from "../testing/receipts.js";
 import { buildDurableRunReport } from "../testing/durableRunReport.js";
 import { RunStateStore, requestRunCancellation, withTargetExecutionLease } from "../testing/runState.js";
+import { ApplicationRunService } from "../navigation/applicationRunService.js";
 import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
 import { InvestigationEngine } from "../investigation/engine.js";
 import { InterventionStore, InterventionWatcher } from "../runtime/interventions.js";
@@ -28,19 +27,53 @@ import { AuthorizationGrantStore } from "../runtime/approvals.js";
 import { createDecisionRuntime } from "../decisions/runtime.js";
 import { trackRunResult } from "../runtime/runTracker.js";
 import { ProfileLoader } from "../testing/profiles.js";
-import { buildEnvironmentBinding, verifyObservedUrl } from "../environments/model.js";
-import { createCloudAgentEntryWorkflow, resolveCloudAgentEntry, verifyCloudAgentReady } from "../testing/qualifyCloudAgent.js";
+import { buildEnvironmentBinding, resolveObservedApplication, verifyObservedUrl } from "../environments/model.js";
+import { createCloudAgentEntryWorkflow, resolveCloudAgentEntry, verifyCloudAgentReady } from "../testing/cloudAgentEntry.js";
 import { prepareCloudAgentTask } from "../integrations/freeinference/prepareCloudAgentTask.js";
 import { verifyCloudAgentRunOutcome } from "../integrations/freeinference/cloudAgentWorkflow.js";
 import { eventIdsForEvidence } from "../telemetry/evidenceRefs.js";
 import { randomUUID } from "node:crypto";
 import { assertRedactedEvidenceOnly } from "../diagnostics/evidenceReleasePolicy.js";
 import { createQualificationRuntime } from "../testing/qualificationRuntime.js";
+import { CapabilityRegistry } from "../capabilities/capabilityRegistry.js";
+import { CapabilityService } from "../capabilities/capabilityService.js";
+import { loadExtractionFieldPolicy } from "../capabilities/fieldPolicy.js";
+import { EvidenceReleaseGrantStore } from "../runtime/evidenceReleaseGrants.js";
+import { preflightModelCapabilities, writeModelPreflightSummary } from "../navigation/modelPreflight.js";
+import { approvePublicReadThroughApi } from "../capabilities/publicReadApprovalClient.js";
+import { FileUploadGrantStore } from "../runtime/fileUploadGrants.js";
+
+const modelPreflight = await preflightModelCapabilities();
+writeModelPreflightSummary(modelPreflight);
 
 const endpoint = process.env.ACTIVETAB_CDP_ENDPOINT ?? "http://127.0.0.1:9222";
 const sessions = new Map();
+const mcpInstanceId = randomUUID();
+const mcpPrincipalId = `local_os_user:${userInfo().username}`;
+const evidenceReleaseStore = new EvidenceReleaseGrantStore({
+  databasePath: process.env.ACTIVETAB_EVIDENCE_RELEASE_DB ?? join(stateDirectory(), "evidence-releases.sqlite")
+});
+const MCP_IMAGE_CONTENT = Symbol("activetab.mcp.imageContent");
 const decisionRuntime = createDecisionRuntime();
 const qualificationService = createQualificationRuntime({ decisionRuntime });
+const capabilityRegistry = await new CapabilityRegistry({
+  directory: process.env.ACTIVETAB_CAPABILITY_DIR ?? join(process.cwd(), ".activetab", "capabilities")
+}).init();
+const extractionFieldPolicy = await loadExtractionFieldPolicy(process.env.ACTIVETAB_EXTRACTION_POLICY_FILE);
+const capabilityService = new CapabilityService({
+  registry: capabilityRegistry,
+  classifyField: extractionFieldPolicy.classifyField,
+  authorizeRead: extractionFieldPolicy.authorizeRead,
+  authorizeRelease: extractionFieldPolicy.authorizeRelease,
+  classifyPublicField: extractionFieldPolicy.classifyPublicField,
+  publicFieldPolicy: extractionFieldPolicy.publicFieldPolicy,
+  authorizePublicRead: extractionFieldPolicy.authorizePublicRead,
+  authorizePublicRelease: extractionFieldPolicy.authorizePublicRelease,
+  approvePublicRead: (proposal, options) => approvePublicReadThroughApi(proposal, options),
+  authorizePagination: extractionFieldPolicy.authorizePagination
+});
+const authorizeExtractionField = field => extractionFieldPolicy.authorizeRead(field);
+const authorizeExtractionRelease = field => extractionFieldPolicy.authorizeRelease(field);
 let chromeConnection;
 const autoConnect = process.env.ACTIVETAB_AUTO_CONNECT === "1";
 const extensionMode = process.env.ACTIVETAB_EXTENSION === "1";
@@ -48,6 +81,10 @@ let extensionBroker;
 if (extensionMode) extensionBroker = await new ExtensionBroker({ socketPath: brokerSocketPath() }).start();
 const workflowStore = process.env.ACTIVETAB_WORKFLOW_STORE ? new WorkflowStore(process.env.ACTIVETAB_WORKFLOW_STORE) : undefined;
 const taskJournalStore = new McpTaskJournalStore();
+const fileUploadGrantStore = new FileUploadGrantStore({
+  stagingDirectory: join(stateDirectory(), "uploads"),
+  trustedIssuer: "activetab-mcp"
+});
 // Run registry is declared BEFORE any service that depends on it (P0-7):
 // constructing the intervention tools with an uninitialized registry was a
 // temporal-dead-zone error that could prevent MCP startup.
@@ -106,11 +143,6 @@ interventionWatcher.onResume = async (record) => {
 };
 interventionWatcher.start();
 
-function createBrowserDiagnosticSources(session, collector) {
-  registerBrowserDiagnosticSources(session, collector);
-  return collector;
-}
-
 async function loadEnvironmentProfile(profileId) {
   if (profileId === undefined || profileId === null) return null;
   if (typeof profileId !== "string" || profileId.length === 0) throw new Error("profileId must select a local ActiveTab environment profile.");
@@ -119,17 +151,53 @@ async function loadEnvironmentProfile(profileId) {
   return { profile, environment: buildEnvironmentBinding(profile) };
 }
 
+function evidenceReleaseSelectors(facet, args, environmentScope) {
+  const selectors = { ...environmentScope };
+  if (facet === "form_values") selectors.facets = args.facets;
+  if (facet === "runtime_values") {
+    selectors.path = args.path;
+    if (args.frameTargetId !== undefined) selectors.frameTargetId = args.frameTargetId;
+  }
+  if (facet === "response_body" || facet === "response_credential_values") {
+    selectors.requestId = args.requestId;
+    selectors.view = args.view ?? "markdown";
+    if (args.sectionId !== undefined) selectors.sectionId = args.sectionId;
+    if (args.blockId !== undefined) selectors.blockId = args.blockId;
+  }
+  return selectors;
+}
+
+async function resolveEvidenceReleaseBinding(session, evidenceId, profileId) {
+  const selected = session.observer.getEvidence(evidenceId, { facets: ["page"] });
+  if (selected?.status !== "available") throw new Error("The selected evidence is not retained on this exact target.");
+  const loaded = await loadEnvironmentProfile(profileId);
+  if (!loaded) throw new Error("Sensitive evidence release requires an explicit local profileId.");
+  const application = resolveObservedApplication(loaded.environment, selected.page?.url ?? "");
+  if (application.status !== "matched") throw new Error(`Selected evidence does not resolve to one profile-bound application: ${application.reason ?? application.status}.`);
+  return {
+    selected,
+    environmentScope: {
+      profileId: loaded.environment.profileId,
+      environmentId: loaded.environment.environmentId,
+      applicationId: application.applicationId,
+      authenticationRealm: application.authenticationRealm ?? null
+    }
+  };
+}
+
+function mcpResult(value) {
+  const images = value?.[MCP_IMAGE_CONTENT] ?? [];
+  return {
+    content: [
+      { type: "text", text: JSON.stringify(value) },
+      ...images.map(image => ({ type: "image", data: image.data, mimeType: image.mimeType }))
+    ],
+    structuredContent: value
+  };
+}
+
 function startWorkflowRun({ session, workflow, environment = null, operationAuthorizer = null, runId = null, controller = new AbortController(), verifyAuthentication = null, verifyEnvironment = null, profileId = null, principalId = null, existingRunStateId = null, resumeReceipt = null } = {}) {
   const effectiveRunId = runId ?? `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const collector = new DiagnosticCollector({ runId: effectiveRunId });
-  createBrowserDiagnosticSources(session, collector);
-  const correlator = new DiagnosticCorrelator();
-  const runner = new TestRunner({
-    session, collector, correlator, signal: controller.signal, interventions: interventionStore,
-    decisionRuntime, qualificationService, environment, operationAuthorizer, runStateStore, existingRunStateId,
-    profileId,
-    principalId: principalId ?? session?.principalId ?? session?.authorizationPrincipalId ?? "local_mcp_automation"
-  });
   const runCtx = {
     ...interventionCtx,
     hasAttachmentGrant: async targetId => sessions.has(targetId)
@@ -139,12 +207,31 @@ function startWorkflowRun({ session, workflow, environment = null, operationAuth
     ...(typeof verifyAuthentication === "function" ? { verifyAuthentication } : {}),
     ...(typeof verifyEnvironment === "function" ? { verifyEnvironment } : environment ? { verifyEnvironment: url => verifyObservedUrl(environment, url) } : {})
   };
+  const { collector, correlator, runner, runPromise: initialRunPromise } = new ApplicationRunService({ runStateStore }).startWorkflowRun({
+    session,
+    workflow,
+    runId: effectiveRunId,
+    signal: controller.signal,
+    resumeReceipt,
+    resumeOptions: { verify: runCtx, workflow },
+    runnerOptions: {
+      interventions: interventionStore,
+      decisionRuntime,
+      qualificationService,
+      fileUploadGrantStore,
+      environment,
+      operationAuthorizer,
+      existingRunStateId,
+      profileId,
+      principalId: principalId ?? session?.principalId ?? session?.authorizationPrincipalId ?? "local_mcp_automation"
+    }
+  });
   const runPromise = resumeReceipt
-    ? runner.resume(resumeReceipt, { verify: runCtx, workflow }).then(result => {
+    ? initialRunPromise.then(result => {
         if (!result.receipt) throw new Error(result.reason ?? "The durable intervention was not independently verified.");
         return result.receipt;
       })
-    : runner.run(workflow, { runId: effectiveRunId });
+    : initialRunPromise;
   const runState = trackRunResult(runPromise);
   testRuns.set(effectiveRunId, {
     collector, correlator, controller, runState, runPromise, session, runner, workflow, environment,
@@ -179,16 +266,20 @@ function startWorkflowRun({ session, workflow, environment = null, operationAuth
 }
 
 const tools = [
+  { name: "get_runtime_capabilities", description: "Report current browser attachment, navigation scope requirements, extraction/form boundaries, workflow reuse, and catalog-preflight status for the configured inference routes. Catalog availability does not prove a live inference call will succeed; the response never returns credentials or full endpoint URLs.", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
   { name: "list_tabs", description: "List page targets on the configured loopback CDP endpoint. ACTIVETAB_AUTO_CONNECT=1 uses Chrome's opt-in debugging bridge. ACTIVETAB_EXTENSION=1 lists tabs individually attached from the ActiveTab toolbar popup. Listing alone does not grant control.", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
   { name: "attach_tab", description: "Adopt the exact tab authorized out of band, by a Chrome permission prompt, or by a separate ActiveTab toolbar Attach click on that tab. An MCP argument alone never grants consent; attaching another authorized tab preserves existing sessions.", inputSchema: { type: "object", properties: { targetId: { type: "string" } }, required: ["targetId"], additionalProperties: false } },
   { name: "detach_tab", description: "Close ActiveTab's session for one explicitly attached tab. This releases its extension lease or native transport; it does not close the Chrome tab.", inputSchema: { type: "object", properties: { targetId: { type: "string" } }, required: ["targetId"], additionalProperties: false } },
-  { name: "observe_page", description: "Capture a redacted current URL, frame tree, DOMSnapshot, accessibility, layout, bounded lifecycle, network metadata and DOM mutation deltas, compact interactable candidates, and visible scroll regions. MCP does not release screenshots or sensitive page content.", inputSchema: { type: "object", properties: { ...targetIdOptional }, additionalProperties: false } },
-  { name: "get_evidence", description: "Retrieve redacted retained browser instrumentation facets by evidence id. OOPIF snapshots are selected with the outOfProcessFrames facet; scrollTargets describes bounded observed page and nested scroll regions; selectedElement accepts frameTargetId to distinguish target-scoped node ids. Sensitive content and screenshots require a separately authenticated evidence grant and are not released through MCP.", inputSchema: { type: "object", properties: { ...targetIdOptional, evidenceId: { type: "string" }, facets: { type: "array", items: { type: "string", enum: ["page", "domSnapshot", "accessibilityTree", "frameTree", "outOfProcessFrames", "scrollTargets", "selectedElement", "networkActivity", "lifecycleEvents", "domMutations", "runtimeState"] } }, backendNodeId: { type: "integer" }, frameTargetId: { type: "string" } }, required: ["evidenceId"], additionalProperties: false } },
-  { name: "inspect_runtime_state", description: "Read one redacted JavaScript-exposed value from the page or an attached out-of-process iframe through an exact own-property path. This never accepts or evaluates caller JavaScript; path traversal uses V8 side-effect checking and reports accessors without reading them. Selecting an object returns its type; specify a deeper path to inspect a child value. Sensitive primitive values require a separately authenticated evidence grant and are not released through MCP. Same-process child-frame execution contexts are not yet selectable.", inputSchema: { type: "object", properties: { ...targetIdOptional, evidenceId: { type: "string" }, path: { type: "array", maxItems: 8, items: { type: "string", maxLength: 128 } }, frameTargetId: { type: "string" } }, required: ["evidenceId"], additionalProperties: false } },
+  { name: "observe_page", description: "Capture bounded browser evidence. Select visual to retain a screenshot for later separately approved release; observe_page itself returns no screenshot or sensitive page values.", inputSchema: { type: "object", properties: { ...targetIdOptional, profile: { type: "string", enum: ["lightweight", "interaction", "structural", "visual"] } }, additionalProperties: false } },
+  { name: "read_page_records", description: "Read requested fields from one freshly observed visible table or repeated record group. This ephemeral read never registers a reusable capability and always reports observed_partial because page-level completeness is unproven. Profile-bound reads use that profile's field policy. An unfamiliar, conservatively classified public field requires an exact-origin publicReadEntries allowlist or exact run-local operator approval through the authenticated loopback API; unclassified and denied fields remain withheld. Query changes invalidate its candidate.", inputSchema: { type: "object", properties: { ...targetIdOptional, profileId: { type: "string", minLength: 1, maxLength: 128 }, candidateId: { type: "string", minLength: 1, maxLength: 128 }, fields: { type: "array", minItems: 1, maxItems: 32, items: { type: "object", properties: { name: { type: "string", minLength: 1, maxLength: 64 }, sourceHeader: { type: "string", minLength: 1, maxLength: 160 }, sourceKey: { type: "string", minLength: 1, maxLength: 128 }, type: { type: "string", enum: ["string", "integer", "number", "boolean"] }, required: { type: "boolean" } }, required: ["name", "type", "required"], additionalProperties: false } }, maxRecords: { type: "integer", minimum: 1, maximum: 1000 }, uniqueBy: { type: "array", maxItems: 8, items: { type: "string", minLength: 1, maxLength: 64 } } }, required: ["fields"], additionalProperties: false } },
+  { name: "get_evidence", description: "Retrieve retained redacted browser instrumentation facets by evidence id. OOPIF snapshots are selected with the outOfProcessFrames facet; scrollTargets describes bounded observed page and nested scroll regions; selectedElement accepts frameTargetId to distinguish target-scoped node ids. Sensitive values and screenshots require an independently operator-approved, profile-bound evidence release.", inputSchema: { type: "object", properties: { ...targetIdOptional, evidenceId: { type: "string" }, facets: { type: "array", items: { type: "string", enum: ["page", "domSnapshot", "accessibilityTree", "frameTree", "outOfProcessFrames", "scrollTargets", "selectedElement", "networkActivity", "lifecycleEvents", "domMutations", "runtimeState"] } }, backendNodeId: { type: "integer" }, frameTargetId: { type: "string" } }, required: ["evidenceId"], additionalProperties: false } },
+  { name: "inspect_runtime_state", description: "Read one redacted JavaScript-exposed value from the page or an attached out-of-process iframe through an exact own-property path. This never accepts or evaluates caller JavaScript; path traversal uses V8 side-effect checking and reports accessors without reading them. Selecting an object returns its type; specify a deeper path to inspect a child value. Sensitive primitive values remain redacted because the separately authenticated evidence-grant release path is not implemented yet. Same-process child-frame execution contexts are not yet selectable.", inputSchema: { type: "object", properties: { ...targetIdOptional, evidenceId: { type: "string" }, path: { type: "array", maxItems: 8, items: { type: "string", maxLength: 128 } }, frameTargetId: { type: "string" } }, required: ["evidenceId"], additionalProperties: false } },
   { name: "click_observed_element", description: "Perform one click on a target selected from retained evidence. The target must still appear in a fresh observation; current human-handoff and caller-intent policy are checked. Returns a post-action observation and requires the caller to verify the task outcome; it never reports task success.", inputSchema: { type: "object", properties: { ...targetIdOptional, goal: { type: "string", minLength: 1, maxLength: 2000 }, evidenceId: { type: "string" }, backendNodeId: { type: "integer", minimum: 0 }, frameTargetId: { type: "string" } }, required: ["goal", "evidenceId", "backendNodeId"], additionalProperties: false } },
-  { name: "inspect_network_response", description: "Inspect redacted metadata for one response selected from a retained networkActivity facet. Response bodies, sensitive URLs, and headers are not released through MCP without a separately authenticated evidence grant. Output is capped at 256 KiB.", inputSchema: { type: "object", properties: { ...targetIdOptional, evidenceId: { type: "string" }, requestId: { type: "string" }, maxBytes: { type: "integer", minimum: 1, maximum: 262144 } }, required: ["evidenceId", "requestId"], additionalProperties: false } },
+  { name: "inspect_network_response", description: "Inspect one selected response as redacted, format-aware diagnostics. By default it returns a page of Markdown with JSON repair or non-JSON analysis, credential metadata, indexed sections and blocks, and source offsets. Select view, sectionId, or blockId and page with offset/maxBytes. Recognized credential values stay redacted; this does not verify application success.", inputSchema: { type: "object", properties: { ...targetIdOptional, evidenceId: { type: "string" }, requestId: { type: "string" }, view: { type: "string", enum: ["markdown", "source", "normalized"] }, sectionId: { type: "string" }, blockId: { type: "string" }, offset: { type: "integer", minimum: 0 }, maxBytes: { type: "integer", minimum: 1, maximum: 262144 } }, required: ["evidenceId", "requestId"], additionalProperties: false } },
+  { name: "request_evidence_release", description: "Create a pending request for sensitive retained evidence. It cannot approve itself. Scope is bound to the exact target, evidence, selected facet/Markdown subtree, verified profile application and this MCP process; an independently authenticated operator must approve it through the local API.", inputSchema: { type: "object", properties: { ...targetIdOptional, profileId: { type: "string", minLength: 1, maxLength: 128 }, evidenceId: { type: "string" }, facet: { type: "string", enum: ["screenshot", "form_values", "runtime_values", "response_body", "response_credential_values"] }, facets: { type: "array", minItems: 1, maxItems: 3, items: { type: "string", enum: ["domSnapshot", "accessibilityTree", "outOfProcessFrames"] } }, path: { type: "array", maxItems: 8, items: { type: "string", maxLength: 128 } }, frameTargetId: { type: "string" }, requestId: { type: "string" }, view: { type: "string", enum: ["markdown", "source", "normalized"] }, sectionId: { type: "string" }, blockId: { type: "string" }, byteBudget: { type: "integer", minimum: 1, maximum: 8388608 }, expiresInMs: { type: "integer", minimum: 1000, maximum: 900000 } }, required: ["profileId", "evidenceId", "facet", "byteBudget"], additionalProperties: false } },
+  { name: "release_evidence", description: "Release only the exact scope of an approved, unexpired operator grant. Response credential values require both a response_body grant and a separate response_credential_values grant. The token is bound to this MCP process, principal, target, evidence, profile application and selected Markdown subtree; byte budgets are cumulative and no content is truncated to fit.", inputSchema: { type: "object", properties: { ...targetIdOptional, profileId: { type: "string", minLength: 1, maxLength: 128 }, evidenceId: { type: "string" }, facet: { type: "string", enum: ["screenshot", "form_values", "runtime_values", "response_body", "response_credential_values"] }, grantToken: { type: "string" }, credentialGrantToken: { type: "string" }, facets: { type: "array", minItems: 1, maxItems: 3, items: { type: "string", enum: ["domSnapshot", "accessibilityTree", "outOfProcessFrames"] } }, path: { type: "array", maxItems: 8, items: { type: "string", maxLength: 128 } }, frameTargetId: { type: "string" }, requestId: { type: "string" }, view: { type: "string", enum: ["markdown", "source", "normalized"] }, sectionId: { type: "string" }, blockId: { type: "string" }, offset: { type: "integer", minimum: 0 }, maxBytes: { type: "integer", minimum: 1, maximum: 262144 }, maxChars: { type: "integer", minimum: 1, maximum: 16384 } }, required: ["profileId", "evidenceId", "facet", "grantToken"], additionalProperties: false } },
   { name: "discover_application", description: "Run bounded autonomous discovery on an attached tab. Builds an application capability map from passive observations and safe same-origin link navigation. Returns discoveries and the capability map.", inputSchema: { type: "object", properties: { ...targetIdOptional, maxSteps: { type: "integer", minimum: 1, maximum: 16 }, maxLinksPerStep: { type: "integer", minimum: 1, maximum: 6 } }, additionalProperties: false } },
-  { name: "investigate_failure", description: "Run a bounded bug-isolation investigation after a failed step or run. Classifies the failure, generates hypotheses, executes safe discriminating checks, and returns a qualified report.", inputSchema: { type: "object", properties: { ...targetIdOptional, runId: { type: "string" }, subject: { type: "string" }, reason: { type: "string" } }, required: ["subject", "reason"], additionalProperties: false } },
+  { name: "investigate_failure", description: "Run read-only bug isolation after a failed step or run. It inspects durable operation reservations and later evidence; it never replays an effect. Pass runId and, when known, stepId or operationId to bind inspection to the exact prior operation. Raw observed values and full request URLs are omitted from diagnostic projections.", inputSchema: { type: "object", properties: { ...targetIdOptional, runId: { type: "string" }, stepId: { type: "string" }, operationId: { type: "string" }, subject: { type: "string" }, reason: { type: "string" } }, required: ["subject", "reason"], additionalProperties: false } },
   { name: "start_test_run", description: "Start a declarative workflow on an authorized attached tab. Select a local profileId whenever the workflow navigates or follows links; the profile is resolved from ActiveTab's local profiles directory and bound to run/resume. Returns runId for status polling.", inputSchema: { type: "object", properties: { ...targetIdOptional, profileId: { type: "string", minLength: 1, maxLength: 128 }, workflow: { type: "object" } }, required: ["workflow"], additionalProperties: false } },
   { name: "resume_test_run", description: "Continue a durable DAG after restart using the exact original workflow, run binding, and reattached target. This refuses changed workflow/authority bindings and unresolved dispatched effects; suspended human handoffs must pass their stored completion predicate first.", inputSchema: { type: "object", properties: { runId: { type: "string", minLength: 1, maxLength: 160 }, targetId: { type: "string", minLength: 1, maxLength: 256 }, profileId: { type: "string", minLength: 1, maxLength: 128 }, workflow: { type: "object" } }, required: ["runId", "targetId", "workflow"], additionalProperties: false } },
   { name: "enter_cloud_agent", description: "On an explicitly attached FreeInference staging tab, follow the visible Agents/Cloud Agents UI path and verify the real Cloud Agent task composer. Uses the same browser session, never navigates to a guessed destination, and suspends for human authentication when needed. This entry primitive does not create or submit a Cloud Agent task; use start_cloud_agent_task afterward with exact caller-supplied values.", inputSchema: { type: "object", properties: { ...targetIdOptional }, additionalProperties: false } },
@@ -206,7 +297,7 @@ const tools = [
   { name: "resume_run", description: "Resume a suspended run: verifies the exact completion predicate (grant scope/expiry, authenticated session, attachment grant, or outcome reconciliation) with fresh evidence before admitting execution.", inputSchema: { type: "object", properties: { interventionId: { type: "string" } }, required: ["interventionId"], additionalProperties: false } },
   { name: "get_run_state", description: "Get the resumable state of a run (including suspended/waiting states).", inputSchema: { type: "object", properties: { runId: { type: "string" } }, required: ["runId"], additionalProperties: false } },
   { name: "cancel_run", description: "Cancel a run or intervention. Cancellation is permitted during suspension.", inputSchema: { type: "object", properties: { runId: { type: "string" }, interventionId: { type: "string" } }, additionalProperties: false } },
-  { name: "run_goal", description: "Run a bounded standalone browser task. Select profileId from ActiveTab's local profiles directory whenever navigation is needed; the environment is bound to resumable state. plannerMode=workflow synthesizes one guarded workflow from a typed workflowIntent and fresh application evidence, then executes it locally through the authorized executor. Supply workflowIntent purposeCode and outcomeCode as lowercase structural identifiers (never as free-form task text); optional targetRoles and constraints are bounded identifiers. The built-in workflow capability follows a unique visible link; application profiles may register additional trusted capabilities and fresh-page target resolvers. FreeInference Production GLM5.3-flash is the default model ID for an explicitly configured OpenAI-compatible endpoint. Jev 1.14 is the system's independent, advisory batch reviewer; its unavailability never grants or changes authority. Model retries count toward the durable per-run inference-attempt budget. Task continuation uses a goal fingerprint and bounded state. Set newTask=true to start a completed task again. Set reuseWorkflows=true to replay or record verified workflows; configure ACTIVETAB_WORKFLOW_STORE first.", inputSchema: { type: "object", properties: { ...targetIdOptional, profileId: { type: "string", minLength: 1, maxLength: 128 }, goal: { type: "string" }, maxActions: { type: "integer", minimum: 1, maximum: 10 }, maxScrolls: { type: "integer", minimum: 0, maximum: 8 }, plannerMode: { type: "string", enum: ["deterministic", "model", "workflow"] }, workflowIntent: { type: "object", properties: { purposeCode: { type: "string", minLength: 1, maxLength: 64 }, outcomeCode: { type: "string", minLength: 1, maxLength: 64 }, targetRoles: { type: "array", maxItems: 24, items: { type: "string", minLength: 1, maxLength: 64 } }, constraints: { type: "array", maxItems: 24, items: { type: "string", minLength: 1, maxLength: 64 } } }, required: ["purposeCode", "outcomeCode"], additionalProperties: false }, reuseWorkflows: { type: "boolean" }, newTask: { type: "boolean" } }, required: ["goal"], additionalProperties: false } }
+  { name: "run_goal", description: "Run a bounded standalone browser task. plannerMode=auto (the default) checks fresh DOM/AX evidence first, then calls Jev for an unclear visual page state or the configured secondary model for unresolved single-step navigation. Explicit read/extract/collect/retrieve/summarize/compare/scrape goals and output requests such as “list the names” or “return the prices” use the guarded workflow path so a single navigation cannot be reported as the requested data result. Compound requests and caller-typed workflow intents also enter guarded workflow planning; without a trusted complete plan they abstain before any partial browser action. A uniquely matched current-page HTML table may use a run-local read capability when every requested field passes exact trusted policy; its result is always observed_partial. Complete collection requests still need a matching qualified read capability. If no unique authorized source or usable synthesis route exists, the task abstains without browser mutation. Auto uses no remote model unless an endpoint is configured and page-content consent is enabled; it can reuse ACTIVETAB_SEMANTIC_ENDPOINT, defaults to FreeInference model ID glm-5.3-flash, and accepts FREEINFERENCE_API_KEY. Unique local matches need no inference. plannerMode=model explicitly uses the configured secondary action planner; plannerMode=workflow synthesizes one guarded workflow from typed intent or fresh application evidence, then executes it locally through the authorized executor. Set ACTIVETAB_MODEL_ALLOW_GOAL_TEXT=1 to send the natural-language goal for bounded model interpretation; otherwise task matching uses only caller-typed contracts and deterministic observed-field matches. This opt-in separately allows goal text to leave ActiveTab; ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT=1 is still required before page evidence is sent. Mutations, submissions, and unrelated read capabilities are never inferred. Select profileId from ActiveTab's local profiles directory whenever navigation is needed; the environment is bound to resumable state. Supply workflowIntent purposeCode and outcomeCode as lowercase structural identifiers (never as free-form task text); set cardinality to atomic, compound, or unknown. Unknown task shape routes through trusted workflow capabilities or abstains instead of selecting a partial action from goal wording. Optional targetRoles and constraints are bounded identifiers. Add a registered capability ID to requiredCapabilityIds when its output is required; this requires plannerMode=workflow, and synthesis cannot omit or conditionally skip it. Qualified, exact-scope, single-page extraction capabilities from the local registry are available only when the profile, principal, environment, read policy, and release policy match. Verified, policy-released outputs are retained in separate owner-only artifacts and rechecked before replay. The built-in workflow capability follows a unique visible link; application profiles may register additional trusted capabilities and fresh-page target resolvers. FreeInference Production model ID glm-5.3-flash is the default for an explicitly configured OpenAI-compatible endpoint. Jev 1.14 is the system's independent, advisory batch reviewer; its unavailability never grants or changes authority. Model retries count toward the durable per-run inference-attempt budget. Task continuation uses a goal fingerprint and bounded state. Set newTask=true to start a completed task again. When ACTIVETAB_WORKFLOW_STORE is configured, verified read-only workflow reuse is enabled automatically; set reuseWorkflows=false to skip it.", inputSchema: { type: "object", properties: { ...targetIdOptional, profileId: { type: "string", minLength: 1, maxLength: 128 }, goal: { type: "string" }, maxActions: { type: "integer", minimum: 1, maximum: 10 }, maxScrolls: { type: "integer", minimum: 0, maximum: 8 }, plannerMode: { type: "string", enum: ["deterministic", "auto", "model", "workflow"] }, workflowIntent: { type: "object", properties: { purposeCode: { type: "string", minLength: 1, maxLength: 64 }, outcomeCode: { type: "string", minLength: 1, maxLength: 64 }, cardinality: { type: "string", enum: ["atomic", "compound", "unknown"] }, targetRoles: { type: "array", maxItems: 24, items: { type: "string", minLength: 1, maxLength: 64 } }, constraints: { type: "array", maxItems: 24, items: { type: "string", minLength: 1, maxLength: 64 } }, requiredCapabilityIds: { type: "array", maxItems: 24, items: { type: "string", minLength: 1, maxLength: 96 } } }, required: ["purposeCode", "outcomeCode"], additionalProperties: false }, reuseWorkflows: { type: "boolean" }, newTask: { type: "boolean" } }, required: ["goal"], additionalProperties: false } }
 ];
 for (const tool of tools) {
   if (Object.hasOwn(tool.inputSchema.properties, "targetId") && tool.name !== "attach_tab" && tool.name !== "detach_tab") {
@@ -218,6 +309,36 @@ async function callTool(name, args) {
   // Intervention tools (P0-6): long-running and suspended runs never block
   // these status/acknowledgement/approval/cancellation/resume tools.
   if (Object.hasOwn(interventionTools, name)) return await interventionTools[name](args);
+  if (name === "get_runtime_capabilities") {
+    const routeFor = roles => roles.map(role => modelPreflight.routes.find(route => route.role === role)).find(Boolean) ?? null;
+    const secondary = routeFor(["planner", "semantic", "workflow"]);
+    const jev = routeFor(["jev"]);
+    const pageConsent = process.env.ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT === "1";
+    const screenshotConsent = process.env.ACTIVETAB_MODEL_ALLOW_SCREENSHOTS === "1";
+    const configuredModelEndpoint = Boolean(process.env.ACTIVETAB_MODEL_ENDPOINT || process.env.ACTIVETAB_SEMANTIC_ENDPOINT || process.env.ACTIVETAB_WORKFLOW_ENDPOINT);
+    const modelRouteStatus = route => !route ? "disabled" : route.status;
+    const plannerStatus = !configuredModelEndpoint ? "disabled"
+      : !pageConsent ? "requires_consent"
+        : modelRouteStatus(secondary);
+    const imageStatus = (route, optedIn) => !route || route.imageCapability !== true ? "unavailable"
+      : !screenshotConsent || !optedIn ? "requires_consent"
+        : route.status;
+    const attachedTargetIds = [...sessions.entries()].filter(([, session]) => session?.attached === true).map(([targetId]) => targetId).sort();
+    return {
+      browser: { status: attachedTargetIds.length ? "attached" : "requires_target_attachment", attachedTargetCount: attachedTargetIds.length, targetIds: attachedTargetIds },
+      navigation: { status: "requires_profile", reasonCode: "navigation_scope_required" },
+      planning: { status: plannerStatus, reasonCode: plannerStatus === "requires_consent" ? "model_page_content_consent_required" : plannerStatus === "disabled" ? "provider_unavailable" : null, model: secondary?.model ?? null, preflight: secondary?.status ?? "not_configured", preflightKind: "authenticated_catalog_only", inferenceReachability: secondary?.inferenceReachability ?? "not_configured", pageContentConsent: pageConsent },
+      visual: {
+        secondary: { status: imageStatus(secondary, true), model: secondary?.model ?? null, catalogSupportsImages: secondary?.imageCapability === true, screenshotConsent },
+        jev: { status: imageStatus(jev, process.env.ACTIVETAB_JEV_ALLOW_IMAGES === "1"), model: jev?.model ?? null, catalogSupportsImages: jev?.imageCapability === true, screenshotConsent }
+      },
+      jev: { status: modelRouteStatus(jev), model: jev?.model ?? null, preflight: jev?.status ?? "not_configured", preflightKind: "authenticated_catalog_only", inferenceReachability: jev?.inferenceReachability ?? "not_configured" },
+      forms: { status: "requires_profile_operation_contract", reasonCode: "operation_not_admitted" },
+      extraction: { status: "requires_profile_field_policy", reasonCode: "extraction_field_policy_required" },
+      workflowReuse: { status: workflowStore ? "available" : "disabled" },
+      modelPreflight: { status: modelPreflight.status, telemetryRecorded: modelPreflight.telemetryRecorded === true }
+    };
+  }
   if (name === "list_tabs") {
     if (extensionMode) return await extensionBroker.listTabs();
     if (!autoConnect) return await listTargets(endpoint);
@@ -271,7 +392,10 @@ async function callTool(name, args) {
     const environment = selectedProfile?.environment ?? null;
     const profileId = selectedProfile?.profile.profile_id ?? null;
     const principalId = session.principalId ?? session.authorizationPrincipalId ?? "local_mcp_automation";
-    const authenticationRealm = environment?.applications?.[0]?.authenticationRealm ?? null;
+    const application = session.target?.url && environment
+      ? resolveObservedApplication(environment, session.target.url)
+      : { status: "unmatched" };
+    const authenticationRealm = application.status === "matched" ? application.authenticationRealm : state.authenticationRealm ?? null;
     if ((environment?.environmentId ?? null) !== state.environmentId
       || profileId !== state.profileId
       || principalId !== state.principalId
@@ -393,17 +517,17 @@ async function callTool(name, args) {
   }
   if (name === "get_test_run") {
     const run = testRuns.get(args.runId);
-    if (!run) {
-      const durable = await runStateStore.getFresh(args.runId);
-      if (!durable) throw new Error(`No test run found for runId '${args.runId}'.`);
-      return receiptFromRunState(durable).toObject();
-    }
-    const runState = run.runState;
-    if (runState.receipt) return runState.receipt.toObject();
-    if (runState.error) {
-      return { runId: args.runId, status: "FAILED", reason: String(runState.error.message ?? runState.error).slice(0, 300), startedAt: run.startedAt };
-    }
-    return { runId: args.runId, status: runState.status, startedAt: run.startedAt };
+    const durable = await runStateStore.getFresh(args.runId);
+    if (!durable) throw new Error(`No test run found for runId '${args.runId}'.`);
+    const receipt = receiptFromRunState(durable).toObject();
+    const unresolvedOperations = (durable.pendingOperations ?? []).filter(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status));
+    return {
+      ...receipt,
+      pendingInterventionId: durable.pendingInterventionId ?? null,
+      unresolvedOperationIds: unresolvedOperations.map(operation => operation.operationId),
+      cancellationRequested: durable.cancellationRequested === true,
+      workerAvailable: Boolean(run)
+    };
   }
   if (name === "cancel_test_run") {
     const run = testRuns.get(args.runId);
@@ -505,11 +629,26 @@ async function callTool(name, args) {
     }
     const browserEventId = `browser:${args.runId}:${args.browserEvidenceId}`;
     const backendEventId = `backend:${args.runId}:${args.cloudAgentRunId}`;
-    run.correlator.addEvent({ eventId: browserEventId, sourceType: "browser_ui", executionId: args.cloudAgentRunId, observedAt: run.startedAt });
-    run.correlator.addEvent({ eventId: backendEventId, sourceType: "cloud_agent_backend", executionId: args.cloudAgentRunId });
+    const backendEvidenceRef = runResult.snapshot.snapshotId ?? runResult.snapshot.evidenceId ?? backendEventId;
+    const principalId = run.session.principalId ?? run.session.authorizationPrincipalId ?? "local_mcp_automation";
+    const correlationProof = {
+      namespace: "cloud-agent-run",
+      value: args.cloudAgentRunId,
+      pairKind: "freeinference_cloud_agent_run",
+      provenance: "verified_in_browser_and_backend",
+      scope: {
+        environmentId: integration.environmentId,
+        targetId: run.session.target.id,
+        runId: args.runId,
+        principalId,
+        operationNamespace: "freeinference.cloud_agent.run"
+      },
+      evidenceRefs: [args.browserEvidenceId, backendEvidenceRef]
+    };
+    run.correlator.addEvent({ eventId: browserEventId, evidenceId: args.browserEvidenceId, sourceType: "browser_ui", correlation: correlationProof, observedAt: run.startedAt });
+    run.correlator.addEvent({ eventId: backendEventId, evidenceId: backendEvidenceRef, sourceType: "cloud_agent_backend", correlation: correlationProof });
     const correlation = run.correlator.correlate(browserEventId, backendEventId);
     const outcome = verifyCloudAgentRunOutcome(integration.expectedOutcome, backendRun);
-    const backendEvidenceRef = runResult.snapshot.snapshotId ?? runResult.snapshot.evidenceId ?? backendEventId;
     run.cloudAgentCorrelation = correlation;
     run.cloudAgentOutcome = outcome;
     const review = await recordCloudAgentOutcome(run, submit, integration, args, outcome, backendRun.status ?? "unavailable", backendEvidenceRef);
@@ -542,8 +681,8 @@ async function callTool(name, args) {
     const run = args.runId ? testRuns.get(args.runId) : null;
     const collector = run?.collector ?? null;
     const correlator = run?.correlator ?? new DiagnosticCorrelator();
-    const engine = new InvestigationEngine({ collector, correlator });
-    return await engine.investigate({ subject: args.subject, reason: args.reason, runId: args.runId ?? null });
+    const engine = new InvestigationEngine({ collector, correlator, session, runStateStore });
+    return await engine.investigate({ subject: args.subject, reason: args.reason, runId: args.runId ?? null, stepId: args.stepId ?? null, operationId: args.operationId ?? null });
   }
   if (name === "get_test_report") {
     const run = testRuns.get(args.runId);
@@ -597,7 +736,20 @@ async function callTool(name, args) {
   const session = selectBrowserSession(sessions, args.targetId);
   if (name === "observe_page") {
     assertRedactedEvidenceOnly(args, ["includeScreenshot"]);
-    return await session.observe({ includeScreenshot: false });
+    if (args.profile === "visual") return await session.observe({ profile: "visual" });
+    return await session.observe({ profile: args.profile ?? "interaction", includeScreenshot: false });
+  }
+  if (name === "read_page_records") {
+    const loaded = await loadEnvironmentProfile(args.profileId);
+    return await capabilityService.readObservedRecords({
+      session,
+      environment: loaded?.environment ?? null,
+      principalId: mcpPrincipalId,
+      ...(args.candidateId ? { candidateId: args.candidateId } : {}),
+      requestedFields: args.fields,
+      maxRecords: args.maxRecords ?? 100,
+      uniqueBy: args.uniqueBy ?? []
+    });
   }
   if (name === "get_evidence") {
     assertRedactedEvidenceOnly(args, ["includeSensitiveFormValues", "includeSensitivePageText", "includeSensitiveUrlData", "includeSensitiveRuntimeValues", "includeScreenshot"]);
@@ -620,7 +772,125 @@ async function callTool(name, args) {
   }
   if (name === "inspect_network_response") {
     assertRedactedEvidenceOnly(args, ["includeSensitive", "includeSensitiveUrlData"]);
-    return await session.observer.inspectNetworkResponse(args.evidenceId, { requestId: args.requestId, includeSensitive: false, includeSensitiveUrlData: false, maxBytes: args.maxBytes });
+    return await session.observer.inspectNetworkResponse(args.evidenceId, {
+      requestId: args.requestId,
+      // Body retrieval is local and explicitly selected by evidence and request id.
+      // The observer returns its complete content-aware projection with recognizable
+      // credentials redacted; the separate grant tool is required for raw values.
+      includeSensitive: true,
+      includeCredentialValues: false,
+      includeSensitiveUrlData: false,
+      view: args.view ?? "markdown",
+      offset: args.offset ?? 0,
+      maxBytes: args.maxBytes ?? 32 * 1024,
+      ...(args.sectionId !== undefined ? { sectionId: args.sectionId } : {}),
+      ...(args.blockId !== undefined ? { blockId: args.blockId } : {})
+    });
+  }
+  if (name === "request_evidence_release") {
+    const { selected, environmentScope } = await resolveEvidenceReleaseBinding(session, args.evidenceId, args.profileId);
+    const facet = args.facet;
+    if (facet === "screenshot" && selected.coverage?.screenshot !== true) throw new Error("The selected evidence has no retained screenshot; capture it with observe_page profile:'visual' first.");
+    if (facet === "form_values") {
+      const formEvidence = session.observer.getEvidence(args.evidenceId, { facets: args.facets });
+      if (formEvidence?.status !== "available") throw new Error("Selected form-capable evidence is unavailable.");
+    }
+    if (facet === "runtime_values") {
+      const runtime = await session.observer.inspectRuntimeState(args.evidenceId, {
+        path: args.path ?? [], frameTargetId: args.frameTargetId ?? null, includeSensitiveValues: false
+      });
+      if (runtime?.status !== "available") throw new Error(`Selected runtime value is ${runtime?.status ?? "unavailable"}.`);
+    }
+    if (facet === "response_body" || facet === "response_credential_values") {
+      const response = await session.observer.inspectNetworkResponse(args.evidenceId, {
+        requestId: args.requestId, includeSensitive: false, includeSensitiveUrlData: false
+      });
+      if (response?.status !== "available" || response.responseBody?.available !== true) throw new Error("The selected response body is unavailable for release.");
+    }
+    const request = evidenceReleaseStore.request({
+      targetId: session.target.id,
+      evidenceId: args.evidenceId,
+      facet,
+      principalId: mcpPrincipalId,
+      callerInstanceId: mcpInstanceId,
+      selectors: evidenceReleaseSelectors(facet, args, environmentScope),
+      maxBytes: args.byteBudget,
+      expiresInMs: args.expiresInMs ?? 5 * 60 * 1000
+    });
+    return { ...request, operatorApprovalRequired: true, tokenReturned: false };
+  }
+  if (name === "release_evidence") {
+    const { selected, environmentScope } = await resolveEvidenceReleaseBinding(session, args.evidenceId, args.profileId);
+    const facet = args.facet;
+    const scope = {
+      targetId: session.target.id,
+      evidenceId: args.evidenceId,
+      facet,
+      principalId: mcpPrincipalId,
+      callerInstanceId: mcpInstanceId,
+      selectors: evidenceReleaseSelectors(facet, args, environmentScope)
+    };
+    const entries = [{ token: args.grantToken, scope }];
+    const responseFacet = facet === "response_body" || facet === "response_credential_values";
+    let includeCredentialValues = false;
+    if (responseFacet) {
+      const credentialScope = { ...scope, facet: "response_credential_values" };
+      const bodyScope = { ...scope, facet: "response_body" };
+      entries[0].scope = bodyScope;
+      if (facet === "response_credential_values") {
+        if (typeof args.credentialGrantToken !== "string") throw new Error("Raw response credentials require a separately approved credential grant as well as the response-body grant.");
+        entries.push({ token: args.credentialGrantToken, scope: credentialScope });
+        includeCredentialValues = true;
+      } else if (args.credentialGrantToken !== undefined) {
+        entries.push({ token: args.credentialGrantToken, scope: credentialScope });
+        includeCredentialValues = true;
+      }
+    } else if (args.credentialGrantToken !== undefined) {
+      throw new Error("A credential grant token applies only to a selected response body.");
+    }
+    const verified = evidenceReleaseStore.verifyMany(entries);
+    if (!verified.ok) throw new Error(verified.reason);
+
+    let result;
+    let imageData = null;
+    if (facet === "screenshot") {
+      result = session.observer.getEvidence(args.evidenceId, { facets: [], includeScreenshot: true });
+      if (result?.status !== "available" || typeof result.screenshotBase64 !== "string") throw new Error("The approved screenshot is no longer retained.");
+      imageData = result.screenshotBase64;
+      delete result.screenshotBase64;
+      result.screenshotReleased = true;
+    } else if (facet === "form_values") {
+      result = session.observer.getEvidence(args.evidenceId, { facets: args.facets, includeSensitiveFormValues: true });
+      if (result?.status !== "available") throw new Error("The approved form evidence is no longer retained.");
+    } else if (facet === "runtime_values") {
+      result = await session.observer.inspectRuntimeState(args.evidenceId, {
+        path: args.path ?? [], frameTargetId: args.frameTargetId ?? null, includeSensitiveValues: true,
+        offset: args.offset ?? 0, maxChars: args.maxChars
+      });
+      if (result?.status !== "available") throw new Error(`The approved runtime value is ${result?.status ?? "unavailable"}.`);
+    } else if (responseFacet) {
+      result = await session.observer.inspectNetworkResponse(args.evidenceId, {
+        requestId: args.requestId,
+        includeSensitive: true,
+        includeCredentialValues,
+        includeSensitiveUrlData: false,
+        view: args.view ?? "markdown",
+        offset: args.offset ?? 0,
+        maxBytes: args.maxBytes ?? 32 * 1024,
+        ...(args.sectionId !== undefined ? { sectionId: args.sectionId } : {}),
+        ...(args.blockId !== undefined ? { blockId: args.blockId } : {})
+      });
+      if (result?.status !== "available" || result.responseBody?.status !== "included") throw new Error("The approved response-body selection is unavailable or incomplete.");
+      result.responseBody.credentialValuesIncluded = includeCredentialValues;
+    } else throw new Error("Evidence-release facet is unsupported.");
+
+    if (imageData !== null) Object.defineProperty(result, MCP_IMAGE_CONTENT, { value: [{ data: imageData, mimeType: "image/jpeg" }] });
+    // Charge the actual MCP representation, which contains both textual and
+    // structured forms (and one base64 image block for screenshot releases).
+    const releasedBytes = Buffer.byteLength(JSON.stringify(mcpResult(result))) + 128;
+    const charged = evidenceReleaseStore.chargeMany(entries, releasedBytes);
+    if (!charged.ok) throw new Error(charged.reason);
+    return result;
   }
   if (name === "run_goal") {
     const selectedProfile = await loadEnvironmentProfile(args.profileId);
@@ -629,6 +899,10 @@ async function callTool(name, args) {
       workflowStore,
       decisionRuntime,
       environment: selectedProfile?.environment ?? null,
+      capabilityRegistry,
+      capabilityService,
+      authorizeExtractionField,
+      authorizeExtractionRelease,
       runStateStore
     });
   }
@@ -745,8 +1019,8 @@ for await (const line of rl) {
       const toolName = request.params.name;
       const toolArgs = request.params.arguments ?? {};
       callTool(toolName, toolArgs)
-        .then(value => {
-          if (requestId !== undefined) write({ jsonrpc: "2.0", id: requestId, result: { content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value } });
+          .then(value => {
+          if (requestId !== undefined) write({ jsonrpc: "2.0", id: requestId, result: mcpResult(value) });
         })
         .catch(error => {
           if (requestId !== undefined) write({ jsonrpc: "2.0", id: requestId, error: { code: error.code ?? -32000, message: String(error.message).slice(0, 1000) } });
@@ -764,3 +1038,4 @@ await Promise.all([...sessions.values()].map(session => session.close()));
 decisionRuntime.close();
 await chromeConnection?.close();
 await extensionBroker?.close();
+evidenceReleaseStore.close();

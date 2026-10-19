@@ -2,6 +2,21 @@ function boundedText(value, max = 256) {
   return typeof value === "string" ? value.slice(0, max) : null;
 }
 
+const RESPONSE_TIMING_FIELDS = new Set([
+  "proxyStart", "proxyEnd", "dnsStart", "dnsEnd", "connectStart", "connectEnd",
+  "sslStart", "sslEnd", "sendStart", "sendEnd", "receiveHeadersEnd", "pushStart", "pushEnd",
+  "workerStart", "workerReady", "workerFetchStart", "workerRespondWithSettled"
+]);
+
+function responseTiming(value) {
+  if (!value || typeof value !== "object") return null;
+  const result = {};
+  for (const [name, duration] of Object.entries(value)) {
+    if (RESPONSE_TIMING_FIELDS.has(name) && Number.isFinite(duration) && duration >= 0) result[name] = duration;
+  }
+  return Object.keys(result).length ? result : null;
+}
+
 export class BrowserActivityRecorder {
   constructor({ maxRequests = 300, maxLifecycleEvents = 500, maxDomMutations = 500 } = {}) {
     this.maxRequests = Math.max(1, Math.min(maxRequests, 1_000));
@@ -45,9 +60,16 @@ export class BrowserActivityRecorder {
         timestamp: Number.isFinite(params.timestamp) ? params.timestamp : null,
         status: null,
         mimeType: null,
+        responseReceivedAt: null,
+        protocol: null,
+        responseTiming: null,
+        connectionReused: false,
         fromDiskCache: false,
         fromServiceWorker: false,
+        fromPrefetchCache: false,
         encodedDataLength: null,
+        decodedDataLength: 0,
+        dataChunkCount: 0,
         finishedAt: null,
         failure: null
       };
@@ -64,8 +86,16 @@ export class BrowserActivityRecorder {
       const response = params.response ?? {};
       record.status = Number.isFinite(response.status) ? response.status : null;
       record.mimeType = boundedText(response.mimeType, 200);
+      record.responseReceivedAt = Number.isFinite(params.timestamp) ? params.timestamp : null;
+      record.protocol = boundedText(response.protocol, 32);
+      record.responseTiming = responseTiming(response.timing);
+      record.connectionReused = response.connectionReused === true;
       record.fromDiskCache = response.fromDiskCache === true;
       record.fromServiceWorker = response.fromServiceWorker === true;
+      record.fromPrefetchCache = response.fromPrefetchCache === true;
+    } else if (method === "Network.dataReceived") {
+      record.decodedDataLength += Number.isFinite(params.dataLength) ? Math.max(0, params.dataLength) : 0;
+      record.dataChunkCount++;
     } else if (method === "Network.loadingFinished") {
       record.encodedDataLength = Number.isFinite(params.encodedDataLength) ? params.encodedDataLength : null;
       record.finishedAt = Number.isFinite(params.timestamp) ? params.timestamp : null;

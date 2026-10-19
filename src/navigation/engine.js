@@ -1,18 +1,23 @@
 import { createHash, randomUUID } from "node:crypto";
-import { configuredPlanner, DeterministicPlanner } from "./planner.js";
-import { createSearchSubmitAuthorizer, searchPhraseFromGoal, SEARCH_SUBMIT_OPERATION_ID } from "./search.js";
+import { configuredPlanner, DeterministicPlanner, goalExpectation } from "./planner.js";
+import { createSearchSubmitAuthorizer, isSearchFieldCandidate, searchPhraseFromGoal, searchReadRequestFromGoal, SEARCH_SUBMIT_OPERATION_ID } from "./search.js";
 import { authorizePlannedAction } from "./actionPolicy.js";
 import { classifyHumanHandoff } from "./handoff.js";
 import { newTaskState, taskGoalFingerprint, updateTaskJournal } from "../state/journal.js";
-import { normalizeOrigin } from "../environments/model.js";
+import { normalizeOrigin, resolveObservedApplication } from "../environments/model.js";
 import { isOperatorProhibitedNavigation } from "../runtime/controlRestrictions.js";
 import { executeAuthorizedAction } from "../runtime/authorizedExecutor.js";
 import { adjudicatePreActionReview } from "../decisions/adjudication.js";
+import { hasReviewIntent, selectAutomaticNavigationRoute, selectPreActionDecisionRoute } from "../decisions/callPolicy.js";
 import { matchesScrollTargetSignature, matchesTargetSignature, observationSemanticFingerprint, observationStateFingerprint, routeFingerprint, scrollPositionFraction, scrollPositionMatches, scrollTargetSignature, targetSignature, visibleCandidatesFingerprint } from "../state/workflows.js";
 import { createConfiguredWorkflowSynthesizer } from "./workflowSynthesizer.js";
 import { WorkflowGraphPlanner } from "./workflowPlanner.js";
-import { createGenericWorkflowCapabilities } from "./workflowCapabilities.js";
+import { createExtractionWorkflowCapabilities, createGenericWorkflowCapabilities, createObservedSearchWorkflowCapabilities, createProfileFormWorkflowCapabilities } from "./workflowCapabilities.js";
+import { classifyTaskRequest, requiresCompositeReadWorkflow, resolveTaskIntent, selectTaskExecutionRoute } from "./taskIntentResolver.js";
 import { hasVerifiedOutcome, pageLabelHashes } from "./outcomeVerifier.js";
+import { discoverVisibleNextPage } from "../extraction/recordResolver.js";
+import { bindVisualEvidence, isBoundVisualEvidence } from "./visualEvidence.js";
+import { revalidateVisualGrounding } from "./visualGrounder.js";
 
 function pageChangeWaitBaseline(observation, scrollTarget) {
   return {
@@ -23,7 +28,15 @@ function pageChangeWaitBaseline(observation, scrollTarget) {
   };
 }
 
-function environmentBindingFingerprint(environment) {
+function availableSearchInputRef(inputs) {
+  const existing = inputs && typeof inputs === "object" && !Array.isArray(inputs) ? inputs : {};
+  let candidate = "activetab_search_query";
+  let suffix = 2;
+  while (Object.hasOwn(existing, candidate)) candidate = `activetab_search_query_${suffix++}`;
+  return candidate;
+}
+
+export function environmentBindingFingerprint(environment) {
   if (!environment) return null;
   const origins = [...new Set((environment.authorizedOrigins ?? []).map(normalizeOrigin).filter(Boolean))].sort();
   const applications = (environment.applications ?? [])
@@ -32,7 +45,10 @@ function environmentBindingFingerprint(environment) {
       authenticationRealm: String(application.authenticationRealm ?? ""),
       candidateEntry: String(application.candidateEntry ?? ""),
       finalOrigin: String(application.finalOrigin ?? ""),
-      status: String(application.status ?? "")
+      status: String(application.status ?? ""),
+      ...(Object.keys(application.workflowOperations ?? {}).length
+        ? { workflowOperations: Object.fromEntries(Object.entries(application.workflowOperations).sort(([left], [right]) => left.localeCompare(right))) }
+        : {})
     }))
     .sort((left, right) => left.applicationId.localeCompare(right.applicationId));
   const authenticationRealms = (environment.authenticationRealms ?? [])
@@ -74,37 +90,250 @@ function unchangedAfterFailedClick(attempt) {
       /^[a-f0-9]{64}$/.test(attempt.beforeStateFingerprint ?? "") && attempt.beforeStateFingerprint === attempt.afterStateFingerprint);
 }
 
+class UnresolvedTaskRoutePlanner {
+  constructor(reason) { this.reason = reason; }
+  async plan() {
+    return { status: "ambiguous", candidates: [], reason: this.reason };
+  }
+}
+
+const REATTACH_FAILURE_CODES = new Set([
+  "not_attempted", "owned_browser_stopped", "target_not_found", "target_scope_rejected",
+  "reattach_attach_failed", "reattach_observation_failed", "reattach_identity_mismatch",
+  "lease_rebind_failed", "unknown"
+]);
+
+function createRegisteredPaginationButtonAuthorizer({ registry, environment, principalId, session, details }) {
+  return Object.freeze({
+    authorize({ action, candidate, observation } = {}) {
+      let page;
+      try { page = new URL(details.fromPageUrl); } catch { return { allowed: false, reason: "The registered pagination source URL is invalid." }; }
+      const application = resolveObservedApplication(environment, page.href);
+      const manifest = application.status === "matched" ? registry?.resolve?.(details.capabilityId, {
+        capabilityVersion: details.capabilityVersion,
+        origin: page.origin,
+        environmentId: environment?.environmentId ?? environment?.id,
+        applicationId: application.applicationId,
+        principalId
+      }) : null;
+      const locator = details.nextPage?.target;
+      const allowed = action === "click" && Boolean(manifest)
+        && manifest.extractionContract?.pagination?.kind === "explicit_next_same_path"
+        && candidate?.targetId === session?.target?.id
+        && candidate?.backendNodeId === locator?.backendNodeId
+        && candidate?.frameId === locator?.frameId
+        && candidate?.tag === locator?.tag
+        && candidate?.visible === true && candidate?.disabled !== true
+        && observation?.targetId === session?.target?.id
+        && observation?.page?.url === details.fromPageUrl;
+      return allowed
+        ? { allowed: true, category: "registered_pagination_button" }
+        : { allowed: false, reason: "The next-page button is outside the registered extraction capability." };
+    }
+  });
+}
+
+/** Advance only a freshly observed registered same-path pagination control. */
+export async function advanceRegisteredPagination({ session, environment, assertExecutionLease, url, fromPageUrl, nextPage, kind = "rel_next_same_path", queryParameter = null, signal, paginationOperationId = null, paginationOperationAuthorizer = null } = {}) {
+  if (signal?.aborted) return { status: "uncertain", reasonCode: "canceled_before_pagination" };
+  if (!session || typeof session.observe !== "function") return { status: "blocked", reasonCode: "pagination_session_unavailable" };
+  if (kind === "virtualized_list") {
+    const before = await Promise.resolve().then(() => session.observe({ profile: "interaction" })).catch(() => null);
+    if (!before?.page?.url || before.targetId && before.targetId !== session.target?.id) return { status: "blocked", reasonCode: "pagination_observation_unavailable" };
+    let current;
+    try { current = new URL(before.page.url); } catch { return { status: "blocked", reasonCode: "pagination_url_invalid" }; }
+    if (fromPageUrl !== before.page.url) return { status: "blocked", reasonCode: "pagination_source_changed" };
+    const target = (before.scrollTargets ?? []).find(item => item.identity === nextPage?.identity
+      && item.targetId === session.target?.id && item.documentGeneration === before.documentGeneration
+      && item.visible === true && item.canScrollDown === true && item.frameTargetId == null);
+    if (!target) return { status: "blocked", reasonCode: "pagination_scroll_target_stale" };
+    const dispatch = await executeAuthorizedAction({
+      session,
+      environment,
+      goal: "Scroll down to reveal the next visible records",
+      action: "scroll",
+      candidate: target,
+      assertExecutionLease,
+      validateActionTarget: (candidate, observation) => candidate?.identity === target.identity
+        && candidate?.canScrollDown === true && candidate?.visible === true
+        && candidate?.frameTargetId == null && observation?.page?.url === current.href
+    });
+    if (!dispatch.dispatched) return {
+      status: dispatch.status === "uncertain" ? "uncertain" : "blocked",
+      reasonCode: dispatch.category ?? "pagination_scroll_refused"
+    };
+    if (signal?.aborted) return { status: "uncertain", reasonCode: "canceled_after_pagination_scroll" };
+    await Promise.resolve(session.waitForChange?.(2_000, {
+      pageChangeFingerprint: before.pageChangeFingerprint,
+      domMutationCount: before.domMutationCount,
+      lifecycleEventCount: before.lifecycleEventCount,
+      scrollTarget: { identity: target.identity, scrollTop: target.scrollTop }
+    })).catch(() => {});
+    const after = await Promise.resolve().then(() => session.observe({ profile: "interaction" })).catch(() => null);
+    if (!after?.page?.url || after.targetId !== session.target?.id || after.page.url !== before.page.url) {
+      return { status: "uncertain", reasonCode: "pagination_scroll_post_observation_unavailable" };
+    }
+    const afterTarget = (after.scrollTargets ?? []).find(item => item.identity === target.identity);
+    if (!afterTarget || !(afterTarget.scrollTop > Number(target.scrollTop ?? 0) + 2)) {
+      return { status: "failed", reasonCode: "pagination_scroll_stalled" };
+    }
+    return { status: "verified", reasonCode: "virtualized_list_scroll_progress_observed", progressVerified: true };
+  }
+  if (kind === "explicit_next_same_path" && nextPage?.action === "click") {
+    const before = await Promise.resolve().then(() => session.observe({ profile: "interaction" })).catch(() => null);
+    if (!before?.page?.url || before.targetId !== session.target?.id || before.page.url !== fromPageUrl) {
+      return { status: "blocked", reasonCode: "pagination_source_changed" };
+    }
+    const retained = session.observer?.getEvidence?.(before.evidenceId, { facets: ["domSnapshot"] });
+    if (retained?.status !== "available" || !retained.domSnapshot) return { status: "blocked", reasonCode: "pagination_dom_evidence_unavailable" };
+    const fresh = discoverVisibleNextPage(retained.domSnapshot, before.page.url, { kind });
+    const target = fresh.status === "available" && fresh.action === "click"
+      && fresh.target?.backendNodeId === nextPage.target?.backendNodeId
+      && fresh.target?.frameId === nextPage.target?.frameId
+      ? (before.candidates ?? []).filter(candidate => candidate.backendNodeId === fresh.target.backendNodeId
+        && candidate.frameId === fresh.target.frameId && candidate.tag === fresh.target.tag
+        && candidate.visible === true && candidate.disabled !== true)
+      : [];
+    if (target.length !== 1) return { status: "blocked", reasonCode: "pagination_control_not_current" };
+    const dispatch = await executeAuthorizedAction({
+      session,
+      environment,
+      goal: "Open the explicitly registered next collection page",
+      action: "click",
+      candidate: target[0],
+      operationId: paginationOperationId,
+      operationAuthorizer: paginationOperationAuthorizer,
+      assertExecutionLease,
+      validateActionTarget: (candidate, observation) => candidate?.identity === target[0].identity
+        && candidate?.backendNodeId === fresh.target.backendNodeId
+        && candidate?.frameId === fresh.target.frameId
+        && candidate?.visible === true && candidate?.disabled !== true
+        && observation?.page?.url === before.page.url
+    });
+    if (!dispatch.dispatched) return {
+      status: dispatch.status === "uncertain" ? "uncertain" : "blocked",
+      reasonCode: dispatch.category ?? "pagination_button_refused"
+    };
+    if (signal?.aborted) return { status: "uncertain", reasonCode: "canceled_after_pagination_click" };
+    await Promise.resolve(session.waitForChange?.(2_000, {
+      pageChangeFingerprint: before.pageChangeFingerprint,
+      domMutationCount: before.domMutationCount,
+      lifecycleEventCount: before.lifecycleEventCount
+    })).catch(() => {});
+    const after = await Promise.resolve().then(() => session.observe({ profile: "interaction" })).catch(() => null);
+    if (!after?.page?.url || after.targetId !== session.target.id
+      || after.pageChangeFingerprint === before.pageChangeFingerprint) {
+      return { status: "uncertain", reasonCode: "pagination_button_progress_unconfirmed" };
+    }
+    try {
+      const oldUrl = new URL(before.page.url);
+      const newUrl = new URL(after.page.url);
+      if (oldUrl.origin !== newUrl.origin || oldUrl.pathname !== newUrl.pathname) {
+        return { status: "failed", reasonCode: "pagination_button_scope_changed" };
+      }
+    } catch { return { status: "uncertain", reasonCode: "pagination_button_post_url_invalid" }; }
+    return { status: "verified", reasonCode: "explicit_pagination_button_progress_observed" };
+  }
+  const before = await Promise.resolve().then(() => session.observe()).catch(() => null);
+  let current;
+  let destination;
+  try {
+    current = new URL(before?.page?.url);
+    destination = new URL(url, current);
+  } catch { return { status: "blocked", reasonCode: "pagination_url_invalid" }; }
+  if (!before?.page?.url || before.page.url !== fromPageUrl
+    || destination.origin !== current.origin || destination.pathname !== current.pathname
+    || destination.username || destination.password || !["http:", "https:"].includes(destination.protocol)) {
+    return { status: "blocked", reasonCode: "pagination_scope_changed" };
+  }
+  destination.hash = "";
+  const retained = session.observer?.getEvidence?.(before.evidenceId, { facets: ["domSnapshot"] });
+  if (retained?.status !== "available" || !retained.domSnapshot) {
+    return { status: "blocked", reasonCode: "pagination_dom_evidence_unavailable" };
+  }
+  const freshNextPage = discoverVisibleNextPage(retained.domSnapshot, current.href, { kind, queryParameter });
+  if (freshNextPage.status !== "available" || freshNextPage.url !== destination.href) {
+    return { status: "blocked", reasonCode: "pagination_control_not_current" };
+  }
+  let dispatch;
+  try {
+    dispatch = await executeAuthorizedAction({
+      session,
+      environment,
+      action: "navigate",
+      url: destination.href,
+      assertExecutionLease
+    });
+  } catch { return { status: "uncertain", reasonCode: "pagination_navigation_result_unknown" }; }
+  if (!dispatch.dispatched) return {
+    status: dispatch.status === "uncertain" ? "uncertain" : "blocked",
+    reasonCode: dispatch.category ?? "pagination_navigation_refused"
+  };
+  if (signal?.aborted) return { status: "uncertain", reasonCode: "canceled_after_pagination_dispatch" };
+  await Promise.resolve(session.waitForChange?.(2_000, {
+    pageChangeFingerprint: before.pageChangeFingerprint,
+    domMutationCount: before.domMutationCount,
+    lifecycleEventCount: before.lifecycleEventCount
+  })).catch(() => {});
+  const after = await Promise.resolve().then(() => session.observe()).catch(() => null);
+  if (!after?.page?.url || before.targetId && after.targetId !== before.targetId) {
+    return { status: "uncertain", reasonCode: "pagination_post_observation_unavailable" };
+  }
+  let observed;
+  try { observed = new URL(after.page.url); }
+  catch { return { status: "uncertain", reasonCode: "pagination_post_url_invalid" }; }
+  if (observed.origin !== destination.origin || observed.pathname !== destination.pathname || observed.search !== destination.search) {
+    return { status: "failed", reasonCode: "pagination_destination_mismatch" };
+  }
+  if (signal?.aborted) return { status: "uncertain", reasonCode: "canceled_after_pagination_observation" };
+  return { status: "verified", reasonCode: "registered_pagination_destination_observed" };
+}
+
 export class NavigationEngine {
-  constructor(session, { planner = null, executionMode = "agent_directed", plannerMode = "deterministic", workflowSynthesizer = null, workflowCapabilities = [], workflowKnowledge = [], workflowInputs = {}, workflowIntent = null, workflowScope = null, journal, workflowStore, decisionRuntime = null, decisionContext = null, operationAuthorizer = null, assertExecutionLease = null, maxActions = 8, maxRecoveries = 1, maxScrolls = 5, signal, environment = null, localFixture = false } = {}) {
+  constructor(session, { planner = null, executionMode = "agent_directed", plannerMode = "deterministic", workflowSynthesizer = null, workflowCapabilities = [], workflowKnowledge = [], workflowInputs = {}, workflowIntent = null, workflowScope = null, capabilityRegistry = null, capabilityService = null, principalId = null, authorizeExtractionField = null, authorizeExtractionRelease = null, persistWorkflowOutputs = null, resumeWorkflowCheckpoint = null, persistWorkflowCheckpoint = null, clearWorkflowCheckpoint = null, journal, workflowStore, decisionRuntime = null, decisionContext = null, operationAuthorizer = null, assertExecutionLease = null, reattachSameTarget = null, maxActions = 8, maxRecoveries = 1, maxScrolls = 5, signal, environment = null, localFixture = false, sameTargetNavigation = false } = {}) {
     this.signal = signal;
     this.session = session;
     if (!["agent_directed", "agent_assisted", "standalone"].includes(executionMode)) throw new Error("Execution mode must be agent_directed, agent_assisted, or standalone.");
+    if (!["deterministic", "auto", "model", "workflow"].includes(plannerMode)) throw new Error("Planner mode must be deterministic, auto, model, or workflow.");
     if (planner?.plannerRole === "standalone_action_proposer" && executionMode !== "standalone") throw new Error("The model action planner is available only in explicit standalone mode.");
     this.executionMode = executionMode;
     this.plannerMode = plannerMode;
-    this.planner = planner ?? configuredPlanner({ executionMode, plannerMode });
+    this.planner = planner ?? configuredPlanner({ executionMode, plannerMode, decisionRuntime });
+    this.deterministicPlanner = plannerMode === "auto" ? new DeterministicPlanner() : null;
+    this.secondaryPlannerAvailable = plannerMode === "auto" && !(this.planner instanceof DeterministicPlanner);
     this.workflowSynthesizer = workflowSynthesizer;
     this.workflowCapabilities = workflowCapabilities;
     this.workflowKnowledge = workflowKnowledge;
     this.workflowInputs = workflowInputs;
     this.workflowIntent = workflowIntent;
     this.workflowScope = workflowScope;
+    this.capabilityRegistry = capabilityRegistry;
+    this.capabilityService = capabilityService;
+    this.principalId = principalId;
+    this.authorizeExtractionField = authorizeExtractionField;
+    this.authorizeExtractionRelease = authorizeExtractionRelease;
+    this.persistWorkflowOutputs = persistWorkflowOutputs;
+    this.resumeWorkflowCheckpoint = resumeWorkflowCheckpoint;
+    this.persistWorkflowCheckpoint = persistWorkflowCheckpoint;
+    this.clearWorkflowCheckpoint = clearWorkflowCheckpoint;
     // Optional verified environment binding. When present, the engine refuses
     // to count a navigation onto a non-authorized origin as goal progress.
     this.environment = environment;
     this.localFixture = localFixture === true;
+    this.sameTargetNavigation = sameTargetNavigation === true;
     this.journal = journal;
     this.workflowStore = workflowStore;
     this.decisionRuntime = decisionRuntime;
     this.decisionContext = decisionContext;
     this.operationAuthorizer = operationAuthorizer;
     this.assertExecutionLease = assertExecutionLease;
+    this.reattachSameTarget = reattachSameTarget;
     this.maxActions = Math.max(1, Math.min(maxActions, 10));
     this.maxRecoveries = Math.max(0, Math.min(maxRecoveries, 3));
     this.maxScrolls = Math.max(0, Math.min(maxScrolls, 8));
   }
 
-  async run(goal, { resumeState, signal, workflowInputs = this.workflowInputs, workflowIntent = this.workflowIntent, _executionState = null, _inferenceBudgeted = false } = {}) {
+  async run(goal, { resumeState, signal, workflowInputs = this.workflowInputs, workflowIntent = this.workflowIntent, inputBindings = {}, _executionState = null, _inferenceBudgeted = false } = {}) {
     const abortSignal = signal ?? this.signal;
     const throwIfAborted = () => {
       if (abortSignal?.aborted) {
@@ -115,13 +344,20 @@ export class NavigationEngine {
       }
     };
     throwIfAborted();
-    const searchPhrase = searchPhraseFromGoal(goal);
+    const searchReadRequest = searchReadRequestFromGoal(goal);
+    const searchPhrase = searchReadRequest?.query ?? searchPhraseFromGoal(goal);
+    const taskRequest = classifyTaskRequest(goal, { suppliedIntent: workflowIntent });
+    const explicitReadWorkflowRequest = taskRequest.explicitReadRequest;
+    const workflowModeActive = (!resumeState || Boolean(this.resumeWorkflowCheckpoint))
+      && ((this.plannerMode === "workflow" && (!searchPhrase || Boolean(searchReadRequest)))
+        || (this.plannerMode === "auto" && (explicitReadWorkflowRequest || taskRequest.compoundRequest || taskRequest.typedWorkflowIntent)));
     const searchSubmitAuthorizer = searchPhrase ? createSearchSubmitAuthorizer(searchPhrase) : null;
     const state = _executionState ?? resumeState ?? newTaskState(goal, this.session.target, this.session.target.endpoint ?? "local-cdp");
+    let effectiveWorkflowIntent = workflowIntent;
     if (!_inferenceBudgeted && typeof this.decisionRuntime?.withInferenceBudget === "function") {
       const runId = this.decisionContext?.runId ?? state.taskId;
       return this.decisionRuntime.withInferenceBudget({ runId }, () => this.run(goal, {
-        resumeState, signal, workflowInputs, workflowIntent,
+        resumeState, signal, workflowInputs, workflowIntent, inputBindings,
         _executionState: state, _inferenceBudgeted: true
       }));
     }
@@ -142,7 +378,9 @@ export class NavigationEngine {
     if (resumeState && (resumeState.targetId !== this.session.target.id || !resumeGoalMatches || (resumeState.endpoint && this.session.target.endpoint && resumeState.endpoint !== this.session.target.endpoint))) {
       throw new Error("Resume state goal fingerprint or target does not match the current authorized session.");
     }
-    let latest = await this.session.observe();
+    let latest = await this.session.observe({ profile: taskRequest.observationProfile, selectionGoal: goal });
+    const initialApplication = this.environment ? resolveObservedApplication(this.environment, latest.page.url) : { status: "unmatched" };
+    const observedApplicationId = initialApplication.status === "matched" ? initialApplication.applicationId : "unknown";
     state.initialUrl ??= latest.page.url;
     state.initialUrlFingerprint ??= routeFingerprint(latest.page.url);
     state.initialPageLabelHashes ??= pageLabelHashes(latest);
@@ -176,7 +414,12 @@ export class NavigationEngine {
       if (attempt?.action !== "click" || !attempt.error) return;
       attempt.sameTargetRemained = (observation.candidates ?? []).some(candidate => candidate.identity === attempt.targetIdentity);
     };
-    const workflowReplay = { status: this.workflowStore ? searchPhrase ? "skipped_form_input" : "miss" : "disabled", actions: 0 };
+    const workflowReplay = {
+      status: this.workflowStore
+        ? explicitReadWorkflowRequest ? "skipped_read_workflow" : searchPhrase ? "skipped_form_input" : "miss"
+        : "disabled",
+      actions: 0
+    };
     const workflowTraceAttempts = [];
     let workflowTraceSafe = true;
     let planner = searchPhrase ? new DeterministicPlanner() : this.planner;
@@ -192,7 +435,7 @@ export class NavigationEngine {
         episodeId: this.decisionContext?.episodeId ?? state.decisionEpisodeId,
         runId: decisionRunId,
         workflowId: this.decisionContext?.workflowId ?? "navigation_goal",
-        applicationId: this.environment?.applications?.[0]?.applicationId ?? "unknown",
+        applicationId: observedApplicationId,
         environmentClass,
         executionMode: this.executionMode,
         policyVersion: "active_policy_v1",
@@ -202,7 +445,7 @@ export class NavigationEngine {
       state.decisionEpisodeId = decisionEpisodeId;
       await updateJournal();
     }
-    if (this.plannerMode === "workflow" && !searchPhrase && !resumeState) {
+    if (workflowModeActive) {
       const synthesizer = this.workflowSynthesizer ?? createConfiguredWorkflowSynthesizer({
         eventStore: this.decisionRuntime?.eventStore,
         ...(typeof this.decisionRuntime?.budgetedFetch === "function" ? { fetchImpl: this.decisionRuntime.budgetedFetch("workflow_synthesis") } : {})
@@ -211,19 +454,140 @@ export class NavigationEngine {
       const environmentClass = this.workflowScope?.environmentClass
         ?? this.environment?.environmentClass
         ?? (environmentId.includes("production") ? "production" : environmentId.includes("staging") ? "staging" : environmentId ? "local" : "unknown");
-      const applicationId = this.workflowScope?.applicationId ?? this.environment?.applications?.[0]?.applicationId ?? "unknown";
-      planner = new WorkflowGraphPlanner({
-        synthesizer,
-        capabilities: Array.isArray(this.workflowCapabilities) && this.workflowCapabilities.length ? this.workflowCapabilities : createGenericWorkflowCapabilities(),
-        knowledge: this.workflowKnowledge,
-        inputs: workflowInputs,
-        taskIntent: workflowIntent,
-        decisionRuntime: this.decisionRuntime,
-        episodeId: decisionEpisodeId,
-        runId: decisionRunId,
-        scope: { applicationId, environmentClass, principalId: this.workflowScope?.principalId ?? this.environment?.principalId ?? "unknown" },
-        fallbackPlanner: new DeterministicPlanner()
+      const applicationId = this.workflowScope?.applicationId ?? observedApplicationId;
+      const profileFormCapabilities = createProfileFormWorkflowCapabilities({ session: this.session, environment: this.environment, applicationId });
+      const callerCapabilities = Array.isArray(this.workflowCapabilities) ? this.workflowCapabilities : [];
+      const searchInputRef = searchReadRequest ? availableSearchInputRef(workflowInputs) : null;
+      const searchWorkflowCapabilities = searchReadRequest
+        ? createObservedSearchWorkflowCapabilities({ observation: latest, session: this.session, inputRef: searchInputRef, query: searchReadRequest.query })
+        : [];
+      const effectiveWorkflowInputs = workflowInputs && typeof workflowInputs === "object" && !Array.isArray(workflowInputs)
+        ? { ...workflowInputs }
+        : {};
+      if (searchWorkflowCapabilities.length === 2) effectiveWorkflowInputs[searchInputRef] = searchReadRequest.query;
+      const configuredCapabilities = [
+        ...createGenericWorkflowCapabilities({ environment: this.environment }),
+        ...profileFormCapabilities,
+        ...searchWorkflowCapabilities,
+        ...callerCapabilities
+      ];
+      const extractionCapabilities = createExtractionWorkflowCapabilities({
+        registry: this.capabilityRegistry,
+        session: this.session,
+        environment: this.environment,
+        principalId: this.principalId,
+        authorizeField: this.authorizeExtractionField,
+        authorizeRelease: this.authorizeExtractionRelease,
+        assertExecutionLease: this.assertExecutionLease,
+        resumeCheckpoint: this.resumeWorkflowCheckpoint,
+        persistCheckpoint: typeof this.persistWorkflowCheckpoint === "function"
+          ? checkpoint => this.persistWorkflowCheckpoint({
+            ...checkpoint,
+            taskId: state.taskId,
+            environmentFingerprint: currentEnvironmentFingerprint,
+            principalId: this.principalId
+          })
+          : null,
+      advancePage: details => advanceRegisteredPagination({
+          session: this.session,
+          environment: this.environment,
+          assertExecutionLease: this.assertExecutionLease,
+          ...details,
+          ...(details.nextPage?.action === "click" ? {
+            paginationOperationId: `registered-pagination:${details.capabilityId}@${details.capabilityVersion}`,
+            paginationOperationAuthorizer: createRegisteredPaginationButtonAuthorizer({
+              registry: this.capabilityRegistry,
+              environment: this.environment,
+              principalId: this.principalId,
+              session: this.session,
+              details
+            })
+          } : {})
+        })
       });
+      const observedReadCapabilities = explicitReadWorkflowRequest
+        && (typeof this.capabilityService?.createObservedReadWorkflowCapabilities === "function"
+          || typeof this.capabilityService?.createDeferredObservedReadWorkflowCapabilities === "function")
+        ? requiresCompositeReadWorkflow(goal)
+          ? (await this.capabilityService.createDeferredObservedReadWorkflowCapabilities?.({
+            session: this.session,
+            environment: this.environment,
+            principalId: this.principalId,
+            goal: searchReadRequest?.resultRequest ?? goal
+          })) ?? []
+          : await this.capabilityService.createObservedReadWorkflowCapabilities?.({
+          session: this.session,
+          environment: this.environment,
+          principalId: this.principalId,
+          observation: latest,
+          goal
+        })
+        : [];
+      const thisSession = this.session;
+      const verifiedSearchCapability = searchWorkflowCapabilities.find(capability => capability.id === "observed_public_search_submit");
+      const deferredReadCapabilities = observedReadCapabilities.map(capability => {
+        if (!searchReadRequest || capability.outputCompleteness !== "observed_partial") return capability;
+        return Object.freeze({
+          ...capability,
+          async execute(args = {}) {
+            if (verifiedSearchCapability?.hasVerifiedSearchSubmission?.() !== true) return {
+              status: "failed",
+              reasonCode: "search_submission_not_verified_before_extraction",
+              evidenceRefs: [args.observation?.evidenceId].filter(Boolean)
+            };
+            const searchVerified = await thisSession.verifySearchOutcome(searchReadRequest.query).catch(() => false);
+            if (!searchVerified) return {
+              status: "failed",
+              reasonCode: "search_results_not_verified_before_extraction",
+              evidenceRefs: [args.observation?.evidenceId].filter(Boolean)
+            };
+            return capability.execute(args);
+          }
+        });
+      });
+      const configuredIds = new Set(configuredCapabilities.map(capability => capability?.id));
+      const workflowCapabilities = [
+        ...configuredCapabilities,
+        ...extractionCapabilities.filter(capability => !configuredIds.has(capability.id)),
+        ...deferredReadCapabilities.filter(capability => !configuredIds.has(capability.id))
+      ];
+      const taskResolution = resolveTaskIntent({
+        goal,
+        suppliedIntent: workflowIntent,
+        capabilities: workflowCapabilities,
+        observedReadCapabilityIds: deferredReadCapabilities.map(capability => capability.id),
+        searchCapabilityIds: searchWorkflowCapabilities.map(capability => capability.id)
+      });
+      const executionRoute = selectTaskExecutionRoute({
+        requestedPlannerMode: this.plannerMode,
+        classifiedTask: taskRequest,
+        trustedCapabilities: workflowCapabilities,
+        taskResolution
+      });
+      if (searchReadRequest) {
+        effectiveWorkflowIntent = taskResolution.status === "resolved" ? taskResolution.intent : null;
+      } else if (taskResolution.status === "resolved") effectiveWorkflowIntent = taskResolution.intent;
+      if (executionRoute.kind === "unresolved") {
+        planner = new UnresolvedTaskRoutePlanner(
+          `No trusted execution route can establish the requested outcome (${executionRoute.reasonCode}); no browser action was selected.`
+        );
+      } else {
+        planner = new WorkflowGraphPlanner({
+          synthesizer,
+          capabilities: workflowCapabilities,
+          knowledge: this.workflowKnowledge,
+          inputs: effectiveWorkflowInputs,
+          taskIntent: effectiveWorkflowIntent,
+          decisionRuntime: this.decisionRuntime,
+          episodeId: decisionEpisodeId,
+          runId: decisionRunId,
+          scope: { applicationId, environmentClass, principalId: this.workflowScope?.principalId ?? this.environment?.principalId ?? "unknown" },
+          allowDeterministicShortcut: !taskRequest.explicitReadRequest && !taskRequest.compoundRequest && !taskRequest.typedWorkflowIntent
+            && profileFormCapabilities.length === 0 && callerCapabilities.length === 0 && extractionCapabilities.length === 0,
+          allowAtomicFallback: !taskRequest.explicitReadRequest && !taskRequest.compoundRequest && !taskRequest.typedWorkflowIntent,
+          fallbackPlanner: new DeterministicPlanner()
+        });
+      }
     }
     const decisionStepId = () => this.decisionContext?.stepPrefix
       ? `${this.decisionContext.stepPrefix}_a${Math.min(999, state.attempts.length + 1)}`
@@ -238,11 +602,9 @@ export class NavigationEngine {
       const reviewRequired = operationContext?.reviewRequired === true
         || workflowCapability?.requiresApproval === true
         || ["shared_mutation", "security_change"].includes(workflowCapability?.effectClass)
-        || actionType === "navigate"
-        || actionType === "upload"
-        || actionType === "toggle"
-        || target?.submitsForm === true
-        || targetIsLink;
+        || target?.submitsForm === true;
+      const reviewTargetRole = operationContext?.targetRole ?? workflowCapability?.targetRole ?? (targetIsLink ? "navigation_link" : "browser_control");
+      const reviewPurposeCode = workflowCapability?.purposeCodes?.[0] ?? operationContext?.purposeCode ?? null;
       const reviewInput = {
         episodeId: decisionEpisodeId,
         runId: decisionRunId,
@@ -250,32 +612,73 @@ export class NavigationEngine {
         decisionId: attempt.decisionId,
         observation: latest,
         operation: actionType,
-        operationClass: operationContext?.operationClass ?? (targetIsLink ? "navigation" : target?.submitsForm ? "form_submission" : "browser_interaction"),
-        targetRole: operationContext?.targetRole ?? (targetIsLink ? "navigation_link" : "browser_control"),
-        expectedOutcomeClass: targetIsLink ? "destination_observed" : "browser_state_change",
+        operationClass: operationContext?.operationClass ?? workflowCapability?.effectClass ?? (targetIsLink ? "navigation" : "unknown"),
+        targetRole: reviewTargetRole,
+        ...(reviewPurposeCode ? { purposeCode: reviewPurposeCode } : {}),
+        expectedOutcomeClass: workflowCapability?.postconditionCodes?.[0] ?? (targetIsLink ? "destination_observed" : "browser_state_change"),
         candidate: target,
         ...(operationContext?.semanticAnnotation ? { semanticAnnotation: operationContext.semanticAnnotation } : {}),
         ...(operationContext?.semanticEventIds?.length ? { semanticEventIds: operationContext.semanticEventIds } : {}),
         signal: abortSignal
       };
       let review;
-      if (workflowReview?.status === "reviewed") {
-        await this.decisionRuntime.recordReviewSkipped({
-          ...reviewInput,
-          reasonCode: "covered_by_batched_workflow_review"
-        });
-        review = { decisionId: attempt.decisionId, authorizesOperation: false, coveredByWorkflowReview: true };
-      } else if (reviewRequired) {
-        // The semantic model is invoked only by an explicit ambiguity resolver
-        // (for example, the FreeInference adapter). A selected target does not
-        // need a second model to repeat the coding agent's intent.
+      const equivalentVisibleCandidates = (latest.candidates ?? []).filter(candidate =>
+        candidate.identity !== target?.identity
+        && candidate.visible === true
+        && candidate.role === target?.role
+        && String(candidate.name ?? "").trim().toLowerCase() === String(target?.name ?? "").trim().toLowerCase()
+      );
+      const visualEvidenceAvailable = this.decisionRuntime.jevClient?.allowImages === true
+        && isBoundVisualEvidence(latest, latest.visualEvidence);
+      const workflowPlanStatus = planner?.getStatus?.();
+      const workflowReviewBound = workflowReview?.status === "reviewed"
+        && workflowReview?.reviewOutcome === "supported"
+        && workflowReview?.disposition === "supported"
+        && workflowReview?.planHash === workflowPlanStatus?.planHash
+        && workflowReview?.observationId === workflowPlanStatus?.observationId
+        && workflowReview?.reviewBindingHash === workflowPlanStatus?.reviewBindingHash
+        && workflowReview?.taskContractHash === workflowPlanStatus?.taskContractHash
+        && workflowReview?.capabilityCatalogHash === workflowPlanStatus?.capabilityCatalogHash
+        && workflowReview?.targetId === latest.targetId
+        && workflowReview?.targetId === workflowPlanStatus?.targetId
+        && workflowReview?.documentGeneration === latest.documentGeneration
+        && workflowReview?.documentGeneration === workflowPlanStatus?.documentGeneration
+        && workflowReview?.reviewPolicyVersion === "workflow_plan_review_v1"
+        && workflowReview?.bindingStatus === "bound";
+      const route = selectPreActionDecisionRoute({
+        actionAdmitted: authorized,
+        workflowReview,
+        workflowReviewBound,
+        reviewRequired,
+        riskClass: workflowCapability?.effectClass ?? operationContext?.operationClass ?? "unknown",
+        uncertaintyClass: equivalentVisibleCandidates.length ? "ambiguous" : "resolved",
+        visualEvidenceAvailable,
+        reviewIntentAvailable: hasReviewIntent({ targetRole: reviewTargetRole, purposeCode: reviewPurposeCode })
+      });
+      this.decisionRuntime.recordInferenceRoute({
+        episodeId: decisionEpisodeId,
+        runId: decisionRunId,
+        stepId: attempt.decisionStepId,
+        decisionId: attempt.decisionId,
+        observationId: latest.evidenceId,
+        route: route.route,
+        reasonCode: route.reasonCode,
+        providers: route.providers,
+        visualEvidenceUsed: route.visualEvidenceUsed
+      });
+      if (route.route === "jev_only") {
         review = await this.decisionRuntime.reviewBeforeAction(reviewInput);
       } else {
         await this.decisionRuntime.recordReviewSkipped({
           ...reviewInput,
-          reasonCode: "policy_boundary_not_triggered"
+          reasonCode: route.reasonCode
         });
-        review = { decisionId: attempt.decisionId, authorizesOperation: false };
+        review = {
+          decisionId: attempt.decisionId,
+          authorizesOperation: false,
+          coveredByWorkflowReview: route.reasonCode === "covered_by_batched_workflow_review",
+          ...(route.reasonCode === "review_insufficient_evidence" ? { evidenceStatus: "insufficient_evidence", reasonCode: route.reasonCode } : {})
+        };
       }
       const adjudication = adjudicatePreActionReview(review);
       await this.decisionRuntime.recordPolicy({
@@ -285,7 +688,9 @@ export class NavigationEngine {
         decisionId: attempt.decisionId,
         observationId: latest.evidenceId,
         disposition: authorized && adjudication.allowed ? "allow" : "deny",
-        reasonCode: !authorized ? "action_policy_refused" : adjudication.allowed ? "action_policy_admitted" : "jev_review_required",
+        reasonCode: !authorized ? "action_policy_refused"
+          : adjudication.category === "insufficient_review_evidence" ? "review_insufficient_evidence"
+            : adjudication.allowed ? "action_policy_admitted" : "jev_review_required",
         policyVersion: "active_policy_v1"
       });
       return adjudication;
@@ -315,6 +720,7 @@ export class NavigationEngine {
       });
     };
     const recordTelemetryDispatch = async (attempt, actionType, dispatchStatus) => {
+      attempt.dispatchStatus = dispatchStatus;
       if (!this.decisionRuntime || !decisionEpisodeId || !attempt.decisionId) return;
       await this.decisionRuntime.recordDispatch({
         episodeId: decisionEpisodeId,
@@ -407,30 +813,295 @@ export class NavigationEngine {
         goal: "[redacted task goal]",
         ...(this.decisionRuntime?.inferenceBudgetSnapshot ? { inferenceBudget: this.decisionRuntime.inferenceBudgetSnapshot(decisionRunId) } : {}),
         ...(workflowPlanStatus ? { workflowPlan: workflowPlanStatus } : {}),
-        ...(this.workflowStore ? { workflowReplay: { ...workflowReplay } } : {})
+        ...(planner?.isComplete?.() && Object.keys(planner?.getOutputs?.() ?? {}).length
+          ? { workflowOutputs: planner.getOutputs() } : {}),
+        ...(this.workflowStore ? { workflowReplay: { ...workflowReplay } } : {}),
+        ...(state.reconciliation ? { reconciliation: state.reconciliation } : {})
       };
     };
     const stopAfterObservationLoss = async (attempt, error) => {
       const observationError = { name: error?.name ?? "Error", message: String(error?.message ?? error).slice(0, 400) };
+      const observationAttempts = Number.isInteger(error?.observationAttempts) && error.observationAttempts >= 1 && error.observationAttempts <= 2
+        ? error.observationAttempts : 1;
+      const failureName = String(error?.name ?? "").toLocaleLowerCase();
+      const failureCode = String(error?.code ?? "").toLocaleUpperCase();
+      const failureMessage = String(error?.message ?? error).toLocaleLowerCase();
+      const targetDetached = this.session.attached === false || ["detached", "closed"].includes(this.session.targetLifecycle)
+        || /target.{0,24}(detached|closed)|(?:detached|closed).{0,24}target/u.test(failureMessage);
+      const observationErrorClass = targetDetached ? "target_detached"
+        : error?.name === "TimeoutError" || ["ETIMEDOUT", "ERR_TIMED_OUT"].includes(failureCode) || /timed?\s*out|timeout/u.test(`${failureName} ${failureMessage}`)
+          ? "timeout"
+          : ["ECONNRESET", "EPIPE", "ECONNREFUSED", "ERR_STREAM_PREMATURE_CLOSE"].includes(failureCode)
+            || /protocol|websocket|cdp|transport|socket/u.test(`${failureName} ${failureMessage}`)
+            ? "cdp_transport" : "unknown";
       attempt.error ??= observationError;
       attempt.observationUnavailable = true;
       attempt.observationError = observationError;
+      attempt.observationAttemptCount = observationAttempts;
       attempt.uncertainOutcome = true;
       attempt.completedAt = new Date().toISOString();
       finishAction(attempt);
+      state.reconciliation = Object.freeze({
+        reasonCode: "post_action_observation_unavailable",
+        errorClass: observationErrorClass,
+        observationAttempts,
+        reattachFailureCode: REATTACH_FAILURE_CODES.has(error?.reattachFailureCode)
+          ? error.reattachFailureCode : "not_attempted"
+      });
       state.status = "unresolved";
-      state.terminationReason = "The browser target or observation connection was lost after the action; no retry was attempted. Reattach and resume from fresh evidence.";
+      state.terminationReason = "The browser target or observation connection could not be re-established after one bounded read retry; no browser action was repeated. Reattach and resume from fresh evidence.";
+      if (this.decisionRuntime?.recordReconciliationRequired && decisionEpisodeId && attempt.decisionId && attempt.operationId) {
+        this.decisionRuntime.recordReconciliationRequired({
+          episodeId: decisionEpisodeId,
+          runId: decisionRunId,
+          stepId: attempt.decisionStepId,
+          decisionId: attempt.decisionId,
+          observationId: attempt.beforeEvidenceId,
+          operation: attempt.action,
+          targetRole: "browser_target",
+          operationId: attempt.operationId,
+          dispatchStatus: attempt.dispatchStatus ?? "uncertain",
+          reasonCode: "post_action_observation_unavailable",
+          observationErrorClass,
+          observationAttempts,
+          evidenceRefs: [attempt.beforeEvidenceId].filter(Boolean)
+        });
+      }
       await updateJournal();
       return resultWithWorkflow({ status: state.status, goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: attempt.beforeEvidenceId });
+    };
+    const observeAfterChange = async (timeoutMs, baseline, attempt = null) => {
+      const reattachToSameTarget = async error => {
+        const errorText = String(error?.message ?? error).toLocaleLowerCase();
+        const detached = this.session.attached === false || ["detached", "closed"].includes(this.session.targetLifecycle)
+          || /target.{0,24}(detached|closed)|(?:detached|closed).{0,24}target/u.test(errorText);
+        if (!detached || !this.sameTargetNavigation || typeof this.reattachSameTarget !== "function"
+          || attempt?.action !== "click" || attempt?.dispatchStatus !== "dispatched") {
+          if (error && typeof error === "object") error.observationAttempts = 1;
+          throw error;
+        }
+
+        let replacement;
+        try {
+          const originalTarget = this.session.target;
+          replacement = await this.reattachSameTarget({
+            targetId: originalTarget?.id,
+            endpoint: originalTarget?.endpoint ?? "local-cdp",
+            environment: this.environment
+          });
+          const nextSession = replacement?.session;
+          const observation = replacement?.observation;
+          const targetId = originalTarget?.id;
+          const endpointValue = originalTarget?.endpoint ?? "local-cdp";
+          const replacementEndpointValue = nextSession?.target?.endpoint ?? "local-cdp";
+          const endpoint = (() => { try { return new URL(endpointValue).origin; } catch { return endpointValue; } })();
+          const replacementEndpoint = (() => { try { return new URL(replacementEndpointValue).origin; } catch { return replacementEndpointValue; } })();
+          if (!nextSession || nextSession.attached !== true || nextSession.target?.id !== targetId
+            || replacementEndpoint !== endpoint || observation?.targetId !== targetId) {
+            throw Object.assign(new Error("Same-target reattachment did not return a fresh observation from the exact leased target."), {
+              reattachFailureCode: "reattach_identity_mismatch"
+            });
+          }
+          let observedUrl;
+          try { observedUrl = new URL(observation.page?.url ?? ""); }
+          catch { throw Object.assign(new Error("Same-target reattachment returned an invalid observed page URL."), { reattachFailureCode: "target_scope_rejected" }); }
+          const allowedOrigins = (this.environment?.authorizedOrigins ?? []).map(normalizeOrigin).filter(Boolean);
+          if (!allowedOrigins.includes(normalizeOrigin(observedUrl.origin)) || observedUrl.username || observedUrl.password) {
+            throw Object.assign(new Error("Same-target reattachment observed a page outside the authorized environment."), { reattachFailureCode: "target_scope_rejected" });
+          }
+          if (typeof replacement.commit === "function") await replacement.commit();
+          this.session = nextSession;
+          await this.assertExecutionLease?.();
+          attempt.reconnectedObservation = true;
+          return observation;
+        } catch (reattachError) {
+          await replacement?.session?.close?.().catch(() => {});
+          if (reattachError && typeof reattachError === "object") {
+            reattachError.observationAttempts = 2;
+            reattachError.reattachFailureCode ??= "unknown";
+          }
+          throw reattachError;
+        }
+      };
+
+      try {
+        await this.session.waitForChange(timeoutMs, baseline);
+        return await this.session.observe({ selectionGoal: goal });
+      } catch (firstError) {
+        if (isAbortError(firstError)) throw firstError;
+        const stillAttached = this.session.attached !== false
+          && !["detached", "closed"].includes(this.session.targetLifecycle);
+        if (!stillAttached) return await reattachToSameTarget(firstError);
+        if (!this.sameTargetNavigation || !stillAttached) {
+          if (firstError && typeof firstError === "object") firstError.observationAttempts = 1;
+          throw firstError;
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+        throwIfAborted();
+        try {
+          const observation = await this.session.observe({ selectionGoal: goal });
+          return observation;
+        } catch (secondError) {
+          const secondErrorText = String(secondError?.message ?? secondError).toLocaleLowerCase();
+          const detachedAfterRetry = this.session.attached === false
+            || ["detached", "closed"].includes(this.session.targetLifecycle)
+            || /target.{0,24}(detached|closed)|(?:detached|closed).{0,24}target/u.test(secondErrorText);
+          if (detachedAfterRetry) return await reattachToSameTarget(secondError);
+          if (secondError && typeof secondError === "object") secondError.observationAttempts = 2;
+          throw secondError;
+        }
+      }
     };
     const outcomeVerified = async () => {
       if (!hasVerifiedOutcome(latest, goal, state.initialPageLabelHashes, this.environment)) return false;
       return !searchPhrase || await this.session.verifySearchOutcome(searchPhrase);
     };
     const workflowPlanCanFinish = () => {
-      if (!(planner instanceof WorkflowGraphPlanner)) return true;
-      const status = planner.getStatus();
-      return !status.planHash || planner.isComplete();
+      const activeIntent = planner?.getTaskIntent?.() ?? effectiveWorkflowIntent;
+      if (resumeState && activeIntent?.requiredCapabilityIds?.length && !this.resumeWorkflowCheckpoint) return false;
+      if (explicitReadWorkflowRequest) {
+        return workflowModeActive && typeof planner?.canFinishWithVisibleOutcome === "function"
+          ? planner.canFinishWithVisibleOutcome()
+          : false;
+      }
+      if (!workflowModeActive || resumeState) return true;
+      return typeof planner?.canFinishWithVisibleOutcome === "function"
+        ? planner.canFinishWithVisibleOutcome()
+        : false;
+    };
+    const captureVisualObservation = async observation => {
+      let visualObservation = observation;
+      let imageEvidence = visualObservation?.visualEvidence ?? null;
+      if (!imageEvidence) {
+        try {
+          visualObservation = await this.session.observe({ profile: "visual", prepareForJev: true, selectionGoal: goal });
+          const retained = this.session.observer?.getEvidence?.(visualObservation.evidenceId, {
+            facets: ["page"], includeScreenshot: true
+          });
+          imageEvidence = bindVisualEvidence(visualObservation, retained);
+        } catch {
+          imageEvidence = null;
+        }
+      }
+      return { observation: visualObservation, imageEvidence };
+    };
+    const classifyAmbiguousPage = async observation => {
+      const service = this.decisionRuntime?.visualDecisionService;
+      if (!service || typeof service.classifyPage !== "function") return null;
+      const decisionId = randomUUID();
+      if (this.decisionRuntime?.jevClient?.allowImages !== true) {
+        this.decisionRuntime.recordInferenceRoute?.({
+          episodeId: decisionEpisodeId, runId: decisionRunId, stepId: decisionStepId(), decisionId,
+          observationId: observation?.evidenceId, route: "deterministic", reasonCode: "image_permission_denied",
+          providers: ["deterministic"], visualEvidenceUsed: false
+        });
+        this.decisionRuntime.recordReviewSkipped({
+          episodeId: decisionEpisodeId, runId: decisionRunId, stepId: decisionStepId(), decisionId,
+          observation, operation: "visual_assessment", operationClass: "read", targetRole: "browser_page",
+          expectedOutcomeClass: "page_classification", reasonCode: "image_permission_denied"
+        });
+        return { assessment: { status: "skipped", failureCode: "image_permission_denied", authorizesOperation: false }, observation, imageEvidence: null };
+      }
+      const captured = await captureVisualObservation(observation);
+      if (!captured.imageEvidence) {
+        this.decisionRuntime.recordInferenceRoute?.({
+          episodeId: decisionEpisodeId, runId: decisionRunId, stepId: decisionStepId(), decisionId,
+          observationId: captured.observation?.evidenceId, route: "deterministic", reasonCode: "visual_evidence_unavailable",
+          providers: ["deterministic"], visualEvidenceUsed: false
+        });
+        this.decisionRuntime.recordReviewSkipped({
+          episodeId: decisionEpisodeId, runId: decisionRunId, stepId: decisionStepId(), decisionId,
+          observation: captured.observation ?? observation, operation: "visual_assessment", operationClass: "read",
+          targetRole: "browser_page", expectedOutcomeClass: "page_classification", reasonCode: "visual_evidence_unavailable"
+        });
+        return { assessment: { status: "skipped", failureCode: "visual_evidence_unavailable", authorizesOperation: false }, ...captured };
+      }
+      const assessment = await service.classifyPage({ ...captured.observation, visualEvidence: captured.imageEvidence }, {
+        episodeId: decisionEpisodeId,
+        runId: decisionRunId,
+        stepId: decisionStepId(),
+        decisionId,
+        imageEvidence: captured.imageEvidence,
+        signal: abortSignal
+      });
+      return { assessment, ...captured };
+    };
+    const groundAmbiguousTarget = async (observation, deterministicPlan, targetRoleCode) => {
+      const service = this.decisionRuntime?.visualDecisionService;
+      if (!service || typeof service.groundTarget !== "function") return null;
+      const allowedCandidateIds = (deterministicPlan?.candidates ?? []).map(candidate => candidate.identity);
+      if (allowedCandidateIds.length < 2 || !targetRoleCode) return null;
+      const decisionId = randomUUID();
+      const stepId = decisionStepId();
+      const captured = await captureVisualObservation(observation);
+      if (!captured.imageEvidence) {
+        this.decisionRuntime?.recordInferenceRoute?.({
+          episodeId: decisionEpisodeId, runId: decisionRunId, stepId, decisionId,
+          observationId: captured.observation?.evidenceId ?? observation.evidenceId,
+          route: "deterministic", reasonCode: "visual_evidence_unavailable",
+          providers: ["deterministic"], visualEvidenceUsed: false
+        });
+        this.decisionRuntime?.recordReviewSkipped?.({
+          episodeId: decisionEpisodeId, runId: decisionRunId, stepId, decisionId,
+          observation: captured.observation ?? observation,
+          operation: "visual_target_grounding", operationClass: "read", targetRole: "visual_target",
+          expectedOutcomeClass: "target_grounding", reasonCode: "visual_evidence_unavailable"
+        });
+        return { assessment: { status: "skipped", failureCode: "visual_evidence_unavailable", authorizesOperation: false }, grounding: null, ...captured };
+      }
+      const assessment = await service.groundTarget({ ...captured.observation, visualEvidence: captured.imageEvidence }, {
+        episodeId: decisionEpisodeId,
+        runId: decisionRunId,
+        stepId,
+        decisionId,
+        targetRoleCode,
+        allowedCandidateIds,
+        imageEvidence: captured.imageEvidence,
+        signal: abortSignal
+      });
+      // Inference may take long enough for the page to change. Reobserve and
+      // resolve the suggested identity again before offering it to the normal
+      // policy and authorized-execution path. Reobserve after failed or
+      // abstaining requests too, so a later GLM fallback sees current evidence.
+      const freshObservation = await this.session.observe({ selectionGoal: goal });
+      const candidate = assessment?.status === "reviewed" && assessment.grounding?.status === "grounded"
+        ? revalidateVisualGrounding(assessment.grounding, freshObservation)
+        : null;
+      if (!candidate) return {
+        assessment: assessment?.status === "reviewed" && assessment.grounding?.status === "grounded" ? {
+          ...assessment,
+          grounding: {
+            status: "unavailable",
+            reasonCode: "stale_after_inference",
+            advisoryOnly: true,
+            authorizesOperation: false
+          }
+        } : assessment,
+        grounding: null,
+        imageEvidence: captured.imageEvidence,
+        observation: freshObservation
+      };
+      if (candidate) {
+        this.decisionRuntime?.recordTargetResolution?.({
+          episodeId: decisionEpisodeId,
+          runId: decisionRunId,
+          stepId,
+          decisionId,
+          observationId: freshObservation.evidenceId,
+          resolver: "jev_box_candidate_intersection",
+          roleMappings: [{ role: targetRoleCode, candidateRef: candidate.identity }],
+          reasonCode: "advisory_box_matched_fresh_candidate",
+          evidenceRefs: [captured.observation.evidenceId, freshObservation.evidenceId],
+          inputEventIds: assessment.inputEventIds ?? []
+        });
+      }
+      return {
+        assessment,
+        grounding: assessment.grounding,
+        candidate,
+        imageEvidence: captured.imageEvidence,
+        observation: freshObservation
+      };
     };
     const handoffIfNeeded = async observation => {
       const handoff = classifyHumanHandoff(observation);
@@ -442,9 +1113,29 @@ export class NavigationEngine {
       return resultWithWorkflow({ status: "needs_human", goal, reason: handoff.reason, interventionRequired: state.interventionRequired, attempts: state.attempts.length, recoveries, evidenceId: observation.evidenceId });
     };
     const succeed = async () => {
+      const activeIntent = planner?.getTaskIntent?.() ?? effectiveWorkflowIntent;
+      const completedOutputs = planner?.isComplete?.() ? planner.getOutputs?.() ?? {} : {};
+      if ((activeIntent?.requiredCapabilityIds ?? []).some(id => !Object.hasOwn(completedOutputs, id))) {
+        state.status = "unresolved";
+        state.terminationReason = "A caller-required workflow capability has no complete verified output; the task cannot be reported as successful.";
+        await updateJournal();
+        return resultWithWorkflow({ status: "unresolved", goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: latest.evidenceId });
+      }
+      if (Object.keys(completedOutputs).length && typeof this.persistWorkflowOutputs === "function"
+        && planner?.hasObservedPartialOutput?.() !== true) {
+        await this.persistWorkflowOutputs({
+          taskId: state.taskId,
+          environmentFingerprint: currentEnvironmentFingerprint,
+          principalId: this.principalId,
+          outputs: completedOutputs
+        });
+      }
+      if (this.resumeWorkflowCheckpoint && typeof this.clearWorkflowCheckpoint === "function") {
+        await this.clearWorkflowCheckpoint();
+      }
       state.status = "succeeded";
       state.resultEvidenceId = latest.evidenceId;
-      if (this.workflowStore && !searchPhrase && workflowReplay.status !== "replayed") {
+      if (this.workflowStore && !searchPhrase && workflowReplay.status !== "replayed" && !activeIntent?.requiredCapabilityIds?.length) {
         try {
           const saved = workflowTraceSafe && workflowTraceAttempts.length
             ? await this.workflowStore.record(goal, state.initialUrlFingerprint, workflowTraceAttempts)
@@ -524,10 +1215,17 @@ export class NavigationEngine {
       state.recoveryCount = recoveries;
       await updateJournal();
     }
+    if (resumeState && (planner?.getTaskIntent?.() ?? effectiveWorkflowIntent)?.requiredCapabilityIds?.length
+      && !this.resumeWorkflowCheckpoint) {
+      state.status = "unresolved";
+      state.terminationReason = "Required extraction output is not retained across task continuation; start a new task to rebuild it from fresh browser evidence.";
+      await updateJournal();
+      return resultWithWorkflow({ status: state.status, goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: latest.evidenceId });
+    }
 
     // Replay only verified traces. Each step resolves a fresh, visible candidate from the current observation.
     // Candidate identities, raw labels, form values, and URL query data are never stored in the workflow file.
-    if (this.workflowStore && !resumeState && !searchPhrase) {
+    if (this.workflowStore && !resumeState && !searchPhrase && !explicitReadWorkflowRequest && !(planner?.getTaskIntent?.() ?? effectiveWorkflowIntent)?.requiredCapabilityIds?.length) {
       const workflow = await this.workflowStore.find(goal, latest);
       if (workflow) {
         const scrollSteps = workflow.steps.filter(step => step.action === "scroll").length;
@@ -569,6 +1267,7 @@ export class NavigationEngine {
                   environment: this.environment,
                   localFixture: this.localFixture,
                   assertExecutionLease: this.assertExecutionLease,
+                  sameTargetNavigation: this.sameTargetNavigation,
                   goal,
                   action: "scroll",
                   candidate: target
@@ -581,8 +1280,7 @@ export class NavigationEngine {
               }
               await recordTelemetryDispatch(attempt, "scroll", attempt.error ? (attempt.dispatchStatus ?? "failed") : "dispatched");
               try {
-                await this.session.waitForChange(1_500, waitBaseline);
-                latest = await this.session.observe();
+                latest = await observeAfterChange(1_500, waitBaseline);
               } catch (error) {
                 workflowReplay.actions++;
                 if (isAbortError(error)) return await canceledWithPendingAction(attempt);
@@ -672,6 +1370,7 @@ export class NavigationEngine {
                 environment: this.environment,
                 localFixture: this.localFixture,
                 assertExecutionLease: this.assertExecutionLease,
+                sameTargetNavigation: this.sameTargetNavigation,
                 goal,
                 action: "click",
                 candidate: target
@@ -684,8 +1383,7 @@ export class NavigationEngine {
             await recordTelemetryDispatch(attempt, "click", attempt.error ? (attempt.dispatchStatus ?? "failed") : "dispatched");
             excludedIdentities.add(target.identity);
             try {
-              await this.session.waitForChange(2_000, waitBaseline);
-              latest = await this.session.observe();
+              latest = await observeAfterChange(2_000, waitBaseline, attempt);
             } catch (error) {
               workflowReplay.actions++;
               if (isAbortError(error)) return await canceledWithPendingAction(attempt);
@@ -743,27 +1441,290 @@ export class NavigationEngine {
       return resultWithWorkflow({ status: state.status, goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: latest.evidenceId });
     }
 
+    let candidateExpansionAttempted = false;
     while (state.attempts.length < this.maxActions) {
-      if (await outcomeVerified()) return await succeed();
-      const planningObservation = {
-        ...latest,
-        candidates: (latest.candidates ?? []).filter(candidate =>
-          (!excludedIdentities.has(candidate.identity) || (searchPhrase && candidate.tag === "input" && String(candidate.type).toLowerCase() === "search")) &&
+      if (await outcomeVerified() && workflowPlanCanFinish()) return await succeed();
+      const filterPlanningObservation = observation => ({
+        ...observation,
+        candidates: (observation.candidates ?? []).filter(candidate =>
+          (!excludedIdentities.has(candidate.identity) || (searchPhrase && isSearchFieldCandidate(candidate, latest))) &&
           !excludedTargetSignatures.some(signature => matchesTargetSignature(candidate, signature))
         ),
-        scrollTargets: (latest.scrollTargets ?? []).filter(target => !excludedScrollIdentities.has(target.identity))
-      };
+        scrollTargets: (observation.scrollTargets ?? []).filter(target => !excludedScrollIdentities.has(target.identity))
+      });
+      let planningObservation = filterPlanningObservation(latest);
+      const candidateCoverage = latest.candidateCoverage;
+      const scopeNeedsExpansion = workflowModeActive
+        && !candidateExpansionAttempted
+        && latest.observationProfile === "interaction"
+        && candidateCoverage?.selectionScope === "task_relevant_region"
+        && candidateCoverage.scopeCoverage === "incomplete"
+        && Number.isInteger(candidateCoverage.scopeCandidateCount)
+        && candidateCoverage.scopeCandidateCount > (candidateCoverage.returnedScopeCandidateCount ?? 0)
+        && candidateCoverage.scopeCandidateCount <= 384;
+      if (scopeNeedsExpansion) {
+        candidateExpansionAttempted = true;
+        const previousEvidenceId = latest.evidenceId;
+        try {
+          const expandedObservation = await this.session.observe({
+            profile: "interaction",
+            selectionGoal: goal,
+            candidateLimit: 384
+          });
+          if (expandedObservation?.evidenceId !== previousEvidenceId
+            && expandedObservation?.targetId === this.session.target.id) {
+            latest = expandedObservation;
+            planningObservation = filterPlanningObservation(latest);
+          }
+        } catch {
+          // Keep the incomplete evidence; synthesis will abstain before dispatch.
+        }
+      }
+      if ((this.plannerMode !== "auto" && planner?.requiresScreenshot === true) || this.decisionRuntime?.requiresScreenshot === true) {
+        latest = await this.session.observe({
+          profile: "visual",
+          prepareForJev: true,
+          selectionGoal: goal,
+          candidateLimit: candidateExpansionAttempted ? 384 : 200
+        });
+        planningObservation = {
+          ...latest,
+          candidates: (latest.candidates ?? []).filter(candidate =>
+            (!excludedIdentities.has(candidate.identity) || (searchPhrase && isSearchFieldCandidate(candidate, latest))) &&
+            !excludedTargetSignatures.some(signature => matchesTargetSignature(candidate, signature))
+          ),
+          scrollTargets: (latest.scrollTargets ?? []).filter(target => !excludedScrollIdentities.has(target.identity))
+        };
+        const visualEvidence = this.session.observer?.getEvidence?.(latest.evidenceId, {
+          facets: ["page"],
+          includeScreenshot: true
+        });
+        const boundVisualEvidence = bindVisualEvidence(latest, visualEvidence);
+        if (boundVisualEvidence) {
+          planningObservation.visualEvidence = boundVisualEvidence;
+          planningObservation.screenshotBase64 = boundVisualEvidence.screenshotBase64;
+        }
+      }
       let plan;
+      let modelPlannerDecisionId = null;
+      let routedVisualReview = null;
+      let visualHandoffSuggested = false;
       try {
         const previousScrollStates = [...scrollConvergenceStates.entries()].map(([identity, data]) => ({
           identity,
           matchingCandidateCount: data.matchingCandidateCount,
           scrollActionsUsed: data.scrollActionsUsed
         }));
-        plan = await planner.plan(goal, planningObservation, { excludedIdentities: [...excludedIdentities], excludedScrollIdentities: [...excludedScrollIdentities], maxScrolls: this.maxScrolls, scrollActionsUsed, previousScrollStates, signal: abortSignal });
+        const planningOptions = { excludedIdentities: [...excludedIdentities], excludedScrollIdentities: [...excludedScrollIdentities], maxScrolls: this.maxScrolls, scrollActionsUsed, previousScrollStates, signal: abortSignal, inputBindings };
+        if (workflowModeActive || this.plannerMode !== "auto") {
+          if (this.plannerMode === "model" && planner?.plannerRole) {
+            const visualEvidenceUsed = planner.requiresScreenshot === true
+              && isBoundVisualEvidence(planningObservation, planningObservation.visualEvidence);
+            modelPlannerDecisionId = randomUUID();
+            this.decisionRuntime?.recordInferenceRoute?.({
+              episodeId: decisionEpisodeId,
+              runId: decisionRunId,
+              stepId: decisionStepId(),
+              decisionId: modelPlannerDecisionId,
+              observationId: planningObservation.evidenceId,
+              route: "semantic_only",
+              reasonCode: "explicit_model_planner",
+              providers: ["secondary"],
+              visualEvidenceUsed
+            });
+          }
+          plan = await planner.plan(goal, planningObservation, planningOptions);
+        } else if (explicitReadWorkflowRequest && resumeState) {
+          const decisionId = randomUUID();
+          this.decisionRuntime?.recordInferenceRoute?.({
+            episodeId: decisionEpisodeId, runId: decisionRunId, stepId: decisionStepId(),
+            decisionId, observationId: planningObservation.evidenceId,
+            route: "abstain", reasonCode: "read_output_not_retained_for_resume",
+            providers: ["deterministic"], visualEvidenceUsed: false
+          });
+          plan = {
+            status: "ambiguous",
+            candidates: [],
+            reason: "Read-only extraction output is not retained in task continuation state; start a new task to rebuild it from fresh evidence. No browser action was selected."
+          };
+        } else {
+          let localPlan = await this.deterministicPlanner.plan(goal, planningObservation, planningOptions);
+          if (searchPhrase) {
+            const routeDecisionId = randomUUID();
+            this.decisionRuntime?.recordInferenceRoute?.({
+              episodeId: decisionEpisodeId,
+              runId: decisionRunId,
+              stepId: decisionStepId(),
+              decisionId: routeDecisionId,
+              observationId: planningObservation.evidenceId,
+              route: "deterministic",
+              reasonCode: "caller_bound_search_primitive",
+              providers: ["deterministic"],
+              visualEvidenceUsed: false
+            });
+            plan = localPlan;
+          } else {
+          const rawTargetRoleCode = goalExpectation(goal).targetTokens.slice(0, 10).join("_");
+          const targetRoleCode = /^[a-z0-9][a-z0-9_]{0,95}$/u.test(rawTargetRoleCode) ? rawTargetRoleCode : "";
+          const visualAssessmentAvailable = this.decisionRuntime?.jevClient?.allowImages === true
+            && typeof this.decisionRuntime?.visualDecisionService?.classifyPage === "function";
+          const visualGroundingAvailable = this.decisionRuntime?.jevClient?.allowImages === true
+            && typeof this.decisionRuntime?.visualDecisionService?.groundTarget === "function"
+            && targetRoleCode.length > 0;
+          const route = selectAutomaticNavigationRoute({
+            goal,
+            deterministicPlan: localPlan,
+            intentShape: effectiveWorkflowIntent?.cardinality ?? "unknown",
+            semanticAvailable: this.secondaryPlannerAvailable,
+            visualAssessmentAvailable,
+            visualGroundingAvailable
+          });
+          const routeDecisionId = randomUUID();
+          if (route.route === "deterministic" || route.route === "abstain") {
+            this.decisionRuntime?.recordInferenceRoute?.({
+              episodeId: decisionEpisodeId,
+              runId: decisionRunId,
+              stepId: decisionStepId(),
+              decisionId: routeDecisionId,
+              observationId: planningObservation.evidenceId,
+              route: route.route,
+              reasonCode: route.reasonCode,
+              providers: route.providers,
+              visualEvidenceUsed: route.visualEvidenceUsed
+            });
+          }
+          if (route.route === "deterministic") {
+            plan = localPlan;
+          } else if (route.route === "abstain") {
+            plan = {
+              status: "ambiguous",
+              candidates: localPlan.candidates ?? [],
+              expected: localPlan.expected,
+              reason: "The task has no trusted atomicity contract and no configured secondary planner is available; no browser action was selected."
+            };
+          } else if (route.route === "jev_only") {
+            routedVisualReview = route.reasonCode === "ambiguous_visual_target_grounding"
+              ? await groundAmbiguousTarget(planningObservation, localPlan, targetRoleCode)
+              : await classifyAmbiguousPage(planningObservation);
+            if (routedVisualReview?.observation?.evidenceId) {
+              latest = routedVisualReview.observation;
+              planningObservation = filterPlanningObservation(latest);
+              if (routedVisualReview.imageEvidence) {
+                planningObservation.visualEvidence = routedVisualReview.imageEvidence;
+                planningObservation.screenshotBase64 = routedVisualReview.imageEvidence.screenshotBase64;
+              }
+              localPlan = await this.deterministicPlanner.plan(goal, planningObservation, planningOptions);
+            }
+            if (routedVisualReview?.candidate && routedVisualReview.grounding?.status === "grounded") {
+              plan = {
+                status: "planned",
+                action: { type: "click", target: routedVisualReview.candidate },
+                expected: localPlan.expected,
+                confidence: Math.min(0.95, routedVisualReview.grounding.scores.boxConfidence, routedVisualReview.grounding.scores.presenceProbability),
+                reasoning: "Jev visually grounded one candidate already selected by deterministic matching; the exact identity was freshly re-resolved before policy admission."
+              };
+            }
+            const pageAnswer = routedVisualReview?.assessment?.answers?.page_state;
+            visualHandoffSuggested = ["login", "challenge"].includes(pageAnswer?.choice)
+              && (pageAnswer.probabilities?.[pageAnswer.choice] ?? 0) >= 0.8;
+            if (plan?.status === "planned") {
+              // The advisory grounding selected only among current observed
+              // candidates. The common action policy and executor still gate it.
+            } else if (visualHandoffSuggested || !this.secondaryPlannerAvailable) {
+              plan = {
+                ...localPlan,
+                status: "ambiguous",
+                reason: visualHandoffSuggested
+                  ? "Visual assessment recommends a manual handoff for the apparent authentication or challenge state; no action was dispatched."
+                  : localPlan.reason
+              };
+            } else {
+              const escalationId = randomUUID();
+              this.decisionRuntime?.recordInferenceRoute?.({
+                episodeId: decisionEpisodeId, runId: decisionRunId, stepId: decisionStepId(),
+                decisionId: escalationId, observationId: planningObservation.evidenceId,
+                route: "semantic_only", reasonCode: "visual_state_did_not_resolve_navigation",
+                providers: ["secondary"], visualEvidenceUsed: this.planner.requiresScreenshot === true && isBoundVisualEvidence(planningObservation, planningObservation.visualEvidence)
+              });
+              if (this.planner.requiresScreenshot === true && !isBoundVisualEvidence(planningObservation, planningObservation.visualEvidence)) {
+                const captured = await captureVisualObservation(planningObservation);
+                latest = captured.observation;
+                planningObservation = filterPlanningObservation(latest);
+                if (captured.imageEvidence) {
+                  planningObservation.visualEvidence = captured.imageEvidence;
+                  planningObservation.screenshotBase64 = captured.imageEvidence.screenshotBase64;
+                }
+              }
+              modelPlannerDecisionId = escalationId;
+              plan = await this.planner.plan(goal, planningObservation, planningOptions);
+            }
+          } else {
+            if (this.planner.requiresScreenshot === true) {
+              const captured = await captureVisualObservation(planningObservation);
+              latest = captured.observation;
+              planningObservation = filterPlanningObservation(latest);
+              if (captured.imageEvidence) {
+                planningObservation.visualEvidence = captured.imageEvidence;
+                planningObservation.screenshotBase64 = captured.imageEvidence.screenshotBase64;
+              }
+            }
+            this.decisionRuntime?.recordInferenceRoute?.({
+              episodeId: decisionEpisodeId, runId: decisionRunId, stepId: decisionStepId(),
+              decisionId: routeDecisionId, observationId: planningObservation.evidenceId,
+              route: route.route, reasonCode: route.reasonCode, providers: route.providers,
+              visualEvidenceUsed: this.planner.requiresScreenshot === true
+                && isBoundVisualEvidence(planningObservation, planningObservation.visualEvidence)
+            });
+            modelPlannerDecisionId = routeDecisionId;
+            plan = await this.planner.plan(goal, planningObservation, planningOptions);
+          }
+          }
+        }
       } catch (error) {
         if (isAbortError(error)) return await canceledBeforeDispatch();
+        if (modelPlannerDecisionId && this.decisionRuntime?.recordPlannerFailure) {
+          const failureCode = ["configuration", "privacy", "size", "timeout", "transport", "http", "schema", "response_too_large", "refusal", "budget_exhausted"].includes(error?.kind)
+            ? error.kind : "unknown";
+          const inputModality = planner?.requiresScreenshot === true && isBoundVisualEvidence(planningObservation, planningObservation.visualEvidence)
+            ? "text_plus_visual" : "text_only";
+          try {
+            this.decisionRuntime.recordPlannerFailure({
+              episodeId: decisionEpisodeId,
+              runId: decisionRunId,
+              stepId: decisionStepId(),
+              decisionId: modelPlannerDecisionId,
+              observationId: planningObservation.evidenceId,
+              model: planner.model ?? "unknown",
+              goal,
+              failureCode,
+              inputModality,
+              clientRequestId: error?.clientRequestId,
+              providerLatencyMs: error?.providerLatencyMs
+            });
+          } catch { /* preserve the original provider failure */ }
+        }
         throw error;
+      }
+      if (modelPlannerDecisionId && this.decisionRuntime?.recordPlannerPrediction) {
+        const selected = plan.status === "planned" ? plan.action?.target : null;
+        this.decisionRuntime.recordPlannerPrediction({
+          episodeId: decisionEpisodeId,
+          runId: decisionRunId,
+          stepId: decisionStepId(),
+          decisionId: modelPlannerDecisionId,
+          observationId: planningObservation.evidenceId,
+          model: planner.model ?? "unknown",
+          goal,
+          candidateIdentity: selected?.identity ?? null,
+          resultCode: plan.status === "planned" ? "planned" : "ambiguous",
+          reasonCode: plan.status === "ambiguous" ? "model_abstained_or_unusable" : null,
+          actionType: plan.status === "planned" ? String(plan.action?.type ?? "click") : null,
+          inputModality: planner.requiresScreenshot && isBoundVisualEvidence(planningObservation, planningObservation.visualEvidence)
+            ? "text_plus_visual" : "text_only",
+          usage: plan.modelUsage,
+          clientRequestId: plan.clientRequestId,
+          providerLatencyMs: plan.providerLatencyMs
+        });
       }
       try { throwIfAborted(); }
       catch (error) {
@@ -772,8 +1733,18 @@ export class NavigationEngine {
       }
       if (plan.status !== "planned") {
         if (plan.status === "completed" && planner?.isComplete?.()) return await succeed();
-        state.status = recoveries ? "needs_human" : "unresolved";
+        const workflowReviewHandoff = plan.status === "needs_human";
+        state.status = workflowReviewHandoff || visualHandoffSuggested || recoveries ? "needs_human" : "unresolved";
         state.terminationReason = plan.reason;
+        if (workflowReviewHandoff) state.authorizationRequired = {
+          category: "workflow_review_required",
+          targetIdentity: null,
+          evidenceId: latest.evidenceId
+        };
+        const visualReview = routedVisualReview ?? (plan.status === "ambiguous" && this.plannerMode === "deterministic"
+          ? await classifyAmbiguousPage(latest)
+          : null);
+        const visualAssessment = visualReview?.assessment ?? null;
         await updateJournal();
         const observedCandidates = new Map((latest.candidates ?? []).map(candidate => [candidate.identity, candidate]));
         const resolutionCandidates = (plan.candidates ?? []).flatMap(candidate => {
@@ -789,13 +1760,23 @@ export class NavigationEngine {
             bounds: observed.bounds ?? null
           }];
         });
-        return resultWithWorkflow({
+        const unresolvedResult = {
           status: state.status,
           goal,
           reason: plan.reason,
           attempts: state.attempts.length,
           recoveries,
           evidenceId: latest.evidenceId,
+          ...(plan.workflowReview ? { workflowReview: plan.workflowReview } : {}),
+          ...(visualAssessment ? { visualAssessment: {
+            status: visualAssessment.status,
+            ...(visualAssessment.observationId ? { evidenceId: visualAssessment.observationId } : {}),
+            ...(visualAssessment.failureCode ? { failureCode: visualAssessment.failureCode } : {}),
+            ...(visualAssessment.answers?.page_state?.choice ? { pageState: visualAssessment.answers.page_state.choice } : {}),
+            ...(visualAssessment.answers?.obstruction_present?.probabilityYes !== undefined
+              ? { obstructionProbability: visualAssessment.answers.obstruction_present.probabilityYes } : {}),
+            authorizesOperation: false
+          } } : {}),
           ...(resolutionCandidates.length ? {
             targetResolution: {
               evidenceId: latest.evidenceId,
@@ -803,7 +1784,10 @@ export class NavigationEngine {
               nextStep: "Inspect retained evidence for these candidates, then submit the selected backendNodeId to click_observed_element. ActiveTab will revalidate it against a fresh observation."
             }
           } : {})
-        });
+        };
+        return resultWithWorkflow(workflowReviewHandoff
+          ? { ...handoffResult(goal, plan.reason, state.authorizationRequired, state.attempts.length, recoveries, latest.evidenceId), workflowReview: plan.workflowReview }
+          : unresolvedResult);
       }
       const actionType = plan.action.type ?? "click";
       const plannedIdentity = plan.action.target?.identity;
@@ -820,7 +1804,7 @@ export class NavigationEngine {
       let operationId = workflowCapability?.operationId ?? this.operationAuthorizer?.operationId ?? null;
       let operationAuthorizer = this.operationAuthorizer;
       if (searchPhrase && searchSubmitAuthorizer && (
-        (actionType === "type" && selectedTarget.tag === "input" && String(selectedTarget.type).toLowerCase() === "search")
+        ((actionType === "type" || actionType === "fill") && isSearchFieldCandidate(selectedTarget, latest))
         || (actionType === "click" && selectedTarget.submitsForm === true)
       )) {
         operationId = SEARCH_SUBMIT_OPERATION_ID;
@@ -843,7 +1827,7 @@ export class NavigationEngine {
           authorization = { authorized: true, category: "deferred_to_authorized_executor" };
         }
       } else if (!authorization.authorized
-        && ["unclassified_form_submission", "unknown_control_effect"].includes(authorization.category)
+        && ["unsupported_action", "unsupported_text_entry", "unclassified_form_submission", "unknown_control_effect"].includes(authorization.category)
         && operationAuthorizer && typeof operationId === "string" && operationId) {
         const typedOperation = await operationAuthorizer.authorize({
           operationId, action: actionType, candidate: selectedTarget, value: plan.action.value ?? null, observation: latest
@@ -900,13 +1884,15 @@ export class NavigationEngine {
           environment: this.environment,
           localFixture: this.localFixture,
           assertExecutionLease: this.assertExecutionLease,
+          sameTargetNavigation: this.sameTargetNavigation,
           goal,
           action: actionType,
           candidate: selectedTarget,
           value: plan.action.value ?? null,
           filePaths: plan.action.filePaths ?? null,
           operationId,
-          operationAuthorizer
+          operationAuthorizer,
+          validateActionTarget: workflowCapability?.validateTarget ?? null
         });
         if (actionType !== "scroll") excludedIdentities.add(selectedTarget.identity);
       } catch (error) {
@@ -918,7 +1904,7 @@ export class NavigationEngine {
         const isStaleError = /stale|no longer exists|no longer visible|changed since observation/.test(String(error?.message ?? ""));
         if (isStaleError && !attempt.retriedAfterStale && recoveries <= this.maxRecoveries) {
           attempt.retriedAfterStale = true;
-          const freshObservation = await this.session.observe();
+          const freshObservation = await this.session.observe({ selectionGoal: goal });
           const freshMatches = (freshObservation.candidates ?? []).filter(candidate =>
             candidate.visible === true && candidate.disabled !== true &&
             (candidate.name === selectedTarget.name || candidate.identity === selectedTarget.identity)
@@ -933,13 +1919,15 @@ export class NavigationEngine {
                 environment: this.environment,
                 localFixture: this.localFixture,
                 assertExecutionLease: this.assertExecutionLease,
+                sameTargetNavigation: this.sameTargetNavigation,
                 goal,
                 action: actionType,
                 candidate: selectedTarget,
                 value: plan.action.value ?? null,
                 filePaths: plan.action.filePaths ?? null,
                 operationId,
-                operationAuthorizer
+                operationAuthorizer,
+                validateActionTarget: workflowCapability?.validateTarget ?? null
               });
               dispatchOutcome = "dispatched";
               delete attempt.error;
@@ -962,8 +1950,7 @@ export class NavigationEngine {
       }
       await recordTelemetryDispatch(attempt, actionType, dispatchOutcome);
       try {
-        await this.session.waitForChange(actionType === "type" ? 500 : actionType === "scroll" ? 1_500 : 2_000, waitBaseline);
-        latest = await this.session.observe();
+        latest = await observeAfterChange(actionType === "type" ? 500 : actionType === "scroll" ? 1_500 : 2_000, waitBaseline, attempt);
       } catch (error) {
         if (isAbortError(error)) return await canceledWithPendingAction(attempt);
         return await stopAfterObservationLoss(attempt, error);
@@ -1100,8 +2087,7 @@ export class NavigationEngine {
             action: "navigate",
             url: recoveryUrl
           });
-            await this.session.waitForChange(2_500, waitBaseline).catch(() => {});
-            latest = await this.session.observe();
+            latest = await observeAfterChange(2_500, waitBaseline);
           } catch (error) {
             if (isAbortError(error)) return await canceledWithPendingAction(attempt);
             return await stopAfterObservationLoss(attempt, error);
@@ -1128,7 +2114,8 @@ export class NavigationEngine {
         await recordWorkflowVerification(attempt, verification);
       }
       await recordTelemetryObservation(attempt, afterStateFingerprint !== beforeStateFingerprint,
-        dispatchOutcome === "dispatched" ? "browser_state_observed" : "dispatch_failed_state_observed");
+        attempt.reconnectedObservation === true ? "same_target_reconnected_observation"
+          : dispatchOutcome === "dispatched" ? "browser_state_observed" : "dispatch_failed_state_observed");
       finishAction(attempt);
       await updateJournal();
       const actionHandoff = await handoffIfNeeded(latest);
@@ -1139,6 +2126,16 @@ export class NavigationEngine {
         if (attempt.error) {
           state.status = "unresolved";
           state.terminationReason = "Search text entry failed; no sensitive input was saved. Resume with a fresh authorized observation.";
+          await updateJournal();
+          return resultWithWorkflow({ status: state.status, goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: latest.evidenceId });
+        }
+        continue;
+      }
+      if (plan.workflowStepId && planner instanceof WorkflowGraphPlanner) {
+        const stepStatus = planner.getStatus()?.stepStatuses?.[plan.workflowStepId];
+        if (stepStatus !== "passed") {
+          state.status = "unresolved";
+          state.terminationReason = "The workflow step did not pass its registered postcondition; no dependent step or retry was attempted.";
           await updateJournal();
           return resultWithWorkflow({ status: state.status, goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: latest.evidenceId });
         }

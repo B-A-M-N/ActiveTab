@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { isAbsolute, join } from "node:path";
 import { stateDirectory } from "../extension/paths.js";
 import { TaskJournal, taskGoalFingerprint } from "./journal.js";
+import { McpResultArtifactStore } from "./mcpResultArtifacts.js";
 
 export const MAX_MCP_TASK_JOURNALS = 128;
 
@@ -35,7 +36,11 @@ export class McpTaskJournalStore {
     const path = join(this.directory, `${key}.json`);
     await this.#ensureJournalFile(path);
     await this.#makeRoom(path);
-    return { key, journal: new TaskJournal(path) };
+    return {
+      key,
+      journal: new TaskJournal(path),
+      resultArtifact: new McpResultArtifactStore({ directory: this.directory, key })
+    };
   }
 
   async #ensureDirectory() {
@@ -80,6 +85,10 @@ export class McpTaskJournalStore {
     completed.sort((left, right) => left.mtimeMs - right.mtimeMs);
     for (const entry of completed) {
       if (journalNames.length < this.maxEntries) break;
+      await new McpResultArtifactStore({
+        directory: this.directory,
+        key: entry.path.slice(this.directory.length + 1, -5)
+      }).clear();
       await rm(entry.path, { force: true });
       journalNames.pop();
     }

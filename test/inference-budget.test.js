@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { InferenceAttemptBudget } from "../src/decisions/inferenceBudget.js";
+import { createDecisionRuntime } from "../src/decisions/runtime.js";
 import { OpenAICompatibleProvider } from "../src/navigation/modelProvider.js";
+import { configuredPlanner } from "../src/navigation/planner.js";
 import { DecisionEventStore } from "../src/telemetry/eventStore.js";
 
 test("physical model retries reserve durable inference attempts and exhaust before sending another request", async () => {
@@ -17,17 +19,73 @@ test("physical model retries reserve durable inference attempts and exhaust befo
   try {
     await budget.run({ runId: episode.runId }, async () => {
       await assert.rejects(provider.requestStructured({ task: "test", instructions: "Return JSON", input: {}, schema: { type: "object" } }), error => error.kind === "transport");
-      assert.equal(physicalCalls, 3, "the provider's two retries count as physical calls");
+      assert.equal(physicalCalls, 2, "the provider's single retry counts as a physical call");
       const partial = store.getEvents(episode.episodeId).filter(event => event.eventType === "inference.attempted");
-      assert.equal(partial.length, 3);
-      assert.deepEqual(partial.map(event => event.payload.attemptNumber), [1, 2, 3]);
+      assert.equal(partial.length, 2);
+      assert.deepEqual(partial.map(event => event.payload.attemptNumber), [1, 2]);
       await fetchImpl("https://model.example/v1/chat/completions");
-      assert.equal(physicalCalls, 4, "the fourth physical request is admitted");
+      assert.equal(physicalCalls, 3, "the third physical request is admitted");
+      await fetchImpl("https://model.example/v1/chat/completions");
+      assert.equal(physicalCalls, 4, "the run retains two attempts for a later model or retry");
       await assert.rejects(Promise.resolve().then(() => fetchImpl("https://model.example/v1/chat/completions")), error => error.kind === "budget_exhausted");
       assert.equal(physicalCalls, 4, "budget refusal occurs before transport dispatch");
     });
     assert.equal(store.verifyEpisodeChain(episode.episodeId).ok, true);
   } finally { store.close(); }
+});
+
+test("automatic secondary planner charges every physical retry to the shared run budget", async () => {
+  const names = ["ACTIVETAB_MODEL_ENDPOINT", "ACTIVETAB_MODEL", "ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT", "ACTIVETAB_MODEL_MAX_RETRIES"];
+  const previous = Object.fromEntries(names.map(name => [name, process.env[name]]));
+  process.env.ACTIVETAB_MODEL_ENDPOINT = "https://model.example/v1";
+  process.env.ACTIVETAB_MODEL = "budget-test-model";
+  process.env.ACTIVETAB_MODEL_ALLOW_PAGE_CONTENT = "1";
+  process.env.ACTIVETAB_MODEL_MAX_RETRIES = "1";
+
+  const store = new DecisionEventStore({ databasePath: ":memory:" });
+  let physicalCalls = 0;
+  const runtime = createDecisionRuntime({ eventStore: store, semanticAnalyzer: null });
+  const originalFetch = async () => {
+    physicalCalls++;
+    return new Response("", { status: 503 });
+  };
+  try {
+    const episode = runtime.startEpisode({
+      runId: "secondary_planner_budget",
+      workflowId: "secondary_planner_budget",
+      applicationId: "fixture_app",
+      environmentClass: "local",
+      executionMode: "standalone"
+    });
+    const planner = configuredPlanner({
+      executionMode: "standalone",
+      plannerMode: "auto",
+      decisionRuntime: runtime,
+      fetchImpl: originalFetch
+    });
+    await runtime.withInferenceBudget({ runId: episode.runId }, async () => {
+      await assert.rejects(planner.plan("Click Save", {
+        evidenceId: "secondary_budget_observation",
+        targetId: "secondary_budget_target",
+        documentGeneration: 1,
+        viewport: { width: 1280, height: 720 },
+        page: { url: "https://fixture.example/settings", title: "Settings" },
+        headings: [],
+        candidates: [{ identity: "save", tag: "button", role: "button", name: "Save", visible: true, disabled: false }],
+        scrollTargets: []
+      }), error => error.kind === "transport");
+    });
+    assert.equal(physicalCalls, 2);
+    const attempts = store.getEvents(episode.episodeId).filter(event => event.eventType === "inference.attempted");
+    assert.deepEqual(attempts.map(event => event.payload.taskCode), ["secondary_planning", "secondary_planning"]);
+    assert.deepEqual(attempts.map(event => event.payload.attemptNumber), [1, 2]);
+  } finally {
+    runtime.close();
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 });
 
 test("attempt reservations remain charged after a run resumes and serialize concurrent callers", async () => {

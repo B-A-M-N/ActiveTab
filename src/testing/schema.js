@@ -192,6 +192,13 @@ export function validateWorkflow(workflow, { maxSteps = 128, requireFinalizedOut
       if (step.action && Object.hasOwn(step.action, "value") && !isWorkflowValue(step.action.value)) {
         errors.push(`${prefix}.action.value must be a scalar or an explicit scoped variable/step-status reference.`);
       }
+      if (step.action?.type === "upload" && (typeof step.action.uploadGrantId !== "string" || !step.action.uploadGrantId
+        || Object.hasOwn(step.action, "filePaths"))) {
+        errors.push(`${prefix}.action.uploadGrantId is required and raw filePaths are not accepted.`);
+      }
+      if (step.action?.type !== "upload" && Object.hasOwn(step.action ?? {}, "uploadGrantId")) {
+        errors.push(`${prefix}.action.uploadGrantId is valid only for upload steps.`);
+      }
     }
     if (step.type === "assert" && !step.assertion) errors.push(`${prefix}.assertion is required for assert steps.`);
     if (step.type === "wait_for" && !step.condition) errors.push(`${prefix}.condition is required for wait_for steps.`);

@@ -14,10 +14,18 @@ ActiveTab's browser control plane. Every effectful browser action ultimately dis
 - Stale document generations and revoked or detached leases fail closed.
 - Closing a BrowserSession or restarting the MCP broker disposes only the local CDP session; the extension's explicitly authorized tab lease persists for same-browser-session reconnect. Only `detach_tab` or the extension's explicit Detach action revokes that lease.
 - Candidates must match the current observation's target, document generation, and freshness state.
+- Candidate link projections may expose `opensNewTarget` as a boolean. Following a link that declares another target is refused by default because its browser behavior can create an unleased target. A trusted run may explicitly select same-target navigation for an observed root-frame anchor; the session revalidates the exact current destination, document generation, and lease before `Page.navigate`.
+- `BrowserSession.observe()` defaults to the interaction profile and does not capture screenshots. Route/lifecycle-only work may request `lightweight`; structural inspection requests `structural`; screenshot evidence requires `visual` or the explicit `includeScreenshot:true` option. Only interaction/visual profiles produce fresh action candidates.
 - Exact native field/selector verification may compare a caller-provided value inside the browser process, but only returns a boolean and never exposes the field value in observations or receipts.
+- Filter checkbox control accepts only an exact caller-selected checked/unchecked state for a fresh native checkbox. It returns no field value and remains behind trusted profile operation authorization.
+- ARIA combobox selection is a composite effect. It requires an executor-approved envelope limited to opening the exact observed combobox and selecting one exact visible option controlled by that still-open combobox; the executor rechecks target lease, page/application binding, and fresh candidate identity before each suboperation.
+- Search, fill, and select value limits come from `actionLimits.js` and must match planning and workflow validation; oversized exact values are refused without truncation.
+- `BrowserSession.typeSearchPhrase()` accepts native `input[type=search]` directly. An `input[type=text][name=q]` is accepted only when the exact fresh observation binds it to a same-origin GET form targeting the same browsing context. The observer projects only a derived `queryField` boolean, never the full attribute map. Submitter-level `formmethod`, `formaction`, and `formtarget` overrides are part of the observed effective form contract; only the central caller-bound search authorizer may admit its exact query and same-form submit.
 - Operator-prohibited control labels must be refused inside `BrowserSession.click()`, including calls that bypass planner admission.
 - Playwright is prohibited as a control or observation dependency.
 - Direct CDP is for a caller-selected target; it never attaches to a default browser profile automatically.
+- Retained network activity stores bounded request/response timing, protocol, cache/reuse flags, and byte counters only. It does not retain response headers or bodies; selected body inspection reads that response from CDP on demand and redacts recognizable credentials before producing any view.
+- A newly observed HTTP 429 may surface as a URL-free, status-only rate-limit signal. Callers must suspend and hand control to the operator; they must not retry, change identity, or bypass the site's limit.
 - Loopback CDP endpoints must be validated; browser application URLs are never loopback.
 
 ## Work Guidance
@@ -26,9 +34,11 @@ ActiveTab's browser control plane. Every effectful browser action ultimately dis
 - `resolveAuthorizedTarget` requires separate `targetId` and `confirmedTargetId`; both must match, and the confirmed value must originate from an independently established grant.
 - Attached mode requires an operator-supplied `ACTIVETAB_AUTHORIZED_TARGET_ID` or extension Attach grant.
 - Owned disposable Chrome may authorize its newly created target by the explicit operator request to launch that browser.
+- Owned disposable Chrome cleanup first requests browser shutdown through its browser-level CDP client, then uses bounded TERM/KILL fallback only for that owned process. A temporary profile is removed only after process exit is confirmed; cleanup is verified only when both browser shutdown and profile removal are confirmed. Closing an ordinary `BrowserSession` remains a local CDP detach and does not close the browser or revoke an extension lease.
 - Before launching with a persistent profile, probe its `DevToolsActivePort` and Chrome singleton lock. Never remove endpoint metadata while Chrome owns the profile; if the lock is live but the endpoint is unavailable, refuse without forwarding a startup URL into that browser.
 - The manual `--open-only` flow may reuse an already-running owned profile only through its live CDP endpoint. Reuse must not navigate, select, or otherwise control a page, and releasing ActiveTab's CDP connection must leave Chrome and its profile open.
 - Qualification may reattach to a live owned profile only with the caller's exact `--target-id` (or the exact target persisted by a suspended run). Reattachment validates the target's current origin against the profile allowlist before and after CDP attach, never navigates, and detaches without closing Chrome. If the exact target is unavailable or unauthorized, refuse without launching a replacement browser.
+- A live qualification may recover a post-navigation observation by reconnecting to the exact target ID and same CDP endpoint from its still-running owned Chrome process. It validates the current route before and after attach, binds the replacement session to the existing same-target lease, and takes a fresh observation before any later dispatch. It never retries the navigation or substitutes another tab.
 - Do not lower freshness, visibility, or occlusion checks to make tests easier.
 
 ## Verification
@@ -37,8 +47,10 @@ ActiveTab's browser control plane. Every effectful browser action ultimately dis
 node --test test/targets.test.js test/cdp.integration.test.js
 ```
 
-CDP integration tests require a headed or Xvfb Chrome environment; `ACTIVETAB_HEADLESS=1` is explicit opt-in, never a silent fallback.
+Integration tests launch disposable Chrome headed by default. Test launch paths use `--headless=new` when the operator explicitly sets `ACTIVETAB_HEADLESS=1`; no launch path silently chooses a mode. The opt-in visible-extension test requires `ACTIVETAB_VISIBLE_CHROME=1` plus a desktop display and explicitly skips when headless mode is selected.
 
 ## Child DOX Index
 
-No child DOX boundaries.
+| Path | Purpose |
+|------|---------|
+| `actionLimits.js` | Shared exact-value size limits for browser dispatch and planning |

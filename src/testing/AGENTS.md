@@ -11,8 +11,11 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 ## Local Contracts
 
 - Dispatch, observed effects, and verified postconditions are separate states. An unresolved dispatched effect yields run status `UNCERTAIN` until independent evidence reconciles it; it is not silently converted to `FAILED` or replayed.
+- Durable operation reservations bind a run-scoped keyed fingerprint of the action, resource, and caller intent. Equivalent unresolved effects are refused across replanned step or operation IDs; raw intent values remain outside run records and telemetry.
 - Cancellation is persisted in `RunStateStore` and remains available after a worker restart. Cancellation stops future dispatches while unresolved reserved/dispatched operations remain reconciliation obligations.
 - A test run holds an exclusive durable lease for its exact browser endpoint and target ID. Continuation reacquires the target under a newer fencing token; operation reservations retain that token, and a competing run is refused before dispatch.
+- A live session may be rebound to a replacement CDP session only when both exact target ID and canonical endpoint match the existing durable lease. Rebinding does not acquire a new lease or change its fencing token; a different target or endpoint is refused.
+- HTTP and MCP adapters create `TestRunner` instances through `ApplicationRunService`, which binds the shared browser diagnostic sources and durable `RunStateStore`; `TestRunner` remains responsible for acquiring and checking its workflow lease.
 - Durable target leases use SQLite transactions across local processes. A lease held by a dead local process can be reclaimed immediately; expired leases are not taken over while their local owner process is still alive. Effects with lost leases are refused before dispatch and any earlier dispatch still requires reconciliation.
 - Diagnostic `api_call` receipts preserve typed refusal/error/unavailable statuses and explicitly record that collection alone did not verify an application outcome.
 - Only an independent verified postcondition may report PASS.
@@ -21,17 +24,20 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 - A page fingerprint change alone is not outcome success.
 - Cleanup is a verifiable obligation for every test-owned resource.
 - Every interaction type in the schema must have a dispatch implementation or fail validation before execution.
-- `discover_tables`, `extract_records`, `collect_records`, and `emit_output` are read-only capability steps. They require a registered fixture-qualified manifest and fresh target/environment/principal/route scope; page advances re-enter the browser step handler and authorized executor.
+- `discover_tables`, `extract_records`, `collect_records`, and `emit_output` are read-only capability steps. They require a registered fixture-qualified manifest and fresh target/environment/principal/route scope. Declarative and synthesized collection share `collectionService.js`; each page advance re-enters the caller's browser navigation handler and authorized executor.
 - Extraction values and accumulators are in-memory run artifacts. On continuation they are re-observed and rebuilt; missing artifacts after process restart produce an inconclusive result rather than a reconstructed PASS.
 - `collect_records` obeys its registered page and row limits, verifies typed fields, uniqueness, provenance, and the declared count-completion policy, and never treats a dispatch acknowledgment as complete output.
 - `execution/workflowScheduler.js` owns pure workflow eligibility, graph status, and trusted subworkflow budget validation. `execution/stepDispatcher.js` routes validated workflow steps to focused handlers. Neither component authorizes effects; browser effects remain behind the shared authorized executor.
 - `lifecycle/RunStateCoordinator` owns durable run bindings, leases, checkpoints, and durable status; it cannot authorize or dispatch effects.
 - `lifecycle/InterventionCoordinator` owns persisted human handoffs and evidence-gated resume while re-entering the same runner callback and shared execution budget.
+- `qualificationRunSelection.js` owns durable staging-run selection, exact resume binding, and explicit abandonment before browser attachment. It validates workflow, environment, profile, mode, intervention cursor, and target identity; it does not connect to a browser.
+- Intervention application identity is derived from the currently observed route through `resolveObservedApplication()` and the requested authentication realm; a realm-only first-match lookup cannot bind a handoff to an arbitrary same-origin application.
 - `steps/ControlFlowStepHandler` owns scalar variable assignment, bounded repetition, and trusted subworkflow composition. Nested work re-enters the same `TestRunner` callback and shared budget.
 - `steps/VerificationStepHandler` owns assertions, diagnostic snapshots, bounded waiting, controlled fixture failures, retry verification, postconditions, and cleanup verification. Cleanup dispatch is injected from `TestRunner` and must pass through the same authorized interaction path.
-- `steps/QualificationStepHandler` invokes the registered qualification service and records its advisory result. Fixture outcomes never authorize parent-run effects or verify live-site success.
+- `steps/QualificationStepHandler` invokes the registered qualification service and records its advisory result. Receipts preserve qualification level, provider identity, scenario seed, source revision, oracle reference, and cleanup result. Resolver results explicitly say that no independent application outcome was tested. Fixture outcomes never authorize parent-run effects or verify live-site success.
 - `steps/BrowserStepHandler` owns declarative navigation and interaction behavior but sends every effect through `executeAuthorizedAction`; it records no alternate CDP dispatch path.
 - `steps/ApiStepHandler` dispatches only registered typed diagnostic operations through the configured collector and records refusal, failure, and uncertain statuses without treating collection as outcome verification.
+- `cloudAgentEntry.js` owns profile identity hints, visible-entry workflow construction, protected task-composer readiness evidence, and read-only visible diagnostic-link inventory. The profile candidate URL is never an automatic navigation target; inventory does not open links or inspect destinations.
 - `telemetry/RunDecisionRecorder` owns the testing layer's mapping from workflow operations to decision events and durable operation receipts. It records but never authorizes or dispatches effects.
 - Unsupported actions fail validation before the test starts.
 - Workflow input is untrusted; it cannot elevate permissions or redefine the environment.
@@ -45,6 +51,7 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 - Never dispatch directly through `session.client.send()` for effectful operations.
 - When authorization changes, test the same action through every entrypoint: navigation engine, test runner, HTTP API, MCP, and workflow replay.
 - When changing qualification contracts, cover optional refusal, required qualification, oracle isolation, cleanup failure, and telemetry linkage.
+- Fixture Lab supports `resolver`, `integration`, and `outcome` qualification levels. A `live` level requires a separately authorized live-target runtime and is refused by the fixture runner.
 - A test-owned resource must be created and identified durably before cleanup verification is meaningful.
 - Staging qualification begins at the profile's real application entry and follows visible navigation to Cloud Agent; a profile candidate URL is an identity hint and never an automatic destination.
 - Authentication handoff keeps the same run and browser alive until fresh evidence verifies the Cloud Agent task composer.
@@ -85,3 +92,5 @@ E2E vertical tests require a real Chrome environment and fixture server.
 | `lifecycle/` | Durable run bindings, leases, checkpoints, interventions, and continuation |
 | `steps/` | Isolated workflow control-flow step behavior |
 | `telemetry/` | Workflow decision events and durable operation receipt integration |
+| `cloudAgentEntry.js` | Cloud Agent identity hints, visible-entry workflow, readiness checks, and read-only link inventory |
+| `qualificationRunSelection.js` | Pre-attachment durable run selection, resume binding, and explicit abandonment |

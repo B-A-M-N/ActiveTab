@@ -272,7 +272,7 @@ test("HTTP restart resume reports durable status and refuses replay of an uncert
       if (statusBody.status !== "RUNNING") break;
       await new Promise(resolve => setTimeout(resolve, 10));
     }
-    assert.equal(statusBody.status, "UNCERTAIN");
+    assert.equal(statusBody.status, "RECONCILING");
     assert.equal(dispatchCount, 1);
   } finally {
     await api.stop();

@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { BrowserSession } from "../src/browser/session.js";
 import { NavigationEngine } from "../src/navigation/engine.js";
+import { FileUploadGrantStore } from "../src/runtime/fileUploadGrants.js";
 
 test("BrowserSession tracks and handles JavaScript dialogs", async t => {
   const dialogEvent = { type: "confirm", message: "Are you sure?", url: "http://fixture.local/" };
@@ -116,7 +120,12 @@ test("scroll convergence stops after repeated scrolling without new content", as
   t.diagnostic(`Scroll convergence: stopped after ${result.attempts} actions with status ${result.status}`);
 });
 
-test("BrowserSession uploadFile validates and dispatches through CDP", async () => {
+test("BrowserSession uploadFile dispatches only a specifically staged one-use grant", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "activetab-upload-session-"));
+  try {
+  const sourcePath = join(directory, "test-file-a.txt");
+  await writeFile(sourcePath, "approved local fixture");
+  const grants = new FileUploadGrantStore({ stagingDirectory: join(directory, "staged"), trustedIssuer: "unit-test-operator" });
   const cdpCalls = [];
   const session = new BrowserSession({
     id: "t1", url: "http://fixture.local/",
@@ -156,13 +165,26 @@ test("BrowserSession uploadFile validates and dispatches through CDP", async () 
     tag: "input", type: "file", name: "Upload attachment",
     visible: true, disabled: false, documentGeneration: 1
   };
-  const result = await session.uploadFile(candidate, ["/tmp/test-file-a.txt", "/tmp/test-file-b.txt"]);
+  const issued = await grants.issue({ approvalRef: "operator-confirmation-1", filePath: sourcePath,
+    principalId: "principal", targetId: "t1", candidateIdentity: candidate.identity,
+    operationId: "upload_attachment", environmentId: "fixture", applicationId: "app" });
+  const context = { principalId: "principal", targetId: "t1", candidateIdentity: candidate.identity,
+    operationId: "upload_attachment", environmentId: "fixture", applicationId: "app" };
+  const dispatch = await grants.beginDispatch(issued.grantId, context);
+  assert.equal(dispatch.ok, true);
+  const result = await session.uploadFile(candidate, dispatch.stagedPaths, {
+    grantToken: dispatch.dispatchToken,
+    beforeDispatch: async () => assert.equal((await grants.assertDispatchToken(dispatch.dispatchToken, context)).ok, true)
+  });
+  await grants.complete(issued.grantId);
   assert.equal(result.dispatched, true);
-  assert.equal(result.fileCount, 2);
+  assert.equal(result.fileCount, 1);
   const setFiles = cdpCalls.find(c => c.method === "DOM.setFileInputFiles");
   assert.ok(setFiles, "DOM.setFileInputFiles was called");
-  assert.deepEqual(setFiles.params.files, ["/tmp/test-file-a.txt", "/tmp/test-file-b.txt"]);
+  assert.deepEqual(setFiles.params.files, dispatch.stagedPaths);
+  assert.equal(JSON.stringify(issued).includes(sourcePath), false);
   assert.equal(setFiles.params.backendNodeId, 10);
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 test("BrowserSession uploadFile rejects non-file inputs", async () => {

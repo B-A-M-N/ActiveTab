@@ -95,6 +95,13 @@ export function buildPageDataExtractionWorkflow(input, taskId) {
 
 export function validateInput(schema, input) {
   const errors = [];
+  if (!input || typeof input !== "object" || Array.isArray(input)) return [{ field: "input", message: "must be an object" }];
+  const declared = new Set(Object.keys(schema.properties ?? {}));
+  if (schema.additionalProperties !== true) {
+    for (const field of Object.keys(input)) {
+      if (!declared.has(field)) errors.push({ field, message: "is not declared by the input schema" });
+    }
+  }
   if (schema.required) {
     for (const field of schema.required) if (!(field in input)) errors.push({ field, message: "must not be null" });
   }

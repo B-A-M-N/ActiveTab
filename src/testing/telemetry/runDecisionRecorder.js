@@ -1,7 +1,68 @@
 import { createHash, randomUUID } from "node:crypto";
 import { adjudicatePreActionReview } from "../../decisions/adjudication.js";
+import { hasReviewIntent, selectPreActionDecisionRoute } from "../../decisions/callPolicy.js";
+import { isBoundVisualEvidence } from "../../navigation/visualEvidence.js";
 import { isWaitingRunStatus, RUN_STATUS, STEP_STATUS } from "../schema.js";
 import { INTERVENTION_STATE } from "../../runtime/interventions.js";
+import { resolveObservedApplication } from "../../environments/model.js";
+
+function boundedText(value, limit = 512) {
+  return typeof value === "string" ? value.trim().slice(0, limit) : null;
+}
+
+function stableUrl(value, { includeQuery = false } = {}) {
+  if (typeof value !== "string") return null;
+  try {
+    const url = new URL(value);
+    return `${url.origin}${url.pathname}${includeQuery ? url.search : ""}`;
+  } catch { return boundedText(value, 2048); }
+}
+
+function stableSelector(target) {
+  if (!target || typeof target !== "object" || Array.isArray(target)) return null;
+  const selector = {};
+  for (const key of ["role", "name", "tag", "type", "contextName", "text", "label"]) {
+    if (typeof target[key] === "string") selector[key] = boundedText(target[key], 512);
+  }
+  if (typeof target.href === "string") selector.href = stableUrl(target.href);
+  return Object.keys(selector).length ? selector : null;
+}
+
+function stableResource(candidate) {
+  if (!candidate) return null;
+  const attributes = candidate.attributes && typeof candidate.attributes === "object" ? candidate.attributes : {};
+  const stableAttributes = {};
+  for (const key of ["id", "name", "type", "data-testid", "aria-label"]) {
+    if (typeof attributes[key] === "string") stableAttributes[key] = boundedText(attributes[key], 256);
+  }
+  return {
+    role: boundedText(candidate.role, 128),
+    tag: boundedText(candidate.tag, 64),
+    kind: boundedText(candidate.kind, 64),
+    name: boundedText(candidate.name, 512),
+    contextName: boundedText(candidate.contextName, 512),
+    type: boundedText(candidate.type, 64),
+    href: stableUrl(candidate.href),
+    page: stableUrl(candidate.documentUrl),
+    formMethod: boundedText(candidate.formMethod, 16),
+    formActionOrigin: boundedText(candidate.formActionOrigin, 512),
+    attributes: stableAttributes
+  };
+}
+
+function stableIntent(intent) {
+  if (!intent || typeof intent !== "object") return null;
+  return {
+    goal: boundedText(intent.goal, 4096),
+    target: stableSelector(intent.target),
+    value: intent.value ?? null,
+    uploadRequested: intent.uploadRequested === true,
+    destination: stableUrl(intent.destination, { includeQuery: true }),
+    expectedUrlPattern: boundedText(intent.expectedUrlPattern, 2048),
+    postcondition: intent.postcondition ?? null,
+    verifyValue: intent.verifyValue === true
+  };
+}
 
 /**
  * Connects a declarative workflow run to decision telemetry and durable
@@ -24,6 +85,9 @@ export class RunDecisionRecorder {
 
   async ensureEpisode(receipt) {
     if (!this.decisionRuntime) return null;
+    const application = this.session?.target?.url && this.environment
+      ? resolveObservedApplication(this.environment, this.session.target.url)
+      : { status: "unmatched" };
     const environmentId = String(this.environment?.environmentId ?? "").toLowerCase();
     const environmentClass = this.environment?.environmentClass
       ?? (environmentId.includes("production") ? "production" : environmentId.includes("staging") ? "staging" : environmentId ? "local" : "unknown");
@@ -31,7 +95,7 @@ export class RunDecisionRecorder {
       ...(this.episodeId ? { episodeId: this.episodeId } : {}),
       runId: receipt.runId,
       workflowId: `workflow_${createHash("sha256").update(receipt.workflowId).digest("hex").slice(0, 16)}`,
-      applicationId: this.environment?.applications?.[0]?.applicationId ?? "unknown",
+      applicationId: application.status === "matched" ? application.applicationId : "unknown",
       environmentClass,
       executionMode: "agent_directed",
       policyVersion: "active_policy_v1",
@@ -57,7 +121,7 @@ export class RunDecisionRecorder {
     this.decisionRuntime.completeEpisode({ episodeId: this.episodeId, runId: receipt.runId, status, cleanupStatus });
   }
 
-  async createHooks({ receipt, action, candidate = null, decisionContext = null, telemetryStepId = null, runtimeStepId = null } = {}) {
+  async createHooks({ receipt, action, candidate = null, decisionContext = null, effectIntent = null, telemetryStepId = null, runtimeStepId = null } = {}) {
     if (!this.decisionRuntime && !this.runStateStore) return null;
     if (this.decisionRuntime && !this.episodeId) await this.ensureEpisode(receipt);
     const decisionId = randomUUID();
@@ -66,9 +130,9 @@ export class RunDecisionRecorder {
     const operationId = createHash("sha256").update(`${receipt.runId}\0${stateStepId}`).digest("hex").slice(0, 40);
     const operationClass = decisionContext?.operationClass ?? (action === "navigate" ? "navigation" : "unknown");
     const targetRole = decisionContext?.targetRole ?? (candidate ? "browser_target" : "navigation_destination");
+    const purposeCode = decisionContext?.purposeCode ?? null;
     const reviewRequired = decisionContext?.reviewRequired ?? (
-      action === "navigate" || action === "upload" || action === "toggle" || candidate?.submitsForm === true
-      || (action === "click" && (candidate?.tag === "a" || candidate?.role === "link") && typeof candidate?.href === "string")
+      candidate?.submitsForm === true || ["shared_mutation", "security_change"].includes(operationClass)
     );
     const runtime = this.decisionRuntime;
     const episodeId = this.episodeId;
@@ -83,8 +147,33 @@ export class RunDecisionRecorder {
         if (!runtime) return { allowed: true, grantsAuthority: false, category: "deterministic_policy_only" };
         if (!observation?.evidenceId) throw new Error("The admitted operation has no fresh observation identity.");
         beforeEvidenceId = observation.evidenceId;
+        const matchingCandidates = (observation.candidates ?? []).filter(item =>
+          item.identity !== candidate?.identity
+          && item.visible === true
+          && item.role === candidate?.role
+          && String(item.name ?? "").trim().toLowerCase() === String(candidate?.name ?? "").trim().toLowerCase()
+        );
+        const route = selectPreActionDecisionRoute({
+          actionAdmitted: true,
+          reviewRequired,
+          riskClass: operationClass,
+          uncertaintyClass: matchingCandidates.length ? "ambiguous" : "resolved",
+          visualEvidenceAvailable: runtime.jevClient?.allowImages === true && isBoundVisualEvidence(observation, observation.visualEvidence),
+          reviewIntentAvailable: hasReviewIntent({ targetRole, purposeCode })
+        });
+        runtime.recordInferenceRoute({
+          episodeId,
+          runId: receipt.runId,
+          stepId,
+          decisionId,
+          observationId: observation.evidenceId,
+          route: route.route,
+          reasonCode: route.reasonCode,
+          providers: route.providers,
+          visualEvidenceUsed: route.visualEvidenceUsed
+        });
         let adjudication;
-        if (reviewRequired) {
+        if (route.route === "jev_only") {
           const review = await runtime.reviewBeforeAction({
             episodeId,
             runId: receipt.runId,
@@ -94,6 +183,7 @@ export class RunDecisionRecorder {
             operation: action,
             operationClass,
             targetRole,
+            ...(purposeCode ? { purposeCode } : {}),
             expectedOutcomeClass: "browser_state_change",
             ...(candidate ? { candidate } : {}),
             ...(decisionContext?.semanticAnnotation ? { semanticAnnotation: decisionContext.semanticAnnotation } : {}),
@@ -112,7 +202,7 @@ export class RunDecisionRecorder {
             operationClass,
             targetRole,
             expectedOutcomeClass: "browser_state_change",
-            reasonCode: "policy_boundary_not_triggered"
+            reasonCode: route.reasonCode
           });
           adjudication = {
             allowed: true,
@@ -135,17 +225,16 @@ export class RunDecisionRecorder {
       },
       async onReserve({ observation } = {}) {
         const targetId = thisRecorder.session?.target?.id ?? null;
-        const effectDigest = createHash("sha256").update(JSON.stringify({
-          operationId,
-          stepId: stateStepId,
-          action,
-          operationClass,
-          environmentId: thisRecorder.environment?.environmentId ?? null,
-          targetId,
-          candidateIdentity: candidate?.identity ?? null,
-          candidateKind: candidate?.kind ?? null,
-          candidateTag: candidate?.tag ?? null
-        })).digest("hex");
+        const effectDigest = thisRecorder.runStateStore
+          ? await thisRecorder.runStateStore.fingerprintOperationEffect(receipt.runId, {
+              schemaVersion: 1,
+              action,
+              environmentId: thisRecorder.environment?.environmentId ?? null,
+              targetId,
+              resource: stableResource(candidate),
+              intent: stableIntent(effectIntent)
+            })
+          : null;
         if (thisRecorder.runStateStore) {
           await thisRecorder.runStateStore.reserveOperation(receipt.runId, {
             operationId,

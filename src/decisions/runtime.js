@@ -1,24 +1,12 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { DecisionEventStore } from "../telemetry/eventStore.js";
 import { DecisionCoordinator } from "./decisionCoordinator.js";
-import { JEV_MODEL_ID, JevDecisionClient, JevRequestError } from "./jevClient.js";
+import { hasReviewIntent, selectPreActionDecisionRoute } from "./callPolicy.js";
+import { VisualDecisionService } from "./visualDecisionService.js";
+import { defaultJevCredentialFile, JEV_MODEL_ID, JevDecisionClient, JevRequestError } from "./jevClient.js";
 import { createConfiguredSemanticAnalyzer, DEFAULT_SEMANTIC_MODEL } from "../navigation/semanticAnalyzer.js";
-import { InferenceAttemptBudget } from "./inferenceBudget.js";
-import { lstatSync } from "node:fs";
-import { homedir } from "node:os";
-import { resolve } from "node:path";
-
-function defaultJevCredentialFile() {
-  if (process.env.ACTIVETAB_JEV_KEY_FILE) return process.env.ACTIVETAB_JEV_KEY_FILE;
-  const workingDirectoryFile = resolve(process.cwd(), "JEV.txt");
-  try {
-    lstatSync(workingDirectoryFile);
-    return workingDirectoryFile;
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-  }
-  return resolve(homedir(), "JEV.txt");
-}
+import { DEFAULT_INFERENCE_ATTEMPT_BUDGET, InferenceAttemptBudget } from "./inferenceBudget.js";
+import { isBoundVisualEvidence } from "../navigation/visualEvidence.js";
 
 /**
  * One process-wide decision runtime shared by browser execution entrypoints.
@@ -30,6 +18,7 @@ export function createDecisionRuntime({
   jevClient = null,
   semanticAnalyzer = undefined,
   databasePath,
+  maxInferenceAttempts = DEFAULT_INFERENCE_ATTEMPT_BUDGET,
   authenticateTrainingApprover,
   jevOptions,
   semanticOptions
@@ -38,7 +27,7 @@ export function createDecisionRuntime({
     ...(databasePath ? { databasePath } : {}),
     ...(authenticateTrainingApprover ? { authenticateTrainingApprover } : {})
   });
-  const inferenceBudget = new InferenceAttemptBudget({ eventStore: store });
+  const inferenceBudget = new InferenceAttemptBudget({ eventStore: store, maxAttempts: maxInferenceAttempts });
   const budgetedFetch = (taskCode, fetchImpl = fetch) => inferenceBudget.wrapFetch(taskCode, fetchImpl);
   let client = jevClient;
   if (!client) {
@@ -58,14 +47,19 @@ export function createDecisionRuntime({
   }
   const semanticProviderId = analyzer?.providerId ?? semanticOptions?.providerId ?? process.env.ACTIVETAB_SEMANTIC_PROVIDER_ID ?? "freeinference_production";
   const semanticModel = analyzer?.model ?? semanticOptions?.model ?? process.env.ACTIVETAB_SEMANTIC_MODEL ?? DEFAULT_SEMANTIC_MODEL;
+  // Image capability is availability, not a reason to capture pixels on every run.
+  const requiresScreenshot = false;
   const coordinator = new DecisionCoordinator({ client, eventStore: store });
+  const visualDecisionService = new VisualDecisionService({ coordinator });
   let closed = false;
 
   return Object.freeze({
     eventStore: store,
     jevClient: client,
     semanticAnalyzer: analyzer,
+    requiresScreenshot,
     coordinator,
+    visualDecisionService,
     withInferenceBudget({ runId }, callback) { return inferenceBudget.run({ runId }, callback); },
     budgetedFetch(taskCode, fetchImpl = fetch) { return budgetedFetch(taskCode, fetchImpl); },
     inferenceBudgetSnapshot(runId) { return inferenceBudget.snapshot(runId); },
@@ -86,19 +80,41 @@ export function createDecisionRuntime({
       });
     },
     async reviewBeforeAction(input) {
-      if (analyzer && Array.isArray(input.semanticRoles) && input.semanticRoles.length) {
-        const { semanticRoles, intentHints, ...review } = input;
-        try {
-          return await coordinator.mapAndReviewBeforeAction({ semanticAnalyzer: analyzer, requestedRoles: semanticRoles, intentHints, ...review });
-        } catch (error) {
-          if (!error?.kind) throw error;
-          return { decisionId: review.decisionId, semanticFailureCode: null, jevFailureCode: error.kind, authorizesOperation: false };
-        }
-      }
-      const { semanticRoles, intentHints: _intentHints, ...review } = input;
+      const { semanticRoles, intentHints = [], ...review } = input;
       const decisionId = review.decisionId ?? randomUUID();
       let semanticUnavailable = null;
-      if (Array.isArray(semanticRoles) && semanticRoles.length) {
+      let semantic = null;
+      let semanticFailureCode = null;
+      let semanticContextEventIds = [];
+      let semanticEventIds = [];
+      if (Array.isArray(semanticRoles) && semanticRoles.length && analyzer) {
+        const visualEvidenceUsed = input.useVisualEvidence === true
+          && analyzer.allowScreenshots === true
+          && isBoundVisualEvidence(review.observation, review.observation?.visualEvidence);
+        store.append({
+          episodeId: review.episodeId, runId: review.runId, stepId: review.stepId,
+          decisionId, observationId: review.observation?.evidenceId,
+          eventType: "inference.route_selected", trainingEligibility: "pending",
+          payload: { route: "semantic_only", reasonCode: "explicit_semantic_role_mapping", providers: ["secondary"], visualEvidenceUsed }
+        });
+        try {
+          const annotated = await coordinator.annotateRoles({
+            semanticAnalyzer: analyzer,
+            requestedRoles: semanticRoles,
+            intentHints,
+            ...review,
+            decisionId,
+            ...(input.useVisualEvidence === true ? { useVisualEvidence: true } : {})
+          });
+          semantic = annotated.semantic;
+          semanticFailureCode = annotated.semanticFailureCode;
+          semanticContextEventIds = annotated.contextEventIds ?? [];
+          semanticEventIds = annotated.eventIds ?? [];
+        } catch (error) {
+          if (!error?.kind) throw error;
+          semanticFailureCode = error.kind;
+        }
+      } else if (Array.isArray(semanticRoles) && semanticRoles.length) {
         semanticUnavailable = coordinator.recordSemanticUnavailable({
           ...review,
           decisionId,
@@ -106,6 +122,76 @@ export function createDecisionRuntime({
           analyzerProvider: semanticProviderId,
           analyzerModel: semanticModel
         });
+        semanticFailureCode = "configuration";
+      }
+      if (Array.isArray(semanticRoles) && semanticRoles.length) {
+        const uncertaintyClass = !semantic?.annotations?.length || semantic.annotations.some(annotation =>
+          annotation.resultCode !== "mapped" || annotation.confidence < 0.8
+        ) ? "ambiguous" : "resolved";
+        const visualEvidenceAvailable = client.allowImages === true && isBoundVisualEvidence(review.observation, review.observation?.visualEvidence);
+        const route = selectPreActionDecisionRoute({
+          reviewRequired: input.reviewRequired === true || ["shared_mutation", "security_change"].includes(review.operationClass) || review.candidate?.submitsForm === true,
+          riskClass: review.operationClass ?? "unknown",
+          uncertaintyClass,
+          visualEvidenceAvailable,
+          reviewIntentAvailable: hasReviewIntent({ targetRole: review.targetRole, purposeCode: review.purposeCode })
+        });
+        store.append({
+          episodeId: review.episodeId, runId: review.runId, stepId: review.stepId,
+          decisionId, observationId: review.observation?.evidenceId,
+          eventType: "inference.route_selected", trainingEligibility: "pending",
+          payload: { ...route }
+        });
+        if (route.route !== "jev_only") {
+          const insufficientReviewEvidence = route.reasonCode === "review_insufficient_evidence";
+          coordinator.recordReviewSkipped({
+            ...review,
+            decisionId,
+            reasonCode: insufficientReviewEvidence
+              ? route.reasonCode
+              : semantic ? "semantic_mapping_sufficient" : semanticFailureCode === "configuration" ? "semantic_provider_unavailable" : route.reasonCode
+          });
+          return {
+            decisionId,
+            ...(semantic ? { semantic } : {}),
+            ...(semanticFailureCode ? { semanticFailureCode } : {}),
+            semanticUnavailable: Boolean(semanticUnavailable),
+            ...(insufficientReviewEvidence ? { evidenceStatus: "insufficient_evidence", reasonCode: route.reasonCode } : {}),
+            jevSkipped: true,
+            authorizesOperation: false
+          };
+        }
+        const semanticAnnotation = semantic?.annotations?.find(annotation => annotation.semanticRole === review.targetRole)
+          ?? semantic?.annotations?.[0]
+          ?? null;
+        try {
+          const jev = await coordinator.reviewBeforeAction({
+            ...review,
+            decisionId,
+            semanticAnnotation,
+            semanticEventIds,
+            inputEventIds: [...semanticContextEventIds, ...semanticEventIds],
+            recordContext: false
+          });
+          return {
+            decisionId,
+            ...(semantic ? { semantic } : {}),
+            ...(semanticFailureCode ? { semanticFailureCode } : {}),
+            ...(semanticUnavailable ? { semanticUnavailable: true } : {}),
+            jev,
+            authorizesOperation: false
+          };
+        } catch (error) {
+          if (!error?.kind) throw error;
+          return {
+            decisionId,
+            ...(semantic ? { semantic } : {}),
+            ...(semanticFailureCode ? { semanticFailureCode } : {}),
+            jevFailureCode: error.kind,
+            reviewer: { provider: "openrouter", model: JEV_MODEL_ID },
+            authorizesOperation: false
+          };
+        }
       }
       try {
         const jev = await coordinator.reviewBeforeAction({
@@ -113,7 +199,13 @@ export function createDecisionRuntime({
           decisionId,
           ...(semanticUnavailable ? { inputEventIds: semanticUnavailable.contextEventIds, recordContext: false } : {})
         });
-        return { decisionId, semanticUnavailable: Boolean(semanticUnavailable), jev, authorizesOperation: false };
+        return {
+          decisionId,
+          semanticUnavailable: Boolean(semanticUnavailable),
+          jev,
+          ...(jev?.evidenceStatus ? { evidenceStatus: jev.evidenceStatus, reasonCode: jev.reasonCode } : {}),
+          authorizesOperation: false
+        };
       } catch (error) {
         if (!error?.kind) throw error;
         return {
@@ -127,6 +219,60 @@ export function createDecisionRuntime({
     },
     recordReviewSkipped(input) {
       return coordinator.recordReviewSkipped(input);
+    },
+    recordInferenceRoute({ episodeId, runId, stepId, decisionId, observationId, parentEventId = null, route, reasonCode, providers, visualEvidenceUsed = false }) {
+      return store.append({
+        episodeId,
+        runId,
+        stepId,
+        decisionId,
+        observationId,
+        ...(parentEventId ? { parentEventId } : {}),
+        eventType: "inference.route_selected",
+        trainingEligibility: "pending",
+        payload: { route, reasonCode, providers, visualEvidenceUsed }
+      });
+    },
+    recordPlannerPrediction({ episodeId, runId, stepId, decisionId, observationId, model, goal, candidateIdentity = null, resultCode, reasonCode = null, actionType = null, inputModality = "text_only", usage = null, clientRequestId, providerLatencyMs }) {
+      const usageProjection = usage && typeof usage === "object" ? {
+        ...(Number.isInteger(usage.prompt_tokens) && usage.prompt_tokens >= 0 ? { inputTokens: usage.prompt_tokens } : {}),
+        ...(Number.isInteger(usage.completion_tokens) && usage.completion_tokens >= 0 ? { outputTokens: usage.completion_tokens } : {}),
+        ...(Number.isInteger(usage.total_tokens) && usage.total_tokens >= 0 ? { totalTokens: usage.total_tokens } : {})
+      } : null;
+      return store.append({
+        episodeId, runId, stepId, decisionId, observationId,
+        eventType: "planner.predicted", trainingEligibility: "pending",
+        payload: {
+          provider: "secondary",
+          model,
+          inputFingerprint: createHash("sha256").update(randomUUID()).update(String(goal ?? "")).update(String(observationId ?? "")).digest("hex"),
+          inputModality,
+          resultCode,
+          ...(reasonCode ? { reasonCode } : {}),
+          ...(actionType ? { actionType } : {}),
+          ...(candidateIdentity ? { selectedCandidateFingerprint: createHash("sha256").update(String(observationId)).update("\0").update(String(candidateIdentity)).digest("hex") } : {}),
+          ...(clientRequestId ? { clientRequestId } : {}),
+          ...(Number.isInteger(providerLatencyMs) ? { providerLatencyMs } : {}),
+          ...(usageProjection && Object.keys(usageProjection).length ? { usage: usageProjection } : {})
+        }
+      });
+    },
+    recordPlannerFailure({ episodeId, runId, stepId, decisionId, observationId, model, goal, failureCode, inputModality = "text_only", clientRequestId, providerLatencyMs }) {
+      const safeFailureCode = new Set(["configuration", "privacy", "size", "timeout", "transport", "http", "schema", "response_too_large", "refusal", "budget_exhausted", "unknown"]).has(failureCode)
+        ? failureCode : "unknown";
+      return store.append({
+        episodeId, runId, stepId, decisionId, observationId,
+        eventType: "planner.failed", trainingEligibility: "pending",
+        payload: {
+          provider: "secondary",
+          model,
+          inputFingerprint: createHash("sha256").update(randomUUID()).update(String(goal ?? "")).update(String(observationId ?? "")).digest("hex"),
+          inputModality,
+          failureCode: safeFailureCode,
+          ...(clientRequestId ? { clientRequestId } : {}),
+          ...(Number.isInteger(providerLatencyMs) ? { providerLatencyMs } : {})
+        }
+      });
     },
     async annotateRoles(input) {
       if (analyzer) {
@@ -205,6 +351,13 @@ export function createDecisionRuntime({
         episodeId, runId, stepId, decisionId, observationId,
         eventType: "execution.dispatched", trainingEligibility: "pending",
         payload: { operation, targetRole, dispatchStatus, operationId }
+      });
+    },
+    recordReconciliationRequired({ episodeId, runId, stepId, decisionId, observationId, operation, targetRole, operationId, dispatchStatus, reasonCode, observationErrorClass, observationAttempts, evidenceRefs = [] }) {
+      return store.append({
+        episodeId, runId, stepId, decisionId, observationId,
+        eventType: "execution.reconciliation_required", trainingEligibility: "pending",
+        payload: { operation, targetRole, operationId, dispatchStatus, reasonCode, observationErrorClass, observationAttempts, evidenceRefs }
       });
     },
     recordObserved({ episodeId, runId, stepId, decisionId, observationId, outcomeClass, changed, evidenceRefs = [] }) {

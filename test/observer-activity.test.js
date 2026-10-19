@@ -2,12 +2,15 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { BrowserActivityRecorder } from "../src/browser/activity.js";
 import { BrowserObserver } from "../src/observe/observer.js";
+import { indexMarkdownDocument } from "../src/observe/responseBodyInspector.js";
+import { MAX_RESPONSE_BODY_BYTES } from "../src/observe/responseBodyShared.js";
+import { classifyHumanHandoff } from "../src/navigation/handoff.js";
 
 const pageUrl = "https://page-user:page-pass@example.test/page?token=topsecret#section";
 const linkUrl = "https://link-user:link-pass@destination.test/account?session=private#modal";
 
 function fixtureSnapshot() {
-  const strings = ["frame-main", pageUrl, "HTML", "A", "Account", "href", linkUrl, "FORM", "BUTTON", "Search", "INPUT", "password", "value", "form-secret", "input", "type"];
+  const strings = ["frame-main", pageUrl, "HTML", "A", "Account", "href", linkUrl, "FORM", "BUTTON", "Search", "INPUT", "password", "value", "form-secret", "input", "type", "target", "_blank"];
   return {
     strings,
     documents: [{
@@ -18,7 +21,7 @@ function fixtureSnapshot() {
         nodeValue: [-1, -1, -1, -1, -1],
         textValue: [-1, 4, -1, 9, -1],
         parentIndex: [-1, 0, 0, 2, 2],
-        attributes: [[], [5, 6], [], [], [15, 11, 12, 13]],
+        attributes: [[], [5, 6, 16, 17], [], [], [15, 11, 12, 13]],
         backendNodeId: [1, 2, 4, 5, 3],
         inputValue: [-1, -1, -1, -1, 13]
       },
@@ -73,16 +76,60 @@ function fakeSession() {
   };
 }
 
+test("Markdown diagnostics decompose into nested sections and byte-addressable data blocks", () => {
+  const markdown = [
+    "# Run",
+    "## Evidence",
+    "### Parse details",
+    "~~~json",
+    '{"name":"🌳"}',
+    "## A heading inside a code fence",
+    "~~~",
+    "### Table data",
+    "| field | value |",
+    "| --- | --- |",
+    "| name | tree |",
+    ""
+  ].join("\r\n");
+  const index = indexMarkdownDocument(markdown);
+  const [run, evidence, parse, tableSection] = index.sections;
+  assert.deepEqual(index.sections.map(section => section.title), ["Run", "Evidence", "Parse details", "Table data"]);
+  assert.equal(run.parentId, null);
+  assert.equal(evidence.parentId, run.id);
+  assert.equal(parse.parentId, evidence.id);
+  assert.equal(tableSection.parentId, evidence.id);
+  assert.deepEqual(evidence.childIds, [parse.id, tableSection.id]);
+  assert.equal(run.subtreeByteLength, Buffer.byteLength(markdown));
+
+  const [fence, table] = index.blocks;
+  assert.equal(fence.kind, "code_fence");
+  assert.equal(fence.language, "json");
+  assert.equal(fence.closed, true);
+  assert.equal(fence.parentId, parse.id);
+  const bytes = Buffer.from(markdown);
+  assert.equal(bytes.subarray(fence.contentOffset, fence.contentOffset + fence.contentByteLength).toString("utf8"), '{"name":"🌳"}\r\n## A heading inside a code fence\r\n');
+  assert.equal(bytes.subarray(fence.offset, fence.offset + fence.byteLength).toString("utf8"), "~~~json\r\n{\"name\":\"🌳\"}\r\n## A heading inside a code fence\r\n~~~\r\n");
+  assert.equal(table.kind, "table");
+  assert.equal(table.parentId, tableSection.id);
+  assert.equal(table.rowCount, 2);
+  assert.equal(table.columnCount, 2);
+  assert.equal(table.inconsistentRowCount, 0);
+  assert.equal(bytes.subarray(table.offset, table.offset + table.byteLength).toString("utf8"), "| field | value |\r\n| --- | --- |\r\n| name | tree |\r\n");
+});
+
 test("compact and default evidence redact URL secrets while detailed URL access is opt-in", async () => {
   const session = fakeSession();
   const observer = new BrowserObserver(session);
-  const compact = await observer.capture();
+  const compact = await observer.capture({ profile: "visual" });
   assert.match(compact.pageChangeFingerprint, /^[a-f0-9]{64}$/);
   assert.equal(Object.keys(compact).includes("pageChangeFingerprint"), false, "the internal wait baseline is not returned as model evidence");
   assert.equal(JSON.stringify(compact).includes(compact.pageChangeFingerprint), false);
   assert.equal(compact.page.url, "https://example.test/page");
   assert.equal(compact.frames[0].url, "https://example.test/page");
   assert.equal(compact.candidates[0].href, "https://destination.test/account");
+  assert.equal(compact.candidates[0].opensNewTarget, true);
+  assert.equal(compact.candidates[0].target, undefined, "raw page target names are not projected into model-facing candidates");
+  assert.equal("recordContext" in compact.candidates[0], false, "local ranking context is not included in the compact candidate projection");
   assert.equal(compact.candidates.find(candidate => candidate.name === "Search").submitsForm, true, "snapshot ancestry identifies a default submit button inside a form");
   assert.equal("attributes" in compact.candidates[0], false, "compact model evidence omits the full attribute map");
   assert.equal(compact.coverage.network, true);
@@ -152,6 +199,127 @@ test("compact and default evidence redact URL secrets while detailed URL access 
   assert.equal(JSON.stringify(detailedForms).includes("topsecret"), false, "form opt-in does not expose URL secrets");
 });
 
+test("observation profiles make visual capture explicit and expose capture cost metrics", async () => {
+  const session = fakeSession();
+  const methods = [];
+  const originalSend = session.client.send.bind(session.client);
+  session.client.send = async (method, ...args) => {
+    methods.push(method);
+    return originalSend(method, ...args);
+  };
+  const observer = new BrowserObserver(session);
+
+  const interaction = await observer.capture();
+  assert.equal(interaction.observationProfile, "interaction");
+  assert.equal(interaction.coverage.screenshot, false);
+  assert.equal(interaction.coverage.interactionCandidates, true);
+  assert.ok(interaction.candidateCount > 0);
+  assert.equal(methods.includes("Page.captureScreenshot"), false, "ordinary interaction evidence avoids screenshot capture");
+  assert.ok(interaction.captureMetrics.cdpRoundTrips > 0);
+  assert.equal(interaction.captureMetrics.domSnapshotCount, 1);
+  assert.ok(interaction.captureMetrics.cdpRoundTripP95Ms >= 0);
+  assert.ok(interaction.captureMetrics.captureDurationMs >= 0);
+  assert.ok(interaction.captureMetrics.retainedEvidenceBytes > 0);
+  assert.ok(interaction.captureMetrics.peakRetainedEvidenceBytes >= interaction.captureMetrics.retainedEvidenceBytes);
+  assert.equal(interaction.captureMetrics.documentIndexBuildCount, 1, "candidate discovery and semantic compilation share one root-document index");
+  assert.ok(interaction.captureMetrics.documentIndexBuildMs >= 0);
+  assert.ok(interaction.captureMetrics.candidateDerivationMs >= 0);
+  assert.ok(interaction.captureMetrics.semanticCompilationMs >= 0);
+
+  methods.length = 0;
+  const structural = await observer.capture({ profile: "structural" });
+  assert.equal(structural.coverage.domSnapshot, true);
+  assert.equal(structural.coverage.accessibility, true);
+  assert.equal(structural.coverage.interactionCandidates, false);
+  assert.equal(structural.candidateCount, 0);
+  assert.equal(structural.captureMetrics.domNodeCount > 0, true);
+  assert.equal(structural.semanticPage.schemaVersion, 3, "structural reads still receive the semantic page model");
+  assert.equal(structural.captureMetrics.documentIndexBuildCount, 1);
+  assert.equal(structural.captureMetrics.semanticCompilationMs >= 0, true);
+  assert.equal(methods.includes("Page.captureScreenshot"), false);
+
+  methods.length = 0;
+  const lightweight = await observer.capture({ profile: "lightweight" });
+  assert.equal(lightweight.coverage.domSnapshot, false);
+  assert.equal(lightweight.coverage.accessibility, false);
+  assert.equal(lightweight.coverage.interactionCandidates, false);
+  assert.equal(lightweight.candidateCount, 0);
+  assert.equal(lightweight.captureMetrics.domNodeCount, 0);
+  assert.equal(methods.includes("DOMSnapshot.captureSnapshot"), false);
+  assert.equal(methods.includes("Accessibility.getFullAXTree"), false);
+  assert.equal(methods.includes("Page.captureScreenshot"), false);
+  const lightweightEvidence = observer.getEvidence(lightweight.evidenceId, { facets: ["page"] });
+  assert.equal(lightweightEvidence.observationProfile, "lightweight");
+  assert.equal(lightweightEvidence.coverage.domSnapshot, false);
+
+  methods.length = 0;
+  const visual = await observer.capture({ profile: "visual" });
+  assert.equal(visual.coverage.screenshot, true);
+  assert.equal(methods.includes("Page.captureScreenshot"), true);
+});
+
+test("root and OOPIF candidate discovery share one document index per captured snapshot", async () => {
+  const session = fakeSession();
+  const childClient = {
+    async send(method) {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-child", url: "https://frame.test/child" } } };
+      if (method === "DOMSnapshot.captureSnapshot") {
+        const snapshot = fixtureSnapshot();
+        snapshot.strings[0] = "frame-child";
+        return snapshot;
+      }
+      if (method === "Accessibility.getFullAXTree") return {
+        nodes: [{ backendDOMNodeId: 2, ignored: false, role: { value: "link" }, name: { value: "Account" } }]
+      };
+      if (method === "Runtime.evaluate") return {
+        result: { value: JSON.stringify({ url: "https://frame.test/child", title: "Frame", readyState: "complete" }) }
+      };
+      throw new Error(`Unexpected frame CDP method: ${method}`);
+    }
+  };
+  session.getOutOfProcessFrames = async () => [{
+    targetId: "oopif-target",
+    frameId: "frame-child",
+    parentFrameId: "frame-main",
+    client: childClient,
+    domObservationAvailable: true,
+    networkObservationAvailable: false
+  }];
+
+  const observation = await new BrowserObserver(session).capture({ selectionGoal: "account link" });
+  assert.equal(observation.captureMetrics.documentIndexBuildCount, 2, "one index is built for the root and one for the captured OOPIF");
+  assert.ok(observation.semanticPage.controls.some(control => control.frameTargetId === "oopif-target"
+    && control.frameId === "frame-child"));
+});
+
+test("a fresh HTTP 429 is surfaced as a one-shot rate-limit handoff without request URLs", async () => {
+  const session = fakeSession();
+  session.activity.recordNetworkEvent("Network.requestWillBeSent", {
+    requestId: "limited-request",
+    request: { url: "https://api.example.test/items?token=must-not-appear", method: "GET" },
+    type: "Fetch",
+    timestamp: 5
+  });
+  session.activity.recordNetworkEvent("Network.responseReceived", {
+    requestId: "limited-request",
+    response: { status: 429, mimeType: "application/json" },
+    timestamp: 5.1
+  });
+  const observer = new BrowserObserver(session);
+  const pending = await observer.capture({ includeScreenshot: false });
+  assert.deepEqual(pending.networkSignals, [], "an in-flight 429 is not presented as a completed server response");
+  session.activity.recordNetworkEvent("Network.loadingFinished", { requestId: "limited-request", timestamp: 5.2 });
+  const first = await observer.capture({ includeScreenshot: false });
+  const handoff = classifyHumanHandoff(first);
+  assert.equal(first.networkSignals.length, 1);
+  assert.equal(handoff.category, "rate_limited");
+  assert.match(handoff.reason, /stop requests/iu);
+  assert.equal(JSON.stringify(first).includes("must-not-appear"), false);
+
+  const next = await observer.capture({ includeScreenshot: false });
+  assert.deepEqual(next.networkSignals, [], "the same old 429 cannot retrigger a handoff on a later observation");
+});
+
 test("a selected network response body is never fetched or returned without explicit sensitive-data opt-in", async () => {
   const session = fakeSession();
   const originalSend = session.client.send.bind(session.client);
@@ -171,14 +339,246 @@ test("a selected network response body is never fetched or returned without expl
   assert.equal(hidden.responseBody.status, "not_returned");
   assert.equal(JSON.stringify(hidden).includes("fixture-response-secret"), false);
 
-  const included = await observer.inspectNetworkResponse(compact.evidenceId, { requestId: "request-1", includeSensitive: true });
+  const included = await observer.inspectNetworkResponse(compact.evidenceId, { requestId: "request-1", includeSensitive: true, view: "normalized" });
   assert.equal(bodyReads, 1);
   assert.equal(included.responseBody.status, "included");
-  assert.equal(included.responseBody.data, JSON.stringify({ loaded: true, access_token: "fixture-response-secret" }));
-  const truncated = await observer.inspectNetworkResponse(compact.evidenceId, { requestId: "request-1", includeSensitive: true, maxBytes: 12 });
-  assert.equal(truncated.responseBody.truncated, true);
-  assert.equal(truncated.responseBody.returnedBytes, 12);
+  assert.equal(included.responseBody.data, JSON.stringify({ loaded: true, access_token: "[REDACTED]" }));
+  assert.equal(included.responseBody.credentialDetails.items[0].kind, "access_token");
+  assert.equal(included.responseBody.credentialDetails.items[0].characterLength, "fixture-response-secret".length);
+  assert.equal(JSON.stringify(included).includes("fixture-response-secret"), false);
+  const preCancelled = new AbortController();
+  preCancelled.abort();
+  const cancelledCacheRead = await observer.inspectNetworkResponse(compact.evidenceId, {
+    requestId: "request-1", includeSensitive: true, view: "normalized", signal: preCancelled.signal
+  });
+  assert.equal(cancelledCacheRead.responseBody.status, "cancelled", "an aborted caller cannot receive a cached projection");
+  assert.equal(bodyReads, 1);
+  await assert.rejects(
+    observer.inspectNetworkResponse(compact.evidenceId, { requestId: "request-1", offset: -1 }),
+    /non-negative safe integer/u
+  );
+  await assert.rejects(
+    observer.inspectNetworkResponse(compact.evidenceId, { requestId: "request-1", offset: Number.MAX_SAFE_INTEGER + 1 }),
+    /non-negative safe integer/u
+  );
+  const revealed = await observer.inspectNetworkResponse(compact.evidenceId, {
+    requestId: "request-1", includeSensitive: true, includeCredentialValues: true, view: "normalized"
+  });
+  assert.equal(revealed.responseBody.data, JSON.stringify({ loaded: true, access_token: "fixture-response-secret" }));
+  assert.equal(revealed.responseBody.credentialValuesIncluded, true);
+  assert.equal(Object.hasOwn(revealed.responseBody.credentialDetails.items[0], "value"), false, "credential summaries identify values without duplicating them outside the paged source");
+  assert.ok(JSON.stringify(revealed).includes("fixture-response-secret"));
+  assert.equal(bodyReads, 2, "explicit full credential views bypass reusable redacted projections");
+  await assert.rejects(
+    observer.inspectNetworkResponse(compact.evidenceId, { requestId: "request-1", includeCredentialValues: true }),
+    /requires includeSensitive:true/u
+  );
+  assert.equal(included.responseBody.hasMore, false);
+  const page = await observer.inspectNetworkResponse(compact.evidenceId, { requestId: "request-1", includeSensitive: true, view: "normalized", maxBytes: 12 });
+  assert.equal(page.responseBody.truncated, false);
+  assert.equal(page.responseBody.returnedBytes, 12);
+  assert.equal(page.responseBody.hasMore, true);
+  assert.equal(bodyReads, 2, "redacted pages reuse the existing projection");
+
+  const markdown = await observer.inspectNetworkResponse(compact.evidenceId, { requestId: "request-1", includeSensitive: true, view: "markdown" });
+  assert.equal(markdown.responseBody.status, "included");
+  assert.ok(markdown.responseBody.sections.some(section => section.title === "Response body: json"));
+  assert.ok(markdown.responseBody.sections.some(section => section.parentId === "response-body-json"));
+  assert.ok(markdown.responseBody.blocks.some(block => block.kind === "code_fence" && block.language === "json"));
+  assert.equal(JSON.stringify(markdown).includes("fixture-response-secret"), false);
+  const revealedMarkdown = await observer.inspectNetworkResponse(compact.evidenceId, {
+    requestId: "request-1", includeSensitive: true, includeCredentialValues: true, view: "markdown"
+  });
+  assert.ok(revealedMarkdown.responseBody.data.includes("fixture-response-secret"));
+  assert.match(revealedMarkdown.responseBody.data, /Complete source \(credential values included\)/u);
+  assert.equal(bodyReads, 4, "full credential Markdown is acquired directly and never stored in the redacted projection cache");
   assert.equal((await observer.inspectNetworkResponse(compact.evidenceId, { requestId: "missing" })).status, "not_found");
+});
+
+test("response body acquisition enforces byte limits and reports timeout or cancellation", async () => {
+  const reportedLargeSession = fakeSession();
+  reportedLargeSession.activity.recordNetworkEvent("Network.dataReceived", {
+    requestId: "request-1", dataLength: MAX_RESPONSE_BODY_BYTES + 1
+  });
+  let reportedLargeBodyReads = 0;
+  const reportedLargeSend = reportedLargeSession.client.send.bind(reportedLargeSession.client);
+  reportedLargeSession.client.send = async (method, params) => {
+    if (method === "Network.getResponseBody") reportedLargeBodyReads++;
+    return reportedLargeSend(method, params);
+  };
+  const reportedLargeObserver = new BrowserObserver(reportedLargeSession);
+  const reportedLargeEvidence = await reportedLargeObserver.capture({ includeScreenshot: false });
+  const preflight = await reportedLargeObserver.inspectNetworkResponse(reportedLargeEvidence.evidenceId, {
+    requestId: "request-1", includeSensitive: true
+  });
+  assert.equal(preflight.responseBody.status, "over_limit");
+  assert.equal(preflight.responseBody.reasonCode, "reported_decoded_body_bytes_limit");
+  assert.equal(preflight.responseBody.bodyRetrieved, false);
+  assert.equal(reportedLargeBodyReads, 0, "retained CDP byte counts reject oversized responses before retrieving the body");
+
+  const encodedLargeSession = fakeSession();
+  encodedLargeSession.activity.recordNetworkEvent("Network.loadingFinished", {
+    requestId: "request-1", timestamp: 1.9, encodedDataLength: MAX_RESPONSE_BODY_BYTES + 1
+  });
+  let encodedLargeBodyReads = 0;
+  const encodedLargeSend = encodedLargeSession.client.send.bind(encodedLargeSession.client);
+  encodedLargeSession.client.send = async (method, params) => {
+    if (method === "Network.getResponseBody") encodedLargeBodyReads++;
+    return encodedLargeSend(method, params);
+  };
+  const encodedLargeObserver = new BrowserObserver(encodedLargeSession);
+  const encodedLargeEvidence = await encodedLargeObserver.capture({ includeScreenshot: false });
+  const encodedPreflight = await encodedLargeObserver.inspectNetworkResponse(encodedLargeEvidence.evidenceId, {
+    requestId: "request-1", includeSensitive: true
+  });
+  assert.equal(encodedPreflight.responseBody.status, "over_limit");
+  assert.equal(encodedPreflight.responseBody.reasonCode, "reported_encoded_body_bytes_limit");
+  assert.equal(encodedPreflight.responseBody.bodyRetrieved, false);
+  assert.equal(encodedLargeBodyReads, 0, "oversized transfer counts reject before the all-at-once CDP body result is requested");
+
+  const actualLargeSession = fakeSession();
+  const actualLargeSend = actualLargeSession.client.send.bind(actualLargeSession.client);
+  actualLargeSession.client.send = async (method, params) => method === "Network.getResponseBody"
+    ? { body: "x".repeat(MAX_RESPONSE_BODY_BYTES + 1), base64Encoded: false }
+    : actualLargeSend(method, params);
+  const actualLargeObserver = new BrowserObserver(actualLargeSession);
+  const actualLargeEvidence = await actualLargeObserver.capture({ includeScreenshot: false });
+  const actualLarge = await actualLargeObserver.inspectNetworkResponse(actualLargeEvidence.evidenceId, {
+    requestId: "request-1", includeSensitive: true
+  });
+  assert.equal(actualLarge.responseBody.status, "over_limit");
+  assert.equal(actualLarge.responseBody.reasonCode, "decoded_body_bytes_limit");
+  assert.equal(actualLarge.responseBody.bodyRetrieved, true);
+  assert.equal(actualLarge.responseBody.bodyDecoded, false);
+
+  const pendingSession = fakeSession();
+  const pendingSend = pendingSession.client.send.bind(pendingSession.client);
+  pendingSession.client.send = (method, params) => method === "Network.getResponseBody"
+    ? new Promise(() => {})
+    : pendingSend(method, params);
+  const pendingObserver = new BrowserObserver(pendingSession);
+  const pendingEvidence = await pendingObserver.capture({ includeScreenshot: false });
+  const timedOut = await pendingObserver.inspectNetworkResponse(pendingEvidence.evidenceId, {
+    requestId: "request-1", includeSensitive: true, timeoutMs: 5
+  });
+  assert.equal(timedOut.responseBody.status, "timed_out");
+  assert.equal(timedOut.responseBody.phase, "acquisition");
+
+  const abortController = new AbortController();
+  const cancelledPromise = pendingObserver.inspectNetworkResponse(pendingEvidence.evidenceId, {
+    requestId: "request-1", includeSensitive: true, signal: abortController.signal
+  });
+  setImmediate(() => abortController.abort());
+  const cancelled = await cancelledPromise;
+  assert.equal(cancelled.responseBody.status, "cancelled");
+  assert.equal(cancelled.responseBody.phase, "acquisition");
+});
+
+test("Markdown response diagnostics can drill into nested sections and page exact indexed blocks", async () => {
+  const session = fakeSession();
+  const source = JSON.stringify({
+    result: { records: [{ id: 1, profile: { name: "A", email: "a@example.test" } }, { id: 2, profile: { name: "B", email: "b@example.test" } }] },
+    access_token: "fixture-response-secret"
+  });
+  const originalSend = session.client.send.bind(session.client);
+  let responseBodyReads = 0;
+  session.client.send = async (method, params = {}) => {
+    if (method === "Network.getResponseBody") {
+      responseBodyReads++;
+      return { body: source, base64Encoded: false };
+    }
+    return originalSend(method, params);
+  };
+  const observer = new BrowserObserver(session);
+  const compact = await observer.capture({ includeScreenshot: false });
+  const overview = await observer.inspectNetworkResponse(compact.evidenceId, {
+    requestId: "request-1", includeSensitive: true, view: "markdown", maxBytes: 256 * 1024
+  });
+  const report = overview.responseBody;
+  assert.equal(report.inspectionMetrics.projectionCacheHit, false);
+  const records = report.sections.find(section => section.title.includes("$.result.records"));
+  const result = report.sections.find(section => section.title.includes("$.result`"));
+  const profile = report.sections.find(section => section.title.includes("$.result.records[].profile"));
+  assert.ok(records, "the report indexes the nested records section");
+  assert.ok(result, "object-only containers remain addressable in the section tree");
+  assert.ok(profile, "nested object fields remain addressable in the section tree");
+  assert.equal(records.parentId, result.id);
+  assert.equal(profile.parentId, records.id);
+  assert.ok(records.childIds.includes(profile.id));
+  const sectionView = await observer.inspectNetworkResponse(compact.evidenceId, {
+    requestId: "request-1", includeSensitive: true, view: "markdown", sectionId: records.id, maxBytes: 256 * 1024
+  });
+  assert.equal(sectionView.responseBody.selection.kind, "section");
+  assert.equal(sectionView.responseBody.inspectionMetrics.projectionCacheHit, true);
+  assert.equal(sectionView.responseBody.selection.id, records.id);
+  assert.match(sectionView.responseBody.data, /\| id \| profile \|/u);
+  assert.match(sectionView.responseBody.data, /#### `\$\.result\.records\[\]\.profile`/u);
+  assert.equal(JSON.stringify(sectionView).includes("fixture-response-secret"), false);
+
+  const normalizedJsonSection = report.sections.find(section => section.title === "Normalized, redacted JSON");
+  const normalizedBlock = report.blocks.find(block => block.kind === "code_fence" && block.language === "json" && block.parentId === normalizedJsonSection.id);
+  assert.ok(normalizedBlock);
+  const firstPage = await observer.inspectNetworkResponse(compact.evidenceId, {
+    requestId: "request-1", includeSensitive: true, view: "markdown", blockId: normalizedBlock.id, maxBytes: 32
+  });
+  assert.equal(firstPage.responseBody.selection.kind, "block");
+  assert.equal(firstPage.responseBody.selection.id, normalizedBlock.id);
+  assert.equal(firstPage.responseBody.offset, 0);
+  assert.equal(firstPage.responseBody.documentOffset, normalizedBlock.offset);
+  assert.equal(firstPage.responseBody.hasMore, true);
+  assert.equal(firstPage.responseBody.inspectionMetrics.projectionCacheHit, true);
+  let pages = [firstPage.responseBody.data];
+  let finalPagingMetrics = firstPage.responseBody.inspectionMetrics.paging;
+  let nextOffset = firstPage.responseBody.nextOffset;
+  while (nextOffset < normalizedBlock.byteLength) {
+    const next = await observer.inspectNetworkResponse(compact.evidenceId, {
+      requestId: "request-1", includeSensitive: true, view: "markdown", blockId: normalizedBlock.id, offset: nextOffset, maxBytes: 32
+    });
+    pages.push(next.responseBody.data);
+    finalPagingMetrics = next.responseBody.inspectionMetrics.paging;
+    assert.equal(next.responseBody.documentOffset, normalizedBlock.offset + nextOffset);
+    nextOffset = next.responseBody.nextOffset;
+  }
+  const fullBlock = Buffer.from(report.data).subarray(normalizedBlock.offset, normalizedBlock.offset + normalizedBlock.byteLength).toString("utf8");
+  assert.equal(pages.join(""), fullBlock, "block paging reconstructs every byte of the complete redacted block");
+  assert.equal(fullBlock.includes("fixture-response-secret"), false);
+  assert.equal(responseBodyReads, 1, "section and page requests reuse the bounded redacted projection instead of reacquiring the CDP body");
+  assert.ok(firstPage.responseBody.inspectionMetrics.paging.utf8IndexedLookups > 0);
+  assert.ok(finalPagingMetrics.utf8CursorHits > 0, "sequential block pages reuse their prior UTF-8 character cursor");
+  session.target.id = "target-2";
+  const afterTargetChange = await observer.inspectNetworkResponse(compact.evidenceId, {
+    requestId: "request-1", includeSensitive: true, view: "markdown"
+  });
+  assert.equal(afterTargetChange.status, "stale", "the old projection cannot be read or reacquired through a changed browser target");
+  assert.equal(afterTargetChange.reasonCode, "evidence_target_changed");
+  assert.equal(responseBodyReads, 1);
+});
+
+test("response projection cache entries are cleared when their evidence is evicted", async () => {
+  const session = fakeSession();
+  const originalSend = session.client.send.bind(session.client);
+  let responseBodyReads = 0;
+  session.client.send = async (method, params = {}) => {
+    if (method === "Network.getResponseBody") {
+      responseBodyReads++;
+      return { body: JSON.stringify({ ok: true }), base64Encoded: false };
+    }
+    return originalSend(method, params);
+  };
+  const observer = new BrowserObserver(session, { evidenceLimit: 1 });
+  const first = await observer.capture({ includeScreenshot: false });
+  const inspected = await observer.inspectNetworkResponse(first.evidenceId, {
+    requestId: "request-1", includeSensitive: true, view: "normalized"
+  });
+  assert.equal(inspected.responseBody.inspectionMetrics.projectionCacheHit, false);
+  assert.equal(observer.responseProjectionCache.size, 1);
+
+  await observer.capture({ includeScreenshot: false });
+  assert.equal(observer.responseProjectionCache.size, 0, "evicting evidence also releases its cached projection");
+  assert.equal((await observer.inspectNetworkResponse(first.evidenceId, {
+    requestId: "request-1", includeSensitive: true, view: "normalized"
+  })).status, "expired");
+  assert.equal(responseBodyReads, 1);
 });
 
 test("out-of-process network events retain their target-qualified request identity", () => {

@@ -27,15 +27,14 @@ import { projectInput } from "./input-projection.js";
 import { sendJson, sendError, readBody, parseQuery } from "./http-utils.js";
 import { createDiagnostics } from "../runtime/diagnostics.js";
 import { logger } from "../runtime/logger.js";
-import { DiagnosticCollector } from "../diagnostics/collector.js";
 import { createDiagnosticContract, AUTHORITY, OPERATION, SENSITIVITY } from "../diagnostics/contracts.js";
-import { registerBrowserDiagnosticSources } from "../diagnostics/adapters/browserSources.js";
 import { DiagnosticCorrelator } from "../diagnostics/correlator.js";
 import { DiagnosticReport, FINDING_LEVEL, deriveRunInvestigationStatus } from "../diagnostics/report.js";
-import { TestRunner } from "../testing/runner.js";
 import { receiptFromRunState } from "../testing/receipts.js";
+import { resolveObservedApplication } from "../environments/model.js";
 import { buildDurableRunReport } from "../testing/durableRunReport.js";
 import { RunStateStore, requestRunCancellation, withTargetExecutionLease } from "../testing/runState.js";
+import { ApplicationRunService } from "../navigation/applicationRunService.js";
 import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
 import { InvestigationEngine } from "../investigation/engine.js";
 import { InterventionStore } from "../runtime/interventions.js";
@@ -45,6 +44,10 @@ import { trackRunResult } from "../runtime/runTracker.js";
 import { randomUUID } from "node:crypto";
 import { createQualificationRuntime } from "../testing/qualificationRuntime.js";
 import { projectExtractionOutput, projectExtractionOutputs } from "../extraction/outputRelease.js";
+import { EvidenceReleaseGrantStore } from "../runtime/evidenceReleaseGrants.js";
+import { stateDirectory } from "../extension/paths.js";
+import { RunLocalPublicReadApprovalBroker } from "../capabilities/publicReadApprovalBroker.js";
+import { FileUploadGrantStore } from "../runtime/fileUploadGrants.js";
 
 const DEFAULT_PORT = 9377;
 const API_PREFIX = "/v3/bots";
@@ -56,12 +59,21 @@ const OUTPUT_EXTENSIONS = new Set(["json", "md", "csv", "xml"]);
 // the run as finished.
 const TERMINAL = new Set(["finished", "failed", "canceled"]);
 
-export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationRunner, decisionRuntime = null, qualificationService = null, capabilityRegistry = null, capabilityService = null, authorizeExtractionField = null, authorizeExtractionRelease = null, apiToken, operatorToken = process.env.ACTIVETAB_OPERATOR_TOKEN ?? null, operatorId = process.env.ACTIVETAB_OPERATOR_ID ?? null, operatorAuthenticator = null, host = "127.0.0.1", maxTasks = MAX_TASK_RECORDS, executorName, reportDir, testSessionResolver = null, testEnvironmentResolver = null, testProfileIdResolver = null, testPrincipalResolver = null, runStateStore: suppliedRunStateStore = null } = {}) {
+export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationRunner, decisionRuntime = null, qualificationService = null, capabilityRegistry = null, capabilityService = null, authorizeExtractionField = null, authorizeExtractionRelease = null, apiToken, operatorToken = process.env.ACTIVETAB_OPERATOR_TOKEN ?? null, operatorId = process.env.ACTIVETAB_OPERATOR_ID ?? null, operatorAuthenticator = null, evidenceReleaseStore: suppliedEvidenceReleaseStore = null, evidenceReleaseDatabasePath = process.env.ACTIVETAB_EVIDENCE_RELEASE_DB ?? join(stateDirectory(), "evidence-releases.sqlite"), fileUploadGrantStore: suppliedFileUploadGrantStore = null, interventionStore: suppliedInterventionStore = null, publicReadApprovalBroker = null, host = "127.0.0.1", maxTasks = MAX_TASK_RECORDS, executorName, reportDir, testSessionResolver = null, testEnvironmentResolver = null, testProfileIdResolver = null, testPrincipalResolver = null, runStateStore: suppliedRunStateStore = null } = {}) {
   const store = new TaskStore(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"));
   const lifecycle = new RunLifecycle({ store, navigationRunner, executorName, reportDir });
   const token = apiToken ?? process.env.ACTIVETAB_API_TOKEN ?? null;
   const authorizeMutation = createMutationAuthorizer(token);
   const authenticateOperator = operatorAuthenticator ?? createOperatorAuthenticator(operatorToken, operatorId);
+  let evidenceReleaseStore = suppliedEvidenceReleaseStore;
+  let ownsEvidenceReleaseStore = false;
+  function getEvidenceReleaseStore() {
+    if (!evidenceReleaseStore) {
+      evidenceReleaseStore = new EvidenceReleaseGrantStore({ databasePath: evidenceReleaseDatabasePath });
+      ownsEvidenceReleaseStore = true;
+    }
+    return evidenceReleaseStore;
+  }
   const maxTaskRecords = Number.isInteger(maxTasks) && maxTasks >= 1 ? Math.min(maxTasks, 10_000) : MAX_TASK_RECORDS;
   const diagnostics = createDiagnostics();
   const runQualificationService = qualificationService ?? createQualificationRuntime({ decisionRuntime });
@@ -69,9 +81,24 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
   const runStateStore = suppliedRunStateStore ?? new RunStateStore(
     process.env.ACTIVETAB_RUN_STATE_DIR ?? join(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"), "..", "runs")
   );
+  const fileUploadGrantStore = suppliedFileUploadGrantStore ?? new FileUploadGrantStore({
+    stagingDirectory: join(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"), "..", "uploads"),
+    trustedIssuer: "activetab-api"
+  });
+  const applicationRunService = new ApplicationRunService({ runStateStore });
   let runStateStoreReady = null;
-  const interventionStore = new InterventionStore(join(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"), "..", "interventions"));
-  interventionStore.init().catch(() => {}); // lazy init; durable records reload on first use
+  const interventionStore = suppliedInterventionStore ?? new InterventionStore(join(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"), "..", "interventions"));
+  let interventionStoreReady = null;
+  async function ensureInterventionStoreReady() {
+    interventionStoreReady ??= Promise.resolve().then(() => interventionStore.init());
+    try { await interventionStoreReady; }
+    catch (cause) {
+      const error = Object.assign(new Error("Durable intervention storage is unavailable."), {
+        code: "intervention_store_unavailable", cause
+      });
+      throw error;
+    }
+  }
   const grantStore = new AuthorizationGrantStore({ trustedIssuer: process.env.ACTIVETAB_TRUSTED_ISSUER ?? "activetab-api" });
   const interventionTools = createInterventionTools({
     store: interventionStore,
@@ -83,11 +110,6 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
       revokeGrant: grantId => grantStore.revoke(grantId)
     }
   });
-
-  function createBrowserDiagnosticSources(session, collector) {
-    registerBrowserDiagnosticSources(session, collector);
-    return collector;
-  }
 
   function createTestVerificationContext(session) {
     return {
@@ -207,16 +229,25 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
       return;
     }
     const runId = `test-${Date.now()}-${randomUUID().slice(0, 8)}`;
-    const collector = new DiagnosticCollector({ runId });
-    createBrowserDiagnosticSources(session, collector);
-    const correlator = new DiagnosticCorrelator();
     const controller = new AbortController();
-    const runner = new TestRunner({
-      session, collector, correlator, signal: controller.signal, interventions: interventionStore,
-      decisionRuntime, qualificationService: runQualificationService, capabilityRegistry, capabilityService, authorizeExtractionField, authorizeExtractionRelease, runStateStore, ...binding
+    const { collector, correlator, runner, runPromise } = applicationRunService.startWorkflowRun({
+      session,
+      workflow,
+      runId,
+      signal: controller.signal,
+      runnerOptions: {
+        interventions: interventionStore,
+        decisionRuntime,
+        qualificationService: runQualificationService,
+        capabilityRegistry,
+        capabilityService,
+        fileUploadGrantStore,
+        authorizeExtractionField,
+        authorizeExtractionRelease,
+        ...binding
+      }
     });
     const runCtx = createTestVerificationContext(session);
-    const runPromise = runner.run(workflow, { runId });
     installTestRun({ runId, session, workflow, binding, controller, collector, correlator, runner, runPromise, runCtx });
     sendJson(res, 200, { status: "started", runId });
   }
@@ -261,7 +292,10 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
     let binding;
     try {
       binding = await resolveTestRunBinding(req, workflow, session, state);
-      const authenticationRealm = binding.environment?.applications?.[0]?.authenticationRealm ?? null;
+      const application = session.target?.url && binding.environment
+        ? resolveObservedApplication(binding.environment, session.target.url)
+        : { status: "unmatched" };
+      const authenticationRealm = application.status === "matched" ? application.authenticationRealm : state.authenticationRealm ?? null;
       if ((binding.environment?.environmentId ?? null) !== state.environmentId
         || (binding.profileId ?? null) !== state.profileId
         || (binding.principalId ?? null) !== state.principalId
@@ -272,68 +306,103 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
       sendError(res, 409, 99409, `Run continuation identity could not be verified: ${String(error?.message ?? error).slice(0, 200)}`);
       return;
     }
-    await interventionStore.init();
+    await ensureInterventionStoreReady();
     const intervention = state.pendingInterventionId ? interventionStore.get(state.pendingInterventionId) : null;
     if (state.pendingInterventionId && (!intervention || intervention.runId !== runId)) {
       sendError(res, 409, 99409, "The durable intervention required by this run is unavailable or mismatched.");
       return;
     }
-    const collector = new DiagnosticCollector({ runId });
-    createBrowserDiagnosticSources(session, collector);
-    const correlator = new DiagnosticCorrelator();
     const controller = new AbortController();
-    const runner = new TestRunner({
-      session, collector, correlator, signal: controller.signal, interventions: interventionStore,
-      decisionRuntime, qualificationService: runQualificationService, capabilityRegistry, capabilityService, authorizeExtractionField, authorizeExtractionRelease, runStateStore, existingRunStateId: runId, ...binding
-    });
     const runCtx = createTestVerificationContext(session);
+    const { collector, correlator, runner, runPromise: initialRunPromise } = applicationRunService.startWorkflowRun({
+      session,
+      workflow,
+      runId,
+      signal: controller.signal,
+      resumeReceipt: intervention ? receiptFromRunState(state, intervention) : null,
+      resumeOptions: { verify: runCtx, workflow },
+      runnerOptions: {
+        interventions: interventionStore,
+        decisionRuntime,
+        qualificationService: runQualificationService,
+        capabilityRegistry,
+        capabilityService,
+        fileUploadGrantStore,
+        authorizeExtractionField,
+        authorizeExtractionRelease,
+        existingRunStateId: runId,
+        ...binding
+      }
+    });
     const runPromise = intervention
-      ? runner.resume(receiptFromRunState(state, intervention), { verify: runCtx, workflow }).then(result => {
+      ? initialRunPromise.then(result => {
           if (!result.receipt) throw new Error(result.reason ?? "The run resume predicate was not independently verified.");
           return result.receipt;
         })
-      : runner.run(workflow, { runId });
+      : initialRunPromise;
     installTestRun({ runId, session, workflow, binding, controller, collector, correlator, runner, runPromise, runCtx });
     sendJson(res, 202, { status: "resuming", runId });
   }
 
   async function handleGetTestRun(req, res, runId) {
     const run = testRuns.get(runId);
-    if (!run) {
-      try {
-        await ensureRunStateStore();
-        const state = await runStateStore.getFresh(runId);
-        if (state) {
-          const receipt = receiptFromRunState(state).toObject();
-          const missingExtractionArtifact = (state.completedSteps ?? []).some(item => ["emit_output", "discover_tables", "extract_records", "collect_records"].includes(item.type) && item.status === "PASS");
-          if (missingExtractionArtifact) {
-            receipt.status = "UNCERTAIN";
-            receipt.limitations.push("Capability discovery and structured extraction artifacts are held in memory only; their result cannot be reconstructed after process restart.");
-            const outputStep = [...receipt.steps].reverse().find(item => ["emit_output", "discover_tables", "extract_records", "collect_records"].includes(item.type));
-            if (outputStep) {
-              outputStep.status = "UNCERTAIN";
-              outputStep.reason = "The prior process completed this capability step, but its in-memory result is unavailable after restart.";
-            }
-          }
-          sendJson(res, 200, { ...receipt, outputs: {}, capability_discoveries: [] });
-          return;
-        }
-      } catch (error) {
-        sendError(res, 503, 99503, `Durable run-state lookup failed: ${String(error?.message ?? error).slice(0, 200)}`);
-        return;
-      }
-      sendError(res, 404, 99404, `No test run found for runId '${runId}'.`); return;
-    }
-    if (!run.runState.settled) { sendJson(res, 200, { runId, status: "RUNNING", startedAt: run.startedAt }); return; }
-    if (run.runState.receipt) {
-      sendJson(res, 200, {
-        ...run.runState.receipt.toObject(),
-        outputs: projectExtractionOutputs(run.runner?.outputResults ?? {}, authorizeExtractionRelease, { req, runId, principalId: run.binding?.principalId ?? null }),
-        capability_discoveries: run.runner?.capabilityDiscoveries ?? []
-      });
+    let state;
+    try {
+      await ensureRunStateStore();
+      state = await runStateStore.getFresh(runId);
+    } catch (error) {
+      sendError(res, 503, 99503, `Durable run-state lookup failed: ${String(error?.message ?? error).slice(0, 200)}`);
       return;
     }
-    sendJson(res, 200, { runId, status: "FAILED", startedAt: run.startedAt, error: String(run.runState.error?.message ?? "Run failed.").slice(0, 300) });
+    if (!state) {
+      // The worker acquires its durable run and target leases before creating
+      // the first checkpoint. Keep a just-accepted local run visible during
+      // that bounded initialization window without inventing a receipt.
+      if (run && !run.runState.settled) {
+        sendJson(res, 200, {
+          runId,
+          status: "RUNNING",
+          pendingInterventionId: null,
+          unresolvedOperationIds: [],
+          cancellationRequested: false,
+          outputs: {},
+          capability_discoveries: []
+        });
+        return;
+      }
+      sendError(res, 404, 99404, `No test run found for runId '${runId}'.`);
+      return;
+    }
+
+    const receipt = receiptFromRunState(state).toObject();
+    const hasLocalWorker = Boolean(run);
+    if (run && !run.runState.settled && receipt.status.startsWith("WAITING_FOR_")) {
+      // A resumed worker has accepted the continuation but may still be
+      // checking its intervention predicate. The durable waiting checkpoint
+      // is stale for the duration of that active continuation.
+      receipt.status = "RUNNING";
+    }
+    const hasLocalOutputs = Object.keys(run?.runner?.outputResults ?? {}).length > 0;
+    const missingExtractionArtifact = !hasLocalOutputs && (state.completedSteps ?? []).some(item =>
+      ["emit_output", "discover_tables", "extract_records", "collect_records"].includes(item.type) && item.status === "PASS");
+    if (missingExtractionArtifact) {
+      receipt.status = "UNCERTAIN";
+      receipt.limitations.push("Capability discovery and structured extraction artifacts are unavailable in this process and cannot be reconstructed from durable run state.");
+      const outputStep = [...receipt.steps].reverse().find(item => ["emit_output", "discover_tables", "extract_records", "collect_records"].includes(item.type));
+      if (outputStep) {
+        outputStep.status = "UNCERTAIN";
+        outputStep.reason = "The durable checkpoint records this capability step, but its result artifact is unavailable.";
+      }
+    }
+    const unresolvedOperations = (state.pendingOperations ?? []).filter(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status));
+    sendJson(res, 200, {
+      ...receipt,
+      pendingInterventionId: state.pendingInterventionId ?? null,
+      unresolvedOperationIds: unresolvedOperations.map(operation => operation.operationId),
+      cancellationRequested: state.cancellationRequested === true,
+      outputs: hasLocalWorker ? projectExtractionOutputs(run.runner?.outputResults ?? {}, authorizeExtractionRelease, { req, runId, principalId: state.principalId ?? null }) : {},
+      capability_discoveries: hasLocalWorker ? run.runner?.capabilityDiscoveries ?? [] : []
+    });
   }
 
   async function handleCancelTestRun(req, res, runId) {
@@ -478,9 +547,72 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
         if (!authorizeMutation(req)) { sendError(res, 401, 99401, "Authentication required."); return; }
         const body = await readBody(req);
         if (!body?.subject || !body?.reason) { sendError(res, 400, 99001, "subject and reason are required."); return; }
-        const engine = new InvestigationEngine({ collector: null, correlator: new DiagnosticCorrelator() });
-        const result = await engine.investigate({ subject: body.subject, reason: body.reason, runId: body.runId ?? null });
+        await ensureRunStateStore();
+        const engine = new InvestigationEngine({ collector: null, correlator: new DiagnosticCorrelator(), runStateStore });
+        const result = await engine.investigate({
+          subject: body.subject,
+          reason: body.reason,
+          runId: body.runId ?? null,
+          stepId: body.stepId ?? null,
+          operationId: body.operationId ?? null
+        });
         sendJson(res, 200, result);
+        return;
+      }
+
+      // ── Intervention lifecycle (P0-6): status/ack/approval/resume/cancel ──
+      if (path === "/v1/public-reads/requests" || path.startsWith("/v1/public-reads/requests/")) {
+        if (!publicReadApprovalBroker) { sendError(res, 503, 99503, "public_read_approval_unavailable"); return; }
+        if (method === "POST" && path === "/v1/public-reads/requests") {
+          if (!authorizeMutation(req)) { sendError(res, 401, 99401, "Authentication required."); return; }
+          const body = await readBody(req);
+          try {
+            const request = publicReadApprovalBroker.create(body);
+            sendJson(res, 202, { requestId: request.requestId, revision: request.revision, status: request.status, expiresAt: request.expiresAt });
+          } catch (error) { sendError(res, 400, 99001, String(error?.message ?? error).slice(0, 300)); }
+          return;
+        }
+        if (method === "GET" && path === "/v1/public-reads/requests") {
+          const authenticatedOperator = await authenticateOperator(req);
+          if (!authenticatedOperator) { sendError(res, 403, 99403, "Independent operator authentication required."); return; }
+          sendJson(res, 200, { requests: publicReadApprovalBroker.listPending() });
+          return;
+        }
+        const statusMatch = path.match(/^\/v1\/public-reads\/requests\/([^/]+)\/status$/u);
+        if (method === "GET" && statusMatch) {
+          if (!authorizeMutation(req)) { sendError(res, 401, 99401, "Authentication required."); return; }
+          const request = publicReadApprovalBroker.get(decodeURIComponent(statusMatch[1]));
+          if (!request) { sendError(res, 404, 99404, "Public-read approval request was not found."); return; }
+          sendJson(res, 200, { requestId: request.requestId, revision: request.revision, status: request.status, expiresAt: request.expiresAt });
+          return;
+        }
+        const decisionMatch = path.match(/^\/v1\/public-reads\/requests\/([^/]+)\/(approve|reject)$/u);
+        if (method === "POST" && decisionMatch) {
+          const authenticatedOperator = await authenticateOperator(req);
+          if (!authenticatedOperator) { sendError(res, 403, 99403, "Independent operator authentication required."); return; }
+          const body = await readBody(req) ?? {};
+          if (!body || typeof body !== "object" || Array.isArray(body)
+            || Object.keys(body).some(key => !["expectedRevision", "approvalPhrase"].includes(key))
+            || !Number.isInteger(body.expectedRevision)
+            || (decisionMatch[2] === "approve" && typeof body.approvalPhrase !== "string")
+            || (decisionMatch[2] === "reject" && Object.hasOwn(body, "approvalPhrase"))) {
+            sendError(res, 400, 99001, "Approval requires the current revision and the exact phrase; rejection accepts only the revision.");
+            return;
+          }
+          try {
+            const request = publicReadApprovalBroker.resolve(decodeURIComponent(decisionMatch[1]), {
+              decision: decisionMatch[2], operatorId: authenticatedOperator,
+              expectedRevision: body.expectedRevision,
+              ...(body.approvalPhrase ? { approvalPhrase: body.approvalPhrase } : {})
+            });
+            sendJson(res, 200, request);
+          } catch (error) {
+            const message = String(error?.message ?? error).slice(0, 300);
+            sendError(res, /not found/u.test(message) ? 404 : 409, /not found/u.test(message) ? 99404 : 99409, message);
+          }
+          return;
+        }
+        sendError(res, 404, 99404, "No such public-read approval resource.");
         return;
       }
 
@@ -531,6 +663,57 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
           sendError(res, 404, 99404, "No such intervention resource.");
         } catch (error) {
           sendError(res, 400, 99400, String(error?.message ?? error).slice(0, 300));
+        }
+        return;
+      }
+
+      // Evidence releases are reviewed on the independent operator channel.
+      // The model-facing MCP process can create requests but cannot approve them.
+      if (path === "/v1/evidence/releases/requests" || path === "/v1/evidence/releases/audit"
+        || path.startsWith("/v1/evidence/releases/requests/") || path.startsWith("/v1/evidence/releases/grants/")) {
+        const authenticatedOperator = await authenticateOperator(req);
+        if (!authenticatedOperator) { sendError(res, 403, 99403, "Independent operator authentication required."); return; }
+        const releaseStore = getEvidenceReleaseStore();
+        try {
+          if (method === "GET" && path === "/v1/evidence/releases/requests") {
+            sendJson(res, 200, { requests: releaseStore.listRequests({ states: ["pending", "approved", "rejected", "expired"] }) });
+            return;
+          }
+          if (method === "GET" && path === "/v1/evidence/releases/audit") {
+            sendJson(res, 200, { events: releaseStore.audit({ limit: Math.min(Number.parseInt(query.limit ?? "200", 10) || 200, 1_000) }) });
+            return;
+          }
+          const requestMatch = path.match(/^\/v1\/evidence\/releases\/requests\/([^/]+)\/(approve|reject)$/u);
+          if (method === "POST" && requestMatch) {
+            const body = await readBody(req) ?? {};
+            if (typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(key => key !== "expectedRevision")
+              || !Number.isSafeInteger(body.expectedRevision) || body.expectedRevision < 1) {
+              sendError(res, 400, 99001, "expectedRevision is required; request scope is fixed and cannot be changed during review.");
+              return;
+            }
+            const requestId = decodeURIComponent(requestMatch[1]);
+            if (requestMatch[2] === "approve") {
+              sendJson(res, 200, releaseStore.approveRequest(requestId, { operatorId: authenticatedOperator, expectedRevision: body.expectedRevision }));
+            } else {
+              sendJson(res, 200, releaseStore.rejectRequest(requestId, { operatorId: authenticatedOperator, expectedRevision: body.expectedRevision }));
+            }
+            return;
+          }
+          const grantMatch = path.match(/^\/v1\/evidence\/releases\/grants\/([^/]+)\/revoke$/u);
+          if (method === "POST" && grantMatch) {
+            const body = await readBody(req) ?? {};
+            if (typeof body !== "object" || Array.isArray(body) || Object.keys(body).length) {
+              sendError(res, 400, 99001, "Grant revocation takes no caller-supplied scope.");
+              return;
+            }
+            sendJson(res, 200, releaseStore.revokeGrant(decodeURIComponent(grantMatch[1]), { operatorId: authenticatedOperator }));
+            return;
+          }
+          sendError(res, 404, 99404, "No such evidence-release resource.");
+        } catch (error) {
+          const message = String(error?.message ?? error).slice(0, 300);
+          sendError(res, /not found/u.test(message) ? 404 : /revision changed|already|expired/u.test(message) ? 409 : 400,
+            /not found/u.test(message) ? 99404 : /revision changed|already|expired/u.test(message) ? 99409 : 99400, message);
         }
         return;
       }
@@ -631,6 +814,84 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
           return;
         }
 
+        if (method === "POST" && path === "/v3/capabilities/revoke") {
+          const body = await readBody(req) ?? {};
+          const allowedFields = new Set(["capability_id", "version", "origin", "environment_id", "application_id", "principal_id", "reason_code"]);
+          if (!body || typeof body !== "object" || Array.isArray(body)
+            || Object.keys(body).some(key => !allowedFields.has(key))
+            || [...allowedFields].some(key => !Object.hasOwn(body, key))) {
+            sendError(res, 400, 99001, "Capability revocation requires the exact registered scope and a reason code.");
+            return;
+          }
+          const revoke = capabilityService?.revoke
+            ? (identity, options) => capabilityService.revoke(identity, options)
+            : capabilityRegistry?.revoke
+              ? (identity, options) => capabilityRegistry.revoke(identity, options)
+              : null;
+          if (!revoke) {
+            sendError(res, 503, 99503, "Capability revocation is unavailable on this server.");
+            return;
+          }
+          const result = await revoke({
+            capabilityId: body.capability_id,
+            capabilityVersion: body.version,
+            origin: body.origin,
+            environmentId: body.environment_id,
+            applicationId: body.application_id,
+            principalId: body.principal_id
+          }, { reasonCode: body.reason_code });
+          if (result.status === "not_found") {
+            sendError(res, 404, 99404, "No active capability matches the exact supplied scope.");
+            return;
+          }
+          sendJson(res, 200, result);
+          return;
+        }
+
+        if (method === "POST" && path === "/v3/capabilities/network/discover") {
+          if (!executorReady || typeof navigationRunner.discoverObservedApis !== "function") {
+            sendError(res, 503, 99503, "Observed API discovery is unavailable on this server.");
+            return;
+          }
+          const input = await readBody(req) ?? {};
+          const result = await navigationRunner.discoverObservedApis({ input, req, templateId: "observed-api-discovery", taskId: randomUUID() });
+          sendJson(res, 200, result);
+          return;
+        }
+
+        const inspectObservedApiMatch = method === "POST" && path.match(/^\/v3\/capabilities\/network\/candidates\/([0-9a-f-]{36})\/inspect$/);
+        if (inspectObservedApiMatch) {
+          if (!executorReady || typeof navigationRunner.inspectObservedApi !== "function") {
+            sendError(res, 503, 99503, "Observed API inspection is unavailable on this server.");
+            return;
+          }
+          const input = await readBody(req) ?? {};
+          const result = await navigationRunner.inspectObservedApi(inspectObservedApiMatch[1], {
+            input,
+            req,
+            targetId: input.target_id,
+            templateId: "observed-api-inspection",
+            taskId: randomUUID()
+          });
+          sendJson(res, 200, result);
+          return;
+        }
+
+        const qualifyObservedApiMatch = method === "POST" && path.match(/^\/v3\/capabilities\/network\/candidates\/([0-9a-f-]{36})\/qualify$/);
+        if (qualifyObservedApiMatch) {
+          if (!executorReady || typeof navigationRunner.qualifyObservedApi !== "function") {
+            sendError(res, 503, 99503, "Observed API qualification is unavailable on this server.");
+            return;
+          }
+          const body = await readBody(req) ?? {};
+          const result = await navigationRunner.qualifyObservedApi(qualifyObservedApiMatch[1], {
+            variants: body.variants ?? 30,
+            ...(req.signal ? { signal: req.signal } : {})
+          }, { req });
+          sendJson(res, 200, result);
+          return;
+        }
+
         if (method === "POST" && path === "/v3/capabilities/discover") {
           if (!executorReady || typeof navigationRunner.discoverCapabilities !== "function") {
             sendError(res, 503, 99503, "Capability discovery is unavailable on this server.");
@@ -638,6 +899,31 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
           }
           const input = await readBody(req) ?? {};
           const result = await navigationRunner.discoverCapabilities({ input, req, templateId: "capability-discovery", taskId: randomUUID() });
+          sendJson(res, 200, result);
+          return;
+        }
+
+        if (method === "POST" && path === "/v3/capabilities/read") {
+          if (!executorReady || typeof navigationRunner.readObservedRecords !== "function") {
+            sendError(res, 503, 99503, "Ephemeral read-only extraction is unavailable on this server.");
+            return;
+          }
+          const body = await readBody(req) ?? {};
+          const allowed = new Set(["candidate_id", "fields", "max_records", "unique_by"]);
+          if (!body || typeof body !== "object" || Array.isArray(body)
+            || Object.keys(body).some(key => !allowed.has(key))
+            || !Array.isArray(body.fields) || body.fields.length < 1 || body.fields.length > 32
+            || (body.max_records !== undefined && (!Number.isInteger(body.max_records) || body.max_records < 1 || body.max_records > 1000))
+            || (body.unique_by !== undefined && (!Array.isArray(body.unique_by) || body.unique_by.length > 8))) {
+            sendError(res, 400, 99001, "Read-only extraction requires bounded fields, max_records, and unique_by values.");
+            return;
+          }
+          const result = await navigationRunner.readObservedRecords({
+            ...(body.candidate_id ? { candidateId: body.candidate_id } : {}),
+            requestedFields: body.fields,
+            maxRecords: body.max_records ?? 100,
+            uniqueBy: body.unique_by ?? []
+          }, { input: body, req, templateId: "ephemeral-page-data-read", taskId: randomUUID() });
           sendJson(res, 200, result);
           return;
         }
@@ -742,7 +1028,22 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
 
         // ── GET /v3/bots/runs ──
         if (method === "GET" && path === `${API_PREFIX}/runs`) {
-          sendJson(res, 200, store.list(parseInt(query.page ?? "1", 10), parseInt(query.limit ?? "10", 10)));
+          const result = store.list(parseInt(query.page ?? "1", 10), parseInt(query.limit ?? "10", 10));
+          sendJson(res, 200, {
+            ...result,
+            items: result.items.map(task => {
+              const template = findTemplate(task.template_id);
+              return {
+                task_id: task.task_id,
+                template_id: task.template_id,
+                status: task.status,
+                input: projectInput(task.input, template?.input_schema),
+                created_at: task.created_at,
+                updated_at: task.updated_at,
+                finished_at: task.finished_at ?? null
+              };
+            })
+          });
           return;
         }
 
@@ -759,6 +1060,10 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
 
       sendError(res, 404, 99404, `No static resource ${path.replace(/^\//, "")}.`);
     } catch (error) {
+      if (error?.code === "intervention_store_unavailable") {
+        sendError(res, 503, 99503, "intervention_store_unavailable");
+        return;
+      }
       sendError(res, 500, 99500, String(error.message ?? error).slice(0, 500));
     }
   });
@@ -769,7 +1074,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
     async start() {
       await store.init();
       await ensureRunStateStore();
-      await interventionStore.init().catch(() => {});
+      await ensureInterventionStoreReady();
       return new Promise((resolvePromise, reject) => {
         server.listen(port, host, () => {
           const address = server.address();
@@ -786,6 +1091,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, navigationR
       await lifecycle.stopAll();
       return new Promise(resolvePromise => server.close(() => {
         decisionRuntime?.close();
+        if (ownsEvidenceReleaseStore) evidenceReleaseStore?.close();
         resolvePromise();
       }));
     }
@@ -835,7 +1141,7 @@ async function handleCreateRun(req, res, { templateRun, botRun, path, executorRe
     }
   }
 
-  const task = store.create(id, body.input, templateRun ? null : id);
+  const task = store.create(id, body.input, templateRun ? null : id, template.input_schema);
   store.update(task.task_id, { status: "queued" });
   await store.persist(task.task_id);
   diagnostics.bump("runs.created");

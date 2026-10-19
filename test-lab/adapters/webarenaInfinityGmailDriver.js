@@ -40,6 +40,7 @@ export function createWebArenaInfinityGmailExtractionDriver({
     let owned = null;
     let runStateStore = null;
     let targetLease = null;
+    let failureStage = "browser_launch";
     try {
       owned = await launchBrowser({
         initialUrl: targetBinding.entryUrl,
@@ -49,6 +50,7 @@ export function createWebArenaInfinityGmailExtractionDriver({
         preserveProfile: false,
         reuseExisting: false
       });
+      failureStage = "target_lease";
       runStateStore = new RunStateStore(stateDirectory);
       await runStateStore.init();
       targetLease = await acquireBrowserTargetLease(runStateStore, owned.session, automationRunId);
@@ -65,16 +67,18 @@ export function createWebArenaInfinityGmailExtractionDriver({
           && allowedSourceKeys.has(field.sourceKey)
           ? "public" : null
       });
+      failureStage = "extraction_discovery";
       const discovery = await capabilityService.discover({ session: owned.session, environment, principalId });
       const candidates = discovery.candidates.filter(candidate => candidate.kind === "visible_record_group"
         && FIELD_SOURCES.every(field => candidate.fields.some(source => source.sourceKey === field.sourceKey)));
-      if (candidates.length !== 1) return { status: "failed", reasonCode: "visible_inbox_record_group_not_unique" };
+      if (candidates.length !== 1) return { status: "failed", reasonCode: "extraction_discovery_failed", detailCode: "visible_inbox_record_group_not_unique" };
       const expectedRecords = candidates[0].visibleRowCount;
       if (!Number.isInteger(expectedRecords) || expectedRecords < 2 || expectedRecords > 20) {
-        return { status: "failed", reasonCode: "visible_inbox_record_count_out_of_scope" };
+        return { status: "failed", reasonCode: "extraction_discovery_failed", detailCode: "visible_inbox_record_count_out_of_scope" };
       }
 
-      const compiled = capabilityService.compile({
+      failureStage = "qualification";
+      const compiled = await capabilityService.compile({
         candidateId: candidates[0].candidateId,
         capabilityId: "webarena.gmail.inbox",
         capabilityVersion: 1,
@@ -88,11 +92,12 @@ export function createWebArenaInfinityGmailExtractionDriver({
         completionPolicy: "exact_count",
         uniqueBy: ["subject"]
       });
-      const qualification = await capabilityService.qualify(compiled.recipeId, { variants: 30, principalId, signal });
+      const qualification = await capabilityService.qualify(compiled.recipeId, { variants: 30, session: owned.session, environment, principalId, signal });
       if (qualification.status !== "qualified") {
-        return { status: "failed", reasonCode: qualification.reasonCode ?? "capability_qualification_failed" };
+        return { status: "failed", reasonCode: "qualification_failed", detailCode: qualification.reasonCode ?? "capability_qualification_failed" };
       }
 
+      failureStage = "workflow";
       const runner = new TestRunner({
         session: owned.session,
         environment,
@@ -125,13 +130,22 @@ export function createWebArenaInfinityGmailExtractionDriver({
       const succeeded = receipt.status === "PASSED" && verification.status === "complete";
       return Object.freeze({
         status: succeeded ? "succeeded" : "failed",
-        reasonCode: succeeded ? null : "active_tab_extraction_incomplete",
+        reasonCode: succeeded ? null : receipt.status !== "PASSED" ? "workflow_failed" : "extraction_incomplete",
+        detailCode: succeeded ? null : receipt.status !== "PASSED" ? "workflow_receipt_not_passed" : verification.reasonCode ?? "extraction_contract_incomplete",
+        scope: output?.scope ?? null,
+        schema: output?.schema ?? null,
         records: output?.records ?? [],
+        fieldProvenance: output?.fieldProvenance ?? [],
         completeness: output?.completeness ?? "incomplete",
         verification: output?.verification ?? null
       });
     } catch (error) {
-      return { status: "failed", reasonCode: error?.name === "AbortError" ? "benchmark_canceled" : "active_tab_extraction_failed" };
+      const reasonCode = error?.name === "AbortError" ? "benchmark_canceled"
+        : failureStage === "browser_launch" ? "browser_launch_failed"
+          : failureStage === "target_lease" ? "target_lease_failed"
+            : failureStage === "extraction_discovery" ? "extraction_discovery_failed"
+              : failureStage === "qualification" ? "qualification_failed" : "workflow_failed";
+      return { status: "failed", reasonCode, detailCode: typeof error?.kind === "string" ? error.kind : error?.name ?? "Error" };
     } finally {
       try { await owned?.close(); }
       finally {

@@ -14,18 +14,15 @@
  * --no-sandbox, and the debug port Chrome assigns (port 0); only
  * resources owned by the runner are terminated on cleanup.
  */
-import { NavigationEngine } from "../navigation/engine.js";
+import { ApplicationRunService } from "../navigation/applicationRunService.js";
 import { BrowserSession } from "../browser/session.js";
 import { TaskJournal } from "../state/journal.js";
 import { generateOutputFiles } from "./output-files.js";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { withTargetExecutionLease } from "../testing/runState.js";
-import { TestRunner } from "../testing/runner.js";
-import { DiagnosticCollector } from "../diagnostics/collector.js";
-import { DiagnosticCorrelator } from "../diagnostics/correlator.js";
 import { RUN_STATUS } from "../testing/schema.js";
+import { isExplicitReadWorkflowRequest } from "../navigation/taskIntentResolver.js";
 import { projectExtractionOutputs } from "../extraction/outputRelease.js";
 
 function abortedMarker(signal) {
@@ -120,24 +117,24 @@ export function createNavigationRunner({
           const resolvedPrincipalId = principalId ?? (typeof resolvePrincipal === "function"
             ? await resolvePrincipal({ session, goal, input, templateId, taskId })
             : "local_api_automation");
-          const collector = new DiagnosticCollector({ runId: taskId });
-          const runner = new TestRunner({
+          const { runner, runPromise } = new ApplicationRunService({ runStateStore }).startWorkflowRun({
             session,
-            collector,
-            correlator: new DiagnosticCorrelator(),
+            workflow,
+            runId: taskId,
             signal,
-            environment,
-            decisionRuntime: engineOptions.decisionRuntime ?? null,
-            qualificationService: engineOptions.qualificationService ?? null,
-            capabilityRegistry,
-            capabilityService,
-            authorizeExtractionField,
-            authorizeExtractionRelease,
-            runStateStore,
-            principalId: resolvedPrincipalId,
-            profileId: environment?.profileId ?? environment?.id ?? environment?.environmentId ?? null
+            runnerOptions: {
+              environment,
+              decisionRuntime: engineOptions.decisionRuntime ?? null,
+              qualificationService: engineOptions.qualificationService ?? null,
+              capabilityRegistry,
+              capabilityService,
+              authorizeExtractionField,
+              authorizeExtractionRelease,
+              principalId: resolvedPrincipalId,
+              profileId: environment?.profileId ?? environment?.id ?? environment?.environmentId ?? null
+            }
           });
-          const receipt = await runner.run(workflow, { runId: taskId });
+          const receipt = await runPromise;
           abortError ??= abortedMarker(signal);
           if (abortError) throw abortError;
           let status = receipt.status === RUN_STATUS.PASSED ? "succeeded"
@@ -187,20 +184,40 @@ export function createNavigationRunner({
         }
         const journalPath = join(journalDir, `${taskId}.json`);
         const journal = new TaskJournal(journalPath);
+        let navigationEnvironment = environmentBinding ?? null;
+        let navigationPrincipalId = principalId ?? null;
+        const effectivePlannerMode = plannerMode ?? engineOptions.plannerMode ?? (engineOptions.planner ? "deterministic" : "auto");
+        if ((effectivePlannerMode === "workflow"
+          || (effectivePlannerMode === "auto" && isExplicitReadWorkflowRequest(goal))) && capabilityRegistry) {
+          navigationEnvironment ??= typeof resolveEnvironmentBinding === "function"
+            ? await resolveEnvironmentBinding({ session, goal, input, templateId, taskId, signal }) : null;
+          navigationPrincipalId ??= typeof resolvePrincipal === "function"
+            ? await resolvePrincipal({ session, goal, input, templateId, taskId }) : "local_api_automation";
+        }
 
-        const result = await withTargetExecutionLease(runStateStore, session, `api-navigation-${taskId}`, async lease => {
-          const engine = new NavigationEngine(session, {
+        const result = await new ApplicationRunService({ runStateStore }).runNavigation({
+          session,
+          goal,
+          journal,
+          signal,
+          workflowIntent,
+          inputBindings: input && typeof input === "object" && !Array.isArray(input) ? input : {},
+          workflowInputs: input && typeof input === "object" && !Array.isArray(input) ? input : {},
+          leaseOwner: `api-navigation-${taskId}`,
+          engineOptions: {
             executionMode: engineOptions.executionMode ?? "standalone",
-            plannerMode: plannerMode ?? engineOptions.plannerMode ?? "deterministic",
-            journal,
+            plannerMode: plannerMode ?? engineOptions.plannerMode ?? (engineOptions.planner ? "deterministic" : "auto"),
             maxActions: engineOptions.maxActions ?? 8,
             maxRecoveries: engineOptions.maxRecoveries ?? 1,
             maxScrolls: engineOptions.maxScrolls ?? 5,
-            signal,
             ...engineOptions,
-            assertExecutionLease: lease.assertCurrent
-          });
-          return await engine.run(goal, { workflowIntent });
+            environment: navigationEnvironment ?? engineOptions.environment ?? null,
+            capabilityRegistry,
+            capabilityService,
+            principalId: navigationPrincipalId,
+            authorizeExtractionField,
+            authorizeExtractionRelease
+          }
         });
         abortError ??= abortedMarker(signal);
         if (abortError) throw abortError;
@@ -250,6 +267,42 @@ export function createNavigationRunner({
         return await capabilityService.discover({ session, environment, principalId });
       });
     },
+    async readObservedRecords(input = {}, context = {}) {
+      if (!capabilityService?.readObservedRecords) throw new Error("Ephemeral read-only extraction is not configured.");
+      return await withAuthorizedSession(context, async session => {
+        const environment = typeof resolveEnvironmentBinding === "function"
+          ? await resolveEnvironmentBinding({ ...context, session }) : null;
+        const principalId = typeof resolvePrincipal === "function"
+          ? await resolvePrincipal({ ...context, session }) : "local_api_automation";
+        return await capabilityService.readObservedRecords({ ...input, session, environment, principalId });
+      });
+    },
+    async discoverObservedApis(context = {}) {
+      if (!capabilityService?.discoverObservedApis) throw new Error("Observed API discovery is not configured.");
+      return await withAuthorizedSession(context, async session => {
+        const environment = typeof resolveEnvironmentBinding === "function"
+          ? await resolveEnvironmentBinding({ ...context, session }) : null;
+        const principalId = typeof resolvePrincipal === "function"
+          ? await resolvePrincipal({ ...context, session }) : "local_api_automation";
+        return await capabilityService.discoverObservedApis({ session, environment, principalId });
+      });
+    },
+    async inspectObservedApi(candidateId, context = {}) {
+      if (!capabilityService?.inspectObservedApi) throw new Error("Observed API inspection is not configured.");
+      return await withAuthorizedSession(context, async session => {
+        const environment = typeof resolveEnvironmentBinding === "function"
+          ? await resolveEnvironmentBinding({ ...context, session }) : null;
+        const principalId = typeof resolvePrincipal === "function"
+          ? await resolvePrincipal({ ...context, session }) : "local_api_automation";
+        return await capabilityService.inspectObservedApi(candidateId, { session, environment, principalId });
+      });
+    },
+    async qualifyObservedApi(candidateId, options = {}, context = {}) {
+      if (!capabilityService?.qualifyObservedApi) throw new Error("Observed API qualification is not configured.");
+      const principalId = typeof resolvePrincipal === "function"
+        ? await resolvePrincipal(context) : "local_api_automation";
+      return await capabilityService.qualifyObservedApi(candidateId, { ...options, principalId });
+    },
     async compileCapability(input, context = {}) {
       if (!capabilityService?.compile) throw new Error("Capability compilation is not configured.");
       return await withAuthorizedSession(context, async session => {
@@ -262,9 +315,13 @@ export function createNavigationRunner({
     },
     async qualifyCapability(recipeId, options = {}, context = {}) {
       if (!capabilityService?.qualify) throw new Error("Capability qualification is not configured.");
-      const principalId = typeof resolvePrincipal === "function"
-        ? await resolvePrincipal(context) : "local_api_automation";
-      return await capabilityService.qualify(recipeId, { ...options, principalId });
+      return await withAuthorizedSession(context, async session => {
+        const environment = typeof resolveEnvironmentBinding === "function"
+          ? await resolveEnvironmentBinding({ ...context, session }) : null;
+        const principalId = typeof resolvePrincipal === "function"
+          ? await resolvePrincipal({ ...context, session }) : "local_api_automation";
+        return await capabilityService.qualify(recipeId, { ...options, session, environment, principalId });
+      });
     },
     listCapabilities() {
       return capabilityRegistry?.list?.() ?? [];
@@ -288,6 +345,14 @@ function buildOutput(result, input) {
   if (result.evidenceId) output.evidence_id = result.evidenceId;
   if (result.page?.extractedData) output.records = result.page.extractedData;
   if (result.records) output.records = result.records;
+  if (result.workflowOutputs && typeof result.workflowOutputs === "object" && !Array.isArray(result.workflowOutputs)) {
+    output.workflow_outputs = result.workflowOutputs;
+    const names = Object.keys(result.workflowOutputs);
+    if (names.length === 1 && Array.isArray(result.workflowOutputs[names[0]]?.records) && !output.records) {
+      output.records = result.workflowOutputs[names[0]].records;
+      output.schema = result.workflowOutputs[names[0]].schema;
+    }
+  }
   return output;
 }
 

@@ -2,6 +2,7 @@ import { evaluateCompletion, externalRunState, INTERVENTION_STATE } from "../../
 import { isWaitingRunStatus, RUN_STATUS, STEP_STATUS } from "../schema.js";
 import { deriveRunStatus, STEP_STATUS_EXTENDED } from "../receipts.js";
 import { deriveWorkflowRunStatus } from "../execution/workflowScheduler.js";
+import { resolveObservedApplication } from "../../environments/model.js";
 
 /** Owns durable human handoffs and evidence-gated workflow continuation. */
 export class InterventionCoordinator {
@@ -74,6 +75,10 @@ export class InterventionCoordinator {
       });
       return { status: STEP_STATUS.BLOCKED, reason: fallback };
     }
+    const authenticationRealm = condition?.realm ?? step.intervention?.realm ?? null;
+    const observedApplication = this.environment && this.session?.target?.url
+      ? resolveObservedApplication(this.environment, this.session.target.url, { authenticationRealm })
+      : { status: "unmatched" };
     const record = await this.interventions.create({
       runId: receipt.runId,
       stepId: step.id,
@@ -83,9 +88,9 @@ export class InterventionCoordinator {
       requiredHumanAction,
       completionCondition: condition,
       environmentId: this.environment?.environmentId ?? step.intervention?.environmentId ?? null,
-      authenticationRealm: condition?.realm ?? step.intervention?.realm ?? null,
+      authenticationRealm,
       targetId: this.session?.target?.id ?? null,
-      applicationId: this.environment?.applications?.find(application => application.authenticationRealm === condition?.realm)?.applicationId ?? null,
+      applicationId: observedApplication.status === "matched" ? observedApplication.applicationId : null,
       ...(step.intervention?.ttlMs ? { ttlMs: step.intervention.ttlMs } : {})
     });
     receipt.recordStep({
@@ -168,7 +173,10 @@ export class InterventionCoordinator {
           const state = await this.runStateStore.getFresh(receipt.runId);
           const environmentId = this.environment?.environmentId ?? null;
           const targetId = this.session?.target?.id ?? null;
-          const authenticationRealm = this.environment?.applications?.[0]?.authenticationRealm ?? null;
+          const application = this.session?.target?.url && this.environment
+            ? resolveObservedApplication(this.environment, this.session.target.url)
+            : { status: "unmatched" };
+          const authenticationRealm = application.status === "matched" ? application.authenticationRealm : state?.authenticationRealm ?? null;
           if (!state || state.runId !== receipt.runId || state.environmentId !== environmentId
             || (state.target?.targetId ?? null) !== targetId
             || state.authenticationRealm !== authenticationRealm
@@ -192,6 +200,11 @@ export class InterventionCoordinator {
             principalId: this.principalId,
             profileId: this.profileId,
             policyVersion: this.policyVersion
+          });
+          await this.runStateStore.update(receipt.runId, {
+            status: "running",
+            currentStepId: suspendedStep.stepId,
+            pendingInterventionId: null
           });
         }
         receipt.status = RUN_STATUS.RUNNING;

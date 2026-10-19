@@ -38,7 +38,9 @@ export class QualificationStepHandler {
     const qualificationStatus = result?.status ?? "unavailable";
     const required = step.required === true;
     const stepStatus = required && qualificationStatus !== "qualified" ? STEP_STATUS.FAIL : STEP_STATUS.PASS;
-    const reason = qualificationStatus === "qualified" ? "Candidate strategy qualified against the independent fixture oracle."
+    const reason = qualificationStatus === "qualified" && result?.qualification?.level === "resolver"
+      ? "Resolver strategy passed synthetic DOM variants; no independent application outcome was tested."
+      : qualificationStatus === "qualified" ? `Candidate strategy qualified at the ${result?.qualification?.level ?? "unknown"} level against an independent fixture outcome.`
       : qualificationStatus === "not_qualified" ? "Candidate strategy did not satisfy the independent fixture oracle."
         : qualificationStatus === "inconclusive" ? "Fixture qualification was inconclusive; actual task execution remains governed by its own policy and evidence."
           : "Fixture qualification was unavailable; actual task execution remains governed by its own policy and evidence.";
@@ -47,6 +49,15 @@ export class QualificationStepHandler {
       required,
       ...(typeof result?.qualificationId === "string" ? { qualificationId: result.qualificationId } : {}),
       ...(typeof result?.reasonCode === "string" ? { reasonCode: result.reasonCode } : {}),
+      ...(result?.qualification ? {
+        qualificationLevel: result.qualification.level,
+        providerIdentity: result.qualification.providerIdentity,
+        scenarioSeed: result.qualification.scenarioSeed,
+        sourceRevision: result.qualification.sourceRevision,
+        oracleReference: result.qualification.oracleReference,
+        independentApplicationOutcome: result.qualification.independentApplicationOutcome,
+        cleanupResult: result.cleanupResult
+      } : {}),
       evidenceRefs: (result?.evidenceRefs ?? []).filter(ref => typeof ref === "string").slice(0, 32)
     };
     receipt.recordStep({

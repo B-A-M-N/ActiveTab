@@ -78,6 +78,12 @@ test("fixture catalog validates and derives reproducible semantic UI variants", 
   const invalid = structuredClone(baseScenario);
   invalid.application.variants.modelSelector = "unknown_widget";
   assert.throws(() => deriveUiVariant(invalid), /Unsupported modelSelector/u);
+  const falseResolverClaim = structuredClone(baseScenario);
+  falseResolverClaim.qualification.level = "resolver";
+  assert.ok(validateScenario(falseResolverClaim).errors.some(error => error.includes("Resolver qualification cannot claim")));
+  const live = structuredClone(baseScenario);
+  live.qualification.level = "live";
+  assert.ok(validateScenario(live).errors.some(error => error.includes("separately authorized live-target runtime")));
 });
 
 test("FI Agent Twin separates auth realms, persists asynchronous runs, and keeps the oracle out of the driver binding", async t => {

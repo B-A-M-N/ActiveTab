@@ -1,9 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { createCloudAgentTaskPlan, CLOUD_AGENT_TASK_ROLES, verifyCloudAgentRunOutcome } from "../src/integrations/freeinference/cloudAgentWorkflow.js";
 import { buildEnvironmentBinding } from "../src/environments/model.js";
 import { TestRunner } from "../src/testing/runner.js";
 import { createRunStateFixture } from "./runStateFixture.js";
+import { isBoundVisualEvidence } from "../src/navigation/visualEvidence.js";
 
 const profile = {
   profile_id: "cloud-agent-staging",
@@ -20,6 +23,7 @@ const profile = {
     }]
   }
 };
+const visualFixtureBase64 = readFileSync(resolve("docs/assets/first-run.jpg")).toString("base64");
 
 // Synthetic observation fixture. This models the staging form shape; it is not
 // loaded from or evidence about the live FreeInference product.
@@ -157,11 +161,27 @@ test("Jev service refusal falls back to policy and the workflow uses exact model
   const dispatched = [];
   const reviews = [];
   const skippedReviews = [];
-  let current = { ...page, pageChangeFingerprint: "composer" };
+  const routes = [];
+  let current = {
+    ...page,
+    documentGeneration: 1,
+    viewport: { width: 780, height: 437 },
+    visualEvidence: {
+      evidenceId: page.evidenceId,
+      targetId: page.targetId,
+      documentGeneration: 1,
+      viewport: { width: 780, height: 437 },
+      screenshotBase64: visualFixtureBase64
+    },
+    pageChangeFingerprint: "composer"
+  };
   const session = {
     target: { id: page.targetId, url: page.page.url },
     attached: true,
-    async observe() { return { ...structuredClone(current), evidenceId: `runtime-${dispatched.length}-${Date.now()}` }; },
+    async observe() {
+      const evidenceId = `runtime-${dispatched.length}-${Date.now()}`;
+      return { ...structuredClone(current), evidenceId, visualEvidence: { ...current.visualEvidence, evidenceId } };
+    },
     async selectOption(candidate, value) { dispatched.push(["select", candidate.identity, value]); return { dispatched: true }; },
     async fillField(candidate, value) { dispatched.push(["fill", candidate.identity, value]); return { dispatched: true }; },
     async click(candidate) {
@@ -174,18 +194,23 @@ test("Jev service refusal falls back to policy and the workflow uses exact model
   };
 
   const decisionRuntime = {
+    jevClient: { allowImages: true },
     startEpisode({ runId }) { return { episodeId: `episode-${runId}` }; },
     completeEpisode() {},
     async reviewBeforeAction(input) {
       reviews.push(input);
       return { decisionId: input.decisionId, jevFailureCode: "refusal", authorizesOperation: false };
     },
+    recordInferenceRoute(input) { routes.push(input); },
     recordReviewSkipped(input) { skippedReviews.push(input); },
     recordPolicy() {},
     reserveExecution() {},
     recordDispatch() {},
     recordObserved() {}
   };
+  const preflightObservation = await session.observe();
+  assert.equal(decisionRuntime.jevClient.allowImages, true);
+  assert.equal(isBoundVisualEvidence(preflightObservation, preflightObservation.visualEvidence), true);
   const receipt = await new TestRunner({
     session,
     environment: buildEnvironmentBinding(profile),
@@ -198,6 +223,7 @@ test("Jev service refusal falls back to policy and the workflow uses exact model
   assert.deepEqual(reviews.map(item => item.targetRole), [CLOUD_AGENT_TASK_ROLES.SUBMIT_TASK]);
   assert.equal(skippedReviews.length, 2);
   assert.deepEqual(skippedReviews.map(item => item.operation), ["select", "fill"]);
+  assert.deepEqual(routes.map(item => item.route), ["deterministic", "deterministic", "jev_only"]);
   assert.equal(receipt.steps[0].status, "PASS");
   assert.equal(receipt.steps[1].status, "PASS");
   assert.equal(receipt.steps[2].status, "UNCERTAIN");

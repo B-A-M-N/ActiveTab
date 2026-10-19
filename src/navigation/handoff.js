@@ -16,6 +16,9 @@ export function classifyHumanHandoff(observation) {
   if (labels.some(label => ANTI_AUTOMATION.test(label))) {
     return { category: "anti_automation", reason: "An anti-automation challenge is visible. Complete it manually, then resume the task." };
   }
+  if ((observation.networkSignals ?? []).some(signal => signal?.kind === "http_rate_limit" && signal.status === 429)) {
+    return { category: "rate_limited", reason: "The site returned HTTP 429. Stop requests and wait for the site's limit window before resuming." };
+  }
 
   let pathname = "";
   try { pathname = new URL(observation.page?.url).pathname; } catch { /* non-URL page */ }

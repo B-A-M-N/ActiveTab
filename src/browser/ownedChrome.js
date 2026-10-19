@@ -250,7 +250,7 @@ export async function launchOwnedChrome({
         session.persistent = true;
 
         // Recheck after CDP attachment to close the target-list/attach race.
-        const observation = await session.observe();
+        const observation = await session.observe({ profile: "lightweight" });
         let observedOrigin = null;
         try { observedOrigin = new URL(observation?.page?.url ?? "").origin; } catch { /* rejected below */ }
         if (!observedOrigin || !existingOriginAllowlist.has(observedOrigin)) {
@@ -438,7 +438,7 @@ export async function launchOwnedChrome({
     const deadline = Date.now() + 20_000;
     let observed = null;
     while (Date.now() < deadline) {
-      observed = await session.observe().catch(() => null);
+      observed = await session.observe({ profile: "lightweight" }).catch(() => null);
       const url = observed?.page?.url;
       if (url && url !== "about:blank" && url !== "chrome-error://chromewebdata/") {
         try {
@@ -488,37 +488,59 @@ export async function launchOwnedChrome({
   async function close() {
     if (closed) return closeResult;
     closed = true;
-    const outcome = { graceful: false, forced: false, exitCode: null, profileRemoved: false, profilePreserved: preserveProfile, browserPreserved: false, error: null };
+    const outcome = { graceful: false, forced: false, processStopped: false, exitCode: null, profileRemoved: false, profilePreserved: preserveProfile, browserPreserved: false, error: null };
+    const processStopped = () => Boolean(chromeProcess
+      && (chromeProcess.exitCode !== null || chromeProcess.signalCode !== null));
+    const waitForExit = async timeoutMs => {
+      if (processStopped()) return true;
+      await Promise.race([
+        once(chromeProcess, "exit").catch(() => {}),
+        new Promise(resolve => setTimeout(resolve, timeoutMs))
+      ]);
+      return processStopped();
+    };
     try {
-      // Close the CDP session first (this also detaches owned targets).
-      if (session) await session.close().catch(() => {});
       if (keepBrowserOpen) {
+        if (session) await session.close().catch(() => {});
         chromeProcess?.unref();
         outcome.graceful = true;
         outcome.browserPreserved = true;
-      } else if (chromeProcess && chromeProcess.exitCode === null) {
-        chromeProcess.kill("SIGTERM");
-        const gracefulDeadline = Date.now() + 5_000;
-        while (Date.now() < gracefulDeadline && chromeProcess.exitCode === null) {
-          await new Promise(r => setTimeout(r, 100));
+      } else {
+        // Ask the owned browser to close through its browser-level CDP client
+        // before falling back to process signals. This avoids routine forced
+        // termination and lets Chrome flush its temporary profile cleanly.
+        if (session && !processStopped()) {
+          await Promise.race([
+            Promise.resolve(session.target?.browserClient?.send?.("Browser.close")).catch(() => {}),
+            new Promise(resolve => setTimeout(resolve, 2_000))
+          ]);
         }
-        if (chromeProcess.exitCode === null) {
+        if (session) await session.close().catch(() => {});
+        let stopped = processStopped();
+        if (chromeProcess && !stopped) stopped = await waitForExit(5_000);
+        if (chromeProcess && !stopped) {
+          chromeProcess.kill("SIGTERM");
+          stopped = await waitForExit(5_000);
+        }
+        if (chromeProcess && !stopped) {
           chromeProcess.kill("SIGKILL");
           outcome.forced = true;
-          await Promise.race([once(chromeProcess, "exit"), new Promise(r => setTimeout(r, 3_000))]).catch(() => {});
+          stopped = await waitForExit(3_000);
         }
-        outcome.graceful = !outcome.forced;
+        outcome.processStopped = stopped;
+        outcome.graceful = stopped && !outcome.forced;
         outcome.exitCode = chromeProcess.exitCode;
-      } else {
-        outcome.exitCode = chromeProcess?.exitCode ?? null;
-        outcome.graceful = true;
+        if (chromeProcess && !stopped) outcome.error = "chrome_exit_unconfirmed";
       }
     } catch (error) {
       outcome.error = String(error?.message ?? error).slice(0, 300);
     } finally {
-      if (!preserveProfile) {
+      if (chromeProcess && processStopped()) outcome.processStopped = true;
+      if (!preserveProfile && (!chromeProcess || outcome.processStopped)) {
         try { await rm(profileDir, { recursive: true, force: true }); outcome.profileRemoved = true; }
         catch (error) { outcome.error = outcome.error ?? String(error?.message ?? error).slice(0, 300); }
+      } else if (!preserveProfile && !outcome.processStopped) {
+        outcome.error = outcome.error ?? "chrome_exit_unconfirmed";
       }
       closeResult = outcome;
     }

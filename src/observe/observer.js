@@ -1,22 +1,36 @@
 import { createHash, randomUUID } from "node:crypto";
 import { sanitizeUrl, sanitizeUrlAttribute, URL_ATTRIBUTES } from "../browser/urlPrivacy.js";
+import { createUtf8OffsetIndex, indexMarkdownDocument, inspectResponseBody, redactCredentialUrl, selectMarkdownRange, sliceUtf8View } from "./responseBodyInspector.js";
+import { MAX_RESPONSE_BODY_BYTES, MAX_RESPONSE_MARKDOWN_BYTES } from "./responseBodyShared.js";
+import { planJevImagePreparation } from "../decisions/imagePreparation.js";
+import { compileSemanticPageModel, rankInteractionCandidates } from "./semanticPageCompiler.js";
+import { buildDocumentIndex, documentIndexFor } from "./documentIndex.js";
 
 const STYLE_NAMES = ["display", "visibility", "opacity", "pointer-events", "position", "z-index"];
 const ACTIONABLE_TAGS = new Set(["A", "BUTTON", "INPUT", "SELECT", "TEXTAREA", "SUMMARY"]);
 const CONTEXT_CONTAINERS = new Set(["SECTION", "ARTICLE", "NAV", "ASIDE", "MAIN", "FORM"]);
 const MAX_SCROLL_TARGETS_PER_FRAME = 8;
 const DEFAULT_NETWORK_RESPONSE_BYTES = 32 * 1024;
-const MAX_NETWORK_RESPONSE_BYTES = 256 * 1024;
+const MAX_NETWORK_RESPONSE_CHUNK_BYTES = 256 * 1024;
+const DEFAULT_NETWORK_RESPONSE_TIMEOUT_MS = 8_000;
+const MAX_NETWORK_RESPONSE_TIMEOUT_MS = 15_000;
+const MAX_NETWORK_RESPONSE_INSPECTION_MS = 3_000;
+const NETWORK_RESPONSE_PROJECTION_CACHE_TTL_MS = 5 * 60_000;
+const NETWORK_RESPONSE_PROJECTION_CACHE_MAX_ENTRIES = 2;
+const NETWORK_RESPONSE_PROJECTION_CACHE_MAX_BYTES = 18 * 1024 * 1024;
+const NETWORK_RESPONSE_PROJECTION_CACHE_MAX_ENTRY_BYTES = 17 * 1024 * 1024;
+const MAX_NETWORK_RESPONSE_PAGE_CURSORS = 64;
 const FORBIDDEN_VALUE_ATTRIBUTES = new Set(["value", "placeholder"]);
 const VALUE_ROLES = new Set(["textbox", "searchbox", "combobox", "spinbutton", "slider", "progressbar"]);
 const MAX_RUNTIME_PATH_SEGMENTS = 8;
 const MAX_RUNTIME_PATH_SEGMENT_LENGTH = 128;
-const MAX_RUNTIME_VALUE_LENGTH = 4_096;
+const DEFAULT_RUNTIME_VALUE_CHUNK_LENGTH = 4_096;
+const MAX_RUNTIME_VALUE_CHUNK_LENGTH = 16_384;
 const MAX_RUNTIME_RECORD_BYTES = 512 * 1024;
 const MAX_RUNTIME_RECORDS_PER_EVIDENCE = 8;
 const MAX_RUNTIME_EVIDENCE_BYTES_PER_PAGE = 1024 * 1024;
-
-const RUNTIME_PATH_INSPECTOR = `function(path, failureMarker, includeSensitiveValues) {
+const OBSERVATION_PROFILES = new Set(["lightweight", "interaction", "structural", "visual"]);
+const RUNTIME_PATH_INSPECTOR = `function(path, failureMarker, includeSensitiveValues, valueOffset, valueChunkLength) {
   let current = this;
   for (let index = 0; index < path.length; index++) {
     if (current === null || (typeof current !== "object" && typeof current !== "function")) {
@@ -32,7 +46,27 @@ const RUNTIME_PATH_INSPECTOR = `function(path, failureMarker, includeSensitiveVa
   const type = current === null ? "null" : typeof current;
   if (type !== "object" && type !== "function") {
     if (!includeSensitiveValues) return failureMarker + ":primitive_redacted:" + type;
-    if (type === "string") return current.length > ${MAX_RUNTIME_VALUE_LENGTH} ? failureMarker + ":primitive_oversize:" + current.length : current;
+    if (type === "string") {
+      let start = Math.min(Math.max(0, valueOffset), current.length);
+      if (start > 0 && start < current.length) {
+        const currentUnit = current.charCodeAt(start);
+        const previousUnit = current.charCodeAt(start - 1);
+        if (currentUnit >= 0xdc00 && currentUnit <= 0xdfff && previousUnit >= 0xd800 && previousUnit <= 0xdbff) start--;
+      }
+      let end = Math.min(current.length, start + valueChunkLength);
+      if (end > start && end < current.length) {
+        const previousUnit = current.charCodeAt(end - 1);
+        const currentUnit = current.charCodeAt(end);
+        if (previousUnit >= 0xd800 && previousUnit <= 0xdbff && currentUnit >= 0xdc00 && currentUnit <= 0xdfff) end--;
+      }
+      return failureMarker + ":primitive_string_chunk:" + JSON.stringify({
+        value: current.slice(start, end),
+        valueOffset: start,
+        valueLength: current.length,
+        valueComplete: end >= current.length,
+        nextOffset: end
+      });
+    }
     if (type === "number" || type === "boolean" || type === "undefined" || type === "null") return current;
     return failureMarker + ":primitive_unavailable:" + type;
   }
@@ -76,6 +110,142 @@ function jsonByteLength(root) {
     }
   }
   return bytes;
+}
+
+function inlineMarkdown(value) {
+  const text = String(value ?? "unavailable").replace(/\r?\n/g, " ");
+  let maxTicks = 0;
+  for (const match of text.matchAll(/`+/g)) maxTicks = Math.max(maxTicks, match[0].length);
+  const fence = "`".repeat(maxTicks + 1);
+  return `${fence}${text}${fence}`;
+}
+
+function renderNetworkResponseMarkdown(request, requestEvidence, inspection) {
+  const cache = request.fromServiceWorker ? "service worker"
+    : request.fromDiskCache ? "disk cache"
+      : request.fromPrefetchCache ? "prefetch cache"
+        : request.connectionReused ? "reused connection" : "network";
+  const lines = [
+    "# Network response",
+    "",
+    `- Request: ${inlineMarkdown(`${request.method ?? "unavailable"} ${requestEvidence.url ?? "unavailable"}`)}`,
+    `- Status: ${inlineMarkdown(request.status)}`,
+    `- Resource type: ${inlineMarkdown(request.resourceType)}`,
+    `- Content type: ${inlineMarkdown(request.mimeType)}`,
+    `- Protocol: ${inlineMarkdown(request.protocol)}`,
+    `- Source: ${cache}`,
+    `- Duration: ${inlineMarkdown(requestEvidence.durationMs)} ms`,
+    `- Time to response: ${inlineMarkdown(requestEvidence.timeToResponseMs)} ms`,
+    `- Encoded bytes: ${inlineMarkdown(request.encodedDataLength)}`,
+    `- Decoded bytes observed: ${inlineMarkdown(request.decodedDataLength)}`,
+    `- Decoded data chunks: ${inlineMarkdown(request.dataChunkCount)}`,
+    `- Body interpretation: ${inlineMarkdown(`${inspection.format}${inspection.parseMode ? ` (${inspection.parseMode})` : ""}`)}`,
+    `- Recognized credential redactions: ${inlineMarkdown(inspection.credentialRedactions)}`,
+    `- Credential values: ${inspection.credentialValuesIncluded ? "included by explicit local request" : "redacted"}`,
+    "",
+    "## Response timing phases",
+    "",
+    "```json",
+    JSON.stringify(request.responseTiming ?? {}, null, 2),
+    "```",
+    "",
+    inspection.markdown
+  ];
+  return lines.join("\n");
+}
+
+function readSelectedResponseBody(client, requestId, { signal, timeoutMs }) {
+  if (signal?.aborted) return Promise.resolve({ status: "cancelled" });
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(result);
+    };
+    const onAbort = () => finish({ status: "cancelled" });
+    const timer = setTimeout(() => finish({ status: "timed_out" }), timeoutMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    Promise.resolve().then(() => client.send("Network.getResponseBody", { requestId }))
+      .then(response => finish({ status: "available", response }), () => finish({ status: "unavailable" }));
+  });
+}
+
+function estimateBase64DecodedBytes(value) {
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor(value.length * 3 / 4) - padding);
+}
+
+function instrumentCaptureClient(client, metrics) {
+  return {
+    send(method, ...args) {
+      metrics.cdpRoundTrips++;
+      const startedAt = Date.now();
+      if (method === "DOMSnapshot.captureSnapshot") metrics.domSnapshotCount++;
+      return Promise.resolve().then(() => client.send(method, ...args)).finally(() => {
+        const duration = Date.now() - startedAt;
+        metrics.totalCdpRoundTripMs += duration;
+        if (metrics.cdpRoundTripDurations.length < 2048) metrics.cdpRoundTripDurations.push(duration);
+      });
+    }
+  };
+}
+
+function percentile(values, fraction) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)];
+}
+
+function parentFrameIdFromTree(tree, childFrameId, parentId = null) {
+  const node = tree?.frameTree ?? tree;
+  if (!node?.frame?.id) return null;
+  if (node.frame.id === childFrameId) return parentId;
+  for (const child of node.childFrames ?? []) {
+    const found = parentFrameIdFromTree(child, childFrameId, node.frame.id);
+    if (found) return found;
+  }
+  return null;
+}
+
+async function captureFrameGeometry(session, frame, childFrameId, frameViewport, rootClient, metrics) {
+  const parentFrame = [...(session.frameSessions?.values?.() ?? [])].find(item => item.sessionId === frame.parentSessionId);
+  const isRootParent = frame.parentSessionId === session.sessionId;
+  const parentClient = parentFrame?.client ?? (isRootParent ? rootClient : null);
+  if (!parentClient) return { status: "unavailable", reason: "parent_frame_session_unavailable" };
+  try {
+    const client = instrumentCaptureClient(parentClient, metrics);
+    let parentFrameId = frame.parentFrameId;
+    if (!parentFrameId) {
+      const parentTree = await client.send("Page.getFrameTree");
+      parentFrameId = parentFrameIdFromTree(parentTree, childFrameId);
+    }
+    if (!parentFrameId) return { status: "unavailable", reason: "parent_frame_identity_unavailable" };
+    const owner = await client.send("DOM.getFrameOwner", { frameId: childFrameId });
+    if (!Number.isInteger(owner?.backendNodeId)) return { status: "unavailable", reason: "frame_owner_unavailable" };
+    const box = await client.send("DOM.getBoxModel", { backendNodeId: owner.backendNodeId });
+    const quad = box?.model?.content;
+    if (!Array.isArray(quad) || quad.length !== 8 || !quad.every(Number.isFinite)) {
+      return { status: "unavailable", reason: "frame_owner_geometry_unavailable" };
+    }
+    return {
+      status: "available",
+      frameTargetId: frame.targetId,
+      frameId: frame.frameId,
+      parentTargetId: parentFrame?.targetId ?? null,
+      parentFrameId,
+      viewport: { width: frameViewport.width, height: frameViewport.height },
+      ownerContentQuad: quad
+    };
+  } catch {
+    return { status: "unavailable", reason: "frame_geometry_capture_failed" };
+  }
 }
 
 function stringAt(strings, index) {
@@ -268,13 +438,23 @@ function viewportScrollTarget(targetId, frameId, generation, scrollState, frameT
   };
 }
 
-function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, { frameTargetId = null, parentFrameId = null, outOfProcess = false } = {}) {
+function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, {
+  frameTargetId = null,
+  parentFrameId = null,
+  outOfProcess = false,
+  selectionGoal = "",
+  candidateLimit = 200,
+  documentIndex: suppliedIndex = null
+} = {}) {
   const axFacts = accessibleFacts(axTree);
   const candidates = [];
   const headings = [];
   const frameSummaries = [];
-  for (const document of snapshot.documents ?? []) {
-    const frameId = stringAt(snapshot.strings, document.frameId) || String(document.frameId ?? "unknown");
+  const sharedIndex = documentIndexFor(snapshot, suppliedIndex, { frameTargetId, parentFrameId });
+  for (const indexedDocument of sharedIndex.documents) {
+    const document = indexedDocument?.sourceDocument;
+    if (!document) continue;
+    const frameId = indexedDocument.frameId;
     const mainFrame = !outOfProcess && frameId === rootFrameId;
     const documentUrl = stringAt(snapshot.strings, document.documentURL);
     const nodes = document.nodes;
@@ -294,27 +474,15 @@ function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, { 
     const nodeValues = nodes.nodeValue ?? [];
     const textValues = nodes.textValue ?? [];
     const parents = nodes.parentIndex ?? [];
-    const attributesByNode = nodeNames.map((_, index) => unpackAttributes(nodes.attributes?.[index], snapshot.strings));
-    const formIndexesById = new Map();
-    for (let index = 0; index < nodeNames.length; index++) {
-      if (stringAt(snapshot.strings, nodeNames[index]).toUpperCase() !== "FORM") continue;
-      const formId = attributesByNode[index].id;
-      if (formId) formIndexesById.set(formId, index);
-    }
+    const attributesByNode = indexedDocument.attributes;
+    const formIndexesById = indexedDocument.formIndexesById;
     for (let index = nodeNames.length - 1; index >= 0; index--) {
       const value = stringAt(snapshot.strings, textValues[index] ?? nodeValues[index]);
       if (value) text[index] = value.slice(0, 2_000);
       const parent = parents[index];
       if (Number.isInteger(parent) && parent >= 0 && text[index]) text[parent] = `${text[parent]} ${text[index]}`.trim().slice(0, 2_000);
     }
-    const childrenByParent = new Map();
-    for (let index = 0; index < parents.length; index++) {
-      const parent = parents[index];
-      if (!Number.isInteger(parent) || parent < 0) continue;
-      const children = childrenByParent.get(parent) ?? [];
-      children.push(index);
-      childrenByParent.set(parent, children);
-    }
+    const childrenByParent = indexedDocument.children;
     const contextNameFor = index => {
       let branch = index;
       for (let depth = 0; depth < 8; depth++) {
@@ -324,12 +492,12 @@ function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, { 
         const branchPosition = siblings.indexOf(branch);
         for (let siblingPosition = branchPosition - 1; siblingPosition >= 0; siblingPosition--) {
           const sibling = siblings[siblingPosition];
-          if (/^H[1-6]$/.test(stringAt(snapshot.strings, nodeNames[sibling]).toUpperCase()) && text[sibling]) {
+          if (/^H[1-6]$/.test(indexedDocument.tags[sibling]) && text[sibling]) {
             return text[sibling].trim().slice(0, 160);
           }
         }
-        const parentTag = stringAt(snapshot.strings, nodeNames[parent]).toUpperCase();
-        const parentAttributes = unpackAttributes(nodes.attributes?.[parent], snapshot.strings);
+        const parentTag = indexedDocument.tags[parent];
+        const parentAttributes = attributesByNode[parent];
         const parentRole = String(parentAttributes.role ?? "").toLowerCase();
         if (CONTEXT_CONTAINERS.has(parentTag) || ["region", "group"].includes(parentRole)) {
           const namedContext = parentAttributes["aria-label"] || parentAttributes.title;
@@ -339,8 +507,21 @@ function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, { 
       }
       return null;
     };
+    const recordContextFor = index => {
+      let ancestor = parents[index];
+      for (let depth = 0; depth < 12 && Number.isInteger(ancestor) && ancestor >= 0; depth++) {
+        const ancestorTag = indexedDocument.tags[ancestor];
+        const ancestorRole = String(attributesByNode[ancestor]?.role ?? "").toLowerCase();
+        if (["TR", "LI", "ARTICLE"].includes(ancestorTag) || ["row", "listitem", "article"].includes(ancestorRole)) {
+          const value = String(text[ancestor] ?? "").replace(/\s+/gu, " ").trim();
+          if (value) return value.slice(0, 180);
+        }
+        ancestor = parents[ancestor];
+      }
+      return null;
+    };
     for (let index = 0; index < nodeNames.length; index++) {
-      const tag = stringAt(snapshot.strings, nodeNames[index]).toUpperCase();
+      const tag = indexedDocument.tags[index];
       const attrs = attributesByNode[index];
       const role = attrs.role?.toLowerCase();
       const isActionable = ACTIONABLE_TAGS.has(tag) || ["button", "link", "menuitem", "option", "checkbox", "radio", "tab", "textbox", "combobox"].includes(role) || "tabindex" in attrs || attrs["contenteditable"] === "true";
@@ -359,13 +540,30 @@ function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, { 
         ancestor = parents[ancestor];
       }
       const associatedWithForm = Number.isInteger(formIndex);
+      const linkTarget = typeof attrs.target === "string" ? attrs.target.trim().toLowerCase() : "";
+      const opensNewTarget = Boolean(linkTarget && !["_self", "_parent", "_top"].includes(linkTarget));
       const formAttributes = Number.isInteger(formIndex) ? attributesByNode[formIndex] : null;
       const formBackendNodeId = Number.isInteger(formIndex) ? nodes.backendNodeId?.[formIndex] : null;
       let formActionOrigin = null;
       if (formAttributes) {
-        try { formActionOrigin = new URL(formAttributes.action || documentUrl, documentUrl).origin; }
+        try { formActionOrigin = new URL(attrs.formaction || formAttributes.action || documentUrl, documentUrl).origin; }
         catch { formActionOrigin = null; }
       }
+      const formMethod = formAttributes
+        ? String(attrs.formmethod ?? formAttributes.method ?? "get").toLowerCase()
+        : null;
+      const formTarget = String(attrs.formtarget ?? formAttributes?.target ?? "").trim().toLowerCase();
+      const formTargetSameContext = !formTarget || formTarget === "_self";
+      let documentOrigin = null;
+      try { documentOrigin = new URL(documentUrl).origin; }
+      catch { /* A malformed document URL cannot produce a public query-field cue. */ }
+      const isSameOriginGetQueryField = explicitType === "text"
+        && String(attrs.name ?? "") === "q"
+        && Boolean(formAttributes)
+        && formMethod === "get"
+        && formTargetSameContext
+        && Boolean(documentOrigin)
+        && formActionOrigin === documentOrigin;
       if (/^H[1-6]$/.test(tag) && text[index]) headings.push({ level: Number(tag[1]), text: text[index].trim().slice(0, 300), frameId });
       if (!isActionable) continue;
       candidates.push({
@@ -382,13 +580,17 @@ function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, { 
         contentEditable: ["true", "", "plaintext-only"].includes(attrs.contenteditable),
         name: String(label).trim().slice(0, 300),
         contextName: contextNameFor(index),
+        recordContext: recordContextFor(index),
+        ...(isSameOriginGetQueryField ? { queryField: true } : {}),
         href: attrs.href ? sanitizeUrl(attrs.href, { base: stringAt(snapshot.strings, document.documentURL) }) : null,
+        opensNewTarget,
         type: attrs.type ?? null,
         submitsForm: submitsByDefault && associatedWithForm,
         ...(formAttributes && Number.isInteger(formBackendNodeId) ? {
           formIdentity: `${targetId}:${frameTargetId ?? "root"}:${frameId}:${formBackendNodeId}:${generation}`,
-          formMethod: String(formAttributes.method ?? "get").toLowerCase(),
-          formActionOrigin
+          formMethod,
+          formActionOrigin,
+          formTargetSameContext
         } : {}),
         disabled: attrs.disabled !== undefined || attrs["aria-disabled"] === "true",
         visible,
@@ -397,8 +599,19 @@ function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, { 
       });
     }
   }
-  candidates.sort((a, b) => Number(b.visible === true) - Number(a.visible === true));
-  return { candidates: candidates.slice(0, 200), headings: headings.slice(0, 100), frames: frameSummaries };
+  const selection = rankInteractionCandidates(candidates, selectionGoal, { maxCandidates: candidateLimit });
+  return {
+    candidates: [...selection.candidates],
+    candidateCount: candidates.length,
+    taskRelevantCandidateCount: selection.taskRelevantCandidateCount,
+    scopeCandidateCount: selection.scopeCandidateCount,
+    returnedCandidateCount: selection.candidates.length,
+    returnedScopeCandidateCount: selection.returnedScopeCandidateCount,
+    scopeCandidateIdentities: [...selection.scopeCandidateIdentities],
+    headings: headings.slice(0, 100),
+    headingCount: headings.length,
+    frames: frameSummaries
+  };
 }
 
 function sanitizeSnapshotForRetrieval(snapshot, { includeSensitiveFormValues = false, includeSensitiveUrlData = false } = {}) {
@@ -469,13 +682,24 @@ export class BrowserObserver {
     this.maxEvidenceBytes = Math.max(1024 * 1024, Math.min(maxEvidenceBytes, 256 * 1024 * 1024));
     this.evidence = new Map();
     this.evidenceBytes = 0;
+    this.peakRetainedEvidenceBytes = 0;
+    this.networkSignalState = new Map();
+    this.responseProjectionCache = new Map();
+    this.responseProjectionCacheBytes = 0;
   }
 
-  async inspectRuntimeState(id, { path = [], frameTargetId = null, includeSensitiveValues = false } = {}) {
+  async inspectRuntimeState(id, {
+    path = [], frameTargetId = null, includeSensitiveValues = false,
+    offset = 0, maxChars = DEFAULT_RUNTIME_VALUE_CHUNK_LENGTH
+  } = {}) {
     const stored = this.evidence.get(id);
     if (!stored) return { status: "expired", evidenceId: id };
     if (!Array.isArray(path) || path.length > MAX_RUNTIME_PATH_SEGMENTS || path.some(segment => typeof segment !== "string" || segment.length > MAX_RUNTIME_PATH_SEGMENT_LENGTH)) {
       throw new Error(`path must contain at most ${MAX_RUNTIME_PATH_SEGMENTS} strings of at most ${MAX_RUNTIME_PATH_SEGMENT_LENGTH} characters.`);
+    }
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("offset must be a non-negative safe integer.");
+    if (!Number.isInteger(maxChars) || maxChars < 1 || maxChars > MAX_RUNTIME_VALUE_CHUNK_LENGTH) {
+      throw new Error(`maxChars must be an integer from 1 to ${MAX_RUNTIME_VALUE_CHUNK_LENGTH}.`);
     }
     if (stored.evidence.documentGeneration !== this.session.documentGeneration) {
       return { status: "stale", evidenceId: id, documentGeneration: stored.evidence.documentGeneration, currentDocumentGeneration: this.session.documentGeneration };
@@ -502,7 +726,13 @@ export class BrowserObserver {
         const selectedResponse = await client.send("Runtime.callFunctionOn", {
           objectId: root.result.objectId,
           functionDeclaration: RUNTIME_PATH_INSPECTOR,
-          arguments: [{ value: path }, { value: failureMarker }, { value: includeSensitiveValues === true }],
+          arguments: [
+            { value: path },
+            { value: failureMarker },
+            { value: includeSensitiveValues === true },
+            { value: offset },
+            { value: maxChars }
+          ],
           objectGroup,
           returnByValue: false,
           generatePreview: false,
@@ -514,17 +744,40 @@ export class BrowserObserver {
         if (selectedResponse.exceptionDetails || !selectedRemote) {
           result = { status: "unavailable", reason: "inspection_rejected_or_unsupported" };
         } else if (selectedRemote.type === "string" && typeof selectedRemote.value === "string" && selectedRemote.value.startsWith(`${failureMarker}:`)) {
-          const [, status, detailOne, detailTwo, detailThree] = selectedRemote.value.split(":");
+          const markerPayload = selectedRemote.value.slice(failureMarker.length + 1);
+          const markerSeparator = markerPayload.indexOf(":");
+          const status = markerSeparator < 0 ? markerPayload : markerPayload.slice(0, markerSeparator);
+          const details = markerSeparator < 0 ? "" : markerPayload.slice(markerSeparator + 1);
+          const [detailOne, detailTwo, detailThree] = details.split(":");
           if (status.startsWith("primitive_")) {
-            const type = status === "primitive_oversize" ? "string" : detailOne;
+            const type = status === "primitive_oversize" || status === "primitive_string_chunk" ? "string" : detailOne;
             const selected = { kind: "primitive", type };
-            if (status === "primitive_redacted" && type !== "undefined") selected.valueRedacted = true;
-            if (status === "primitive_oversize") {
+            if (status === "primitive_string_chunk") {
+              let chunk;
+              try { chunk = JSON.parse(details); }
+              catch { chunk = null; }
+              if (chunk && typeof chunk.value === "string" && Number.isSafeInteger(chunk.valueLength)
+                && Number.isSafeInteger(chunk.valueOffset) && Number.isSafeInteger(chunk.nextOffset)
+                && typeof chunk.valueComplete === "boolean") {
+                selected.value = chunk.value;
+                selected.valueLength = chunk.valueLength;
+                selected.valueOffset = chunk.valueOffset;
+                selected.valueComplete = chunk.valueComplete;
+                selected.nextOffset = chunk.nextOffset;
+                selected.valueChunked = !chunk.valueComplete || chunk.valueOffset > 0;
+                result = { status: "available", selected };
+              } else {
+                result = { status: "unavailable", reason: "runtime_string_chunk_invalid" };
+              }
+            } else if (status === "primitive_oversize") {
               selected.valueRedacted = true;
               selected.valueLength = Number(detailOne);
+              result = { status: "available", selected };
+            } else {
+              if (status === "primitive_redacted" && type !== "undefined") selected.valueRedacted = true;
+              if (status === "primitive_unavailable") selected.valueUnavailable = true;
+              result = { status: "available", selected };
             }
-            if (status === "primitive_unavailable") selected.valueUnavailable = true;
-            result = { status: "available", selected };
           } else {
             result = { status };
             if (detailOne !== undefined && Number.isInteger(Number(detailOne))) result.pathIndex = Number(detailOne);
@@ -606,22 +859,42 @@ export class BrowserObserver {
     return { ...structuredClone(record), retained };
   }
 
-  async capture({ includeScreenshot = true, includeRawInResponse = false } = {}) {
-    const client = this.session.client;
+  async capture({ profile = "interaction", includeScreenshot, includeRawInResponse = false, prepareForJev = false, selectionGoal = "", candidateLimit = 200 } = {}) {
+    if (!OBSERVATION_PROFILES.has(profile)) throw new Error(`profile must be one of: ${[...OBSERVATION_PROFILES].join(", ")}.`);
+    if (includeScreenshot !== undefined && typeof includeScreenshot !== "boolean") throw new Error("includeScreenshot must be a boolean.");
+    if (typeof prepareForJev !== "boolean") throw new Error("prepareForJev must be a boolean.");
+    if (typeof selectionGoal !== "string" || selectionGoal.length > 2_048) throw new Error("selectionGoal must be a string no longer than 2048 characters.");
+    if (!Number.isInteger(candidateLimit) || candidateLimit < 200 || candidateLimit > 384) throw new Error("candidateLimit must be an integer from 200 to 384.");
+    const captureStartedAt = Date.now();
+    const memoryBefore = process.memoryUsage();
+    const metrics = { cdpRoundTrips: 0, totalCdpRoundTripMs: 0, domSnapshotCount: 0, cdpRoundTripDurations: [] };
+    const rawClient = this.session.client;
+    const client = instrumentCaptureClient(rawClient, metrics);
+    const captureStructure = profile !== "lightweight";
+    const deriveInteraction = profile === "interaction" || profile === "visual";
+    const deriveSemantic = profile !== "lightweight";
+    const captureScreenshot = includeScreenshot ?? profile === "visual";
+    const runtimeExpression = profile === "lightweight"
+      ? "JSON.stringify({url:location.href,title:document.title,readyState:document.readyState})"
+      : "JSON.stringify({url:location.href,title:document.title,readyState:document.readyState,scrollTop:document.scrollingElement?.scrollTop??0,maxScrollTop:Math.max(0,(document.scrollingElement?.scrollHeight??0)-(document.scrollingElement?.clientHeight??innerHeight)),viewportHeight:innerHeight,viewportWidth:innerWidth,deviceScaleFactor:window.devicePixelRatio||1})";
     const [{ frameTree }, snapshot, ax, runtime] = await Promise.all([
       client.send("Page.getFrameTree"),
-      client.send("DOMSnapshot.captureSnapshot", { computedStyles: STYLE_NAMES, includePaintOrder: true, includeDOMRects: true }),
-      client.send("Accessibility.getFullAXTree"),
-      client.send("Runtime.evaluate", { expression: "JSON.stringify({url:location.href,title:document.title,readyState:document.readyState,changeText:document.body?.innerText?.slice(0,4000)??'',scrollTop:document.scrollingElement?.scrollTop??0,maxScrollTop:Math.max(0,(document.scrollingElement?.scrollHeight??0)-(document.scrollingElement?.clientHeight??innerHeight)),viewportHeight:innerHeight,viewportWidth:innerWidth})", returnByValue: true })
+      captureStructure
+        ? client.send("DOMSnapshot.captureSnapshot", { computedStyles: STYLE_NAMES, includePaintOrder: true, includeDOMRects: true })
+        : Promise.resolve({ strings: [], documents: [] }),
+      captureStructure ? client.send("Accessibility.getFullAXTree") : Promise.resolve({ nodes: [] }),
+      client.send("Runtime.evaluate", { expression: runtimeExpression, returnByValue: true })
     ]);
     const pageState = JSON.parse(runtime.result?.value ?? "{}" );
-    const changeText = String(pageState.changeText ?? "");
-    delete pageState.changeText;
+    const deviceScaleFactor = Number.isFinite(pageState.deviceScaleFactor) && pageState.deviceScaleFactor > 0 && pageState.deviceScaleFactor <= 8
+      ? pageState.deviceScaleFactor : 1;
+    const activity = this.session.activity.snapshot();
     const scrollState = {
       scrollTop: Number(pageState.scrollTop ?? 0),
       maxScrollTop: Number(pageState.maxScrollTop ?? 0),
       viewportHeight: Number(pageState.viewportHeight ?? 0),
       viewportWidth: Number(pageState.viewportWidth ?? 0),
+      deviceScaleFactor,
       canScrollDown: Number(pageState.maxScrollTop ?? 0) - Number(pageState.scrollTop ?? 0) > 2,
       canScrollUp: Number(pageState.scrollTop ?? 0) > 2
     };
@@ -629,28 +902,57 @@ export class BrowserObserver {
     delete pageState.maxScrollTop;
     delete pageState.viewportHeight;
     delete pageState.viewportWidth;
-    const pageChangeFingerprint = createHash("sha256").update(JSON.stringify([pageState.url, pageState.title, changeText])).digest("hex");
+    delete pageState.deviceScaleFactor;
+    const pageChangeFingerprint = createHash("sha256").update(JSON.stringify([
+      pageState.url,
+      pageState.title,
+      pageState.readyState,
+      this.session.documentGeneration,
+      activity.totalDomMutations,
+      activity.totalLifecycleEvents
+    ])).digest("hex");
     const rootFrameId = frameTree?.frame?.id;
-    const rootScrollTargets = [
+    const rootScrollTargets = deriveInteraction ? [
       viewportScrollTarget(this.session.target.id, rootFrameId, this.session.documentGeneration, scrollState),
       ...await captureScrollableTargets(client, { targetId: this.session.target.id, frameId: rootFrameId, generation: this.session.documentGeneration })
-    ].filter(Boolean);
+    ].filter(Boolean) : [];
     let screenshot = null;
-    if (includeScreenshot) {
-      try { screenshot = (await client.send("Page.captureScreenshot", { format: "jpeg", quality: 55, fromSurface: true, captureBeyondViewport: false })).data ?? null; }
+    if (captureScreenshot) {
+      const preparation = prepareForJev ? planJevImagePreparation({
+        width: Math.round(scrollState.viewportWidth * deviceScaleFactor),
+        height: Math.round(scrollState.viewportHeight * deviceScaleFactor)
+      }) : null;
+      const screenshotOptions = { format: "jpeg", quality: 55, fromSurface: true, captureBeyondViewport: false };
+      if (preparation?.status === "ready" && preparation.scale < 1) {
+        screenshotOptions.clip = {
+          x: 0,
+          y: 0,
+          width: scrollState.viewportWidth,
+          height: scrollState.viewportHeight,
+          scale: preparation.scale
+        };
+      }
+      try { screenshot = (await client.send("Page.captureScreenshot", screenshotOptions)).data ?? null; }
       catch { screenshot = null; }
     }
-    const activity = this.session.activity.snapshot();
     const baseEvidenceBytes = jsonByteLength({ page: pageState, domSnapshot: snapshot, accessibilityTree: ax.nodes ?? [], frameTree, activity, screenshotBase64: screenshot, scrollTargets: rootScrollTargets });
     let remainingFrameBytes = Math.max(0, this.maxEvidenceBytes - baseEvidenceBytes - Math.max(256 * 1024, Math.floor(this.maxEvidenceBytes / 10)));
-    const attachedFrames = await this.session.getOutOfProcessFrames?.() ?? [];
+    const attachedFrames = captureStructure
+      ? await this.session.getOutOfProcessFrames?.({
+        onCdpRoundTrip: durationMs => {
+          metrics.cdpRoundTrips++;
+          metrics.totalCdpRoundTripMs += durationMs;
+        }
+      }) ?? []
+      : [];
     const captureFrame = async frame => {
       try {
+        const frameClient = instrumentCaptureClient(frame.client, metrics);
         const [frameTreeResult, frameSnapshot, frameAx, frameRuntime] = await Promise.all([
-          frame.client.send("Page.getFrameTree"),
-          frame.client.send("DOMSnapshot.captureSnapshot", { computedStyles: STYLE_NAMES, includePaintOrder: true, includeDOMRects: true }),
-          frame.client.send("Accessibility.getFullAXTree"),
-          frame.client.send("Runtime.evaluate", { expression: "JSON.stringify({url:location.href,title:document.title,readyState:document.readyState,scrollTop:document.scrollingElement?.scrollTop??0,maxScrollTop:Math.max(0,(document.scrollingElement?.scrollHeight??0)-(document.scrollingElement?.clientHeight??innerHeight)),viewportHeight:innerHeight,viewportWidth:innerWidth})", returnByValue: true })
+          frameClient.send("Page.getFrameTree"),
+          frameClient.send("DOMSnapshot.captureSnapshot", { computedStyles: STYLE_NAMES, includePaintOrder: true, includeDOMRects: true }),
+          frameClient.send("Accessibility.getFullAXTree"),
+          frameClient.send("Runtime.evaluate", { expression: runtimeExpression, returnByValue: true })
         ]);
         const childFrameId = frameTreeResult.frameTree?.frame?.id ?? frame.frameId;
         const page = JSON.parse(frameRuntime.result?.value ?? "{}");
@@ -662,19 +964,24 @@ export class BrowserObserver {
           canScrollDown: Number(page.maxScrollTop ?? 0) - Number(page.scrollTop ?? 0) > 2,
           canScrollUp: Number(page.scrollTop ?? 0) > 2
         };
+        const frameGeometry = await captureFrameGeometry(this.session, frame, childFrameId, {
+          width: frameScrollState.viewportWidth,
+          height: frameScrollState.viewportHeight
+        }, client, metrics);
         delete page.scrollTop;
         delete page.maxScrollTop;
         delete page.viewportHeight;
         delete page.viewportWidth;
-        const frameScrollTargets = [
+        const frameScrollTargets = deriveInteraction ? [
           viewportScrollTarget(this.session.target.id, childFrameId, this.session.documentGeneration, frameScrollState, frame.targetId),
-          ...await captureScrollableTargets(frame.client, { targetId: this.session.target.id, frameTargetId: frame.targetId, frameId: childFrameId, generation: this.session.documentGeneration, limit: 4 })
-        ].filter(Boolean);
+          ...await captureScrollableTargets(frameClient, { targetId: this.session.target.id, frameTargetId: frame.targetId, frameId: childFrameId, generation: this.session.documentGeneration, limit: 4 })
+        ].filter(Boolean) : [];
         return {
           targetId: frame.targetId,
           frameId: childFrameId,
           parentFrameId: frame.parentFrameId,
           page,
+          frameGeometry,
           domSnapshot: frameSnapshot,
           accessibilityTree: frameAx.nodes ?? [],
           scrollTargets: frameScrollTargets,
@@ -704,26 +1011,108 @@ export class BrowserObserver {
       frameResults.push(captured);
     }
     const frameSnapshots = frameResults.filter(frame => frame.status === "available");
-    const mainDerived = buildCandidates(snapshot, ax.nodes, rootFrameId, this.session.documentGeneration, this.session.target.id);
-    const childDerived = frameSnapshots.map(frame => buildCandidates(
+    const documentIndexStartedAt = performance.now();
+    const rootDocumentIndex = deriveSemantic
+      ? buildDocumentIndex(snapshot, { frameTargetId: null, parentFrameId: null })
+      : null;
+    const frameDocumentIndexes = deriveSemantic ? frameSnapshots.map(frame => buildDocumentIndex(frame.domSnapshot, {
+      frameTargetId: frame.targetId,
+      parentFrameId: frame.parentFrameId
+    })) : [];
+    metrics.documentIndexBuildCount = deriveSemantic ? 1 + frameDocumentIndexes.length : 0;
+    metrics.documentIndexBuildMs = performance.now() - documentIndexStartedAt;
+    const candidateDerivationStartedAt = performance.now();
+    const mainDerived = deriveInteraction
+      ? buildCandidates(snapshot, ax.nodes, rootFrameId, this.session.documentGeneration, this.session.target.id, {
+        selectionGoal,
+        candidateLimit,
+        documentIndex: rootDocumentIndex
+      })
+      : { candidates: [], candidateCount: 0, taskRelevantCandidateCount: 0, scopeCandidateCount: 0, returnedCandidateCount: 0, returnedScopeCandidateCount: 0, scopeCandidateIdentities: [], headings: [], headingCount: 0, frames: [] };
+    const childDerived = deriveInteraction ? frameSnapshots.map((frame, frameIndex) => buildCandidates(
       frame.domSnapshot,
       frame.accessibilityTree,
       frame.frameId,
       this.session.documentGeneration,
       this.session.target.id,
-      { frameTargetId: frame.targetId, parentFrameId: frame.parentFrameId, outOfProcess: true }
-    ));
+      {
+        frameTargetId: frame.targetId,
+        parentFrameId: frame.parentFrameId,
+        outOfProcess: true,
+        selectionGoal,
+        candidateLimit,
+        documentIndex: frameDocumentIndexes[frameIndex]
+      }
+    )) : [];
+    metrics.candidateDerivationMs = performance.now() - candidateDerivationStartedAt;
+    const observedCandidateCount = mainDerived.candidateCount + childDerived.reduce((total, frame) => total + frame.candidateCount, 0);
+    const observedHeadingCount = mainDerived.headingCount + childDerived.reduce((total, frame) => total + frame.headingCount, 0);
+    const taskRelevantCandidateCount = mainDerived.taskRelevantCandidateCount + childDerived.reduce((total, frame) => total + frame.taskRelevantCandidateCount, 0);
+    const scopeCandidateCount = taskRelevantCandidateCount > 0
+      ? mainDerived.scopeCandidateCount + childDerived.reduce((total, frame) => total + frame.scopeCandidateCount, 0)
+      : observedCandidateCount;
+    const combinedCandidates = [...mainDerived.candidates, ...childDerived.flatMap(frame => frame.candidates)];
+    const priorityCandidateIdentities = mainDerived.scopeCandidateIdentities
+      .concat(...childDerived.map(frame => frame.scopeCandidateIdentities));
+    const combinedRanking = rankInteractionCandidates(combinedCandidates, selectionGoal, { maxCandidates: candidateLimit, priorityCandidateIdentities });
     const derived = {
-      candidates: [...mainDerived.candidates, ...childDerived.flatMap(frame => frame.candidates)].slice(0, 200),
+      candidates: [...combinedRanking.candidates],
       headings: [...mainDerived.headings, ...childDerived.flatMap(frame => frame.headings)].slice(0, 100),
       frames: [...mainDerived.frames, ...childDerived.flatMap(frame => frame.frames)]
     };
+    const returnedScopeCandidateCount = mainDerived.scopeCandidateIdentities
+      .concat(...childDerived.map(frame => frame.scopeCandidateIdentities))
+      .filter(identity => derived.candidates.some(candidate => candidate.identity === identity)).length;
+    const taskScopedSelection = combinedRanking.selectionScope === "task_relevant_region" && taskRelevantCandidateCount > 0;
+    const candidateCoverage = {
+      pageCandidateCount: observedCandidateCount,
+      returnedCandidateCount: derived.candidates.length,
+      omittedCandidateCount: Math.max(0, observedCandidateCount - derived.candidates.length),
+      pageCoverage: observedCandidateCount <= derived.candidates.length ? "complete" : "partial",
+      selectionScope: taskScopedSelection ? "task_relevant_region" : "page",
+      taskRelevantCandidateCount,
+      scopeCandidateCount,
+      returnedScopeCandidateCount,
+      scopeCoverage: scopeCandidateCount <= returnedScopeCandidateCount ? "complete" : "incomplete",
+      truncated: observedCandidateCount > derived.candidates.length
+    };
+    const headingCoverage = {
+      pageHeadingCount: observedHeadingCount,
+      returnedHeadingCount: derived.headings.length,
+      truncated: observedHeadingCount > derived.headings.length
+    };
     const scrollTargets = [...rootScrollTargets, ...frameSnapshots.flatMap(frame => frame.scrollTargets ?? [])].slice(0, 32);
+    const coverage = {
+      domSnapshot: captureStructure,
+      accessibility: captureStructure,
+      frameTree: true,
+      layout: captureStructure,
+      scrollTargets: deriveInteraction,
+      interactionCandidates: deriveInteraction,
+      interactionCandidatesTruncated: candidateCoverage.truncated,
+      interactionCandidateCount: observedCandidateCount,
+      screenshot: screenshot !== null,
+      network: this.session.networkObservationAvailable,
+      lifecycleEvents: true,
+      domMutations: this.session.domObservationAvailable,
+      closedShadowDom: false,
+      crossFrameActions: deriveInteraction && this.session.frameAttachmentAvailable,
+      outOfProcessFramesCaptured: captureStructure,
+      outOfProcessFramesObserved: frameSnapshots.length,
+      outOfProcessFramesUnavailable: frameResults.filter(frame => frame.status === "unavailable").length,
+      outOfProcessFrameAttachmentFailures: captureStructure ? [...(this.session.frameSessions?.values?.() ?? [])].filter(frame => frame.status === "failed").length : 0,
+      outOfProcessFramesOmitted: captureStructure ? (this.session.frameAttachmentOmitted ?? 0) + frameResults.filter(frame => frame.status === "omitted").length : 0
+    };
     const id = randomUUID();
     const evidence = {
       id,
+      targetId: this.session.target.id,
       capturedAt: new Date().toISOString(),
       documentGeneration: this.session.documentGeneration,
+      viewport: { width: scrollState.viewportWidth, height: scrollState.viewportHeight },
+      deviceScaleFactor,
+      observationProfile: profile,
+      coverage,
       page: pageState,
       domSnapshot: snapshot,
       accessibilityTree: ax.nodes ?? [],
@@ -737,6 +1126,29 @@ export class BrowserObserver {
       scrollTargets,
       elements: derived.candidates
     };
+    const semanticCompilationStartedAt = performance.now();
+    const semanticPage = deriveSemantic ? compileSemanticPageModel({
+      observationId: id,
+      targetId: this.session.target.id,
+      documentGeneration: this.session.documentGeneration,
+      page: pageState,
+      domSnapshot: snapshot,
+      frameSnapshots: frameSnapshots.map(frame => ({
+        targetId: frame.targetId,
+        frameId: frame.frameId,
+        parentFrameId: frame.parentFrameId,
+        domSnapshot: frame.domSnapshot
+      })),
+      documentIndex: rootDocumentIndex,
+      frameDocumentIndexes,
+      candidates: deriveInteraction ? derived.candidates : [],
+      controlLimit: candidateLimit,
+      headings: derived.headings,
+      headingCount: observedHeadingCount,
+      candidateCoverage,
+      coverage
+    }) : null;
+    metrics.semanticCompilationMs = deriveSemantic ? performance.now() - semanticCompilationStartedAt : 0;
     const byteLength = jsonByteLength(evidence);
     let retained = byteLength <= this.maxEvidenceBytes;
     if (retained) {
@@ -747,40 +1159,60 @@ export class BrowserObserver {
         const oldest = this.evidence.get(oldestId);
         this.evidence.delete(oldestId);
         this.evidenceBytes -= oldest.byteLength;
+        this.#deleteResponseProjectionsForEvidence(oldestId);
         if (oldestId === id) retained = false;
       }
+      this.peakRetainedEvidenceBytes = Math.max(this.peakRetainedEvidenceBytes, this.evidenceBytes);
     }
+    const domNodeCount = (snapshot.documents ?? []).reduce((total, document) => total + (document.nodes?.nodeName?.length ?? 0), 0)
+      + frameSnapshots.reduce((total, frame) => total + (frame.domSnapshot.documents ?? []).reduce((frameTotal, document) => frameTotal + (document.nodes?.nodeName?.length ?? 0), 0), 0);
+    const accessibilityNodeCount = (ax.nodes ?? []).length + frameSnapshots.reduce((total, frame) => total + frame.accessibilityTree.length, 0);
+    const memoryAfter = process.memoryUsage();
     const compact = {
       evidenceId: id,
       targetId: this.session.target.id,
       capturedAt: evidence.capturedAt,
       documentGeneration: evidence.documentGeneration,
+      viewport: { ...evidence.viewport },
+      deviceScaleFactor: evidence.deviceScaleFactor,
+      observationProfile: profile,
       page: { ...pageState, url: sanitizeUrl(pageState.url ?? "") },
       frames: derived.frames,
+      outOfProcessFrameGeometry: frameSnapshots.map(frame => frame.frameGeometry).filter(Boolean),
       headings: derived.headings,
-      candidates: derived.candidates.map(({ evidence: _e, attributes: _attributes, documentUrl: _documentUrl, ...candidate }) => candidate),
+      candidates: derived.candidates.map(({ evidence: _e, attributes: _attributes, documentUrl: _documentUrl, recordContext: _recordContext, ...candidate }) => candidate),
       scrollTargets,
       candidateCount: derived.candidates.length,
+      candidateCoverage,
+      headingCoverage,
+      semanticPage,
       retained,
       networkRequestCount: evidence.activity.totalRequests,
+      networkSignals: this.#networkSignals(evidence.activity),
       lifecycleEventCount: evidence.activity.totalLifecycleEvents,
       domMutationCount: evidence.activity.totalDomMutations,
-      coverage: {
-        domSnapshot: true,
-        accessibility: true,
-        frameTree: true,
-        layout: true,
-        scrollTargets: true,
-        screenshot: screenshot !== null,
-        network: this.session.networkObservationAvailable,
-        lifecycleEvents: true,
-        domMutations: this.session.domObservationAvailable,
-        closedShadowDom: false,
-        crossFrameActions: this.session.frameAttachmentAvailable,
-        outOfProcessFramesObserved: frameSnapshots.length,
-        outOfProcessFramesUnavailable: frameResults.filter(frame => frame.status === "unavailable").length,
-        outOfProcessFrameAttachmentFailures: [...(this.session.frameSessions?.values?.() ?? [])].filter(frame => frame.status === "failed").length,
-        outOfProcessFramesOmitted: (this.session.frameAttachmentOmitted ?? 0) + frameResults.filter(frame => frame.status === "omitted").length
+      coverage,
+      captureMetrics: {
+        captureDurationMs: Date.now() - captureStartedAt,
+        cdpRoundTrips: metrics.cdpRoundTrips,
+        totalCdpRoundTripMs: metrics.totalCdpRoundTripMs,
+        cdpRoundTripP95Ms: percentile(metrics.cdpRoundTripDurations, 0.95),
+        domSnapshotCount: metrics.domSnapshotCount,
+        documentIndexBuildCount: metrics.documentIndexBuildCount ?? 0,
+        documentIndexBuildMs: metrics.documentIndexBuildMs ?? 0,
+        candidateDerivationMs: metrics.candidateDerivationMs ?? 0,
+        semanticCompilationMs: metrics.semanticCompilationMs ?? 0,
+        serializedEvidenceBytes: byteLength,
+        retainedEvidenceBytes: retained ? byteLength : 0,
+        peakRetainedEvidenceBytes: this.peakRetainedEvidenceBytes,
+        screenshotBase64Bytes: screenshot === null ? 0 : Buffer.byteLength(screenshot, "ascii"),
+        domNodeCount,
+        accessibilityNodeCount,
+        outOfProcessFrames: frameSnapshots.length,
+        rssBeforeBytes: memoryBefore.rss,
+        rssAfterBytes: memoryAfter.rss,
+        heapBeforeBytes: memoryBefore.heapUsed,
+        heapAfterBytes: memoryAfter.heapUsed
       }
     };
     Object.defineProperty(compact, "pageChangeFingerprint", { value: pageChangeFingerprint });
@@ -788,20 +1220,78 @@ export class BrowserObserver {
     return compact;
   }
 
-  async inspectNetworkResponse(id, { requestId, includeSensitive = false, includeSensitiveUrlData = false, maxBytes = DEFAULT_NETWORK_RESPONSE_BYTES } = {}) {
+  #networkSignals(activity) {
+    const signals = [];
+    for (const request of activity.networkRequests) {
+      if (!request.requestId) continue;
+      const state = `${request.status ?? "pending"}:${request.failure?.errorText ?? ""}:${request.finishedAt ?? "pending"}`;
+      const previous = this.networkSignalState.get(request.requestId);
+      if (request.status === 429 && request.finishedAt !== null && request.finishedAt !== undefined && previous !== state) signals.push({
+        kind: "http_rate_limit",
+        status: 429,
+        method: request.method,
+        resourceType: request.resourceType,
+        frameTargetId: request.frameTargetId,
+        observedAt: new Date().toISOString()
+      });
+      this.networkSignalState.set(request.requestId, state);
+    }
+    while (this.networkSignalState.size > 1_000) this.networkSignalState.delete(this.networkSignalState.keys().next().value);
+    return signals.slice(-32);
+  }
+
+  async inspectNetworkResponse(id, {
+    requestId,
+    includeSensitive = false,
+    includeCredentialValues = false,
+    includeSensitiveUrlData = false,
+    maxBytes = DEFAULT_NETWORK_RESPONSE_BYTES,
+    timeoutMs = DEFAULT_NETWORK_RESPONSE_TIMEOUT_MS,
+    signal,
+    offset = 0,
+    view = "markdown",
+    sectionId,
+    blockId
+  } = {}) {
     const stored = this.evidence.get(id)?.evidence;
     if (!stored) return { status: "expired", evidenceId: id };
+    if (stored.targetId && stored.targetId !== this.session.target.id) return {
+      status: "stale",
+      evidenceId: id,
+      reasonCode: "evidence_target_changed",
+      evidenceTargetId: stored.targetId,
+      currentTargetId: this.session.target.id
+    };
     if (typeof requestId !== "string" || !requestId) return { status: "not_found", evidenceId: id, requestId: requestId ?? null };
-    if (!Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_NETWORK_RESPONSE_BYTES) {
-      throw new Error(`maxBytes must be an integer from 1 to ${MAX_NETWORK_RESPONSE_BYTES}.`);
+    if (!Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_NETWORK_RESPONSE_CHUNK_BYTES) {
+      throw new Error(`maxBytes must be an integer from 1 to ${MAX_NETWORK_RESPONSE_CHUNK_BYTES}.`);
     }
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_NETWORK_RESPONSE_TIMEOUT_MS) {
+      throw new Error(`timeoutMs must be an integer from 1 to ${MAX_NETWORK_RESPONSE_TIMEOUT_MS}.`);
+    }
+    if (signal !== undefined && (!signal || typeof signal.aborted !== "boolean" || typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function")) {
+      throw new Error("signal must be an AbortSignal.");
+    }
+    if (includeCredentialValues === true && includeSensitive !== true) {
+      throw new Error("includeCredentialValues:true requires includeSensitive:true.");
+    }
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("offset must be a non-negative safe integer.");
+    if (view !== "markdown" && view !== "source" && view !== "normalized") throw new Error("view must be markdown, source, or normalized.");
+    if (sectionId !== undefined && (typeof sectionId !== "string" || !sectionId)) throw new Error("sectionId must be a non-empty string.");
+    if (blockId !== undefined && (typeof blockId !== "string" || !blockId)) throw new Error("blockId must be a non-empty string.");
+    if ((sectionId !== undefined || blockId !== undefined) && view !== "markdown") throw new Error("sectionId and blockId require view:'markdown'.");
+    if (sectionId !== undefined && blockId !== undefined) throw new Error("Select either sectionId or blockId, not both.");
     const request = stored.activity.networkRequests.filter(item => item.requestId === requestId).at(-1);
     if (!request) return { status: "not_found", evidenceId: id, requestId };
     const { protocolRequestId: _protocolRequestId, ...publicRequest } = request;
     const requestEvidence = {
       ...structuredClone(publicRequest),
-      url: request.url ? sanitizeUrl(request.url, { includeSensitiveUrlData }) : request.url,
-      redirectedTo: request.redirectedTo ? sanitizeUrl(request.redirectedTo, { includeSensitiveUrlData }) : request.redirectedTo
+      durationMs: Number.isFinite(request.timestamp) && Number.isFinite(request.finishedAt)
+        ? Math.max(0, Math.round((request.finishedAt - request.timestamp) * 1000)) : null,
+      timeToResponseMs: Number.isFinite(request.timestamp) && Number.isFinite(request.responseReceivedAt)
+        ? Math.max(0, Math.round((request.responseReceivedAt - request.timestamp) * 1000)) : null,
+      url: request.url ? redactCredentialUrl(sanitizeUrl(request.url, { includeSensitiveUrlData }), { includeUserInfo: includeSensitiveUrlData }) : request.url,
+      redirectedTo: request.redirectedTo ? redactCredentialUrl(sanitizeUrl(request.redirectedTo, { includeSensitiveUrlData }), { includeUserInfo: includeSensitiveUrlData }) : request.redirectedTo
     };
     if (includeSensitive !== true) {
       return {
@@ -819,30 +1309,346 @@ export class BrowserObserver {
     if (request.redirectedTo) return { status: "unavailable", evidenceId: id, request: requestEvidence, responseBody: { status: "redirect_body_unavailable" } };
     if (request.finishedAt === null) return { status: "unavailable", evidenceId: id, request: requestEvidence, responseBody: { status: "request_not_finished" } };
     if (!request.protocolRequestId) return { status: "unavailable", evidenceId: id, request: requestEvidence, responseBody: { status: "request_identity_unavailable" } };
+    const projectionCacheKey = JSON.stringify([id, stored.targetId ?? this.session.target.id, request.frameTargetId ?? null, requestId, view]);
+    const canReuseProjection = includeCredentialValues !== true && includeSensitiveUrlData !== true;
+    if (signal?.aborted) return {
+      status: "available", evidenceId: id, request: requestEvidence,
+      responseBody: { status: "cancelled", phase: "before_acquisition" }
+    };
+    const cachedProjection = canReuseProjection ? this.#getResponseProjection(projectionCacheKey) : null;
+    if (cachedProjection) return this.#pageResponseProjection({
+      evidenceId: id,
+      requestEvidence,
+      projection: cachedProjection.projection,
+      projectionCacheKey,
+      cacheHit: true,
+      offset,
+      maxBytes,
+      sectionId,
+      blockId
+    });
     const client = this.session.networkClientForTarget?.(request.frameTargetId ?? null);
     if (!client) return { status: "unavailable", evidenceId: id, request: requestEvidence, responseBody: { status: "network_session_unavailable" } };
-    let response;
-    try {
-      response = await client.send("Network.getResponseBody", { requestId: request.protocolRequestId });
-    } catch {
+    if (Number.isFinite(request.decodedDataLength) && request.decodedDataLength > MAX_RESPONSE_BODY_BYTES) return {
+      status: "available", evidenceId: id, request: requestEvidence,
+      responseBody: {
+        status: "over_limit",
+        reasonCode: "reported_decoded_body_bytes_limit",
+        reportedDecodedBytes: request.decodedDataLength,
+        maxDecodedBytes: MAX_RESPONSE_BODY_BYTES,
+        bodyRetrieved: false
+      }
+    };
+    if (Number.isFinite(request.encodedDataLength) && request.encodedDataLength > MAX_RESPONSE_BODY_BYTES) return {
+      status: "available", evidenceId: id, request: requestEvidence,
+      responseBody: {
+        status: "over_limit",
+        reasonCode: "reported_encoded_body_bytes_limit",
+        reportedEncodedBytes: request.encodedDataLength,
+        maxEncodedBytes: MAX_RESPONSE_BODY_BYTES,
+        bodyRetrieved: false
+      }
+    };
+    const acquisitionStartedAt = Date.now();
+    const acquisition = await readSelectedResponseBody(client, request.protocolRequestId, { signal, timeoutMs });
+    const acquisitionMs = Date.now() - acquisitionStartedAt;
+    if (acquisition.status === "cancelled") return {
+      status: "available", evidenceId: id, request: requestEvidence,
+      responseBody: { status: "cancelled", phase: "acquisition", acquisitionMs }
+    };
+    if (acquisition.status === "timed_out") return {
+      status: "available", evidenceId: id, request: requestEvidence,
+      responseBody: { status: "timed_out", phase: "acquisition", timeoutMs, acquisitionMs }
+    };
+    if (acquisition.status !== "available") {
       return { status: "unavailable", evidenceId: id, request: requestEvidence, responseBody: { status: "body_evicted_or_unavailable" } };
     }
+    const response = acquisition.response;
     if (typeof response?.body !== "string") return { status: "unavailable", evidenceId: id, request: requestEvidence, responseBody: { status: "empty_or_unavailable" } };
     const base64Encoded = response.base64Encoded === true;
+    const encodedBodyBytes = Buffer.byteLength(response.body, "utf8");
+    const decodedBodyEstimate = base64Encoded ? estimateBase64DecodedBytes(response.body) : encodedBodyBytes;
+    const maximumEncodedBase64Bytes = Math.ceil(MAX_RESPONSE_BODY_BYTES * 4 / 3) + 4;
+    if (decodedBodyEstimate > MAX_RESPONSE_BODY_BYTES
+      || (base64Encoded && encodedBodyBytes > maximumEncodedBase64Bytes)) return {
+      status: "available", evidenceId: id, request: requestEvidence,
+      responseBody: {
+        status: "over_limit",
+        reasonCode: "decoded_body_bytes_limit",
+        encodedBodyBytes,
+        decodedBodyEstimate,
+        maxDecodedBytes: MAX_RESPONSE_BODY_BYTES,
+        bodyRetrieved: true,
+        bodyDecoded: false
+      }
+    };
+    if (signal?.aborted) return {
+      status: "available", evidenceId: id, request: requestEvidence,
+      responseBody: { status: "cancelled", phase: "after_acquisition", acquisitionMs }
+    };
     const bytes = base64Encoded ? Buffer.from(response.body, "base64") : Buffer.from(response.body, "utf8");
-    const returned = bytes.subarray(0, maxBytes);
+    if (bytes.length > MAX_RESPONSE_BODY_BYTES) return {
+      status: "available", evidenceId: id, request: requestEvidence,
+      responseBody: {
+        status: "over_limit",
+        reasonCode: "decoded_body_bytes_limit",
+        encodedBodyBytes,
+        decodedBytes: bytes.length,
+        maxDecodedBytes: MAX_RESPONSE_BODY_BYTES,
+        bodyRetrieved: true,
+        bodyDecoded: true
+      }
+    };
+    const processingStartedAt = Date.now();
+    const analysisStartedAt = Date.now();
+    const inspection = inspectResponseBody(bytes, request.mimeType, {
+      base64Encoded,
+      includeCredentialValues,
+      includeMarkdown: view === "markdown"
+    });
+    const analysisMs = Date.now() - analysisStartedAt;
+    if (inspection.status === "over_limit") return {
+      status: "available", evidenceId: id, request: requestEvidence,
+      responseBody: {
+        status: "over_limit",
+        reasonCode: inspection.reasonCode,
+        analysis: inspection.analysis,
+        credentialValuesIncluded: false,
+        limits: inspection.analysis?.budgetExceeded ?? null
+      }
+    };
+    if (signal?.aborted) return {
+      status: "available", evidenceId: id, request: requestEvidence,
+      responseBody: { status: "cancelled", phase: "analysis", acquisitionMs, analysisMs }
+    };
+    if (analysisMs > MAX_NETWORK_RESPONSE_INSPECTION_MS) return {
+      status: "available", evidenceId: id, request: requestEvidence,
+      responseBody: {
+        status: "over_limit",
+        reasonCode: "analysis_time_budget_exceeded",
+        analysisMs,
+        maxAnalysisMs: MAX_NETWORK_RESPONSE_INSPECTION_MS,
+        sourceBytes: bytes.length
+      }
+    };
+    const renderStartedAt = Date.now();
+    const markdownReport = view === "markdown" ? renderNetworkResponseMarkdown(request, requestEvidence, inspection) : null;
+    const renderMs = Date.now() - renderStartedAt;
+    const markdownBytes = markdownReport === null ? 0 : Buffer.byteLength(markdownReport);
+    if (markdownBytes > MAX_RESPONSE_MARKDOWN_BYTES) return {
+      status: "available", evidenceId: id, request: requestEvidence,
+      responseBody: {
+        status: "over_limit",
+        reasonCode: "markdown_output_limit",
+        markdownBytes,
+        maxMarkdownBytes: MAX_RESPONSE_MARKDOWN_BYTES,
+        sourceBytes: bytes.length
+      }
+    };
+    if (signal?.aborted) return {
+      status: "available", evidenceId: id, request: requestEvidence,
+      responseBody: { status: "cancelled", phase: "render", acquisitionMs, analysisMs, renderMs }
+    };
+    if (view === "normalized" && inspection.normalizedText === null) {
+      return {
+        status: "unavailable",
+        evidenceId: id,
+        request: requestEvidence,
+        responseBody: {
+          status: "normalization_unavailable",
+          format: inspection.format,
+          parseMode: inspection.parseMode,
+          credentialValuesIncluded: inspection.credentialValuesIncluded,
+          analysis: inspection.analysis,
+          reason: `No structured JSON value could be established. Request view:'source' to inspect the complete ${includeCredentialValues ? "source" : "redacted source"}.`
+        }
+      };
+    }
+    const selectedView = view === "source" ? inspection.sourceText
+      : view === "normalized" ? inspection.normalizedText : markdownReport;
+    const indexingStartedAt = Date.now();
+    const markdownIndex = view === "markdown" ? indexMarkdownDocument(markdownReport) : undefined;
+    const byteOffsets = markdownIndex?.byteOffsets ?? createUtf8OffsetIndex(selectedView);
+    const indexingMs = Date.now() - indexingStartedAt;
+    if (signal?.aborted) return {
+      status: "available", evidenceId: id, request: requestEvidence,
+      responseBody: { status: "cancelled", phase: "indexing", acquisitionMs, analysisMs, renderMs, indexingMs }
+    };
+    const processingMs = Date.now() - processingStartedAt;
+    if (processingMs > MAX_NETWORK_RESPONSE_INSPECTION_MS) return {
+      status: "available", evidenceId: id, request: requestEvidence,
+      responseBody: {
+        status: "over_limit",
+        reasonCode: "total_inspection_time_budget_exceeded",
+        acquisitionMs,
+        analysisMs,
+        renderMs,
+        indexingMs,
+        processingMs,
+        maxProcessingMs: MAX_NETWORK_RESPONSE_INSPECTION_MS,
+        sourceBytes: bytes.length
+      }
+    };
+    const projection = {
+      evidenceId: id,
+      view,
+      selectedView,
+      format: inspection.format,
+      parseMode: inspection.parseMode,
+      encoding: inspection.encoding,
+      credentialRedactions: inspection.credentialRedactions,
+      credentialValuesIncluded: inspection.credentialValuesIncluded,
+      credentialDetails: inspection.credentialDetails,
+      analysis: inspection.analysis,
+      markdownIndex,
+      byteOffsets,
+      sourceBytes: bytes.length,
+      markdownBytes,
+      phaseMetrics: { acquisitionMs, analysisMs, renderMs, indexingMs, processingMs },
+      pageCursors: new Map(),
+      pagingCounters: { pageCount: 0, utf8IndexedLookups: 0, utf8CursorHits: 0, utf8ScannedBytes: 0 }
+    };
+    if (canReuseProjection) this.#storeResponseProjection(projectionCacheKey, projection);
+    return this.#pageResponseProjection({
+      evidenceId: id,
+      requestEvidence,
+      projection,
+      projectionCacheKey: canReuseProjection ? projectionCacheKey : null,
+      cacheHit: false,
+      offset,
+      maxBytes,
+      sectionId,
+      blockId
+    });
+  }
+
+  #getResponseProjection(key) {
+    const entry = this.responseProjectionCache.get(key);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+      this.responseProjectionCache.delete(key);
+      this.responseProjectionCacheBytes -= entry.weightBytes;
+      return null;
+    }
+    this.responseProjectionCache.delete(key);
+    this.responseProjectionCache.set(key, entry);
+    return entry;
+  }
+
+  #deleteResponseProjectionsForEvidence(evidenceId) {
+    for (const [key, entry] of this.responseProjectionCache) {
+      if (entry.projection.evidenceId !== evidenceId) continue;
+      this.responseProjectionCache.delete(key);
+      this.responseProjectionCacheBytes -= entry.weightBytes;
+    }
+  }
+
+  #storeResponseProjection(key, projection) {
+    const metadataBytes = Buffer.byteLength(JSON.stringify({
+      analysis: projection.analysis,
+      credentialDetails: projection.credentialDetails,
+      sections: projection.markdownIndex?.sections,
+      blocks: projection.markdownIndex?.blocks
+    })) + (projection.byteOffsets.checkpoints.length * 32);
+    const weightBytes = metadataBytes + (projection.selectedView.length * 2);
+    if (weightBytes > NETWORK_RESPONSE_PROJECTION_CACHE_MAX_ENTRY_BYTES) return false;
+    const prior = this.responseProjectionCache.get(key);
+    if (prior) {
+      this.responseProjectionCache.delete(key);
+      this.responseProjectionCacheBytes -= prior.weightBytes;
+    }
+    const now = Date.now();
+    const entry = { projection, weightBytes, expiresAt: now + NETWORK_RESPONSE_PROJECTION_CACHE_TTL_MS };
+    this.responseProjectionCache.set(key, entry);
+    this.responseProjectionCacheBytes += weightBytes;
+    while (this.responseProjectionCache.size > NETWORK_RESPONSE_PROJECTION_CACHE_MAX_ENTRIES
+      || this.responseProjectionCacheBytes > NETWORK_RESPONSE_PROJECTION_CACHE_MAX_BYTES) {
+      const oldestKey = this.responseProjectionCache.keys().next().value;
+      const oldest = this.responseProjectionCache.get(oldestKey);
+      this.responseProjectionCache.delete(oldestKey);
+      this.responseProjectionCacheBytes -= oldest.weightBytes;
+    }
+    return this.responseProjectionCache.has(key);
+  }
+
+  #pageResponseProjection({ evidenceId, requestEvidence, projection, projectionCacheKey, cacheHit, offset, maxBytes, sectionId, blockId }) {
+    const pageStartedAt = Date.now();
+    const { selectedView, markdownIndex, byteOffsets } = projection;
+    const selectionResult = markdownIndex
+      ? selectMarkdownRange(selectedView, markdownIndex, { sectionId, blockId, includeText: false })
+      : null;
+    if ((sectionId !== undefined || blockId !== undefined) && !selectionResult) return {
+      status: "not_found",
+      evidenceId,
+      request: requestEvidence,
+      reasonCode: "markdown_selection_not_found",
+      selection: { kind: sectionId !== undefined ? "section" : "block", id: sectionId ?? blockId },
+      availableSelections: { sections: markdownIndex?.sections ?? [], blocks: markdownIndex?.blocks ?? [] }
+    };
+    const selection = selectionResult?.selection
+      ?? (markdownIndex ? { kind: "document", id: null, documentOffset: 0, totalBytes: byteOffsets.totalBytes } : undefined);
+    const rangeStart = selection?.documentOffset ?? 0;
+    const rangeEnd = rangeStart + (selection?.totalBytes ?? byteOffsets.totalBytes);
+    const cursorKey = JSON.stringify([selection?.kind ?? "view", selection?.id ?? null, rangeStart, rangeEnd]);
+    const cursor = projection.pageCursors.get(cursorKey);
+    const page = sliceUtf8View(selectedView, offset, maxBytes, {
+      index: byteOffsets,
+      cursor,
+      rangeStart,
+      endOffset: rangeEnd
+    });
+    if (projectionCacheKey) {
+      if (!projection.pageCursors.has(cursorKey) && projection.pageCursors.size >= MAX_NETWORK_RESPONSE_PAGE_CURSORS) {
+        projection.pageCursors.delete(projection.pageCursors.keys().next().value);
+      }
+      projection.pageCursors.set(cursorKey, {
+        byteOffset: rangeStart + page.nextOffset,
+        characterOffset: page.nextCharacterOffset
+      });
+    }
+    const counters = projection.pagingCounters;
+    counters.pageCount++;
+    if (page.startLookupMode === "cursor") counters.utf8CursorHits++;
+    counters.utf8IndexedLookups += [page.startLookupMode, page.endLookupMode].filter(mode => mode === "sparse_index").length;
+    counters.utf8ScannedBytes += page.scannedBytes;
     return {
       status: "available",
-      evidenceId: id,
+      evidenceId,
       request: requestEvidence,
       responseBody: {
         status: "included",
-        contentType: request.mimeType,
-        encoding: base64Encoded ? "base64" : "utf-8",
-        data: base64Encoded ? returned.toString("base64") : returned.toString("utf8"),
-        totalBytes: bytes.length,
-        returnedBytes: returned.length,
-        truncated: bytes.length > returned.length
+        contentType: requestEvidence.mimeType,
+        format: projection.format,
+        parseMode: projection.parseMode,
+        view: projection.view,
+        encoding: projection.view === "markdown" || projection.view === "normalized" ? "utf-8" : projection.encoding,
+        data: page.data,
+        totalBytes: projection.sourceBytes,
+        viewBytes: page.totalBytes,
+        returnedBytes: Buffer.byteLength(page.data),
+        offset: page.offset,
+        nextOffset: page.nextOffset,
+        documentOffset: selection ? selection.documentOffset + page.offset : undefined,
+        hasMore: page.hasMore,
+        truncated: false,
+        ...(selection ? { selection } : {}),
+        ...(markdownIndex ? { sections: markdownIndex.sections, blocks: markdownIndex.blocks } : {}),
+        credentialRedactions: projection.credentialRedactions,
+        credentialValuesIncluded: projection.credentialValuesIncluded,
+        credentialDetails: projection.credentialDetails,
+        analysis: projection.analysis,
+        inspectionMetrics: {
+          acquisitionMs: cacheHit ? 0 : projection.phaseMetrics.acquisitionMs,
+          analysisMs: cacheHit ? 0 : projection.phaseMetrics.analysisMs,
+          renderMs: cacheHit ? 0 : projection.phaseMetrics.renderMs,
+          indexingMs: cacheHit ? 0 : projection.phaseMetrics.indexingMs,
+          processingMs: cacheHit ? Date.now() - pageStartedAt : projection.phaseMetrics.processingMs,
+          sourceBytes: projection.sourceBytes,
+          markdownBytes: projection.markdownBytes,
+          returnedPageBytes: Buffer.byteLength(page.data),
+          projectionCacheHit: cacheHit,
+          paging: { ...counters }
+        }
       }
     };
   }
@@ -853,7 +1659,16 @@ export class BrowserObserver {
     const selected = new Set(facets ?? ["page", "domSnapshot", "accessibilityTree", "frameTree"]);
     const availableFacets = new Set(["page", "domSnapshot", "accessibilityTree", "frameTree", "outOfProcessFrames", "scrollTargets", "selectedElement", "networkActivity", "lifecycleEvents", "domMutations", "runtimeState"]);
     for (const facet of selected) if (!availableFacets.has(facet)) throw new Error(`Unknown evidence facet: ${facet}`);
-    const result = { status: "available", evidenceId: id, capturedAt: stored.capturedAt, documentGeneration: stored.documentGeneration };
+    const result = {
+      status: "available",
+      evidenceId: id,
+      targetId: stored.targetId,
+      capturedAt: stored.capturedAt,
+      documentGeneration: stored.documentGeneration,
+      viewport: structuredClone(stored.viewport ?? { width: 0, height: 0 }),
+      observationProfile: stored.observationProfile ?? "interaction",
+      coverage: structuredClone(stored.coverage ?? {})
+    };
     for (const facet of selected) {
       if (facet === "selectedElement") {
         const element = stored.elements.find(item => item.backendNodeId === backendNodeId && (item.frameTargetId ?? null) === frameTargetId);
@@ -893,8 +1708,8 @@ export class BrowserObserver {
           const { protocolRequestId: _protocolRequestId, ...publicRequest } = request;
           return {
             ...structuredClone(publicRequest),
-            url: request.url ? sanitizeUrl(request.url, { includeSensitiveUrlData }) : request.url,
-            redirectedTo: request.redirectedTo ? sanitizeUrl(request.redirectedTo, { includeSensitiveUrlData }) : request.redirectedTo
+            url: request.url ? redactCredentialUrl(sanitizeUrl(request.url, { includeSensitiveUrlData }), { includeUserInfo: includeSensitiveUrlData }) : request.url,
+            redirectedTo: request.redirectedTo ? redactCredentialUrl(sanitizeUrl(request.redirectedTo, { includeSensitiveUrlData }), { includeUserInfo: includeSensitiveUrlData }) : request.redirectedTo
           };
         });
         result.networkActivityCoverage = {
@@ -902,13 +1717,13 @@ export class BrowserObserver {
           dropped: stored.activity.droppedRequests,
           bodiesCaptured: false,
           responseBodyRetrieval: this.session.networkObservationAvailable ? "selected_on_demand" : "unavailable",
-          maxSelectedBodyBytes: MAX_NETWORK_RESPONSE_BYTES,
+          maxSelectedBodyChunkBytes: MAX_NETWORK_RESPONSE_CHUNK_BYTES,
           headersCaptured: false
         };
       } else if (facet === "lifecycleEvents") {
         result.lifecycleEvents = stored.activity.lifecycleEvents.map(event => ({
           ...structuredClone(event),
-          url: event.url ? sanitizeUrl(event.url, { includeSensitiveUrlData }) : event.url
+          url: event.url ? redactCredentialUrl(sanitizeUrl(event.url, { includeSensitiveUrlData }), { includeUserInfo: includeSensitiveUrlData }) : event.url
         }));
         result.lifecycleEventCoverage = {
           total: stored.activity.totalLifecycleEvents,

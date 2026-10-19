@@ -120,6 +120,9 @@ test("native CDP recursively attaches, observes, and controls nested out-of-proc
     assert.ok(nestedCandidate, "recursive auto-attach exposes a control from the nested out-of-process frame");
     assert.equal(candidate.frameTargetId, iframeTarget.targetId);
     assert.equal(observation.coverage.outOfProcessFramesObserved, 2);
+    assert.equal(observation.outOfProcessFrameGeometry.length, 2);
+    assert.ok(observation.outOfProcessFrameGeometry.every(frame => frame.status === "available" && frame.ownerContentQuad.length === 8),
+      `each attached OOPIF includes observed owner geometry for root-coordinate visual mapping: ${JSON.stringify(observation.outOfProcessFrameGeometry)}`);
     const frameEvidence = session.observer.getEvidence(observation.evidenceId, { facets: ["outOfProcessFrames"] }).outOfProcessFrames;
     assert.equal(frameEvidence.length, 2, "full DOMSnapshot and accessibility evidence for each OOPIF remains selectively retrievable");
     assert.ok(frameEvidence.some(frame => frame.targetId === iframeTarget.targetId && frame.page.url.startsWith("http://localhost:")));
@@ -154,7 +157,10 @@ test("native CDP recursively attaches, observes, and controls nested out-of-proc
     assert.equal(JSON.stringify(hiddenFrameBody).includes("fixture-oopif-secret"), false);
     const selectedFrameBody = await session.observer.inspectNetworkResponse(result.evidenceId, { requestId: frameApiRequest.requestId, includeSensitive: true });
     assert.equal(selectedFrameBody.responseBody.status, "included", "selected OOPIF responses use the matching frame CDP session");
-    assert.ok(selectedFrameBody.responseBody.data.includes("fixture-oopif-secret"));
+    assert.ok(selectedFrameBody.responseBody.data.includes("access_token"), "the complete response shape remains available for diagnosis");
+    assert.ok(selectedFrameBody.responseBody.data.includes("[REDACTED]"), "credential values stay redacted even when the response body is explicitly selected");
+    assert.equal(JSON.stringify(selectedFrameBody).includes("fixture-oopif-secret"), false);
+    assert.ok(selectedFrameBody.responseBody.credentialRedactions > 0);
     assert.ok(activity.domMutations.some(mutation => mutation.frameTargetId === candidate.frameTargetId), "direct OOPIF DOM mutations retain their frame-target provenance");
     assert.ok(activity.domMutations.some(mutation => mutation.frameTargetId === nestedCandidate.frameTargetId), "nested OOPIF DOM mutations retain their frame-target provenance");
 

@@ -1,8 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { NavigationEngine as RuntimeNavigationEngine } from "../src/navigation/engine.js";
+import { DeterministicPlanner } from "../src/navigation/planner.js";
 import { taskGoalFingerprint } from "../src/state/journal.js";
-import { buildEnvironmentBinding } from "../src/environments/model.js";
+import { buildEnvironmentBinding, buildEphemeralCurrentOriginBinding } from "../src/environments/model.js";
+
+const visualFixtureBase64 = readFileSync(resolve("docs/assets/first-run.jpg")).toString("base64");
 
 const authorizedFixtureSessions = new WeakSet();
 
@@ -94,6 +99,125 @@ test("an unrelated URL change is not treated as task success", async () => {
   assert.equal(result.status, "needs_human");
   assert.equal(result.attempts, 1);
   assert.equal(result.page, undefined);
+});
+
+test("ephemeral current-origin binding permits a same-origin visible link and blocks a cross-origin link", async t => {
+  class ScopedOriginSession {
+    target = { id: "scoped-origin-target", endpoint: "local-cdp", url: "https://shop.example.test/" };
+    attached = true;
+    observations = 0;
+    clicks = 0;
+    generation = 1;
+    destination = "https://shop.example.test/account";
+    state = {
+      page: { url: this.target.url, title: "Shop" },
+      headings: [{ level: 1, text: "Shop" }],
+      candidates: [{ identity: "account-link", backendNodeId: 17, name: "Account", role: "link", tag: "a", href: "https://shop.example.test/account", visible: true, disabled: false }]
+    };
+
+    async observe() {
+      this.observations += 1;
+      return {
+        evidenceId: `scoped-origin-evidence-${this.observations}`,
+        targetId: this.target.id,
+        documentGeneration: this.generation,
+        ...structuredClone(this.state),
+        candidates: this.state.candidates.map(candidate => ({
+          ...candidate,
+          targetId: this.target.id,
+          documentGeneration: this.generation
+        }))
+      };
+    }
+
+    async click(candidate) {
+      this.clicks += 1;
+      assert.equal(candidate.href, this.destination);
+      this.generation += 1;
+      this.state = {
+        page: { url: this.destination, title: "Account" },
+        headings: [{ level: 1, text: "Account" }],
+        candidates: []
+      };
+    }
+
+    async waitForChange() {}
+  }
+
+  const sameOrigin = new ScopedOriginSession();
+  sameOrigin.destination = "https://shop.example.test/account";
+  sameOrigin.state.candidates[0].href = sameOrigin.destination;
+  const environment = buildEphemeralCurrentOriginBinding(sameOrigin.target.url);
+  const allowed = await new NavigationEngine(sameOrigin, { environment, maxActions: 1, maxRecoveries: 0 }).run("Open the account page");
+  assert.equal(allowed.status, "succeeded");
+  assert.equal(sameOrigin.clicks, 1);
+
+  const crossOrigin = new ScopedOriginSession();
+  crossOrigin.destination = "https://outside.example/account";
+  crossOrigin.state.candidates[0].href = crossOrigin.destination;
+  const denied = await new NavigationEngine(crossOrigin, { environment, maxActions: 1, maxRecoveries: 0 }).run("Open the account page");
+  assert.notEqual(denied.status, "succeeded");
+  assert.equal(crossOrigin.clicks, 0, "an external link is rejected before CDP dispatch");
+});
+
+test("auto routing abstains without a typed atomicity contract instead of executing a partial local match", async () => {
+  let clicks = 0;
+  const session = {
+    target: { id: "untyped-auto-target", endpoint: "local-cdp" },
+    async observe() {
+      return {
+        evidenceId: "untyped-auto-observation",
+        targetId: this.target.id,
+        documentGeneration: 1,
+        page: { url: "https://shop.example.test/", title: "Shop" },
+        headings: [],
+        candidates: [{ identity: "save-button", backendNodeId: 1, name: "Save", role: "button", tag: "button", visible: true, enabled: true }],
+        scrollTargets: []
+      };
+    },
+    async click() { clicks++; },
+    async waitForChange() {}
+  };
+  const result = await new NavigationEngine(session, {
+    plannerMode: "auto",
+    planner: new DeterministicPlanner(),
+    maxRecoveries: 0
+  }).run("Click Save");
+  assert.equal(clicks, 0);
+  assert.equal(result.status, "unresolved");
+  assert.match(result.reason, /no configured secondary planner is available/u);
+});
+
+test("auto routing keeps a caller-bound search primitive local instead of sending its query to the model", async () => {
+  let modelCalls = 0;
+  const session = {
+    target: { id: "auto-search-target", endpoint: "fixture", url: "https://search.example.test/" },
+    async observe() {
+      return {
+        evidenceId: "auto-search-observation",
+        targetId: this.target.id,
+        documentGeneration: 1,
+        page: { url: "https://search.example.test/", title: "Search" },
+        headings: [],
+        candidates: [],
+        scrollTargets: []
+      };
+    },
+    async waitForChange() {}
+  };
+  const result = await new NavigationEngine(session, {
+    executionMode: "standalone",
+    plannerMode: "auto",
+    planner: {
+      plannerRole: "standalone_action_proposer",
+      requiresScreenshot: false,
+      async plan() { modelCalls++; throw new Error("search query must not leave the local search path"); }
+    },
+    maxRecoveries: 0
+  }).run("Search for a random public topic");
+  assert.equal(modelCalls, 0);
+  assert.equal(result.status, "unresolved");
+  assert.match(result.reason, /search/i);
 });
 
 test("resume refuses a changed environment binding before observing or dispatching", async () => {
@@ -273,6 +397,52 @@ test("anti-automation and login states stop before any browser action", async ()
     assert.equal(result.interventionRequired.evidenceId, "handoff-evidence");
     assert.equal(session.clicks, 0);
   }
+});
+
+test("screenshot-enabled planning receives pixels from the same retained observation", async () => {
+  const evidenceReads = [];
+  let planningObservation;
+  const session = {
+    target: { id: "vision-planner-target", endpoint: "fixture", url: "https://shop.example.test/" },
+    observer: {
+      getEvidence(evidenceId, options) {
+        evidenceReads.push({ evidenceId, options });
+        return {
+          status: "available",
+          evidenceId,
+          targetId: "vision-planner-target",
+          documentGeneration: 1,
+          viewport: { width: 800, height: 600 },
+          coverage: { screenshot: true },
+          screenshotBase64: visualFixtureBase64
+        };
+      }
+    },
+    async observe() {
+      return {
+        evidenceId: "vision-observation-1",
+        targetId: "vision-planner-target",
+        documentGeneration: 1,
+        viewport: { width: 800, height: 600 },
+        page: { url: "https://shop.example.test/", title: "Shop" },
+        headings: [], frames: [], candidates: [], scrollTargets: []
+      };
+    }
+  };
+  const planner = {
+    requiresScreenshot: true,
+    async plan(_goal, observation) {
+      planningObservation = observation;
+      return { status: "ambiguous", reason: "No action is needed for this evidence-transfer check." };
+    }
+  };
+  const result = await new NavigationEngine(session, { planner }).run("Open the account page");
+  assert.equal(result.status, "unresolved");
+  assert.equal(planningObservation.screenshotBase64, visualFixtureBase64);
+  assert.deepEqual(evidenceReads, [{
+    evidenceId: "vision-observation-1",
+    options: { facets: ["page"], includeScreenshot: true }
+  }]);
 });
 
 test("an unrelated password field does not block navigation without login context", async () => {
@@ -489,6 +659,238 @@ test("a lost tab observation journals the action and resume excludes its matchin
   assert.deepEqual(plannerViews[1], [fallbackTarget.identity], "resume filters a recreated control with the same target signature");
 });
 
+test("same-target navigation retries one transient post-action observation without replaying the click", async () => {
+  const targetId = "same-target-observation-retry";
+  const candidate = {
+    identity: "tardigrade-result", targetId, documentGeneration: 1, backendNodeId: 1,
+    name: "Tardigrade", role: "link", tag: "a", href: "https://en.wikipedia.org/wiki/Tardigrade", visible: true
+  };
+  const session = {
+    target: { id: targetId, endpoint: "local-cdp", url: "https://duckduckgo.com/?q=tardigrade" },
+    attached: true,
+    clicks: 0,
+    postDispatchObservations: 0,
+    current: {
+      page: { url: "https://duckduckgo.com/?q=tardigrade", title: "Search" },
+      headings: [{ level: 1, text: "Search" }], candidates: [candidate], pageChangeFingerprint: "search"
+    },
+    async observe() {
+      if (this.clicks > 0) {
+        this.postDispatchObservations++;
+        if (this.postDispatchObservations === 1) throw new Error("Execution context was replaced during same-target navigation.");
+      }
+      return {
+        evidenceId: `same-target-observation-${this.postDispatchObservations}`,
+        targetId,
+        documentGeneration: this.clicks > 0 ? 2 : 1,
+        ...structuredClone(this.current)
+      };
+    },
+    async click() {
+      this.clicks++;
+      this.current = {
+        page: { url: "https://en.wikipedia.org/wiki/Tardigrade", title: "Tardigrade - Wikipedia" },
+        headings: [{ level: 1, text: "Tardigrade" }], candidates: [], pageChangeFingerprint: "tardigrade"
+      };
+    },
+    async navigateObservedLinkInSameTarget(target, { beforeDispatch } = {}) {
+      await beforeDispatch?.({ href: target.href });
+      await this.click(target);
+    },
+    async waitForChange() {}
+  };
+  const result = await new NavigationEngine(session, {
+    planner: { async plan(_goal, observation) { return { status: "planned", action: { type: "click", target: observation.candidates[0] } }; } },
+    environment: { environmentId: "public-search-test", authorizedOrigins: ["https://duckduckgo.com", "https://en.wikipedia.org"] },
+    sameTargetNavigation: true,
+    maxActions: 1,
+    maxRecoveries: 0
+  }).run("Open the Tardigrade page on Wikipedia");
+
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.page.url, "https://en.wikipedia.org/wiki/Tardigrade");
+  assert.equal(session.clicks, 1, "the action is dispatched once even though observation is retried");
+  assert.equal(session.postDispatchObservations, 2, "one fresh observation is allowed after the transient failure");
+});
+
+test("same-target navigation can reattach the exact leased target for fresh post-action evidence without replaying the click", async () => {
+  const targetId = "same-target-reattach";
+  const endpoint = "http://127.0.0.1:9222";
+  const candidate = {
+    identity: "tardigrade-result", targetId, documentGeneration: 1, backendNodeId: 1,
+    name: "Tardigrade", role: "link", tag: "a", href: "https://en.wikipedia.org/wiki/Tardigrade", visible: true
+  };
+  const session = {
+    target: { id: targetId, endpoint, url: "https://duckduckgo.com/?q=tardigrade" },
+    attached: true,
+    targetLifecycle: "attached",
+    clicks: 0,
+    current: {
+      page: { url: "https://duckduckgo.com/?q=tardigrade", title: "Search" },
+      headings: [{ level: 1, text: "Search" }], candidates: [candidate], pageChangeFingerprint: "search"
+    },
+    async observe() {
+      if (!this.attached) throw new Error("Target detached during post-navigation observation.");
+      return { evidenceId: "before-navigation", targetId, documentGeneration: 1, ...structuredClone(this.current) };
+    },
+    async click() {
+      this.clicks++;
+      this.attached = false;
+      this.targetLifecycle = "detached";
+    },
+    async navigateObservedLinkInSameTarget(target, { beforeDispatch } = {}) {
+      await beforeDispatch?.({ href: target.href });
+      await this.click(target);
+    },
+    async waitForChange() {}
+  };
+  let leasedSession = session;
+  let leaseChecks = 0;
+  let commits = 0;
+  let reattachedSession;
+  const result = await new NavigationEngine(session, {
+    planner: { async plan(_goal, observation) { return { status: "planned", action: { type: "click", target: observation.candidates[0] } }; } },
+    environment: { environmentId: "public-search-test", authorizedOrigins: ["https://duckduckgo.com", "https://en.wikipedia.org"] },
+    sameTargetNavigation: true,
+    reattachSameTarget: async ({ targetId: requestedTargetId, endpoint: requestedEndpoint }) => {
+      assert.equal(requestedTargetId, targetId);
+      assert.equal(requestedEndpoint, endpoint);
+      reattachedSession = {
+        target: { id: targetId, endpoint: `${endpoint}/` }, attached: true,
+        async observe() { throw new Error("The supplied fresh observation must be used."); },
+        async close() { this.closed = true; }
+      };
+      return {
+        session: reattachedSession,
+        observation: {
+          evidenceId: "after-navigation-reattached", targetId, documentGeneration: 2,
+          page: { url: "https://en.wikipedia.org/wiki/Tardigrade", title: "Tardigrade - Wikipedia" },
+          headings: [{ level: 1, text: "Tardigrade" }], candidates: [], pageChangeFingerprint: "tardigrade"
+        },
+        commit() { commits++; leasedSession = reattachedSession; }
+      };
+    },
+    assertExecutionLease: async () => { leaseChecks++; assert.equal(leasedSession.attached, true); },
+    maxActions: 1,
+    maxRecoveries: 0
+  }).run("Open the Tardigrade page on Wikipedia");
+
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.page.url, "https://en.wikipedia.org/wiki/Tardigrade");
+  assert.equal(session.clicks, 1, "the detached navigation is never replayed");
+  assert.equal(commits, 1, "the lease binding changes only after exact target and environment validation");
+  assert.ok(leaseChecks >= 2, "the lease is rechecked before dispatch and after rebinding");
+});
+
+test("same-target navigation reattaches when the detach arrives during the bounded observation retry", async () => {
+  const targetId = "same-target-delayed-detach";
+  const endpoint = "http://127.0.0.1:9222";
+  const candidate = {
+    identity: "tardigrade-result", targetId, documentGeneration: 1, backendNodeId: 1,
+    name: "Tardigrade", role: "link", tag: "a", href: "https://en.wikipedia.org/wiki/Tardigrade", visible: true
+  };
+  const session = {
+    target: { id: targetId, endpoint, url: "https://duckduckgo.com/?q=tardigrade" },
+    attached: true,
+    targetLifecycle: "attached",
+    clicks: 0,
+    postDispatchObservations: 0,
+    current: {
+      page: { url: "https://duckduckgo.com/?q=tardigrade", title: "Search" },
+      headings: [{ level: 1, text: "Search" }], candidates: [candidate], pageChangeFingerprint: "search"
+    },
+    async observe() {
+      if (this.clicks > 0) {
+        this.postDispatchObservations++;
+        if (this.postDispatchObservations === 1) throw new Error("Execution context was replaced during same-target navigation.");
+        this.attached = false;
+        this.targetLifecycle = "detached";
+        throw new Error("Target detached during post-navigation observation.");
+      }
+      return { evidenceId: "before-navigation", targetId, documentGeneration: 1, ...structuredClone(this.current) };
+    },
+    async click() { this.clicks++; },
+    async navigateObservedLinkInSameTarget(target, { beforeDispatch } = {}) {
+      await beforeDispatch?.({ href: target.href });
+      await this.click(target);
+    },
+    async waitForChange() {}
+  };
+  let committed = false;
+  const replacementSession = {
+    target: { id: targetId, endpoint: `${endpoint}/` },
+    attached: true,
+    async observe() { throw new Error("The supplied fresh observation must be used."); },
+    async close() { this.closed = true; }
+  };
+  const result = await new NavigationEngine(session, {
+    planner: { async plan(_goal, observation) { return { status: "planned", action: { type: "click", target: observation.candidates[0] } }; } },
+    environment: { environmentId: "public-search-test", authorizedOrigins: ["https://duckduckgo.com", "https://en.wikipedia.org"] },
+    sameTargetNavigation: true,
+    reattachSameTarget: async () => ({
+      session: replacementSession,
+      observation: {
+        evidenceId: "after-navigation-delayed-reattach", targetId, documentGeneration: 2,
+        page: { url: "https://en.wikipedia.org/wiki/Tardigrade", title: "Tardigrade - Wikipedia" },
+        headings: [{ level: 1, text: "Tardigrade" }], candidates: [], pageChangeFingerprint: "tardigrade"
+      },
+      commit() { committed = true; }
+    }),
+    assertExecutionLease: async () => {},
+    maxActions: 1,
+    maxRecoveries: 0
+  }).run("Open the Tardigrade page on Wikipedia");
+
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.page.url, "https://en.wikipedia.org/wiki/Tardigrade");
+  assert.equal(session.clicks, 1, "the dispatched navigation is not repeated");
+  assert.equal(session.postDispatchObservations, 2);
+  assert.equal(committed, true, "the exact-target lease is rebound after the detach is observed");
+});
+
+test("same-target reattachment rejects another target and keeps the dispatched action unresolved", async () => {
+  const targetId = "same-target-reattach-reject";
+  const candidate = {
+    identity: "tardigrade-result", targetId, documentGeneration: 1, backendNodeId: 1,
+    name: "Tardigrade", role: "link", tag: "a", href: "https://en.wikipedia.org/wiki/Tardigrade", visible: true
+  };
+  const session = {
+    target: { id: targetId, endpoint: "http://127.0.0.1:9222", url: "https://duckduckgo.com/?q=tardigrade" },
+    attached: true, targetLifecycle: "attached", clicks: 0,
+    current: { page: { url: "https://duckduckgo.com/?q=tardigrade", title: "Search" }, headings: [], candidates: [candidate] },
+    async observe() {
+      if (!this.attached) throw new Error("Target detached during post-navigation observation.");
+      return { evidenceId: "before-navigation", targetId, documentGeneration: 1, ...structuredClone(this.current) };
+    },
+    async click() { this.clicks++; this.attached = false; this.targetLifecycle = "detached"; },
+    async navigateObservedLinkInSameTarget(target, { beforeDispatch } = {}) { await beforeDispatch?.({ href: target.href }); await this.click(target); },
+    async waitForChange() {}
+  };
+  let replacementClosed = false;
+  const result = await new NavigationEngine(session, {
+    planner: { async plan(_goal, observation) { return { status: "planned", action: { type: "click", target: observation.candidates[0] } }; } },
+    environment: { environmentId: "public-search-test", authorizedOrigins: ["https://duckduckgo.com", "https://en.wikipedia.org"] },
+    sameTargetNavigation: true,
+    reattachSameTarget: async () => ({
+      session: { target: { id: "other-target", endpoint: "http://127.0.0.1:9222" }, attached: true, async close() { replacementClosed = true; } },
+      observation: { evidenceId: "wrong-target", targetId: "other-target", page: { url: "https://en.wikipedia.org/wiki/Tardigrade" } }
+    }),
+    assertExecutionLease: async () => {},
+    maxActions: 1,
+    maxRecoveries: 0
+  }).run("Open the Tardigrade page on Wikipedia");
+
+  assert.equal(result.status, "unresolved");
+  assert.equal(session.clicks, 1);
+  assert.equal(replacementClosed, true);
+  assert.deepEqual(result.reconciliation, {
+    reasonCode: "post_action_observation_unavailable",
+    errorClass: "target_detached",
+    observationAttempts: 2,
+    reattachFailureCode: "reattach_identity_mismatch"
+  });
+});
+
 test("the journal records a redacted action intent before dispatch and clears it after verification", async () => {
   const target = { identity: "account-link", backendNodeId: 1, documentGeneration: 1, name: "Open account", role: "link", tag: "a", visible: true };
   const journal = {
@@ -608,8 +1010,8 @@ test("search phrase runs locally, verifies the query, and never persists or retu
     value: undefined,
     async write(value) { this.value = structuredClone(value); }
   };
-  const searchField = { identity: "search-field", targetId: "search-target", formIdentity: "search-form", backendNodeId: 1, documentGeneration: 1, tag: "input", type: "search", role: "searchbox", name: "Search products", visible: true };
-  const submitButton = { identity: "search-submit", targetId: "search-target", formIdentity: "search-form", formMethod: "get", formActionOrigin: "https://shop.example.test", backendNodeId: 2, documentGeneration: 1, tag: "button", role: "button", name: "Search", submitsForm: true, visible: true };
+  const searchField = { identity: "search-field", targetId: "search-target", formIdentity: "search-form", formMethod: "get", formActionOrigin: "https://shop.example.test", queryField: true, backendNodeId: 1, documentGeneration: 1, tag: "input", type: "text", role: "textbox", name: "Search products", visible: true };
+  const submitButton = { identity: "search-submit", targetId: "search-target", formIdentity: "search-form", formMethod: "get", formActionOrigin: "https://shop.example.test", formTargetSameContext: true, backendNodeId: 2, documentGeneration: 1, tag: "button", role: "button", name: "Search", submitsForm: true, visible: true };
   const session = {
     target: { id: "search-target", endpoint: "local-cdp" },
     current: {
@@ -734,7 +1136,7 @@ test("resuming a redacted search journal re-enters the caller phrase instead of 
     async write(value) { this.value = structuredClone(value); }
   };
   const searchField = { identity: "resume-search-field", targetId: "resume-search-target", formIdentity: "resume-search-form", backendNodeId: 1, documentGeneration: 1, tag: "input", type: "search", role: "searchbox", name: "Search", visible: true };
-  const submitButton = { identity: "resume-search-submit", targetId: "resume-search-target", formIdentity: "resume-search-form", formMethod: "get", formActionOrigin: "https://shop.example.test", backendNodeId: 2, documentGeneration: 1, tag: "button", role: "button", name: "Search", submitsForm: true, visible: true };
+  const submitButton = { identity: "resume-search-submit", targetId: "resume-search-target", formIdentity: "resume-search-form", formMethod: "get", formActionOrigin: "https://shop.example.test", formTargetSameContext: true, backendNodeId: 2, documentGeneration: 1, tag: "button", role: "button", name: "Search", submitsForm: true, visible: true };
   const session = {
     target: { id: "resume-search-target", endpoint: "local-cdp" },
     current: {

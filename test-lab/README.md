@@ -2,7 +2,11 @@
 
 Fixture Lab is ActiveTab's qualification and adaptation subsystem. It lets an ActiveTab run test a navigation strategy against a reproducible fixture or independently maintained benchmark before that strategy is reused. It is part of ActiveTab's runtime capability surface, while each fixture server remains a separate target.
 
+The native CDP integration suite also exercises a local API-shape fixture. The browser discovers only a same-origin JSON GET already made by the page, then explicitly selects the retained response for schema inspection. Qualification uses the provider-side `api-shape-twin` oracle across 30 seeded record sets; the oracle contract and fixture records stay outside browser evidence. This qualifies response shape only and does not authorize API execution, replay, or registration.
+
 Qualification uses the same native CDP navigation engine as ordinary ActiveTab work. The driver receives a public task and an explicitly bound target. Provider-side oracles remain outside the driver and score the resulting application state afterward. Fixture success never proves a live staging or production result.
+
+Public live-site qualification is a separate ActiveTab path, not a Fixture Lab scenario. List reviewed scenarios with `npm run qualify:public-sites -- --list`; run the real search-and-browse scenario with `npm run qualify:public-sites -- --scenario-id public-search-wikipedia-001 --confirm-readonly --allow-jev-visual`. It opens headed Chrome at a trusted DuckDuckGo GET URL for a generated query, uses NavigationEngine's automatic route to send the observed result selection to the configured secondary model, optionally sends a bound screenshot to Jev when image capability and consent are available, and independently checks the final page against a direct HTTP read. Owner-only inference history and receipts persist after the temporary browser profile is deleted.
 
 ## Current targets
 

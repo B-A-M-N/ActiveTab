@@ -1,6 +1,7 @@
 import { isWaitingRunStatus, RUN_STATUS, STEP_STATUS } from "../schema.js";
 import { INTERVENTION_STATE } from "../../runtime/interventions.js";
 import { acquireBrowserTargetLease } from "../runState.js";
+import { resolveObservedApplication } from "../../environments/model.js";
 
 /** Owns durable workflow-run bindings, leases, checkpoints, and terminal state. */
 export class RunStateCoordinator {
@@ -51,7 +52,10 @@ export class RunStateCoordinator {
     if (existingRunStateId && !run) throw new Error("The bound durable run state no longer exists.");
     const environmentId = this.environment?.environmentId ?? null;
     const targetId = this.session?.target?.id ?? null;
-    const authenticationRealm = this.environment?.applications?.[0]?.authenticationRealm ?? null;
+    const application = this.session?.target?.url && this.environment
+      ? resolveObservedApplication(this.environment, this.session.target.url)
+      : { status: "unmatched" };
+    const authenticationRealm = application.status === "matched" ? application.authenticationRealm : run?.authenticationRealm ?? null;
     if (run) {
       if (run.runId !== receipt.runId || environmentId !== run.environmentId
         || targetId !== (run.target?.targetId ?? null)

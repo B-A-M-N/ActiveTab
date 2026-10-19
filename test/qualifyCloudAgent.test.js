@@ -4,14 +4,16 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  shouldKeepOwnedBrowserOpen,
+  qualifyCloudAgent
+} from "../src/testing/qualifyCloudAgent.js";
+import {
   resolveCloudAgentEntry,
   hasCloudAgentTaskComposer,
   verifyCloudAgentReady,
   discoverVisibleDiagnosticSurfaces,
-  createCloudAgentEntryWorkflow,
-  shouldKeepOwnedBrowserOpen,
-  qualifyCloudAgent
-} from "../src/testing/qualifyCloudAgent.js";
+  createCloudAgentEntryWorkflow
+} from "../src/testing/cloudAgentEntry.js";
 import { InterventionStore } from "../src/runtime/interventions.js";
 import { RunStateStore, blockingQualificationRuns } from "../src/testing/runState.js";
 

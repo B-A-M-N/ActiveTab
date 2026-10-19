@@ -2,6 +2,9 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { generateOutputFiles, redactInput } from "../src/api/output-files.js";
 import { createNavigationRunner } from "../src/api/navigation-runner.js";
+import { DeterministicPlanner } from "../src/navigation/planner.js";
+import { WorkflowSynthesizer } from "../src/navigation/workflowSynthesizer.js";
+import { createRunStateFixture } from "./runStateFixture.js";
 import { mkdtemp, rm, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -283,6 +286,190 @@ test("navigation runner reports locally measured usage instead of synthetic cred
   await assert.rejects(
     runner.run("Test goal", { input: { review_count: 42 }, templateId: "test" })
   );
+});
+
+test("API template inputs reach deterministic form planning without normalization", async () => {
+  const fixture = await createRunStateFixture("activetab-api-input-bindings-");
+  const exactValue = "Foo.Bar+QA@example.com  ";
+  let evidenceNumber = 0;
+  const session = {
+    attached: true,
+    persistent: true,
+    target: { id: "api-input-target", endpoint: "fixture", url: "https://forms.example.test/" },
+    documentGeneration: 1,
+    async observe() {
+      return {
+        evidenceId: `api-input-evidence-${++evidenceNumber}`,
+        targetId: this.target.id,
+        documentGeneration: this.documentGeneration,
+        page: { url: this.target.url, title: "Form", viewportWidth: 800, viewportHeight: 600 },
+        headings: [], frames: [], scrollTargets: [],
+        candidates: [{
+          identity: "email-field", targetId: this.target.id, documentGeneration: this.documentGeneration,
+          backendNodeId: 7, tag: "input", type: "email", role: "textbox", name: "Email",
+          visible: true, disabled: false, bounds: { x: 10, y: 10, width: 300, height: 32 }
+        }]
+      };
+    }
+  };
+  const runner = createNavigationRunner({
+    outputDir: join(tempDir, "api-input-outputs"),
+    journalDir: join(tempDir, "api-input-journals"),
+    resolveSession: async () => session,
+    engineOptions: {
+      planner: {
+        async plan(goal, observation, options) {
+          const planned = await new DeterministicPlanner().plan(goal, observation, options);
+          session.plannedValue = planned.action?.value;
+          return planned;
+        }
+      },
+      executionMode: "standalone"
+    }
+  });
+  try {
+    const result = await runner.run("Fill Email field with inputRef:email", {
+      input: { email: exactValue },
+      taskId: "api-exact-input-binding",
+      templateId: "typed-form-input",
+      runStateStore: fixture.store
+    });
+    assert.equal(result.status, "needs_human", "the unscoped form effect is refused before dispatch");
+    assert.match(result.output.reason, /trusted typed operation contract/);
+    assert.equal(session.plannedValue, exactValue, "the caller's exact input reaches the planner unchanged");
+    const journal = JSON.parse(await readFile(join(tempDir, "api-input-journals", "api-exact-input-binding.json"), "utf8"));
+    assert.equal(JSON.stringify(journal).includes(exactValue), false, "the exact caller value is absent from the task journal");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("API runner routes a default-mode current-page read through verified observed extraction", async () => {
+  const fixture = await createRunStateFixture("activetab-api-auto-read-");
+  const targetId = "api-auto-read-target";
+  const pageUrl = "https://catalog.example.test/products";
+  const output = {
+    schema: { type: "array", items: { name: { type: "string", required: true, dataClass: "public", sourceHeader: "Name" } } },
+    records: [{ name: "Widget" }],
+    fieldProvenance: [{ recordIndex: 0, fields: { name: {
+      observationId: "api-auto-read-evidence", validation: "valid", method: "visible_html_table_cell",
+      sourceHeader: "Name", pageUrl
+    } } }],
+    scope: { origin: "https://catalog.example.test", pagePath: "/products" },
+    completeness: "observed_partial",
+    verification: {
+      recordCount: 1, expectedRecords: null, completionPolicy: "observed_only", pageCount: 1,
+      invalidRows: 0, duplicateKeys: 0, invalidUniqueKeys: 0, overflow: false, failures: [], uniqueBy: ["name"],
+      completenessStatus: "observed_partial", completionReasonCode: "collection_completeness_not_established", completenessClaimed: false
+    }
+  };
+  const capabilityId = "observed_read_api_auto_12345678";
+  const capability = {
+    id: capabilityId, action: "extract", executionOrigin: "ephemeral_observed_read", effectClass: "read",
+    intentBinding: "caller_required", targetRole: "observed_records", purposeCodes: ["extract_records"],
+    preconditionCodes: ["fresh_observed_source"], postconditionCodes: ["observed_records_returned"],
+    verificationCodes: ["observed_records_verified"], outputCompleteness: "observed_partial",
+    outputSchema: [{ name: "name", type: "string", required: true }],
+    async execute() { return { status: "verified", output, completeness: "observed_partial" }; }
+  };
+  const session = {
+    attached: true, persistent: true,
+    target: { id: targetId, endpoint: "fixture", url: pageUrl },
+    async observe() { return {
+      evidenceId: "api-auto-read-evidence", targetId, documentGeneration: 1,
+      page: { url: pageUrl, title: "Products" }, headings: [], candidates: [], scrollTargets: []
+    }; }
+  };
+  const runner = createNavigationRunner({
+    outputDir: join(tempDir, "api-auto-read-output"),
+    journalDir: join(tempDir, "api-auto-read-journal"),
+    resolveSession: async () => session,
+    capabilityService: {
+      async createObservedReadWorkflowCapabilities({ goal }) {
+        assert.equal(goal, "List the visible product names");
+        return [capability];
+      }
+    }
+  });
+
+  try {
+    const result = await runner.run("List the visible product names", {
+      input: {}, taskId: "api-auto-read-task", templateId: "default-read", runStateStore: fixture.store
+    });
+    assert.equal(result.status, "succeeded", JSON.stringify(result));
+    assert.deepEqual(result.output.records, [{ name: "Widget" }]);
+    assert.equal(result.output.workflow_outputs[capabilityId].completeness, "observed_partial");
+    assert.equal(result.output.workflow_outputs[capabilityId].verification.completenessClaimed, false);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("API runner keeps default auto search-and-read on the guarded workflow route", async () => {
+  const fixture = await createRunStateFixture("activetab-api-auto-search-read-");
+  const targetId = "api-auto-search-read-target";
+  const pageUrl = "https://search.example.test/";
+  const query = "rare public phrase";
+  const goal = `Search for ${query} and return the titles`;
+  const candidates = [
+    {
+      identity: "query-field", backendNodeId: 11, targetId, documentGeneration: 1,
+      tag: "input", type: "search", role: "searchbox", name: "Search", visible: true, disabled: false, readOnly: false,
+      formIdentity: "search-form", formMethod: "get", formActionOrigin: "https://search.example.test", formTargetSameContext: true
+    },
+    {
+      identity: "submit-search", backendNodeId: 12, targetId, documentGeneration: 1,
+      tag: "button", role: "button", name: "Search", visible: true, disabled: false, submitsForm: true,
+      formIdentity: "search-form", formMethod: "get", formActionOrigin: "https://search.example.test", formTargetSameContext: true
+    }
+  ];
+  const readCapability = {
+    id: "observed_read_api_search_12345678", action: "extract", effectClass: "read", intentBinding: "caller_required",
+    targetRole: "observed_records", purposeCodes: ["extract_records"], preconditionCodes: ["fresh_observed_source"],
+    postconditionCodes: ["observed_records_returned"], verificationCodes: ["observed_records_verified"],
+    outputCompleteness: "observed_partial", outputSchema: [{ name: "title", type: "string", required: true }],
+    async execute() { throw new Error("search results must be verified before extraction"); }
+  };
+  const session = {
+    attached: true, persistent: true, documentGeneration: 1,
+    target: { id: targetId, endpoint: "fixture", url: pageUrl },
+    async observe() { return {
+      evidenceId: "api-auto-search-read-evidence", targetId, documentGeneration: 1,
+      page: { url: pageUrl, title: "Search" }, headings: [], candidates, scrollTargets: []
+    }; }
+  };
+  let providerInput;
+  const runner = createNavigationRunner({
+    outputDir: join(tempDir, "api-auto-search-read-output"),
+    journalDir: join(tempDir, "api-auto-search-read-journal"),
+    resolveSession: async () => session,
+    capabilityService: {
+      async createDeferredObservedReadWorkflowCapabilities({ goal: readGoal }) {
+        assert.equal(readGoal, "the titles");
+        return [readCapability];
+      }
+    },
+    engineOptions: {
+      workflowSynthesizer: new WorkflowSynthesizer({
+        allowPageEvidence: true,
+        provider: { async requestStructured(request) {
+          providerInput = request.input;
+          return { result: { version: 1, steps: [] } };
+        } }
+      })
+    }
+  });
+
+  try {
+    const result = await runner.run(goal, { input: {}, taskId: "api-auto-search-read-task", templateId: "search-read", runStateStore: fixture.store });
+    assert.equal(result.status, "unresolved");
+    assert.ok(providerInput, "the default API route selected workflow synthesis");
+    assert.equal(providerInput.task.cardinality, "compound");
+    assert.ok(providerInput.task.requiredCapabilityIds.includes(readCapability.id));
+    assert.equal(JSON.stringify(providerInput).includes(query), false, "the caller query stays in its local input binding");
+  } finally {
+    await fixture.cleanup();
+  }
 });
 
 test("createNavigationRunner rejects conflicting session configuration in resolveConfiguredSession", async () => {

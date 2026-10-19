@@ -5,7 +5,7 @@
  * material are never written here.
  */
 
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { mkdir, writeFile, readFile, readdir, rename, open, lstat, chmod, unlink } from "node:fs/promises";
 import { join, dirname, resolve } from "node:path";
@@ -21,6 +21,20 @@ const IMMUTABLE_FIELDS = Object.freeze([
 ]);
 
 function clone(value) { return value === undefined ? undefined : structuredClone(value); }
+
+function canonicalJson(value) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("Effect fingerprint contains a non-finite number.");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).filter(key => value[key] !== undefined).sort()
+      .map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  throw new Error("Effect fingerprint contains an unsupported value.");
+}
 
 function safeIdentifier(value, label, { allowSlash = false } = {}) {
   if (typeof value !== "string" || value.length < 1 || value.length > 160 || value.includes("/") || value.includes("\\")) {
@@ -86,7 +100,9 @@ export async function requestRunCancellation(store, runId, { abort, runPromise }
 
 export function browserTargetLeaseId(target) {
   if (typeof target?.id !== "string" || !target.id) throw new Error("A browser target ID is required for a target lease.");
-  const endpoint = typeof target.endpoint === "string" && target.endpoint ? target.endpoint : "local-cdp";
+  const endpointValue = typeof target.endpoint === "string" && target.endpoint ? target.endpoint : "local-cdp";
+  let endpoint = endpointValue;
+  try { endpoint = new URL(endpointValue).origin; } catch { /* preserve the explicit local-cdp sentinel */ }
   return `browser-${createHash("sha256").update(JSON.stringify([endpoint, target.id])).digest("hex")}`;
 }
 
@@ -100,10 +116,18 @@ export async function acquireBrowserTargetLease(store, session, runId) {
   const target = { id: session.target.id, endpoint: session.target.endpoint ?? "local-cdp" };
   const targetKey = browserTargetLeaseId(target);
   const lease = await store.acquireTargetLease(targetKey, runId);
+  let boundSession = session;
   return {
     fencingToken: lease.fencingToken,
+    bindSession(nextSession) {
+      if (nextSession?.attached !== true || browserTargetLeaseId(nextSession.target) !== targetKey) {
+        throw Object.assign(new Error("A replacement session must be attached to the exact endpoint and target held by the durable lease."), { code: "RUN_TARGET_LEASE_LOST" });
+      }
+      boundSession = nextSession;
+      return true;
+    },
     async assertCurrent() {
-      if (session.attached !== true || browserTargetLeaseId(session.target) !== targetKey) {
+      if (boundSession.attached !== true || browserTargetLeaseId(boundSession.target) !== targetKey) {
         throw Object.assign(new Error("The attached browser target no longer matches its durable lease."), { code: "RUN_TARGET_LEASE_LOST" });
       }
       return await lease.assertCurrent();
@@ -175,6 +199,38 @@ export class RunStateStore {
         expires_at INTEGER NOT NULL
       );
     `);
+  }
+
+  async #effectFingerprintKey(runId) {
+    const keyName = `.effect-key-${createHash("sha256").update(runId).digest("hex")}.bin`;
+    const keyPath = join(this.baseDir, keyName);
+    try {
+      const handle = await open(keyPath, "wx", 0o600);
+      const key = randomBytes(32);
+      try {
+        await handle.writeFile(key);
+        await handle.sync();
+      } finally { await handle.close(); }
+      return key;
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+    const stat = await lstat(keyPath);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Effect fingerprint key must be a regular owner-only file.");
+    await chmod(keyPath, 0o600);
+    const key = await readFile(keyPath);
+    if (key.length !== 32) throw new Error("Effect fingerprint key is malformed; refusing to reserve the effect.");
+    return key;
+  }
+
+  /** Return a stable, run-scoped keyed digest without persisting effect inputs. */
+  async fingerprintOperationEffect(runId, material) {
+    safeIdentifier(String(runId ?? ""), "runId");
+    if (!await this.#readRun(runId)) throw new Error("Cannot fingerprint an effect for an unknown run.");
+    const serialized = canonicalJson(material);
+    if (Buffer.byteLength(serialized, "utf8") > 64 * 1024) throw new Error("Effect fingerprint input exceeds the bounded limit.");
+    const key = await this.#effectFingerprintKey(runId);
+    return createHmac("sha256", key).update("activetab-effect-v1\0").update(serialized).digest("hex");
   }
 
   close() {
@@ -570,6 +626,12 @@ export class RunStateStore {
         if (existing.stepId !== stepId || existing.action !== action || existing.effectDigest !== effectDigest) throw new Error("Operation identity was reused with a different effect contract.");
         if (["DISPATCHED", "UNCERTAIN", "VERIFIED", "REFUSED"].includes(existing.status)) throw new Error(`Operation '${operationId}' already reached ${existing.status}; it cannot be dispatched again.`);
         return;
+      }
+      const duplicate = [...run.pendingOperations, ...run.uncertainOperations].find(item =>
+        item.effectDigest === effectDigest && ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(item.status)
+      );
+      if (duplicate) {
+        throw new Error(`Equivalent effect is already ${duplicate.status} under operation '${duplicate.operationId}'; reconcile it before reserving another operation.`);
       }
       run.pendingOperations.push({
         operationId, stepId, action, effectDigest, status: "RESERVED",

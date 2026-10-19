@@ -9,7 +9,7 @@ const INPUT_PLACEHOLDER = "[redacted]";
 
 export function projectInput(input, schema) {
   if (input === null || input === undefined) return input ?? null;
-  if (Array.isArray(input)) return input.map(item => projectInput(item, undefined));
+  if (Array.isArray(input)) return input.map(item => projectInput(item, schema?.items));
   if (typeof input !== "object") {
     return typeof input === "number" || typeof input === "boolean" ? input : INPUT_PLACEHOLDER;
   }
@@ -17,10 +17,13 @@ export function projectInput(input, schema) {
   const result = {};
   for (const [key, value] of Object.entries(input)) {
     if (SENSITIVE_INPUT_KEY.test(key)) continue;
+    if (schema && schema.additionalProperties !== true && !Object.hasOwn(props, key)) continue;
     const spec = props[key];
     if (spec?.type === "integer" || spec?.type === "number" || spec?.type === "boolean" ||
         typeof value === "number" || typeof value === "boolean") {
       result[key] = value;
+    } else if (spec?.type === "array" && Array.isArray(value)) {
+      result[key] = value.map(item => projectInput(item, spec.items));
     } else {
       result[key] = projectInput(value, spec);
     }

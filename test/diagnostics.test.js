@@ -87,10 +87,15 @@ test("collector collectAll handles mixed success and failure", async () => {
   assert.match(results[2].error, /not registered/);
 });
 
-test("correlator distinguishes direct, probable, temporal, and unknown", () => {
+test("correlator requires scoped verified evidence and treats generic matches as weak", () => {
   const corr = new DiagnosticCorrelator({ temporalWindowMs: 1000 });
-  corr.addEvent({ eventId: "a", traceId: "abc-123", observedAt: "2026-01-01T00:00:00.000Z", sourceType: "http" });
-  corr.addEvent({ eventId: "b", traceId: "abc-123", observedAt: "2026-01-01T00:00:00.500Z", sourceType: "app" });
+  const scope = { environmentId: "staging", targetId: "tab-1", runId: "run-1", principalId: "owner-1", operationNamespace: "cloud_agent.run" };
+  const correlation = {
+    namespace: "cloud-agent-run", value: "run-abc", pairKind: "freeinference_cloud_agent_run",
+    provenance: "verified_in_browser_and_backend", scope, evidenceRefs: ["browser-evidence", "backend-evidence"]
+  };
+  corr.addEvent({ eventId: "a", evidenceId: "browser-evidence", traceId: "abc-123", correlation, observedAt: "2026-01-01T00:00:00.000Z", sourceType: "browser_ui" });
+  corr.addEvent({ eventId: "b", evidenceId: "backend-evidence", traceId: "abc-123", correlation, observedAt: "2026-01-01T00:00:00.500Z", sourceType: "cloud_agent_backend" });
   corr.addEvent({ eventId: "c", observedAt: "2026-01-01T00:00:01.000Z", sourceType: "http", origin: "http://x", operationType: "navigate" });
   corr.addEvent({ eventId: "d", observedAt: "2026-01-01T00:00:01.200Z", sourceType: "http", origin: "http://x", operationType: "navigate" });
   corr.addEvent({ eventId: "e", observedAt: "2026-01-01T00:00:09.000Z" });
@@ -98,12 +103,18 @@ test("correlator distinguishes direct, probable, temporal, and unknown", () => {
   // direct: shared traceId
   let link = corr.correlate("a", "b");
   assert.equal(link.strength, "direct");
-  assert.deepEqual(link.evidence.sharedIds, [{ key: "traceId", value: "abc-123" }]);
+  assert.deepEqual(link.evidence.evidenceRefs, ["backend-evidence", "browser-evidence"]);
 
-  // probable: ≥2 compatible signals, no shared id
+  // Same source, origin, and operation are not causal proof.
   link = corr.correlate("c", "d");
+  assert.equal(link.strength, "temporal");
+
+  // Probable correlation requires an explicit, scoped pair-specific rule.
+  const inferred = { ...correlation, value: "run-inferred", pairKind: "workflow_step_diagnostic", provenance: "pair_specific_inference", evidenceRefs: ["inferred-a", "inferred-b"] };
+  corr.addEvent({ eventId: "inferred-a", evidenceId: "inferred-a", sourceType: "browser_action", correlation: inferred, observedAt: "2026-01-01T00:00:02.000Z" });
+  corr.addEvent({ eventId: "inferred-b", evidenceId: "inferred-b", sourceType: "diagnostic_snapshot", correlation: inferred, observedAt: "2026-01-01T00:00:02.100Z" });
+  link = corr.correlate("inferred-a", "inferred-b");
   assert.equal(link.strength, "probable");
-  assert.ok(link.evidence.compatibleSignals.length >= 2);
 
   // temporal: near but no shared ids or ≥2 signals
   const corr2 = new DiagnosticCorrelator({ temporalWindowMs: 1000 });
@@ -120,10 +131,29 @@ test("correlator distinguishes direct, probable, temporal, and unknown", () => {
   assert.equal(link.strength, "unknown");
 });
 
-test("correlator summary reports counts", () => {
+test("same identifier with mismatched target scope cannot be direct", () => {
+  const corr = new DiagnosticCorrelator({ temporalWindowMs: 1000 });
+  const correlation = targetId => ({
+    namespace: "cloud-agent-run", value: "same-id", pairKind: "freeinference_cloud_agent_run",
+    provenance: "verified_in_browser_and_backend",
+    scope: { environmentId: "staging", targetId, runId: "run-1", principalId: "owner-1", operationNamespace: "cloud_agent.run" },
+    evidenceRefs: ["browser-evidence", "backend-evidence"]
+  });
+  corr.addEvent({ eventId: "browser", evidenceId: "browser-evidence", executionId: "same-id", sourceType: "browser_ui", correlation: correlation("tab-1"), observedAt: "2026-01-01T00:00:00.000Z" });
+  corr.addEvent({ eventId: "backend", evidenceId: "backend-evidence", executionId: "same-id", sourceType: "cloud_agent_backend", correlation: correlation("tab-2"), observedAt: "2026-01-01T00:00:00.100Z" });
+  assert.equal(corr.correlate("browser", "backend").strength, "temporal");
+});
+
+test("correlator summary reports only the established correlation strength", () => {
   const corr = new DiagnosticCorrelator();
-  corr.addEvent({ eventId: "a", traceId: "t1" });
-  corr.addEvent({ eventId: "b", traceId: "t1" });
+  const correlation = {
+    namespace: "cloud-agent-run", value: "t1", pairKind: "freeinference_cloud_agent_run",
+    provenance: "verified_in_browser_and_backend",
+    scope: { environmentId: "staging", targetId: "tab-1", runId: "run-1", principalId: "owner-1", operationNamespace: "cloud_agent.run" },
+    evidenceRefs: ["browser-proof", "backend-proof"]
+  };
+  corr.addEvent({ eventId: "a", evidenceId: "browser-proof", sourceType: "browser_ui", correlation });
+  corr.addEvent({ eventId: "b", evidenceId: "backend-proof", sourceType: "cloud_agent_backend", correlation });
   corr.correlate("a", "b");
   const summary = corr.summary();
   assert.equal(summary.totalLinks, 1);

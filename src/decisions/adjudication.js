@@ -14,6 +14,14 @@ export function adjudicatePreActionReview(review) {
       reason: "Jev flagged the proposed operation for agent review; no browser effect was dispatched."
     };
   }
+  if (review?.evidenceStatus === "insufficient_evidence" || review?.jev?.disposition === "insufficient_evidence") {
+    return {
+      allowed: true,
+      grantsAuthority: false,
+      category: "insufficient_review_evidence",
+      reason: "The advisory review lacked enough intent-bound evidence to assess the target; deterministic policy remains authoritative."
+    };
+  }
   return {
     allowed: true,
     grantsAuthority: false,

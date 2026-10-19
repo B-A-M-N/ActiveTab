@@ -1,5 +1,51 @@
+import { verifyObservedPartialExtractionResult } from "./extractionVerifier.js";
+
 export class OutputAccumulator {
   constructor() { this.outputs = new Map(); }
+
+  restore(outputName, contractId, output, pageEvidence) {
+    if (typeof outputName !== "string" || !outputName || typeof contractId !== "string" || !contractId
+      || !output || typeof output !== "object" || Array.isArray(output)
+      || output.completeness !== "incomplete" || !Array.isArray(output.records)
+      || !Array.isArray(output.fieldProvenance) || output.records.length !== output.fieldProvenance.length
+      || !Array.isArray(pageEvidence) || pageEvidence.length < 1 || pageEvidence.length > 100
+      || !output.verification || output.verification.pageCount !== pageEvidence.length) {
+      throw new Error("A partial extraction checkpoint is malformed.");
+    }
+    const fields = Object.keys(output.schema?.items ?? {});
+    if (!fields.length || output.records.some(record => !record || typeof record !== "object" || Array.isArray(record)
+      || Object.keys(record).length !== fields.length || fields.some(field => !Object.hasOwn(record, field)))) {
+      throw new Error("A partial extraction checkpoint does not contain the complete released schema.");
+    }
+    const partialProof = {
+      ...output,
+      completeness: "observed_partial",
+      verification: {
+        ...output.verification,
+        expectedRecords: null,
+        completionPolicy: "observed_only",
+        completenessStatus: "observed_partial",
+        completenessClaimed: false,
+        completionReasonCode: "collection_in_progress",
+        overflow: false,
+        failures: []
+      }
+    };
+    if (verifyObservedPartialExtractionResult(partialProof).status !== "valid_observed_partial") {
+      throw new Error("A partial extraction checkpoint failed schema, provenance, or uniqueness verification.");
+    }
+    this.outputs.set(outputName, {
+      contractId,
+      records: output.records.map(record => ({ ...record })),
+      fieldProvenance: output.fieldProvenance.map(record => structuredClone(record)),
+      pageEvidence: pageEvidence.map(item => structuredClone(item)),
+      invalidRows: output.verification.invalidRows,
+      overflow: output.verification.overflow === true,
+      failures: Array.isArray(output.verification.failures) ? [...output.verification.failures] : [],
+      paginationExhausted: false
+    });
+    return this.outputs.get(outputName);
+  }
 
   append(outputName, contractId, resolved, provenance) {
     let output = this.outputs.get(outputName);

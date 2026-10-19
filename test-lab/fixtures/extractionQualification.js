@@ -266,7 +266,7 @@ export async function qualifyExtractionManifest({ manifest, variants = 30, signa
       privacyBoundaryPassed
     });
   }
-  return { oracleIndependent: true, variants: reports };
+  return { variants: reports };
 }
 
 export { visibleTableSnapshot };

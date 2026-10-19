@@ -6,12 +6,13 @@ ActiveTab is being decomposed through behavior-preserving extractions. One appli
 
 | Area | Current entrypoint | Current responsibility pressure |
 | --- | --- | --- |
-| Declarative workflows | `src/testing/runner.js` (620 lines after lifecycle, telemetry, handler, dispatcher, and intervention extractions) | Workflow scheduling and collaborator coordination |
-| Navigation | `src/navigation/engine.js` (1,164 lines after outcome-verifier extraction) | Planning, browser coordination, recovery, and replay |
-| MCP transport | `src/mcp/server.js` (766 lines) | Protocol handling mixed with application orchestration |
-| HTTP transport | `src/api/local-server.js` (825 lines) | Routes mixed with run lifecycle and process-local service state |
-| Staging qualification | `src/testing/qualifyCloudAgent.js` (763 lines) | Browser entry, handoff, qualification, diagnostics, reporting, and persistence |
-| FI Agent Twin | `test-lab/fixtures/fi-agent-twin/provider.js` (550 lines) | Provider lifecycle mixed with app, backend, auth, job, and oracle behavior |
+| Declarative workflows | `src/testing/runner.js` (647 lines after lifecycle, telemetry, handler, dispatcher, and intervention extractions) | Workflow scheduling and collaborator coordination |
+| Navigation | `src/navigation/engine.js` (1,218 lines after outcome-verifier extraction) | Planning, browser coordination, recovery, and replay |
+| MCP transport | `src/mcp/server.js` (779 lines) | Protocol handling mixed with application orchestration |
+| HTTP transport | `src/api/local-server.js` (1,031 lines) | Routes mixed with run lifecycle and process-local service state |
+| Staging qualification | `scripts/qualify-staging.mjs` (454 lines) | Browser entry, handoff, qualification, diagnostics, reporting, and persistence |
+| FI Agent Twin | `test-lab/fixtures/fi-agent-twin/provider.js` (247 lines after frontend, HTTP, auth, persistence, and job-service extractions) | Provider lifecycle still includes application routing and independent-oracle HTTP projection |
+| Response diagnostics | `src/observe/responseBodyInspector.js` (220-line dispatcher plus focused parser, format, security, shared, and Markdown modules) | Selected-body interpretation and safe operator views |
 
 These are extraction targets. Size alone is not evidence of a defect.
 
@@ -45,15 +46,23 @@ Extract handlers by responsibility while preserving the receipt shape, state tra
 
 ## Stage 3 — Navigation coordination
 
-Keep `TestRunner` as the top-level declarative workflow owner. `NavigationEngine` remains a subordinate navigation capability. `src/navigation/outcomeVerifier.js` now owns pure visible-destination checks and privacy-preserving initial page-label hashes; it does not verify application-side effects. Continue extracting planning, fresh target binding, replay, recovery, and scroll convergence behind internal interfaces. The existing authorized executor remains the only browser effect boundary. Preserve workflow synthesis and the same per-run inference budget.
+Keep `TestRunner` as the top-level declarative workflow owner. `NavigationEngine` remains a subordinate navigation capability. `src/navigation/outcomeVerifier.js` now owns pure visible-destination checks and privacy-preserving initial page-label hashes; it does not verify application-side effects. `src/navigation/applicationRunService.js` is the shared MCP/HTTP run lifecycle boundary. Continue extracting planning, fresh target binding, replay, recovery, and scroll convergence behind internal interfaces. The existing authorized executor remains the only browser effect boundary. Preserve workflow synthesis and the same per-run inference budget.
 
 ## Stage 4 — Shared application services for transports
 
-Introduce one application-owned run service for MCP and HTTP. It owns run creation, continuation, cancellation, process registries, receipt publication, and reconciliation. MCP and HTTP retain transport validation, authentication, protocol serialization, and response mapping. Cloud Agent outcome recording moves to the shared integration/verification service. Both transports must preserve identical policy and lifecycle semantics.
+The shared run service is in place for MCP and HTTP. Continue moving transport-neutral lifecycle behavior into it while MCP and HTTP retain request validation, authentication, protocol serialization, and response mapping. Cloud Agent outcome recording moves to the shared integration/verification service. Both transports must preserve identical policy and lifecycle semantics.
 
 ## Stage 5 — Qualification and fixture composition
 
-Extract staging qualification coordination from `qualifyCloudAgent.js`. Split FI Agent Twin frontend, authentication, job service, persistence, and oracle behavior behind the existing `FixtureProvider` contract. Keep the provider as lifecycle composition. The driver receives no oracle credentials or hidden scenario state.
+`src/testing/cloudAgentEntry.js` owns Cloud Agent identity hints, visible-entry workflow construction, task-composer readiness checks, and read-only diagnostic-link inventory. `src/testing/qualificationRunSelection.js` owns durable staging-run selection and exact resume/abandon checks before browser attachment. The long-running qualification coordinator retains intervention, diagnostic, and report orchestration. Continue extracting staging browser lifecycle and reporting from `scripts/qualify-staging.mjs`. FI Agent Twin HTML rendering, bounded HTTP helpers, realm-scoped auth/MFA, private SQLite persistence, and Agent job behavior now live in focused modules under `test-lab/fixtures/fi-agent-twin/`. The provider retains server lifecycle, route composition, and the independent-oracle projection. The driver receives no oracle credentials or hidden scenario state.
+
+## Stage 6 — Response diagnostics and Markdown views
+
+Selected response inspection now separates JSON-like repair, non-JSON format analysis, credential discovery/redaction, shared primitives, and Markdown projection. Markdown is a navigable report view: headings, nested tables, indexed diagnostics, fenced source blocks, and byte paging point back to complete safe source. Trusted local callers can select an indexed section subtree or data block, then page within it while retaining document-relative byte offsets. Sparse UTF-8 indexing and sequential cursors avoid rescanning the full prefix; repeated pages reuse a short-lived, size-bounded redacted projection. Complex diagnostics remain drillable without replacing typed parse evidence, repair details, or source provenance. Markdown is not the parser's source of truth, and its interpretation cannot authorize actions or verify outcomes. CDP still supplies a selected response body as a whole protocol result, so report paging does not bound acquisition memory.
+
+## Qualification evidence and remaining benchmark gap
+
+The native CDP API path now discovers a request already issued by a fixture page, inspects only its explicitly selected retained response, and scores its schema against 30 provider-side seeded variants. Extraction qualification has 30 deterministic structural variants plus one independently maintained WebArena-Infinity extraction scenario. The controlled navigation suite covers 10 page variants with independent browser-state checks. These are useful qualification slices; they do not yet constitute held-out visual-accuracy and cross-application API/extraction/failure benchmark coverage. Screenshot forwarding is tested as a privacy and request-shape contract, not as a measured visual-accuracy benchmark.
 
 ## Acceptance gates
 

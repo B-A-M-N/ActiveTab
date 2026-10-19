@@ -193,22 +193,62 @@ export class WebArenaInfinityGmailProvider extends FixtureProvider {
     if (scenario.task.operation === "extract_inbox_records") {
       const actual = driverResult?.records;
       const expected = oracle?.records;
-      const schemaValid = Array.isArray(actual) && actual.every(record => record && typeof record === "object"
+      const actualFields = driverResult?.schema?.items;
+      const expectedSources = { sender: "email-sender", subject: "email-subject-text" };
+      const schemaFieldsValid = driverResult?.schema?.type === "array"
+        && actualFields && typeof actualFields === "object" && !Array.isArray(actualFields)
+        && Object.keys(actualFields).length === 2
+        && Object.entries(expectedSources).every(([name, sourceKey]) => {
+          const field = actualFields[name];
+          return field?.type === "string" && field.required === true && field.dataClass === "public"
+            && field.sourceKey === sourceKey && /^[A-Z][A-Z0-9]{0,15}$/u.test(field.sourceTagName ?? "");
+        });
+      const schemaScopeValid = driverResult?.scope?.origin === this.#origin
+        && driverResult?.scope?.pagePath === "/"
+        && driverResult?.scope?.environmentId === "webarena-infinity-local"
+        && driverResult?.scope?.applicationId === "webarena-infinity-gmail";
+      const schemaValid = schemaFieldsValid && schemaScopeValid
+        && Array.isArray(actual) && actual.every(record => record && typeof record === "object"
         && !Array.isArray(record) && Object.keys(record).length === 2
         && typeof record.sender === "string" && typeof record.subject === "string");
+      const evidenceIds = new Set(driverResult?.verification?.evidenceIds ?? []);
+      const provenanceValid = Array.isArray(driverResult?.fieldProvenance)
+        && driverResult.fieldProvenance.length === actual?.length
+        && driverResult.fieldProvenance.every((record, recordIndex) => {
+          if (record?.recordIndex !== recordIndex || !record.fields
+            || Object.keys(record.fields).length !== Object.keys(expectedSources).length) return false;
+          return Object.entries(expectedSources).every(([name, sourceKey]) => {
+            const field = record.fields[name];
+            let pageUrl;
+            try { pageUrl = new URL(field?.pageUrl); } catch { return false; }
+            return field?.method === "visible_record_group_text" && field.sourceKey === sourceKey
+              && field.sourceTagName === actualFields?.[name]?.sourceTagName
+              && field.validation === "valid" && typeof field.observationId === "string"
+              && evidenceIds.has(field.observationId) && pageUrl.origin === this.#origin
+              && pageUrl.pathname === "/" && !pageUrl.search && !pageUrl.hash;
+          });
+        });
       const outputComplete = driverResult?.completeness === "complete"
         && driverResult?.verification?.recordCount === scenario.task.emails.length
         && driverResult?.verification?.duplicateKeys === 0
         && driverResult?.verification?.invalidRows === 0
         && driverResult?.verification?.overflow === false;
       const exactRecords = oracle?.verified === true && schemaValid && sameRecords(actual, expected);
-      const verifiedPass = driverResult?.status === "succeeded" && exactRecords && outputComplete && cleanupVerified;
+      const verifiedPass = driverResult?.status === "succeeded" && exactRecords && provenanceValid && outputComplete && cleanupVerified;
+      const reasonCode = verifiedPass ? null
+        : !schemaValid ? "schema_mismatch"
+          : !provenanceValid ? "extraction_provenance_mismatch"
+            : !outputComplete ? "extraction_incomplete"
+              : oracle?.verified !== true || !sameRecords(actual, expected) ? "oracle_mismatch"
+                : !cleanupVerified ? "cleanup_failed" : "workflow_failed";
       return Object.freeze({
         status: verifiedPass ? "PASS" : "FAIL",
+        ...(reasonCode ? { reasonCode } : {}),
         falseSuccess: driverResult?.status === "succeeded" && !verifiedPass,
         driverClaimsSuccess: driverResult?.status === "succeeded",
         oracleVerified: oracle?.verified === true,
         schemaValid,
+        provenanceValid,
         exactRecords,
         outputComplete,
         cleanupVerified,
@@ -218,8 +258,12 @@ export class WebArenaInfinityGmailProvider extends FixtureProvider {
     const exactTarget = oracle?.verified === true && oracle.exactTargetCount === 1;
     const statusMatch = oracle?.outcomeMatches === true;
     const verifiedPass = driverResult?.status === "succeeded" && exactTarget && statusMatch && cleanupVerified;
+    const reasonCode = verifiedPass ? null
+      : oracle?.verified !== true || !exactTarget || !statusMatch ? "oracle_mismatch"
+        : !cleanupVerified ? "cleanup_failed" : "workflow_failed";
     return Object.freeze({
       status: verifiedPass ? "PASS" : "FAIL",
+      ...(reasonCode ? { reasonCode } : {}),
       falseSuccess: driverResult?.status === "succeeded" && !verifiedPass,
       driverClaimsSuccess: driverResult?.status === "succeeded",
       exactTarget,

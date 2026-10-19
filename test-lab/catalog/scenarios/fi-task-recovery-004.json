@@ -3,6 +3,14 @@
   "scenario_id": "fi-task-recovery-004",
   "site_family": "fi-agent-twin",
   "seed": 84217,
+  "qualification": {
+    "level": "outcome",
+    "provider_id": "fi_agent_twin",
+    "provider_identity": "activetab_fi_agent_twin_provider_v1",
+    "source_revision": "fi_agent_twin_1",
+    "oracle_reference": "fi_agent_twin_sqlite_state_oracle_v1",
+    "independent_application_outcome": true
+  },
   "application": {
     "build": "fi-agent-twin-1",
     "auth_realms": ["platform", "cloud-agent"],

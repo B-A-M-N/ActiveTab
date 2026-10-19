@@ -2,6 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { executeAuthorizedAction } from "../src/runtime/authorizedExecutor.js";
+import { createSearchSubmitAuthorizer, SEARCH_SUBMIT_OPERATION_ID } from "../src/navigation/search.js";
 
 const fixtureLease = async () => {};
 
@@ -10,12 +11,116 @@ function mockSession({ observation = null } = {}) {
     dispatched: [],
     async observe() { return observation; },
     async click(candidate) { this.dispatched.push(["click", candidate.backendNodeId]); return { dispatched: true }; },
+    async typeSearchPhrase(candidate, value, observation) {
+      this.dispatched.push(["type", candidate.backendNodeId, value, observation?.page?.url]);
+      return { dispatched: true };
+    },
+    async navigateObservedLinkInSameTarget(candidate, { beforeDispatch } = {}) {
+      const href = this.actualLinkHref ?? candidate.href;
+      await beforeDispatch?.({ candidate, href, sameTargetNavigation: true });
+      this.dispatched.push(["same_target_navigation", candidate.backendNodeId, href]);
+      return { dispatched: true, navigationMode: "same_target" };
+    },
     async fillField(candidate, value) { this.dispatched.push(["fill", candidate.backendNodeId, value]); return { dispatched: true }; },
     async selectOption(candidate, value) { this.dispatched.push(["select", candidate.backendNodeId, value]); return { dispatched: true }; },
     async uploadFile(candidate, paths) { this.dispatched.push(["upload", candidate.backendNodeId]); return { dispatched: true }; },
     client: { async send(method, params) { this.sent = this.sent ?? []; this.sent.push([method, params]); return {}; } }
   };
 }
+
+test("same-origin GET query fields require the exact caller search contract for typing and submit", async () => {
+  const field = {
+    identity: "query-field", targetId: "tab-1", formIdentity: "query-form", documentGeneration: 1,
+    backendNodeId: 11, tag: "input", type: "text", queryField: true,
+    formMethod: "get", formActionOrigin: "https://search.example.test", formTargetSameContext: true, name: "Search", visible: true, disabled: false
+  };
+  const submit = {
+    identity: "query-submit", targetId: "tab-1", formIdentity: "query-form", documentGeneration: 1,
+    backendNodeId: 12, tag: "button", type: "submit", name: "Search", submitsForm: true,
+    formMethod: "get", formActionOrigin: "https://search.example.test", formTargetSameContext: true, visible: true, disabled: false
+  };
+  const observation = {
+    evidenceId: "query-evidence", targetId: "tab-1", documentGeneration: 1,
+    page: { url: "https://search.example.test/", title: "Search" }, candidates: [field, submit]
+  };
+  const session = mockSession({ observation });
+  session.target = { id: "tab-1", url: observation.page.url };
+  session.attached = true;
+  const authorizer = createSearchSubmitAuthorizer("rare bookshops");
+  const typed = await executeAuthorizedAction({
+    session, goal: "Search for rare bookshops", action: "type", candidate: field,
+    value: "rare bookshops", operationId: SEARCH_SUBMIT_OPERATION_ID,
+    operationAuthorizer: authorizer, assertExecutionLease: fixtureLease
+  });
+  assert.equal(typed.dispatched, true, JSON.stringify(typed));
+  assert.deepEqual(session.dispatched[0], ["type", field.backendNodeId, "rare bookshops", observation.page.url]);
+
+  const submitted = await executeAuthorizedAction({
+    session, goal: "Search for rare bookshops", action: "click", candidate: submit,
+    operationId: SEARCH_SUBMIT_OPERATION_ID, operationAuthorizer: authorizer,
+    assertExecutionLease: fixtureLease
+  });
+  assert.equal(submitted.dispatched, true, JSON.stringify(submitted));
+  assert.deepEqual(session.dispatched[1], ["click", submit.backendNodeId]);
+
+  const fillSession = mockSession({ observation });
+  fillSession.target = { id: "tab-1", url: observation.page.url };
+  fillSession.attached = true;
+  const fillAuthorizer = createSearchSubmitAuthorizer("rare bookshops");
+  const filled = await executeAuthorizedAction({
+    session: fillSession, goal: "Search for rare bookshops and return prices", action: "fill", candidate: field,
+    value: "rare bookshops", operationId: SEARCH_SUBMIT_OPERATION_ID,
+    operationAuthorizer: fillAuthorizer, assertExecutionLease: fixtureLease
+  });
+  assert.equal(filled.dispatched, true, JSON.stringify(filled));
+  const filledAndSubmitted = await executeAuthorizedAction({
+    session: fillSession, goal: "Search for rare bookshops and return prices", action: "click", candidate: submit,
+    operationId: SEARCH_SUBMIT_OPERATION_ID, operationAuthorizer: fillAuthorizer,
+    assertExecutionLease: fixtureLease
+  });
+  assert.equal(filledAndSubmitted.dispatched, true, JSON.stringify(filledAndSubmitted));
+  assert.deepEqual(fillSession.dispatched.map(([action]) => action), ["fill", "click"]);
+
+  const foreignField = { ...field, identity: "foreign-query", formIdentity: "foreign-form", formActionOrigin: "https://other.example.test" };
+  const foreignObservation = { ...observation, evidenceId: "foreign-query-evidence", candidates: [foreignField] };
+  const foreignSession = mockSession({ observation: foreignObservation });
+  foreignSession.target = { id: "tab-1", url: observation.page.url };
+  foreignSession.attached = true;
+  const refused = await executeAuthorizedAction({
+    session: foreignSession, goal: "Search for rare bookshops", action: "type", candidate: foreignField,
+    value: "rare bookshops", operationId: SEARCH_SUBMIT_OPERATION_ID,
+    operationAuthorizer: createSearchSubmitAuthorizer("rare bookshops"), assertExecutionLease: fixtureLease
+  });
+  assert.equal(refused.dispatched, false);
+  assert.equal(refused.category, "operation_contract_refused");
+  assert.deepEqual(foreignSession.dispatched, []);
+
+  for (const [suffix, overrides] of [
+    ["post-override", { formMethod: "post" }],
+    ["new-target", { formTargetSameContext: false }],
+    ["cross-origin-action", { formActionOrigin: "https://other.example.test" }]
+  ]) {
+    const unsafeSubmit = { ...submit, identity: `unsafe-${suffix}`, ...overrides };
+    const unsafeObservation = { ...observation, evidenceId: `unsafe-${suffix}`, candidates: [field, unsafeSubmit] };
+    const unsafeSession = mockSession({ observation: unsafeObservation });
+    unsafeSession.target = { id: "tab-1", url: observation.page.url };
+    unsafeSession.attached = true;
+    const unsafeAuthorizer = createSearchSubmitAuthorizer("rare bookshops");
+    const unsafeType = await executeAuthorizedAction({
+      session: unsafeSession, goal: "Search for rare bookshops", action: "type", candidate: field,
+      value: "rare bookshops", operationId: SEARCH_SUBMIT_OPERATION_ID,
+      operationAuthorizer: unsafeAuthorizer, assertExecutionLease: fixtureLease
+    });
+    assert.equal(unsafeType.dispatched, true, suffix);
+    const unsafeClick = await executeAuthorizedAction({
+      session: unsafeSession, goal: "Search for rare bookshops", action: "click", candidate: unsafeSubmit,
+      operationId: SEARCH_SUBMIT_OPERATION_ID, operationAuthorizer: unsafeAuthorizer,
+      assertExecutionLease: fixtureLease
+    });
+    assert.equal(unsafeClick.dispatched, false, suffix);
+    assert.deepEqual(unsafeSession.dispatched.map(([action]) => action), ["type"], suffix);
+  }
+});
 
 test("sensitive actions are refused before dispatch through the authorized executor", async () => {
   const candidate = { name: "Delete account", role: "button", tag: "button", visible: true, backendNodeId: 1, targetId: "tab-1", documentGeneration: 1 };
@@ -102,6 +207,64 @@ test("an attached target permits same-origin links but cannot follow them across
   assert.equal(refused.dispatched, false);
   assert.equal(refused.category, "navigation_target_untrusted");
   assert.deepEqual(session.dispatched, []);
+});
+
+test("links that open another target are refused unless same-target navigation is explicit", async () => {
+  const candidate = { identity: "new-tab-link", targetId: "tab-1", documentGeneration: 1, backendNodeId: 18, name: "Article", role: "link", tag: "a", href: "https://app.example.test/article", opensNewTarget: true, visible: true, disabled: false };
+  const observation = { targetId: "tab-1", documentGeneration: 1, page: { url: "https://app.example.test/", title: "Search" }, candidates: [candidate], evidenceId: "e-new-target-link" };
+  const session = mockSession({ observation });
+  session.target = { id: "tab-1", url: observation.page.url };
+  session.attached = true;
+
+  const refused = await executeAuthorizedAction({ session, action: "click", candidate, assertExecutionLease: fixtureLease });
+  assert.equal(refused.dispatched, false);
+  assert.equal(refused.category, "new_target_requires_authorization");
+  assert.deepEqual(session.dispatched, []);
+
+  let authorizations = 0;
+  let leaseChecks = 0;
+  session.actualLinkHref = "https://app.example.test/article?revision=observed";
+  const followed = await executeAuthorizedAction({
+    session,
+    environment: { authorizedOrigins: ["https://app.example.test"] },
+    action: "click",
+    candidate,
+    sameTargetNavigation: true,
+    operationId: "public_search_readonly_browse",
+    operationAuthorizer: {
+      async authorize({ action, url }) {
+        authorizations++;
+        assert.equal(action, "click");
+        assert.equal(url, session.actualLinkHref, "the trusted operation contract receives the exact revalidated destination");
+        return { allowed: true };
+      }
+    },
+    assertExecutionLease: async () => { leaseChecks++; }
+  });
+  assert.equal(followed.dispatched, true);
+  assert.equal(followed.dispatchResult.navigationMode, "same_target");
+  assert.equal(authorizations, 1);
+  assert.ok(leaseChecks >= 3, "the lease is rechecked immediately before direct navigation");
+  assert.deepEqual(session.dispatched, [["same_target_navigation", 18, session.actualLinkHref]]);
+});
+
+test("explicit same-target navigation contains script-opened anchors without a target attribute", async () => {
+  const candidate = { identity: "script-open-link", targetId: "tab-1", documentGeneration: 1, backendNodeId: 19, name: "Article", role: "link", tag: "a", href: "https://app.example.test/article", opensNewTarget: false, visible: true, disabled: false };
+  const observation = { targetId: "tab-1", documentGeneration: 1, page: { url: "https://app.example.test/", title: "Search" }, candidates: [candidate], evidenceId: "e-script-open-link" };
+  const session = mockSession({ observation });
+  session.target = { id: "tab-1", url: observation.page.url };
+  session.attached = true;
+  const result = await executeAuthorizedAction({
+    session,
+    environment: { authorizedOrigins: ["https://app.example.test"] },
+    action: "click",
+    candidate,
+    sameTargetNavigation: true,
+    assertExecutionLease: fixtureLease
+  });
+  assert.equal(result.dispatched, true, result.reason);
+  assert.equal(result.dispatchResult.navigationMode, "same_target");
+  assert.deepEqual(session.dispatched, [["same_target_navigation", 19, candidate.href]]);
 });
 
 test("the explicit local-fixture capability permits loopback navigation", async () => {
@@ -245,4 +408,136 @@ test("lease loss after reservation closes the reservation as refused without dis
   assert.equal(reserved, true);
   assert.equal(dispatchStatus, "refused");
   assert.deepEqual(session.dispatched, []);
+});
+
+function compositeSelectFixture() {
+  const combobox = { identity: "model-combobox", targetId: "tab-1", documentGeneration: 1, backendNodeId: 30, name: "Model", role: "combobox", tag: "button", visible: true, disabled: false };
+  const option = { identity: "model-option", targetId: "tab-1", documentGeneration: 1, backendNodeId: 31, name: "GLM5.3-flash", role: "option", tag: "div", visible: true, disabled: false };
+  let observation = { targetId: "tab-1", documentGeneration: 1, page: { url: "https://app.example.test/models", title: "Models" }, candidates: [combobox, option], evidenceId: "e-composite-select" };
+  const session = mockSession({ observation });
+  session.target = { id: "tab-1", url: observation.page.url };
+  session.attached = true;
+  session.observe = async () => observation;
+  session.setObservation = next => { observation = next; };
+  session.dispatched = [];
+  return { combobox, option, session, getObservation: () => observation };
+}
+
+function allowFixtureSelect(candidateIdentity, exactValue) {
+  const dispatchStatuses = [];
+  return {
+    dispatchStatuses,
+    async authorize({ action, candidate, value, observation }) {
+      const allowed = action === "select" && candidate?.identity === candidateIdentity && value === exactValue
+        && observation?.page?.url === "https://app.example.test/models";
+      return { allowed, category: "fixture_select", reason: "The scoped fixture contract permits only the exact model selection." };
+    },
+    async recordDispatch({ dispatchStatus } = {}) { dispatchStatuses.push(dispatchStatus); }
+  };
+}
+
+test("a composite select refuses an unexpected second control after opening the combobox", async () => {
+  const { combobox, option, session, getObservation } = compositeSelectFixture();
+  const unexpected = { identity: "unexpected-control", targetId: "tab-1", documentGeneration: 1, backendNodeId: 32, name: "GLM5.3-flash", role: "button", tag: "button", visible: true, disabled: false };
+  session.setObservation({ ...getObservation(), candidates: [combobox, option, unexpected] });
+  const operationAuthorizer = allowFixtureSelect(combobox.identity, "GLM5.3-flash");
+  session.selectOption = async (candidate, value, { actionEnvelope, authorizeSuboperation } = {}) => {
+    assert.deepEqual(actionEnvelope.allowedSuboperations, ["open_observed_combobox", "select_exact_controlled_option"]);
+    let decision = await authorizeSuboperation({ stage: "prepare", suboperation: "open_observed_combobox", candidate, menuCandidate: candidate });
+    assert.equal(decision.allowed, true);
+    decision = await authorizeSuboperation({ stage: "dispatch", suboperation: "open_observed_combobox", candidate: decision.candidate, menuCandidate: decision.menuCandidate });
+    assert.equal(decision.allowed, true);
+    session.dispatched.push(["open", candidate.identity]);
+    await authorizeSuboperation({ stage: "completed", suboperation: "open_observed_combobox", candidate: candidate, menuCandidate: candidate });
+
+    decision = await authorizeSuboperation({ stage: "prepare", suboperation: "select_exact_controlled_option", candidate: unexpected, menuCandidate: candidate });
+    if (!decision.allowed) return { dispatched: true, selected: false, selectionStatus: "refused_after_open", reason: decision.reason };
+    session.dispatched.push(["unexpected-click", unexpected.identity]);
+    return { dispatched: true, selected: true, selectionStatus: "selected" };
+  };
+
+  const result = await executeAuthorizedAction({
+    session,
+    action: "select",
+    candidate: combobox,
+    value: "GLM5.3-flash",
+    operationId: "select-model",
+    operationAuthorizer,
+    assertExecutionLease: fixtureLease
+  });
+  assert.equal(result.status, "partial");
+  assert.equal(result.dispatchResult.selectionStatus, "refused_after_open");
+  assert.deepEqual(session.dispatched, [["open", combobox.identity]], "the second control is refused before its click dispatch");
+  assert.deepEqual(operationAuthorizer.dispatchStatuses, ["uncertain"], "a partial composite effect cannot advance the typed operation sequence as complete");
+  assert.ok(option, "the fixture includes the expected option, distinct from the injected control");
+});
+
+test("a composite select rechecks page binding before the option dispatch", async () => {
+  const { combobox, option, session, getObservation } = compositeSelectFixture();
+  const operationAuthorizer = allowFixtureSelect(combobox.identity, "GLM5.3-flash");
+  session.selectOption = async (candidate, value, { authorizeSuboperation } = {}) => {
+    let decision = await authorizeSuboperation({ stage: "prepare", suboperation: "open_observed_combobox", candidate, menuCandidate: candidate });
+    assert.equal(decision.allowed, true);
+    decision = await authorizeSuboperation({ stage: "dispatch", suboperation: "open_observed_combobox", candidate: decision.candidate, menuCandidate: decision.menuCandidate });
+    assert.equal(decision.allowed, true);
+    session.dispatched.push(["open", candidate.identity]);
+    await authorizeSuboperation({ stage: "completed", suboperation: "open_observed_combobox", candidate, menuCandidate: candidate });
+
+    const current = getObservation();
+    session.setObservation({ ...current, page: { ...current.page, url: "https://app.example.test/another-application" }, candidates: [combobox, option], evidenceId: "e-changed-application" });
+    decision = await authorizeSuboperation({ stage: "prepare", suboperation: "select_exact_controlled_option", candidate: option, menuCandidate: candidate });
+    if (!decision.allowed) return { dispatched: true, selected: false, selectionStatus: "refused_after_open", reason: decision.reason };
+    session.dispatched.push(["select", option.identity]);
+    return { dispatched: true, selected: true, selectionStatus: "selected" };
+  };
+
+  const result = await executeAuthorizedAction({
+    session,
+    action: "select",
+    candidate: combobox,
+    value: "GLM5.3-flash",
+    operationId: "select-model",
+    operationAuthorizer,
+    assertExecutionLease: fixtureLease
+  });
+  assert.equal(result.status, "partial");
+  assert.match(result.dispatchResult.reason, /page or target changed/);
+  assert.deepEqual(session.dispatched, [["open", combobox.identity]], "a changed application page cannot receive the option click");
+  assert.deepEqual(operationAuthorizer.dispatchStatuses, ["uncertain"]);
+});
+
+test("a composite select rechecks its durable target lease before the option dispatch", async () => {
+  const { combobox, option, session } = compositeSelectFixture();
+  const operationAuthorizer = allowFixtureSelect(combobox.identity, "GLM5.3-flash");
+  session.selectOption = async (candidate, value, { authorizeSuboperation } = {}) => {
+    let decision = await authorizeSuboperation({ stage: "prepare", suboperation: "open_observed_combobox", candidate, menuCandidate: candidate });
+    assert.equal(decision.allowed, true);
+    decision = await authorizeSuboperation({ stage: "dispatch", suboperation: "open_observed_combobox", candidate: decision.candidate, menuCandidate: decision.menuCandidate });
+    assert.equal(decision.allowed, true);
+    session.dispatched.push(["open", candidate.identity]);
+    await authorizeSuboperation({ stage: "completed", suboperation: "open_observed_combobox", candidate, menuCandidate: candidate });
+
+    decision = await authorizeSuboperation({ stage: "prepare", suboperation: "select_exact_controlled_option", candidate: option, menuCandidate: candidate });
+    if (!decision.allowed) return { dispatched: true, selected: false, selectionStatus: "refused_after_open", reason: decision.reason };
+    session.dispatched.push(["select", option.identity]);
+    return { dispatched: true, selected: true, selectionStatus: "selected" };
+  };
+  let leaseChecks = 0;
+  const result = await executeAuthorizedAction({
+    session,
+    action: "select",
+    candidate: combobox,
+    value: "GLM5.3-flash",
+    operationId: "select-model",
+    operationAuthorizer,
+    assertExecutionLease: async () => {
+      leaseChecks++;
+      if (leaseChecks >= 5) throw new Error("lease expired between composite suboperations");
+    }
+  });
+  assert.equal(leaseChecks, 5, "the executor checks the lease again before preparing the second suboperation");
+  assert.equal(result.status, "partial");
+  assert.match(result.dispatchResult.reason, /execution lease was lost/);
+  assert.deepEqual(session.dispatched, [["open", combobox.identity]], "lease loss prevents the option click");
+  assert.deepEqual(operationAuthorizer.dispatchStatuses, ["uncertain"]);
 });

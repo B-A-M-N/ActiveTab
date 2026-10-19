@@ -36,6 +36,8 @@ export function validateExtractionContract(contract) {
   const errors = [];
   if (!contract || typeof contract !== "object" || Array.isArray(contract)) return { valid: false, errors: ["Extraction contract must be an object."] };
   if (contract.version !== 1) errors.push("Extraction contract version must be 1.");
+  if (contract.scopeKind !== undefined && contract.scopeKind !== "ephemeral_observed_read") errors.push("scopeKind is unsupported.");
+  const ephemeralObservedRead = contract.scopeKind === "ephemeral_observed_read";
   if (!isCode(contract.id, 96)) errors.push("Extraction contract id must be a bounded identifier.");
   if (!Number.isInteger(contract.maxRecords) || contract.maxRecords < 1 || contract.maxRecords > 10_000) errors.push("maxRecords must be from 1 to 10000.");
   if (contract.expectedRecords !== undefined
@@ -95,15 +97,26 @@ export function validateExtractionContract(contract) {
   } else if (contract.fields?.some(field => typeof field?.sourceKey === "string")) {
     errors.push("sourceKey fields require an observed recordGroup contract.");
   }
-  if (!Array.isArray(contract.uniqueBy) || contract.uniqueBy.length < 1
+  if (!Array.isArray(contract.uniqueBy) || (!ephemeralObservedRead && contract.uniqueBy.length < 1)
     || contract.uniqueBy.length > 8 || contract.uniqueBy.some(name => !contract.fields?.some(field => field.name === name))) {
-    errors.push("uniqueBy must name one or more declared fields.");
+    errors.push(ephemeralObservedRead
+      ? "uniqueBy must be empty or name declared fields for an ephemeral read."
+      : "uniqueBy must name one or more declared fields.");
   }
   if (contract.pagination !== undefined) {
     if (!contract.pagination || typeof contract.pagination !== "object" || Array.isArray(contract.pagination)
-      || contract.pagination.kind !== "rel_next_same_path"
+      || !new Set(["rel_next_same_path", "explicit_next_same_path", "page_number_query", "virtualized_list"]).has(contract.pagination.kind)
       || !Number.isInteger(contract.pagination.maxPages) || contract.pagination.maxPages < 2 || contract.pagination.maxPages > 100) {
-      errors.push("pagination must be a trusted rel_next_same_path strategy with a page limit from 2 to 100.");
+      errors.push("pagination must be a trusted bounded strategy with a page limit from 2 to 100.");
+    } else {
+      const allowedPaginationKeys = contract.pagination.kind === "page_number_query"
+        ? new Set(["kind", "queryParameter", "maxPages"])
+        : new Set(["kind", "maxPages"]);
+      if (Object.keys(contract.pagination).some(key => !allowedPaginationKeys.has(key))) errors.push("pagination contains unsupported strategy fields.");
+      if (contract.pagination.kind === "page_number_query"
+        && (typeof contract.pagination.queryParameter !== "string" || !/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/u.test(contract.pagination.queryParameter))) {
+        errors.push("page_number_query requires a bounded queryParameter name.");
+      }
     }
   }
   if (contract.origin !== undefined) {
@@ -123,8 +136,11 @@ export function validateExtractionContract(contract) {
       }
     } catch { errors.push("pagePath must be an exact absolute path within the registered origin."); }
   }
-  if (!isCode(contract.environmentId, 128)) errors.push("environmentId must be a bounded identifier.");
-  if (!isCode(contract.applicationId, 96)) errors.push("applicationId must be a bounded identifier.");
+  if (!(ephemeralObservedRead && contract.environmentId === null) && !isCode(contract.environmentId, 128)) errors.push("environmentId must be a bounded identifier.");
+  if (!(ephemeralObservedRead && contract.applicationId === null) && !isCode(contract.applicationId, 96)) errors.push("applicationId must be a bounded identifier.");
+  if (ephemeralObservedRead && ((contract.environmentId === null) !== (contract.applicationId === null))) {
+    errors.push("An unprofiled ephemeral read must have both environmentId and applicationId null.");
+  }
   if (!isCode(contract.principalId, 128)) errors.push("principalId must bind the extraction contract to a verified principal.");
   return { valid: errors.length === 0, errors };
 }

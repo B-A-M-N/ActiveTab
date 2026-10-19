@@ -4,6 +4,8 @@ import { verifyExtractionResult } from "../../extraction/extractionVerifier.js";
 import { executeExtractionCapability } from "../../capabilities/recipeExecutor.js";
 import { discoverTableCapabilities } from "../../capabilities/capabilityDiscovery.js";
 import { projectExtractionOutput } from "../../extraction/outputRelease.js";
+import { resolveObservedApplication } from "../../environments/model.js";
+import { collectExtractionPages } from "../../extraction/collectionService.js";
 
 /** Runs read-only registered extraction capabilities and verifies final outputs. */
 export class ExtractionStepHandler {
@@ -50,15 +52,16 @@ export class ExtractionStepHandler {
         principalId: this.principalId
       });
     } else {
-      const origin = (() => { try { return new URL(observation.page.url).origin; } catch { return null; } })();
-      const applicationId = this.environment?.applications?.find(item => item.origin === origin)?.applicationId ?? null;
-      discovered = discoverTableCapabilities({
-        observation,
-        domSnapshot: evidence.domSnapshot,
-        environmentId: this.environment?.environmentId ?? this.environment?.id ?? null,
-        applicationId,
-        principalId: this.principalId
-      });
+      const application = resolveObservedApplication(this.environment, observation.page.url);
+      discovered = application.status !== "matched"
+        ? { status: "unavailable", candidates: [], reasonCode: `application_identity_${application.status}` }
+        : discoverTableCapabilities({
+          observation,
+          domSnapshot: evidence.domSnapshot,
+          environmentId: this.environment?.environmentId ?? this.environment?.id ?? null,
+          applicationId: application.applicationId,
+          principalId: this.principalId
+        });
     }
     this.onDiscovery(discovered);
     const reason = discovered.status === "candidate"
@@ -136,128 +139,44 @@ export class ExtractionStepHandler {
   async executeCollectRecords(step, receipt, startedAt) {
     const accumulator = this.accumulators.get(step.outputName) ?? new OutputAccumulator();
     this.accumulators.set(step.outputName, accumulator);
-    const visitedPages = new Set();
-    let contract = this.contracts.get(step.outputName) ?? null;
-    let pageCount = 0;
-
-    const publishIncomplete = reasonCode => {
-      if (!contract) return null;
-      accumulator.markIncomplete(step.outputName, reasonCode);
-      const output = accumulator.finalize(step.outputName, contract);
-      this.onOutput(step.outputName, output);
-      return output;
-    };
-    const fail = (status, reasonCode) => {
-      const output = publishIncomplete(reasonCode);
-      const reason = `Collection ${status.toLocaleLowerCase()}: ${reasonCode}.`;
-      receipt.recordStep({
-        stepId: step.id,
-        type: step.type,
-        status,
-        reason,
-        startedAt,
-        evidenceIds: output?.verification.evidenceIds ?? [],
-        details: { pageCount, completeness: output?.completeness ?? "incomplete", reasonCode }
-      });
-      return { status, reason, output };
-    };
-
-    for (let pageNumber = 1; pageNumber <= 100; pageNumber++) {
-      const result = await executeExtractionCapability({
+    const capabilityVersion = step.capabilityVersion ?? 1;
+    const collection = await collectExtractionPages({
+      outputName: step.outputName,
+      capabilityId: step.capabilityId,
+      capabilityVersion,
+      accumulator,
+      initialContract: this.contracts.get(step.outputName) ?? null,
+      executePage: () => executeExtractionCapability({
         capabilityId: step.capabilityId,
-        capabilityVersion: step.capabilityVersion ?? 1,
+        capabilityVersion,
         registry: this.capabilityRegistry,
         session: this.session,
         environment: this.environment,
         principalId: this.principalId,
         authorizeField: this.authorizeField
-      });
-      if (result.contract) {
-        contract = result.contract;
-        this.contracts.set(step.outputName, contract);
-      }
-      if (result.status !== "available") {
-        if (contract && result.observation && !accumulator.get(step.outputName)?.pageEvidence.some(item => item.observationId === result.observation.evidenceId)) {
-          accumulator.append(step.outputName, `${step.capabilityId}@${step.capabilityVersion ?? 1}`, {
-            records: [], evidence: [], truncated: false
-          }, {
-            observationId: result.observation.evidenceId,
-            pageUrl: result.pageUrl ?? null,
-            maxRecords: contract.maxRecords
-          });
-        }
-        const status = result.status === "blocked" ? STEP_STATUS.BLOCKED
-          : result.status === "incomplete" ? STEP_STATUS.FAIL : STEP_STATUS.UNCERTAIN;
-        return fail(status, result.reasonCode ?? "page_extraction_unavailable");
-      }
-
-      if (!contract || result.capabilityId !== step.capabilityId || result.capabilityVersion !== (step.capabilityVersion ?? 1)) {
-        return fail(STEP_STATUS.BLOCKED, "registered_capability_contract_mismatch");
-      }
-      if (result.pageIdentity && visitedPages.has(result.pageIdentity)) {
-        return fail(STEP_STATUS.FAIL, "pagination_cycle_detected");
-      }
-      if (result.pageIdentity) visitedPages.add(result.pageIdentity);
-      pageCount++;
-      const accumulatedCount = accumulator.append(step.outputName, `${result.capabilityId}@${result.capabilityVersion}`, {
-        records: result.records,
-        truncated: result.truncated,
-        evidence: result.evidence
-      }, {
-        observationId: result.observation.evidenceId,
-        pageUrl: result.pageUrl,
-        maxRecords: contract.maxRecords
-      });
-
-      if (result.truncated || accumulator.get(step.outputName)?.overflow) {
-        return fail(STEP_STATUS.FAIL, "record_limit_exceeded");
-      }
-      if (!contract.pagination) break;
-      if (result.nextPage?.status === "not_found") {
-        accumulator.markPaginationExhausted(step.outputName);
-        break;
-      }
-      if (result.nextPage?.status !== "available") {
-        return fail(STEP_STATUS.FAIL, result.nextPage?.status === "ambiguous" ? "pagination_target_ambiguous" : "pagination_target_unavailable");
-      }
-      if (pageCount >= contract.pagination.maxPages) return fail(STEP_STATUS.FAIL, "pagination_page_limit_reached");
-      if (typeof this.advancePage !== "function") return fail(STEP_STATUS.BLOCKED, "authorized_pagination_executor_unavailable");
-
-      let navigation;
-      try {
-        navigation = await this.advancePage({
-          url: result.nextPage.url,
-          receipt,
-          stepId: step.id,
-          pageNumber: pageCount + 1
-        });
-      } catch {
-        return fail(STEP_STATUS.UNCERTAIN, "pagination_navigation_result_unknown");
-      }
-      if (navigation?.status !== STEP_STATUS.PASS) {
-        const status = navigation?.status === STEP_STATUS.BLOCKED ? STEP_STATUS.BLOCKED
-          : navigation?.status === STEP_STATUS.UNCERTAIN ? STEP_STATUS.UNCERTAIN : STEP_STATUS.FAIL;
-        return fail(status, "authorized_pagination_navigation_not_verified");
-      }
-      if (pageNumber === 100) return fail(STEP_STATUS.FAIL, "hard_page_safety_limit_reached");
-    }
-
-    const output = contract ? accumulator.finalize(step.outputName, contract) : null;
-    if (!output) return fail(STEP_STATUS.UNCERTAIN, "extraction_contract_unavailable");
-    const verification = verifyExtractionResult(output);
-    const status = verification.status === "complete" ? STEP_STATUS.PASS : STEP_STATUS.FAIL;
-    const reason = status === STEP_STATUS.PASS
-      ? `Collected and independently validated ${output.records.length} records across ${pageCount} page(s).`
-      : verification.reason;
-    this.onOutput(step.outputName, output);
+      }),
+      advancePage: typeof this.advancePage === "function"
+        ? details => this.advancePage({ ...details, receipt, stepId: step.id })
+        : null,
+      maxPages: Math.min(100, this.contracts.get(step.outputName)?.pagination?.maxPages ?? 100)
+    });
+    if (collection.contract) this.contracts.set(step.outputName, collection.contract);
+    const output = collection.output;
+    if (output) this.onOutput(step.outputName, output);
+    const status = collection.status === "complete" ? STEP_STATUS.PASS
+      : collection.status === "blocked" ? STEP_STATUS.BLOCKED
+        : collection.status === "uncertain" ? STEP_STATUS.UNCERTAIN : STEP_STATUS.FAIL;
+    const reason = collection.status === "complete"
+      ? `Collected and independently validated ${output.records.length} records across ${collection.pageCount} page(s).`
+      : `Collection ${status.toLocaleLowerCase()}: ${collection.reasonCode}.`;
     receipt.recordStep({
       stepId: step.id,
       type: step.type,
       status,
       reason,
       startedAt,
-      evidenceIds: output.verification.evidenceIds,
-      details: { pageRecordCount: output.records.length, pageCount, completeness: output.completeness, ...output.verification }
+      evidenceIds: output?.verification?.evidenceIds ?? [],
+      details: { pageCount: collection.pageCount, completeness: output?.completeness ?? "incomplete", reasonCode: collection.reasonCode ?? null, ...(output?.verification ?? {}) }
     });
     return { status, reason, output };
   }

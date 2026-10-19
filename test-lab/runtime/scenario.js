@@ -12,6 +12,19 @@ export function validateScenario(scenario) {
   if (typeof scenario.scenario_id !== "string" || !scenario.scenario_id.trim() || scenario.scenario_id.length > 96) errors.push("scenario_id must be a bounded non-empty string.");
   if (typeof scenario.site_family !== "string" || !scenario.site_family.trim()) errors.push("site_family is required.");
   if (!Number.isSafeInteger(scenario.seed) || scenario.seed < 0) errors.push("seed must be a non-negative safe integer.");
+  const qualification = scenario.qualification;
+  if (!qualification || typeof qualification !== "object" || Array.isArray(qualification)) {
+    errors.push("qualification provenance is required.");
+  } else {
+    if (!new Set(["resolver", "integration", "outcome", "live"]).has(qualification.level)) errors.push("qualification.level is unsupported.");
+    for (const field of ["provider_id", "provider_identity", "source_revision", "oracle_reference"]) {
+      if (typeof qualification[field] !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(qualification[field])) errors.push(`qualification.${field} must be a bounded structural identifier.`);
+    }
+    if (qualification.level === "resolver" && qualification.independent_application_outcome !== false) errors.push("Resolver qualification cannot claim an independent application outcome.");
+    if (qualification.level === "integration" && qualification.independent_application_outcome !== false) errors.push("Integration qualification cannot claim an independent application outcome.");
+    if ((qualification.level === "outcome" || qualification.level === "live") && qualification.independent_application_outcome !== true) errors.push("Outcome and live qualification require an independent application outcome.");
+    if (qualification.level === "live") errors.push("Live qualification requires a separately authorized live-target runtime and cannot run through Fixture Lab.");
+  }
   if (scenario.site_family === "fi-agent-twin") {
     const realms = scenario.application?.auth_realms;
     if (!Array.isArray(realms) || realms.length !== 2 || new Set(realms).size !== realms.length || realms.some(realm => !allowedRealms.has(realm))) errors.push("FI Agent Twin scenarios require the platform and cloud-agent auth realms.");

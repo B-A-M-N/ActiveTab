@@ -16,7 +16,28 @@
  * never become a browser navigation target by default.
  */
 
+import { createHash } from "node:crypto";
+
 export const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+const PROFILE_WORKFLOW_OPERATIONS = new Set(["fill", "select", "toggle", "apply_filter"]);
+const WORKFLOW_OPERATION_ID = /^[a-z][a-z0-9_]{0,95}$/u;
+
+function workflowOperationsForApplication(application, environmentId) {
+  const configured = application.workflow_operations;
+  if (configured === undefined) return null;
+  if (!configured || typeof configured !== "object" || Array.isArray(configured)
+    || Object.keys(configured).some(operation => !PROFILE_WORKFLOW_OPERATIONS.has(operation))) {
+    throw new Error(`Environment '${environmentId}' contains unsupported application workflow operations.`);
+  }
+  const result = {};
+  for (const [operation, operationId] of Object.entries(configured)) {
+    if (typeof operationId !== "string" || !WORKFLOW_OPERATION_ID.test(operationId)) {
+      throw new Error(`Environment '${environmentId}' contains an invalid '${operation}' workflow operation ID.`);
+    }
+    result[operation] = operationId;
+  }
+  return Object.freeze(result);
+}
 
 export function isLoopbackUrl(value) {
   try {
@@ -55,13 +76,17 @@ export function buildEnvironmentBinding(profile = {}) {
     );
   }
 
-  const applications = (env.applications ?? []).map(app => ({
-    applicationId: String(app.application_id ?? ""),
-    authenticationRealm: app.authentication_realm ?? null,
-    candidateEntry: app.candidate_entry ?? null,
-    status: app.status ?? "candidate",
-    ...(app.final_origin ? { finalOrigin: app.final_origin } : {})
-  }));
+  const applications = (env.applications ?? []).map(app => {
+    const workflowOperations = workflowOperationsForApplication(app, environmentId);
+    return {
+      applicationId: String(app.application_id ?? ""),
+      authenticationRealm: app.authentication_realm ?? null,
+      candidateEntry: app.candidate_entry ?? null,
+      status: app.status ?? "candidate",
+      ...(app.final_origin ? { finalOrigin: app.final_origin } : {}),
+      ...(workflowOperations ? { workflowOperations } : {})
+    };
+  });
   const authenticationRealms = (profile.authentication_realms ?? []).map(realm => {
     if (!realm || typeof realm !== "object" || typeof realm.realm_id !== "string" || !realm.realm_id
       || !Array.isArray(realm.scope) || realm.scope.some(scope => typeof scope !== "string" || !scope)) {
@@ -118,6 +143,37 @@ export function buildEnvironmentBinding(profile = {}) {
 }
 
 /**
+ * Build a run-local, single-origin binding after the operator authorizes the
+ * observed origin. This grants navigation scope only; it adds no profile
+ * operation IDs and is never persisted as a reusable application profile.
+ */
+export function buildEphemeralCurrentOriginBinding(observedUrl) {
+  let url;
+  try { url = new URL(String(observedUrl)); }
+  catch { throw new Error("Current-origin scope requires a valid observed page URL."); }
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || isLoopbackUrl(url.href)) {
+    throw new Error("Current-origin scope requires an operator-authorized non-loopback HTTP or HTTPS origin.");
+  }
+  const origin = url.origin;
+  const suffix = createHash("sha256").update(origin).digest("hex").slice(0, 16);
+  const profileId = `ephemeral_public_${suffix}`;
+  const binding = buildEnvironmentBinding({
+    profile_id: profileId,
+    environment: {
+      environment_id: profileId,
+      application_entry_url: `${origin}/`,
+      authorized_origins: [origin],
+      applications: [{
+        application_id: "ephemeral_public_site",
+        candidate_entry: `${origin}/`,
+        status: "candidate"
+      }]
+    }
+  });
+  return Object.freeze({ ...binding, environmentClass: "unknown", scopeKind: "current_origin", ephemeral: true });
+}
+
+/**
  * Verify that an observed browser URL belongs to this environment.
  * The browser's current URL must be independently observed and matched
  * against the authorized origins; redirects to unrelated origins are not
@@ -134,4 +190,73 @@ export function verifyObservedUrl(binding, observedUrl) {
     };
   }
   return { ok: true, origin, environmentId: binding.environmentId };
+}
+
+/** Resolve an authorized live URL to exactly one profile-declared application route. */
+export function resolveObservedApplication(binding, observedUrl, { authenticationRealm = null } = {}) {
+  if (!binding || typeof binding !== "object" || !Array.isArray(binding.authorizedOrigins)) {
+    return { status: "unmatched", reason: "A validated environment binding is required." };
+  }
+  const verified = verifyObservedUrl(binding, observedUrl);
+  if (!verified.ok) return { status: "unmatched", reason: verified.reason, origin: verified.origin ?? null };
+  let observed;
+  try { observed = new URL(observedUrl); }
+  catch { return { status: "unmatched", reason: "Observed URL is invalid.", origin: verified.origin };
+  }
+
+  const matches = [];
+  for (const application of binding.applications ?? []) {
+    if (typeof application?.applicationId !== "string" || !application.applicationId) continue;
+    let entry;
+    try {
+      const candidateEntry = application.candidateEntry ?? application.origin ?? "/";
+      entry = new URL(candidateEntry, binding.entryOrigin ?? `${verified.origin}/`);
+      if (entry.username || entry.password || entry.search || entry.hash) continue;
+    } catch { continue; }
+    const routeOrigin = application.finalOrigin ? normalizeOrigin(application.finalOrigin) : entry.origin;
+    if (routeOrigin !== verified.origin) continue;
+    const routePath = entry.pathname.replace(/\/+$/u, "") || "/";
+    const observedPath = observed.pathname.replace(/\/+$/u, "") || "/";
+    const routeMatches = routePath === "/" || observedPath === routePath || observedPath.startsWith(`${routePath}/`);
+    if (!routeMatches) continue;
+    const realmId = application.authenticationRealm ?? null;
+    if (realmId && Array.isArray(binding.authenticationRealms)
+      && !binding.authenticationRealms.some(realm => realm.realmId === realmId)) continue;
+    matches.push({ application, routePath, routeLength: routePath.length, realmId });
+  }
+
+  if (!matches.length) return {
+    status: "unmatched",
+    origin: verified.origin,
+    pathname: observed.pathname,
+    reason: authenticationRealm ? "No profile application route matches the observed URL and verified authentication realm." : "No profile application route matches the observed URL."
+  };
+  matches.sort((left, right) => right.routeLength - left.routeLength);
+  const longest = matches[0].routeLength;
+  let specific = matches.filter(match => match.routeLength === longest);
+  if (authenticationRealm) {
+    specific = specific.filter(match => match.realmId === authenticationRealm);
+    if (!specific.length) return {
+      status: "unmatched",
+      origin: verified.origin,
+      pathname: observed.pathname,
+      reason: "The observed application route does not match the supplied verified authentication realm."
+    };
+  }
+  if (specific.length !== 1) return {
+    status: "ambiguous",
+    origin: verified.origin,
+    pathname: observed.pathname,
+    candidateApplicationIds: [...new Set(specific.map(match => match.application.applicationId))].sort()
+  };
+  const { application, routePath, realmId } = specific[0];
+  return {
+    status: "matched",
+    origin: verified.origin,
+    pathname: observed.pathname,
+    applicationId: application.applicationId,
+    authenticationRealm: realmId,
+    routePath,
+    application
+  };
 }

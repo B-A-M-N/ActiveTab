@@ -20,6 +20,17 @@ export function buildEpisode(store, episodeId) {
       strategyFingerprint: completed.payload.strategyFingerprint,
       status: completed.payload.qualificationStatus,
       reasonCode: completed.payload.reasonCode,
+      ...(completed.payload.qualificationLevel ? {
+        qualification: {
+          level: completed.payload.qualificationLevel,
+          providerIdentity: completed.payload.providerIdentity,
+          scenarioSeed: completed.payload.scenarioSeed,
+          sourceRevision: completed.payload.sourceRevision,
+          oracleReference: completed.payload.oracleReference,
+          independentApplicationOutcome: completed.payload.independentApplicationOutcome,
+          cleanupResult: completed.payload.cleanupResult
+        }
+      } : {}),
       sourceEventIds: started.payload.sourceEventIds,
       evidenceRefs: completed.payload.evidenceRefs,
       eventIds: [started.eventId, completed.eventId],
@@ -27,8 +38,44 @@ export function buildEpisode(store, episodeId) {
       trainingEligibility: "pending"
     };
   }).filter(Boolean);
-  const decisionPredictions = events.filter(event => ["decision.predicted", "semantic.annotated"].includes(event.eventType) && event.decisionId);
+  const decisionPredictions = events.filter(event => ["decision.predicted", "semantic.annotated", "planner.predicted"].includes(event.eventType) && event.decisionId);
+  const modelFailures = events.filter(event => event.eventType === "planner.failed").map(event => ({
+    eventId: event.eventId,
+    sequence: event.sequence,
+    decisionId: event.decisionId,
+    stepId: event.stepId ?? null,
+    model: event.payload.model,
+    inputModality: event.payload.inputModality,
+    failureCode: event.payload.failureCode
+  }));
   const decisions = decisionPredictions.map(prediction => {
+    if (prediction.eventType === "planner.predicted") {
+      const later = events.filter(event => event.sequence > prediction.sequence && event.decisionId === prediction.decisionId);
+      return {
+        decisionId: prediction.decisionId,
+        stepId: prediction.stepId ?? null,
+        predictionEventId: prediction.eventId,
+        sequenceAtPrediction: prediction.sequence,
+        sourceType: "planner",
+        model: { provider: prediction.payload.provider, model: prediction.payload.model },
+        prediction: {
+          resultCode: prediction.payload.resultCode,
+          reasonCode: prediction.payload.reasonCode ?? null,
+          actionType: prediction.payload.actionType ?? null,
+          selectedCandidateFingerprint: prediction.payload.selectedCandidateFingerprint ?? null
+        },
+        inputFingerprint: prediction.payload.inputFingerprint,
+        inputModality: prediction.payload.inputModality,
+        usage: prediction.payload.usage ?? null,
+        inputEventIds: [],
+        inputEvents: [],
+        inputLineageComplete: false,
+        laterEventIds: later.map(event => event.eventId),
+        outcomeEvents: later.filter(event => ["execution.observed", "verification.completed", "correction.recorded"].includes(event.eventType)).map(projectTrainingEvent),
+        label: null,
+        trainingEligible: false
+      };
+    }
     // Use only explicit model-input references. The surrounding event prefix
     // is not proof that a model saw every earlier event.
     const referencedInputEvents = (prediction.payload.inputEventIds ?? [])
@@ -94,6 +141,15 @@ export function buildEpisode(store, episodeId) {
     eventCount: events.length,
     integrity: store.verifyEpisodeChain(episodeId),
     events: events.map(projectTrainingEvent),
+    inferenceRoutes: events.filter(event => event.eventType === "inference.route_selected").map(event => ({
+      eventId: event.eventId,
+      sequence: event.sequence,
+      decisionId: event.decisionId,
+      stepId: event.stepId ?? null,
+      observationId: event.observationId ?? null,
+      ...event.payload
+    })),
+    modelFailures,
     decisions,
     qualifications
   };

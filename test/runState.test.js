@@ -1,7 +1,7 @@
 /** Durable resumable run state across restarts (P1-4) + TaskStore suspension semantics (P0-3). */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -119,7 +119,15 @@ test("browser target lease is bound to the attached endpoint and target identity
     const session = { attached: true, target: { id: "tab-original", endpoint: "http://127.0.0.1:9222" } };
     const lease = await acquireBrowserTargetLease(store, session, "identity-bound-run");
     assert.notEqual(browserTargetLeaseId(session.target), browserTargetLeaseId({ id: session.target.id, endpoint: "http://127.0.0.1:9223" }));
-    session.target = { id: "tab-substituted", endpoint: "http://127.0.0.1:9222" };
+    const replacement = { attached: true, target: { id: "tab-original", endpoint: "http://127.0.0.1:9222/" } };
+    assert.equal(lease.bindSession(replacement), true, "a canonical endpoint representation may retain the same exact target lease");
+    await lease.assertCurrent();
+    assert.throws(() => lease.bindSession({ attached: true, target: { id: "other-tab", endpoint: "http://127.0.0.1:9222" } }), error => error.code === "RUN_TARGET_LEASE_LOST");
+    assert.throws(() => lease.bindSession({ attached: true, target: { id: "tab-original", endpoint: "http://127.0.0.1:9223" } }), error => error.code === "RUN_TARGET_LEASE_LOST");
+    replacement.attached = false;
+    await assert.rejects(() => lease.assertCurrent(), error => error.code === "RUN_TARGET_LEASE_LOST");
+    replacement.attached = true;
+    replacement.target = { id: "tab-substituted", endpoint: "http://127.0.0.1:9222" };
     await assert.rejects(() => lease.assertCurrent(), error => error.code === "RUN_TARGET_LEASE_LOST");
     await lease.release();
   }));
@@ -208,5 +216,35 @@ test("needs_human and waiting_* are suspensions, not terminals; cancellation wor
     store.update(task2.task_id, { status: "waiting_for_mfa" });
     store.forceCancel(task2.task_id);
     assert.equal(store.get(task2.task_id).status, "canceled");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("task records persist only structure-preserving input projections", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "activetab-task-input-"));
+  try {
+    const store = new TaskStore(dir);
+    await store.init();
+    const task = store.create("template", {
+      url: "https://private.example/path?access_token=secret",
+      review_count: 6,
+      api_token: "sensitive-value"
+    });
+    assert.deepEqual(task.input, { url: "[redacted]", review_count: 6 });
+    await store.persist(task.task_id);
+    const persisted = await readFile(join(dir, `${task.task_id}.json`), "utf8");
+    assert.equal(persisted.includes("private.example"), false);
+    assert.equal(persisted.includes("sensitive-value"), false);
+    assert.equal(persisted.includes("access_token"), false);
+    const legacyTaskId = "11111111-1111-4111-8111-111111111111";
+    await writeFile(join(dir, `${legacyTaskId}.json`), JSON.stringify({
+      task_id: legacyTaskId,
+      template_id: "template",
+      input: { url: "https://legacy.example/private", value: "legacy-secret", count: 2 },
+      status: "finished"
+    }), { mode: 0o600 });
+    const reloaded = new TaskStore(dir);
+    await reloaded.init();
+    assert.deepEqual(reloaded.get(legacyTaskId).input, { url: "[redacted]", value: "[redacted]", count: 2 });
+    assert.equal((await readFile(join(dir, `${legacyTaskId}.json`), "utf8")).includes("legacy.example"), false);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

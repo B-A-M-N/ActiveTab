@@ -1,0 +1,32 @@
+# Qualification Contracts
+
+## Ownership
+
+`src/qualification/` owns typed qualification intent and the separate remote live-site qualification runtime. Fixture Lab remains a separate reproducible qualification system; its local fixtures are not evidence of public-site or live-model behavior.
+
+## Live-site boundaries
+
+- `npm run benchmark:semantic-observation` is a read-only diagnostic baseline against four fixed public URLs, using fresh headed owned Chrome and native CDP. It performs zero model calls and browser actions, reports page and task-scope coverage separately, and may repeat one observation at the 384-candidate bound when a known task scope exceeds the initial 200-candidate result. It is not a workflow qualification or proof of live inference behavior.
+- `ApplicationIntelligenceCompiler` accepts only the bounded semantic-page projection emitted by workflow synthesis. Provenance-marked labels, table record-to-control references, and explicit candidate coverage are validated before inference; page-scoped partial coverage is valid only when it remains explicitly incomplete, and unknown collection completeness and operation effects cannot be upgraded by the projection. Form control counts may reach 384 only for the single demand-driven task-scope expansion; default interaction capture remains bounded at 200. An incomplete interaction scan may proceed only for an explicitly typed atomic request bound to exact required read-only extraction capabilities, with all generic navigation capabilities removed from the model input; this does not establish page completeness.
+- Public live scenarios are loaded only from the reviewed `test-lab/catalog/live/` catalog by exact scenario ID; callers cannot supply arbitrary URLs, browser profiles, operation effects, or verification rules.
+- Public search-and-browse scenarios require explicit read-only confirmation, use an owned disposable headed Chrome profile, and bind the browser to exact search-engine and destination origin/path allowlists.
+- The registered search scenario starts at a DuckDuckGo same-origin GET URL built from one random neutral topic in the local topic pool, then browses one observed Wikipedia result. The scenario admits only that generated query and the registered destination path; it never submits a mutating form or authenticates.
+- The browse phase runs through NavigationEngine under the existing durable target lease and authorized executor. It uses normal `auto` routing: deterministic evidence is evaluated first, then the unclassified task is routed to the configured secondary planner. The receipt must contain that route decision and a schema-validated prediction before the run can qualify.
+- The live scenario follows the model-selected observed anchor inside the already leased root target, including results with script-driven new-tab behavior. The executor revalidates the link and exact destination and rechecks scenario authorization and the lease immediately before dispatch; it never adopts a newly opened target.
+- If a dispatched same-target navigation detaches its CDP session before observation, the live driver may reconnect only to the exact target ID and endpoint in the still-running owned Chrome process. It checks the current route against the registered search/Wikipedia scope before and after attach, rebinds the existing lease without changing its fencing token, and requires a fresh target-bound observation. It never repeats the click or selects another tab; failure remains uncertain.
+- Live AI qualification requires an available configured secondary-model route and page-content consent. It records startup capability preflight, the automatic router decision, actual input modality, physical attempts, and a schema-validated planner prediction or typed model failure. OpenAI-compatible planner request UUIDs and bounded latency are retained so local gateway logs can be correlated without storing the request body. The model receives a screenshot only when startup preflight found image support and screenshot privacy consent is enabled. Optional Jev visual review requires its separate image opt-in and the same screenshot consent. Model output remains advisory and cannot authorize browser effects or verify completion.
+- Independent verification compares the browser's visible Wikipedia heading with a bounded direct HTTP fetch and requires the complete canonical topic target phrase as whole words. A generic keyword match cannot verify the requested page, and visible success alone never proves the result.
+- Site/access, environment, evaluator, and agent errors remain separate. Only an independently verified outcome is `verified_success`; a safe abstention is inconclusive.
+- Receipts contain bounded hashes and route-safe metadata, not screenshots, page bodies, full URLs, credentials, or raw browser observations. Owner-only receipts, request budgets, and append-only decision history persist outside the temporary Chrome profile. Profile cleanup removes browser state but preserves evaluation and learning history; it does not automatically fine-tune provider weights.
+- A cross-source page match with unverified owned-browser cleanup is an evaluator error, not a verified success. The qualification receipt records the cleanup failure separately from model and site outcomes.
+- Browser launch, target selection, URL scope, action limits, request rate, duration, and cleanup remain explicit in every receipt. There is no silent headless fallback.
+
+## Verification
+
+```bash
+node --test test/live-site-qualification.test.js
+npm run benchmark:semantic-observation
+npm run qualify:public-sites -- --scenario-id public-search-wikipedia-001 --confirm-readonly --allow-jev-visual
+```
+
+The live observation benchmark uses four fixed public sites and performs no browser action or inference. The public-site qualification performs an external headed search-and-browse run through the shared navigation router and configured live inference routes; count it as verified only after the independent receipt, automatic secondary route, successful model prediction, and cleanup are inspected. Omit `--allow-jev-visual` to use only the configured secondary model. With screenshot privacy consent enabled, preflight enables the secondary model's visual input only when its authenticated catalog reports image support.

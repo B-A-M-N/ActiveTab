@@ -9,7 +9,7 @@ import { validateWorkflow, STEP_STATUS, RUN_STATUS } from "./schema.js";
 import { evaluateAssertion } from "./assertions.js";
 import { TestReceipt, STEP_STATUS_EXTENDED } from "./receipts.js";
 import { classifyHumanHandoff } from "../navigation/handoff.js";
-import { isLoopbackUrl, verifyObservedUrl } from "../environments/model.js";
+import { isLoopbackUrl, resolveObservedApplication, verifyObservedUrl } from "../environments/model.js";
 import { NavigationEngine } from "../navigation/engine.js";
 import { createHash } from "node:crypto";
 import { RunDecisionRecorder } from "./telemetry/runDecisionRecorder.js";
@@ -66,7 +66,7 @@ function canRestoreStepWithoutExecution(step, status) {
 }
 
 export class TestRunner {
-  constructor({ session, collector, correlator, journal, maxSteps = 32, signal, interventions = null, environment = null, localFixture = false, decisionRuntime = null, qualificationService = null, operationAuthorizer = null, workflowRegistry = null, capabilityRegistry = null, capabilityService = null, authorizeExtractionField = null, authorizeExtractionRelease = null, runStateStore = null, existingRunStateId = null, principalId = null, profileId = null, policyVersion = "active_policy_v1", targetLease = null } = {}) {
+  constructor({ session, collector, correlator, journal, maxSteps = 32, signal, interventions = null, environment = null, localFixture = false, decisionRuntime = null, qualificationService = null, operationAuthorizer = null, fileUploadGrantStore = null, workflowRegistry = null, capabilityRegistry = null, capabilityService = null, authorizeExtractionField = null, authorizeExtractionRelease = null, runStateStore = null, existingRunStateId = null, principalId = null, profileId = null, policyVersion = "active_policy_v1", targetLease = null } = {}) {
     this.session = session;
     this.collector = collector;
     this.correlator = correlator;
@@ -83,6 +83,7 @@ export class TestRunner {
     // Supplied only by trusted profile/integration composition code. Workflow
     // JSON can name an operation, but cannot provide or replace this authority.
     this.operationAuthorizer = operationAuthorizer;
+    this.fileUploadGrantStore = fileUploadGrantStore;
     this.workflowRegistry = workflowRegistry;
     this.capabilityRegistry = capabilityRegistry;
     this.capabilityService = capabilityService;
@@ -138,6 +139,8 @@ export class TestRunner {
       collector,
       correlator,
       operationAuthorizer,
+      fileUploadGrantStore,
+      principalId,
       resolveWorkflowValue: (value, context) => this.controlFlowStepHandler.resolveWorkflowValue(value, context),
       createTelemetryHooks: (...args) => this.#telemetryHooks(...args),
       emitTraceEvent: event => this.#emitTraceEvent(event),
@@ -446,12 +449,13 @@ export class TestRunner {
     return this.decisionRecorder.completeEpisode(receipt);
   }
 
-  async #telemetryHooks(receipt, action, candidate = null, decisionContext = null) {
+  async #telemetryHooks(receipt, action, candidate = null, decisionContext = null, effectIntent = null) {
     return this.decisionRecorder.createHooks({
       receipt,
       action,
       candidate,
       decisionContext,
+      effectIntent,
       telemetryStepId: this.currentTelemetryStepId,
       runtimeStepId: this.currentRuntimeStepId
     });
@@ -548,6 +552,7 @@ export class TestRunner {
     }
     // A caller-supplied target or URL alone is never proof of authorization
     // or identity: verify the observed page against the environment first.
+    let observedAuthenticationRealm = null;
     if (this.environment) {
       const preObservation = await this.session.observe().catch(() => null);
       const observedUrl = preObservation?.page?.url;
@@ -563,6 +568,8 @@ export class TestRunner {
             preObservation
           });
         }
+        const application = resolveObservedApplication(this.environment, observedUrl);
+        observedAuthenticationRealm = application.status === "matched" ? application.authenticationRealm : null;
       }
     }
 
@@ -597,7 +604,7 @@ export class TestRunner {
         requiredHumanAction: "Complete the required step in the attached browser (authentication, challenge, or authorization), then let ActiveTab verify it.",
         condition: type === "human_decision" && category === "anti_automation"
           ? { type: "challenge_cleared" }
-          : { type: "authenticated_session_check", realm: step.intervention?.realm ?? this.environment?.applications?.[0]?.authenticationRealm ?? null },
+          : { type: "authenticated_session_check", realm: step.intervention?.realm ?? observedAuthenticationRealm },
         engineResult: { attempts: result.attempts, recoveries: result.recoveries, evidenceId: result.evidenceId ?? null }
       });
     }

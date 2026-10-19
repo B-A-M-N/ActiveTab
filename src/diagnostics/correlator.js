@@ -3,8 +3,8 @@
  * application records by evidence, not temporal adjacency.
  *
  * Correlation strength classes:
- *   direct    — stable shared identifier or demonstrable causal relationship
- *   probable  — multiple compatible signals, not conclusively established
+ *   direct    — a verified identifier with a complete run and target scope
+ *   probable  — an explicitly typed pair-specific inference
  *   temporal  — events near each other without sufficient proof of causality
  *   unknown   — available evidence cannot establish a relationship
  */
@@ -15,6 +15,42 @@ export const CORRELATION_STRENGTH = Object.freeze({
   TEMPORAL: "temporal",
   UNKNOWN: "unknown"
 });
+
+const REQUIRED_SCOPE = Object.freeze(["environmentId", "targetId", "runId", "principalId", "operationNamespace"]);
+const VERIFIED_PAIR_KINDS = new Set(["freeinference_cloud_agent_run"]);
+const INFERRED_PAIR_KINDS = new Set(["workflow_step_diagnostic"]);
+
+function correlationEvidence(event) {
+  const correlation = event?.correlation;
+  if (!correlation || typeof correlation !== "object" || Array.isArray(correlation)
+    || typeof correlation.namespace !== "string" || !correlation.namespace || correlation.namespace.length > 96
+    || typeof correlation.value !== "string" || !correlation.value || correlation.value.length > 512
+    || typeof correlation.pairKind !== "string" || !correlation.pairKind || correlation.pairKind.length > 96
+    || !correlation.scope || typeof correlation.scope !== "object" || Array.isArray(correlation.scope)
+    || !REQUIRED_SCOPE.every(key => typeof correlation.scope[key] === "string" && correlation.scope[key].length > 0 && correlation.scope[key].length <= 256)
+    || !Array.isArray(correlation.evidenceRefs) || correlation.evidenceRefs.length < 2
+    || correlation.evidenceRefs.some(value => typeof value !== "string" || !value || value.length > 256)) return null;
+  const evidenceRefs = [...new Set(correlation.evidenceRefs)].sort();
+  if (evidenceRefs.length < 2 || !evidenceRefs.includes(event.evidenceId)) return null;
+  return {
+    namespace: correlation.namespace,
+    value: correlation.value,
+    pairKind: correlation.pairKind,
+    provenance: correlation.provenance,
+    scope: Object.fromEntries(REQUIRED_SCOPE.map(key => [key, correlation.scope[key]])),
+    evidenceRefs
+  };
+}
+
+function sameCorrelation(left, right) {
+  return left && right
+    && left.namespace === right.namespace
+    && left.value === right.value
+    && left.pairKind === right.pairKind
+    && left.provenance === right.provenance
+    && JSON.stringify(left.scope) === JSON.stringify(right.scope)
+    && JSON.stringify(left.evidenceRefs) === JSON.stringify(right.evidenceRefs);
+}
 
 export class DiagnosticCorrelator {
   constructor({ maxLinks = 512, temporalWindowMs = 5_000 } = {}) {
@@ -40,26 +76,30 @@ export class DiagnosticCorrelator {
   }
 
   /**
-   * Correlate two events by shared identifiers.
-   * Direct requires a non-empty shared identifier match.
-   * Probable requires ≥2 compatible non-identifier signals.
-   * Temporal requires proximity only.
+   * Raw shared strings and generic metadata are weak clues. Only an explicit,
+   * evidence-backed pair rule with a complete scope can produce direct or
+   * probable correlation.
    */
   correlate(eventIdA, eventIdB) {
     const a = this.events.find(e => e.eventId === eventIdA);
     const b = this.events.find(e => e.eventId === eventIdB);
     if (!a || !b) throw new Error("Both eventId values must be added before correlating.");
 
-    // Shared identifiers (direct evidence)
-    const sharedIds = this.#sharedIdentifiers(a, b);
-    if (sharedIds.length > 0) {
-      return this.#record(a, b, CORRELATION_STRENGTH.DIRECT, { sharedIds });
-    }
-
-    // Compatible signals (probable evidence)
-    const compatibleSignals = this.#compatibleSignals(a, b);
-    if (compatibleSignals.length >= 2) {
-      return this.#record(a, b, CORRELATION_STRENGTH.PROBABLE, { compatibleSignals });
+    const left = correlationEvidence(a);
+    const right = correlationEvidence(b);
+    if (sameCorrelation(left, right)) {
+      if (left.provenance === "verified_in_browser_and_backend"
+        && VERIFIED_PAIR_KINDS.has(left.pairKind)
+        && [a.sourceType, b.sourceType].includes("browser_ui")
+        && [a.sourceType, b.sourceType].includes("cloud_agent_backend")) {
+        return this.#record(a, b, CORRELATION_STRENGTH.DIRECT, { pairKind: left.pairKind, namespace: left.namespace, scope: left.scope, evidenceRefs: left.evidenceRefs });
+      }
+      if (left.provenance === "pair_specific_inference"
+        && INFERRED_PAIR_KINDS.has(left.pairKind)
+        && [a.sourceType, b.sourceType].includes("browser_action")
+        && [a.sourceType, b.sourceType].includes("diagnostic_snapshot")) {
+        return this.#record(a, b, CORRELATION_STRENGTH.PROBABLE, { pairKind: left.pairKind, namespace: left.namespace, scope: left.scope, evidenceRefs: left.evidenceRefs });
+      }
     }
 
     // Temporal proximity only
@@ -69,29 +109,6 @@ export class DiagnosticCorrelator {
     }
 
     return this.#record(a, b, CORRELATION_STRENGTH.UNKNOWN, {});
-  }
-
-  #sharedIdentifiers(a, b) {
-    const keys = ["traceId", "requestId", "correlationId", "taskId", "workerId", "executionId"];
-    const shared = [];
-    for (const key of keys) {
-      const va = a[key];
-      const vb = b[key];
-      if (typeof va === "string" && typeof vb === "string" && va.length > 0 && va === vb) {
-        shared.push({ key, value: va });
-      }
-    }
-    return shared;
-  }
-
-  #compatibleSignals(a, b) {
-    const signals = [];
-    if (a.sourceType != null && a.sourceType === b.sourceType) signals.push("sourceType");
-    if (a.origin != null && a.origin === b.origin) signals.push("origin");
-    if (a.resourceId != null && a.resourceId === b.resourceId) signals.push("resourceId");
-    if (a.operationType != null && a.operationType === b.operationType) signals.push("operationType");
-    if (a.sessionKey != null && a.sessionKey === b.sessionKey) signals.push("sessionKey");
-    return signals;
   }
 
   #temporalProximity(a, b) {

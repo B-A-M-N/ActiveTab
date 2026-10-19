@@ -13,7 +13,7 @@
  */
 
 import { authorizePlannedAction } from "../navigation/actionPolicy.js";
-import { normalizeOrigin, verifyObservedUrl, isLoopbackUrl } from "../environments/model.js";
+import { normalizeOrigin, resolveObservedApplication, verifyObservedUrl, isLoopbackUrl } from "../environments/model.js";
 import { isOperatorProhibitedNavigation } from "./controlRestrictions.js";
 
 const SUPPORTED_ACTIONS = new Set(["navigate", "click", "fill", "select", "toggle", "upload", "scroll", "type"]);
@@ -59,10 +59,15 @@ function sameFreshCandidate(candidate, observation, action, session) {
   return fresh ?? null;
 }
 
+function isObservedAnchor(candidate) {
+  return String(candidate?.tag ?? "").toLowerCase() === "a"
+    && typeof candidate?.href === "string" && candidate.href.length > 0;
+}
+
 function authorizeInteraction({ goal, action, candidate, value, url, observation, environment, operationId, operationAuthorizer }) {
   const policyAction = action === "toggle" ? "click" : action;
   const policy = authorizePlannedAction(goal, candidate, policyAction);
-  const adapterEligible = ["unsupported_action", "unclassified_form_submission", "unknown_control_effect"].includes(policy.category);
+  const adapterEligible = ["unsupported_action", "unsupported_text_entry", "unclassified_form_submission", "unknown_control_effect"].includes(policy.category);
   if (!policy.authorized && (!adapterEligible || !operationAuthorizer || typeof operationId !== "string" || !operationId)) {
     return { allowed: false, category: policy.category, reason: policy.reason };
   }
@@ -87,15 +92,108 @@ function sameObservationBinding(before, after, session) {
   return true;
 }
 
+function retainedObservationUrl(session, observation) {
+  const retained = session?.observer?.getEvidence?.(observation?.evidenceId, {
+    facets: ["page"], includeSensitiveUrlData: true
+  });
+  return retained?.status === "available" && typeof retained.page?.url === "string"
+    ? retained.page.url : observation?.page?.url ?? null;
+}
+
+function sameCandidateBinding(before, after) {
+  return before?.identity === after?.identity
+    && before?.backendNodeId === after?.backendNodeId
+    && before?.targetId === after?.targetId
+    && before?.documentGeneration === after?.documentGeneration
+    && before?.tag === after?.tag
+    && before?.type === after?.type
+    && before?.role === after?.role
+    && before?.name === after?.name
+    && before?.href === after?.href
+    && before?.frameTargetId === after?.frameTargetId;
+}
+
+async function revalidateInteractionTarget(session, candidate, observation, action) {
+  const expectedUrl = retainedObservationUrl(session, observation);
+  if (typeof session?.validateObservedCandidate === "function") {
+    const targeted = await session.validateObservedCandidate(candidate, { action, expectedUrl }).catch(() => null);
+    if (targeted?.status === "valid" && targeted.targetId === session.target?.id
+      && targeted.documentGeneration === session.documentGeneration
+      && targeted.backendNodeId === candidate?.backendNodeId && targeted.url === expectedUrl) {
+      return { observation, candidate };
+    }
+  }
+  // A stale, ambiguous, or unavailable targeted check escalates to a full
+  // observation. Rebinding is permitted only when the exact target semantics
+  // and private route remain unchanged.
+  const freshObservation = await session.observe().catch(() => null);
+  if (!sameObservationBinding(observation, freshObservation, session)
+    || retainedObservationUrl(session, freshObservation) !== expectedUrl) {
+    return { errorCode: "pre_dispatch_state_changed" };
+  }
+  const freshCandidate = sameFreshCandidate(candidate, freshObservation, action, session);
+  if (!freshCandidate || !sameCandidateBinding(candidate, freshCandidate)) return { errorCode: "candidate_stale" };
+  return { observation: freshObservation, candidate: freshCandidate };
+}
+
+function interactionBindingError({ session, environment, localFixture, origins, observation }) {
+  if (!observation?.page?.url) return "A fresh browser observation is required before the composite suboperation.";
+  if (environment) {
+    const current = verifyObservedUrl(environment, observation.page.url);
+    if (!current.ok) return current.reason;
+  } else if (localFixture) {
+    if (!isLoopbackUrl(observation.page.url)) return "The local-fixture capability is limited to a loopback browser target.";
+  } else if (session.target?.id && (!origins?.length || !origins.includes(normalizeOrigin(observation.page.url)))) {
+    return "The observed page is outside the origin bound to this browser target.";
+  }
+  return null;
+}
+
+function workflowTargetBindingError(validateActionTarget, candidate, observation) {
+  if (typeof validateActionTarget !== "function") return null;
+  try {
+    if (validateActionTarget(candidate, observation) === true) return null;
+  } catch { /* A trusted capability validator fails closed. */ }
+  return "The selected target no longer matches its trusted workflow capability scope.";
+}
+
+function uploadGrantContext({ session, environment, principalId, operationId, candidate, observation }) {
+  if (!environment || typeof principalId !== "string" || !principalId
+    || typeof operationId !== "string" || !operationId || !session?.target?.id
+    || !candidate?.identity || !observation?.page?.url) return null;
+  const application = resolveObservedApplication(environment, observation.page.url);
+  const environmentId = environment.environmentId ?? environment.id ?? null;
+  if (application.status !== "matched" || !environmentId) return null;
+  return {
+    principalId,
+    targetId: session.target.id,
+    candidateIdentity: candidate.identity,
+    operationId,
+    environmentId,
+    applicationId: application.applicationId
+  };
+}
+
+async function checkUploadGrant({ store, grantId, session, environment, principalId, operationId, candidate, observation }) {
+  if (!store || typeof grantId !== "string" || !grantId) return { ok: false, reasonCode: "upload_grant_required" };
+  const context = uploadGrantContext({ session, environment, principalId, operationId, candidate, observation });
+  if (!context) return { ok: false, reasonCode: "upload_grant_scope_unavailable" };
+  return { ...await store.verify(grantId, context), context };
+}
+
 /**
  * Authorize and dispatch one effectful browser action. Returns a typed
  * result; it never dispatches when authorization or freshness fails.
  */
 export async function executeAuthorizedAction({
-  session, environment = null, goal = null, action, candidate = null, value = null, filePaths = null, url = null, expectedUrlPattern = null, localFixture = false, recovery = false,
-  onAdmission = null, onReserve = null, onDispatch = null, operationId = null, operationAuthorizer = null, assertExecutionLease = null
+  session, environment = null, goal = null, action, candidate = null, value = null, filePaths = null, uploadGrantStore = null, uploadGrantId = null, principalId = null, url = null, expectedUrlPattern = null, localFixture = false, recovery = false,
+  onAdmission = null, onReserve = null, onDispatch = null, operationId = null, operationAuthorizer = null, assertExecutionLease = null,
+  validateActionTarget = null, sameTargetNavigation = false
 }) {
   if (!session) throw new Error("Authorized executor requires a browser session.");
+  if (validateActionTarget !== null && typeof validateActionTarget !== "function") {
+    return refused("A workflow target validator must be trusted code.", null, "workflow_capability_scope_invalid");
+  }
   if (!SUPPORTED_ACTIONS.has(action)) {
     return refused(`Unsupported action '${action}'.`, null, "unsupported_action");
   }
@@ -106,6 +204,7 @@ export async function executeAuthorizedAction({
 
   let observation = null;
   let origins = null;
+  let deferNewTargetAuthorization = false;
   if (action === "navigate") {
     if (!localFixture && (!environment || !Array.isArray(environment.authorizedOrigins) || environment.authorizedOrigins.length === 0)) {
       return refused("Navigation requires an explicitly bound authorized environment.", null, "environment_unbound");
@@ -144,6 +243,12 @@ export async function executeAuthorizedAction({
     const freshCandidate = sameFreshCandidate(candidate, observation, action, session);
     if (!freshCandidate) return refused("The selected target is absent or stale in the fresh observation.", observation, "candidate_stale");
     candidate = freshCandidate;
+    if (action === "click" && candidate.opensNewTarget === true && sameTargetNavigation !== true) {
+      return refused("The selected link opens another browser target; explicit same-target navigation is required to stay within the active lease.", observation, "new_target_requires_authorization");
+    }
+    deferNewTargetAuthorization = action === "click" && sameTargetNavigation === true && isObservedAnchor(candidate);
+    const workflowBindingError = workflowTargetBindingError(validateActionTarget, candidate, observation);
+    if (workflowBindingError) return refused(workflowBindingError, observation, "workflow_capability_scope_mismatch");
     if (action === "click" && typeof candidate.href === "string" && candidate.href.length > 0) {
       let destination;
       try { destination = new URL(candidate.href, observation.page.url); }
@@ -163,10 +268,14 @@ export async function executeAuthorizedAction({
     // A declared typed operation is always checked by its trusted contract,
     // including when generic browser policy would otherwise allow the UI.
     try {
-      const decision = await authorizeInteraction({ goal, action, candidate, value, url, observation, environment, operationId, operationAuthorizer });
+      const decision = await authorizeInteraction({ goal, action, candidate, value, url, observation, environment, operationId: deferNewTargetAuthorization ? null : operationId, operationAuthorizer: deferNewTargetAuthorization ? null : operationAuthorizer });
       if (!decision.allowed) return refused(decision.reason, observation, decision.category);
     } catch {
       return refused("Typed application operation authorization failed.", observation, "operation_contract_refused");
+    }
+    if (action === "upload") {
+      const grant = await checkUploadGrant({ store: uploadGrantStore, grantId: uploadGrantId, session, environment, principalId, operationId, candidate, observation });
+      if (!grant.ok) return refused("The exact file upload grant is unavailable or no longer matches this operation.", observation, grant.reasonCode);
     }
   }
 
@@ -184,12 +293,20 @@ export async function executeAuthorizedAction({
     return refused("Pre-dispatch admission recording failed.", observation, "admission_recording_failed");
   }
 
-  // Review and durable reservation callbacks may take time. Re-observe the
-  // exact page and target after they finish, then rerun policy and application
-  // contracts against the fresh candidate immediately before CDP dispatch.
-  observation = await session.observe().catch(() => null);
-  if (!sameObservationBinding(admittedObservation, observation, session)) {
-    return refused("The authorized page or target changed during pre-dispatch review.", observation, "pre_dispatch_state_changed");
+  // Review may take time. Revalidate the exact node with a small native CDP
+  // check; only fall back to a full observation when that check cannot prove
+  // the existing binding.
+  if (action === "navigate") {
+    observation = await session.observe({ profile: "lightweight" }).catch(() => null);
+    if (!sameObservationBinding(admittedObservation, observation, session)
+      || retainedObservationUrl(session, observation) !== retainedObservationUrl(session, admittedObservation)) {
+      return refused("The authorized page or target changed during pre-dispatch review.", observation, "pre_dispatch_state_changed");
+    }
+  } else {
+    const refreshed = await revalidateInteractionTarget(session, candidate, admittedObservation, action);
+    if (!refreshed?.observation) return refused("The selected target became stale during pre-dispatch review.", admittedObservation, refreshed?.errorCode ?? "candidate_stale");
+    observation = refreshed.observation;
+    candidate = refreshed.candidate;
   }
   if (action === "navigate") {
     const currentOrigin = normalizeOrigin(observation.page.url);
@@ -204,6 +321,8 @@ export async function executeAuthorizedAction({
     const freshCandidate = sameFreshCandidate(candidate, observation, action, session);
     if (!freshCandidate) return refused("The selected target changed during pre-dispatch review.", observation, "candidate_stale");
     candidate = freshCandidate;
+    const workflowBindingError = workflowTargetBindingError(validateActionTarget, candidate, observation);
+    if (workflowBindingError) return refused(workflowBindingError, observation, "workflow_capability_scope_mismatch");
     if (environment) {
       const current = verifyObservedUrl(environment, observation.page.url);
       if (!current.ok) return refused(current.reason, observation, "environment_mismatch");
@@ -217,10 +336,14 @@ export async function executeAuthorizedAction({
       if (!origins?.includes(destination.origin)) return refused("The selected link destination is outside the authorized environment.", observation, "navigation_target_untrusted");
     }
     try {
-      const decision = await authorizeInteraction({ goal, action, candidate, value, url, observation, environment, operationId, operationAuthorizer });
+      const decision = await authorizeInteraction({ goal, action, candidate, value, url, observation, environment, operationId: deferNewTargetAuthorization ? null : operationId, operationAuthorizer: deferNewTargetAuthorization ? null : operationAuthorizer });
       if (!decision.allowed) return refused(decision.reason, observation, decision.category);
     } catch {
       return refused("Typed application operation authorization failed.", observation, "operation_contract_refused");
+    }
+    if (action === "upload") {
+      const grant = await checkUploadGrant({ store: uploadGrantStore, grantId: uploadGrantId, session, environment, principalId, operationId, candidate, observation });
+      if (!grant.ok) return refused("The exact file upload grant is unavailable or no longer matches this operation.", observation, grant.reasonCode);
     }
   }
 
@@ -234,6 +357,36 @@ export async function executeAuthorizedAction({
     }
   } catch {
     return refused("Durable pre-dispatch reservation failed.", observation, "operation_reservation_failed");
+  }
+
+  // Reservations can block on durable storage. Recheck target scope after
+  // reservation, before the final lease assertion and the browser command.
+  if (action === "navigate") {
+    const current = await session.observe({ profile: "lightweight" }).catch(() => null);
+    if (!sameObservationBinding(observation, current, session)
+      || retainedObservationUrl(session, current) !== retainedObservationUrl(session, observation)) {
+      return refused("The authorized page or target changed after operation reservation.", current, "pre_dispatch_state_changed");
+    }
+    observation = current;
+  } else {
+    const refreshed = await revalidateInteractionTarget(session, candidate, observation, action);
+    if (!refreshed?.observation) return refused("The selected target became stale after operation reservation.", observation, refreshed?.errorCode ?? "candidate_stale");
+    observation = refreshed.observation;
+    candidate = refreshed.candidate;
+    const workflowBindingError = workflowTargetBindingError(validateActionTarget, candidate, observation);
+    if (workflowBindingError) return refused(workflowBindingError, observation, "workflow_capability_scope_mismatch");
+    try {
+      const decision = await authorizeInteraction({ goal, action, candidate, value, url, observation, environment,
+        operationId: deferNewTargetAuthorization ? null : operationId,
+        operationAuthorizer: deferNewTargetAuthorization ? null : operationAuthorizer });
+      if (!decision.allowed) return refused(decision.reason, observation, decision.category);
+    } catch {
+      return refused("Typed application operation authorization failed.", observation, "operation_contract_refused");
+    }
+    if (action === "upload") {
+      const grant = await checkUploadGrant({ store: uploadGrantStore, grantId: uploadGrantId, session, environment, principalId, operationId, candidate, observation });
+      if (!grant.ok) return refused("The exact file upload grant is unavailable or no longer matches this operation.", observation, grant.reasonCode);
+    }
   }
 
   try { await assertExecutionLease?.(); }
@@ -251,27 +404,182 @@ export async function executeAuthorizedAction({
         break;
       }
       case "click": case "toggle": {
-        dispatchResult = await session.click(candidate);
+        dispatchResult = action === "toggle" && typeof session.setCheckboxState === "function"
+          && ["checked", "unchecked"].includes(value)
+          ? await session.setCheckboxState(candidate, value === "checked", { beforeDispatch: async () => assertExecutionLease?.() })
+          : action === "click" && sameTargetNavigation === true && isObservedAnchor(candidate)
+          ? await session.navigateObservedLinkInSameTarget(candidate, {
+            beforeDispatch: async ({ href }) => {
+              await assertExecutionLease?.();
+              const refreshed = await revalidateInteractionTarget(session, candidate, observation, "click");
+              if (!refreshed?.observation) {
+                throw new Error("The authorized page or target changed before same-target navigation.");
+              }
+              const currentObservation = refreshed.observation;
+              const freshCandidate = refreshed.candidate;
+              if (!freshCandidate || !isObservedAnchor(freshCandidate)) {
+                throw new Error("The selected target changed before same-target navigation.");
+              }
+              const destination = navigationTarget(href, { environment, localFixture, authorizedOrigins: origins ?? [] });
+              if (destination.error) throw new Error(destination.error);
+              const decision = await authorizeInteraction({
+                goal,
+                action: "click",
+                candidate: { ...freshCandidate, href },
+                value,
+                url: href,
+                observation: currentObservation,
+                environment,
+                operationId,
+                operationAuthorizer
+              });
+              if (!decision.allowed) throw new Error(decision.reason ?? "Typed application operation is outside its registered contract.");
+            }
+          })
+          : await session.click(candidate, { beforeDispatch: async () => assertExecutionLease?.() });
         break;
       }
       case "fill": {
-        dispatchResult = await session.fillField(candidate, value ?? "");
+        dispatchResult = await session.fillField(candidate, value ?? "", { beforeDispatch: async () => assertExecutionLease?.() });
         break;
       }
       case "select": {
-        dispatchResult = await session.selectOption(candidate, value ?? "");
+        const exactValue = value ?? "";
+        const customCombobox = String(candidate?.tag ?? "").toLowerCase() !== "select";
+        if (!customCombobox) {
+          dispatchResult = await session.selectOption(candidate, exactValue, { beforeDispatch: async () => assertExecutionLease?.() });
+          break;
+        }
+
+        const allowedSuboperations = Object.freeze(["open_observed_combobox", "select_exact_controlled_option"]);
+        const actionEnvelope = Object.freeze({
+          type: "aria_combobox_select",
+          version: 1,
+          action: "select",
+          targetId: session.target?.id ?? candidate.targetId,
+          candidateIdentity: candidate.identity,
+          documentGeneration: candidate.documentGeneration,
+          value: exactValue,
+          allowedSuboperations
+        });
+        let nextSuboperation = 0;
+        let pendingSuboperation = null;
+        let pendingCandidateIdentity = null;
+        let pendingMenuIdentity = null;
+        const authorizeSuboperation = async request => {
+          const { stage, suboperation, candidate: subCandidate, menuCandidate } = request ?? {};
+          if (stage === "prepare") {
+            if (pendingSuboperation || allowedSuboperations[nextSuboperation] !== suboperation) {
+              return { allowed: false, reason: "Composite selection attempted an unapproved or out-of-order suboperation.", category: "composite_suboperation_refused" };
+            }
+            if (actionEnvelope.targetId !== subCandidate?.targetId
+              || actionEnvelope.documentGeneration !== subCandidate?.documentGeneration
+              || actionEnvelope.targetId !== menuCandidate?.targetId
+              || actionEnvelope.candidateIdentity !== menuCandidate?.identity) {
+              return { allowed: false, reason: "Composite selection target does not match its approved action envelope.", category: "composite_suboperation_refused" };
+            }
+            try { await assertExecutionLease?.(); }
+            catch { return { allowed: false, reason: "The browser target execution lease was lost before a composite suboperation.", category: "target_lease_lost" }; }
+            const current = await session.observe().catch(() => null);
+            if (!sameObservationBinding(admittedObservation, current, session)) {
+              return { allowed: false, reason: "The authorized page or target changed between composite selection suboperations.", category: "pre_dispatch_state_changed" };
+            }
+            const bindingError = interactionBindingError({ session, environment, localFixture, origins, observation: current });
+            if (bindingError) return { allowed: false, reason: bindingError, category: "environment_mismatch" };
+
+            const freshMenu = sameFreshCandidate(menuCandidate, current, "select", session);
+            if (!freshMenu || freshMenu.identity !== actionEnvelope.candidateIdentity) {
+              return { allowed: false, reason: "The approved combobox is absent or stale in the current observation.", category: "candidate_stale" };
+            }
+            const workflowBindingError = workflowTargetBindingError(validateActionTarget, freshMenu, current);
+            if (workflowBindingError) return { allowed: false, reason: workflowBindingError, category: "workflow_capability_scope_mismatch" };
+            let freshSubCandidate;
+            if (suboperation === "open_observed_combobox") {
+              freshSubCandidate = sameFreshCandidate(subCandidate, current, "select", session);
+              if (!freshSubCandidate || freshSubCandidate.identity !== actionEnvelope.candidateIdentity
+                || String(freshSubCandidate.role ?? "").toLowerCase() !== "combobox") {
+                return { allowed: false, reason: "The approved combobox changed before it could be opened.", category: "candidate_stale" };
+              }
+            } else if (suboperation === "select_exact_controlled_option") {
+              freshSubCandidate = sameFreshCandidate(subCandidate, current, "select", session);
+              if (!freshSubCandidate || String(freshSubCandidate.role ?? "").toLowerCase() !== "option"
+                || freshSubCandidate.name !== exactValue || freshSubCandidate.visible !== true || freshSubCandidate.disabled === true
+                || freshSubCandidate.frameTargetId != null || menuCandidate?.identity !== actionEnvelope.candidateIdentity) {
+                return { allowed: false, reason: "The exact visible option is absent from the current observation.", category: "candidate_stale" };
+              }
+            } else {
+              return { allowed: false, reason: "The composite selection envelope does not permit this suboperation.", category: "composite_suboperation_refused" };
+            }
+
+            try {
+              const decision = await authorizeInteraction({
+                goal, action: "select", candidate: freshMenu, value: exactValue, url, observation: current,
+                environment, operationId, operationAuthorizer
+              });
+              if (!decision.allowed) return { allowed: false, reason: decision.reason, category: decision.category };
+            } catch {
+              return { allowed: false, reason: "Typed application operation authorization failed for a composite suboperation.", category: "operation_contract_refused" };
+            }
+            pendingSuboperation = suboperation;
+            pendingCandidateIdentity = freshSubCandidate.identity;
+            pendingMenuIdentity = freshMenu.identity;
+            return { allowed: true, candidate: freshSubCandidate, menuCandidate: freshMenu };
+          }
+          if (stage === "dispatch") {
+            if (pendingSuboperation !== suboperation
+              || subCandidate?.identity !== pendingCandidateIdentity
+              || menuCandidate?.identity !== pendingMenuIdentity) {
+              return { allowed: false, reason: "Composite suboperation was not prepared for this exact control.", category: "composite_suboperation_refused" };
+            }
+            try { await assertExecutionLease?.(); }
+            catch { return { allowed: false, reason: "The browser target execution lease was lost immediately before a composite suboperation.", category: "target_lease_lost" }; }
+            return { allowed: true };
+          }
+          if (stage === "completed") {
+            if (pendingSuboperation !== suboperation || allowedSuboperations[nextSuboperation] !== suboperation
+              || subCandidate?.identity !== pendingCandidateIdentity || menuCandidate?.identity !== pendingMenuIdentity) {
+              return { allowed: false, reason: "Composite suboperation completion did not match its approved action envelope.", category: "composite_suboperation_refused" };
+            }
+            pendingSuboperation = null;
+            pendingCandidateIdentity = null;
+            pendingMenuIdentity = null;
+            nextSuboperation++;
+            return { allowed: true };
+          }
+          return { allowed: false, reason: "Composite selection requested an unsupported authorization stage.", category: "composite_suboperation_refused" };
+        };
+
+        dispatchResult = await session.selectOption(candidate, exactValue, { actionEnvelope, authorizeSuboperation });
+        if (dispatchResult?.selectionStatus === "selected" && nextSuboperation !== allowedSuboperations.length) {
+          throw new Error("Composite selection completed without authorizing every suboperation.");
+        }
         break;
       }
       case "upload": {
-        dispatchResult = await session.uploadFile(candidate, filePaths ?? []);
+        const grant = await uploadGrantStore.beginDispatch(uploadGrantId,
+          uploadGrantContext({ session, environment, principalId, operationId, candidate, observation }) ?? {});
+        if (!grant.ok) return refused("The approved upload source changed or its scoped grant expired before dispatch.", observation, grant.reasonCode);
+        try {
+          dispatchResult = await session.uploadFile(candidate, grant.stagedPaths, {
+            grantToken: grant.dispatchToken,
+            beforeDispatch: async () => {
+              await assertExecutionLease?.();
+              const stillCurrent = await uploadGrantStore.assertDispatchToken(grant.dispatchToken, {
+                targetId: session.target?.id,
+                candidateIdentity: candidate.identity
+              });
+              if (!stillCurrent.ok) throw new Error("The approved upload source changed before CDP dispatch.");
+            }
+          });
+        } finally { await uploadGrantStore.complete(uploadGrantId); }
         break;
       }
       case "scroll": {
-        dispatchResult = await session.scroll(candidate);
+        dispatchResult = await session.scroll(candidate, { beforeDispatch: async () => assertExecutionLease?.() });
         break;
       }
       case "type": {
-        dispatchResult = await session.typeSearchPhrase(candidate, value ?? "");
+        dispatchResult = await session.typeSearchPhrase(candidate, value ?? "", observation, { beforeDispatch: async () => assertExecutionLease?.() });
         break;
       }
     }
@@ -280,7 +588,7 @@ export async function executeAuthorizedAction({
     try { await onDispatch?.({ action, candidate, url, observation, dispatchResult, dispatchStatus: "uncertain" }); }
     catch { telemetryError = true; }
     let operationError = false;
-    try { await operationAuthorizer?.recordDispatch?.({ operationId, action, candidate, value, observation, dispatchStatus: "uncertain" }); }
+    try { await operationAuthorizer?.recordDispatch?.({ operationId, action, candidate, value, observation, dispatchResult, dispatchStatus: "uncertain" }); }
     catch { operationError = true; }
     return {
       status: "uncertain", dispatched: false, authorized: true,
@@ -292,11 +600,23 @@ export async function executeAuthorizedAction({
       ...(operationError ? { operationError: true } : {})
     };
   }
+  const isCompositeSelect = action === "select" && String(candidate?.tag ?? "").toLowerCase() !== "select";
+  if (isCompositeSelect && dispatchResult?.dispatched !== true) {
+    const category = dispatchResult?.category ?? "composite_suboperation_refused";
+    const reason = dispatchResult?.reason ?? "Composite selection was refused before any browser effect.";
+    try { await onDispatch?.({ action, candidate, url, observation, dispatchResult, dispatchStatus: "refused" }); }
+    catch { /* The refusal remains authoritative if telemetry storage fails. */ }
+    try { await operationAuthorizer?.recordDispatch?.({ operationId, action, candidate, value, observation, dispatchResult, dispatchStatus: "refused" }); }
+    catch { /* Preserve the refusal if operation telemetry storage fails. */ }
+    return refused(reason, observation, category);
+  }
+  const partialCompositeSelect = isCompositeSelect && dispatchResult?.selectionStatus !== "selected";
+  const finalDispatchStatus = partialCompositeSelect ? "uncertain" : "dispatched";
   let telemetryError = false;
-  try { await onDispatch?.({ action, candidate, url, observation, dispatchResult, dispatchStatus: "dispatched" }); }
+  try { await onDispatch?.({ action, candidate, url, observation, dispatchResult, dispatchStatus: finalDispatchStatus }); }
   catch { telemetryError = true; }
   let operationError = false;
-  try { await operationAuthorizer?.recordDispatch?.({ operationId, action, candidate, value, observation, dispatchStatus: "dispatched" }); }
+  try { await operationAuthorizer?.recordDispatch?.({ operationId, action, candidate, value, observation, dispatchResult, dispatchStatus: finalDispatchStatus }); }
   catch { operationError = true; }
-  return { status: "dispatched", dispatched: true, authorized: true, effectStatus: "unknown", verificationStatus: "not_verified", dispatchResult, observation, ...(telemetryError ? { telemetryError: true } : {}), ...(operationError ? { operationError: true } : {}) };
+  return { status: partialCompositeSelect ? "partial" : "dispatched", dispatched: true, authorized: true, effectStatus: partialCompositeSelect ? "partial" : "unknown", verificationStatus: "not_verified", dispatchResult, observation, ...(telemetryError ? { telemetryError: true } : {}), ...(operationError ? { operationError: true } : {}) };
 }

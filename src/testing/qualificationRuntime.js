@@ -25,12 +25,14 @@ export function createQualificationRuntime({
   decisionRuntime,
   externalGmailOrigin = process.env.ACTIVETAB_BENCHMARK_WEBARENA_INFINITY_URL ?? null,
   externalGmailOracleToken = process.env.ACTIVETAB_WEBARENA_ORACLE_TOKEN ?? null,
+  headed = process.env.ACTIVETAB_HEADLESS !== "1",
+  launchBrowser,
   providers = {},
   drivers = {},
   scenarios = scenarioFiles.map(loadScenario)
 } = {}) {
-  const nativeDriver = createNativeCdpQualificationDriver({ decisionRuntime });
-  const gmailExtractionDriver = createWebArenaInfinityGmailExtractionDriver({ decisionRuntime });
+  const nativeDriver = createNativeCdpQualificationDriver({ decisionRuntime, headed, launchBrowser });
+  const gmailExtractionDriver = createWebArenaInfinityGmailExtractionDriver({ decisionRuntime, headed, launchBrowser });
   const configuredProviders = {
     fi_agent_twin: () => createFiAgentTwinProvider(),
     ...(externalGmailOrigin && externalGmailOracleToken ? {

@@ -1,4 +1,5 @@
 import { normalizeFieldValue } from "./extractionContract.js";
+import { descendantNodeIndexes, documentIndexFor } from "../observe/documentIndex.js";
 
 const MAX_GROUP_ITEMS = 10_000;
 
@@ -20,57 +21,15 @@ function splitTokens(value) {
   return [...new Set(tokens)];
 }
 
-function indexDocument(snapshot, document) {
-  const nodes = document?.nodes;
-  if (!nodes) return null;
-  const tags = (nodes.nodeName ?? []).map(index => stringAt(snapshot.strings, index).toLocaleUpperCase());
-  const parentIndex = nodes.parentIndex ?? [];
-  const children = new Map();
-  for (let index = 0; index < parentIndex.length; index++) {
-    const parent = parentIndex[index];
-    if (!Number.isInteger(parent) || parent < 0) continue;
-    const siblings = children.get(parent) ?? [];
-    siblings.push(index);
-    children.set(parent, siblings);
-  }
-  const attributes = (nodes.attributes ?? []).map(flat => {
-    const values = {};
-    for (let index = 0; index + 1 < (flat?.length ?? 0); index += 2) {
-      const name = stringAt(snapshot.strings, flat[index]).toLocaleLowerCase();
-      if (name) values[name] = stringAt(snapshot.strings, flat[index + 1]);
-    }
-    return values;
-  });
-  const visible = new Set();
-  for (let index = 0; index < (document.layout?.nodeIndex?.length ?? 0); index++) {
-    const nodeIndex = document.layout.nodeIndex[index];
-    const bounds = document.layout.bounds?.[index];
-    if (Number.isInteger(nodeIndex) && Array.isArray(bounds) && bounds[2] > 0 && bounds[3] > 0) visible.add(nodeIndex);
-  }
-  return { tags, parentIndex, children, attributes, visible, values: nodes.nodeValue ?? [], textValues: nodes.textValue ?? [], strings: snapshot.strings };
-}
-
-function descendants(root, children) {
-  const result = [];
-  const stack = [...(children.get(root) ?? [])].reverse();
-  while (stack.length) {
-    const index = stack.pop();
-    result.push(index);
-    const nested = children.get(index) ?? [];
-    for (let child = nested.length - 1; child >= 0; child--) stack.push(nested[child]);
-  }
-  return result;
-}
-
 function classTokens(index, nodeIndex) {
   return splitTokens(index.attributes[nodeIndex]?.class);
 }
 
 function textUnder(index, nodeIndex) {
   let result = "";
-  for (const child of [nodeIndex, ...descendants(nodeIndex, index.children)]) {
+  for (const child of [nodeIndex, ...descendantNodeIndexes(nodeIndex, index)]) {
     if (index.tags[child] !== "#TEXT") continue;
-    result += `${stringAt(index.strings, index.textValues[child] ?? index.values[child])} `;
+    result += `${stringAt(index.strings, index.textValues[child] ?? index.nodeValues[child])} `;
   }
   return result.trim().replaceAll("\u00a0", " ").replaceAll("\n", " ").replaceAll("\t", " ");
 }
@@ -87,7 +46,7 @@ function preferredToken(tokens) {
 function repeatedSources(index, items) {
   const perItem = items.map(item => {
     const counts = new Map();
-    for (const node of descendants(item, index.children)) {
+    for (const node of descendantNodeIndexes(item, index)) {
       if (!index.visible.has(node) || !index.tags[node] || index.tags[node].startsWith("#")) continue;
       if (!textUnder(index, node)) continue;
       for (const token of classTokens(index, node)) {
@@ -108,14 +67,14 @@ function repeatedSources(index, items) {
 }
 
 /** Discover repeated visible sibling records without returning their values. */
-export function discoverVisibleRecordGroups(snapshot, { minRecords = 2, maxRecords = MAX_GROUP_ITEMS } = {}) {
+export function discoverVisibleRecordGroups(snapshot, { minRecords = 2, maxRecords = MAX_GROUP_ITEMS, index: suppliedIndex = null } = {}) {
   if (!Number.isInteger(minRecords) || minRecords < 2 || !Number.isInteger(maxRecords) || maxRecords < minRecords) return [];
   const candidates = [];
   const seen = new Set();
-  for (let documentIndex = 0; documentIndex < (snapshot?.documents?.length ?? 0); documentIndex++) {
-    const document = snapshot.documents[documentIndex];
-    const index = indexDocument(snapshot, document);
+  const sharedIndex = documentIndexFor(snapshot, suppliedIndex);
+  for (const index of sharedIndex.documents) {
     if (!index) continue;
+    const { documentIndex } = index;
     for (let parent = 0; parent < index.tags.length; parent++) {
       if (!index.visible.has(parent) || !index.tags[parent] || index.tags[parent].startsWith("#")) continue;
       const containerClassToken = preferredToken(classTokens(index, parent));
@@ -140,6 +99,9 @@ export function discoverVisibleRecordGroups(snapshot, { minRecords = 2, maxRecor
         seen.add(identity);
         candidates.push(Object.freeze({
           documentIndex,
+          frameId: index.frameId,
+          frameTargetId: index.frameTargetId,
+          parentFrameId: index.parentFrameId,
           recordGroup: Object.freeze({
             containerTagName: index.tags[parent],
             containerClassToken,
@@ -162,17 +124,17 @@ function fieldSourceMatches(nodeIndex, index, field) {
 }
 
 /** Resolve one registered repeated-record group against a fresh DOM snapshot. */
-export function resolveVisibleRecordGroupRecords(snapshot, contract) {
+export function resolveVisibleRecordGroupRecords(snapshot, contract, { index: suppliedIndex = null } = {}) {
   const selector = contract?.recordGroup;
   const fields = contract?.fields;
   if (!selector || !Array.isArray(fields) || fields.length === 0) {
     return { status: "invalid_contract", records: [], evidence: [] };
   }
   const groups = [];
-  for (let documentIndex = 0; documentIndex < (snapshot?.documents?.length ?? 0); documentIndex++) {
-    const document = snapshot.documents[documentIndex];
-    const index = indexDocument(snapshot, document);
+  const sharedIndex = documentIndexFor(snapshot, suppliedIndex);
+  for (const index of sharedIndex.documents) {
     if (!index) continue;
+    const { documentIndex } = index;
     for (let parent = 0; parent < index.tags.length; parent++) {
       if (!index.visible.has(parent) || index.tags[parent] !== selector.containerTagName
         || !classTokens(index, parent).includes(selector.containerClassToken)) continue;
@@ -193,7 +155,7 @@ export function resolveVisibleRecordGroupRecords(snapshot, contract) {
     const fieldEvidence = {};
     let valid = true;
     for (const field of fields) {
-      const matches = descendants(item, group.index.children)
+      const matches = descendantNodeIndexes(item, group.index)
         .filter(node => fieldSourceMatches(node, group.index, field));
       const raw = matches.length === 1 ? textUnder(group.index, matches[0]) : "";
       const normalized = normalizeFieldValue(raw, field);

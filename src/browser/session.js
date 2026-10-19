@@ -1,8 +1,11 @@
 import { createHash } from "node:crypto";
 import { CdpClient } from "../cdp/client.js";
 import { BrowserActivityRecorder } from "./activity.js";
+import { ACTION_VALUE_LIMITS } from "./actionLimits.js";
 import { BrowserObserver } from "../observe/observer.js";
+import { sanitizeUrl } from "./urlPrivacy.js";
 import { isOperatorProhibitedControl, operatorProhibitedControlReason } from "../runtime/controlRestrictions.js";
+import { isFileUploadDispatchToken } from "../runtime/fileUploadGrants.js";
 
 function createSessionClient(transport, sessionId) {
   return {
@@ -125,7 +128,7 @@ export class BrowserSession {
       for (const method of ["DOM.childNodeInserted", "DOM.childNodeRemoved", "DOM.attributeModified", "DOM.attributeRemoved", "DOM.characterDataModified", "DOM.childNodeCountUpdated", "DOM.shadowRootPushed", "DOM.shadowRootPopped", "DOM.pseudoElementAdded", "DOM.pseudoElementRemoved", "DOM.inlineStyleInvalidated", "DOM.distributedNodesUpdated"]) {
         this.disposers.push(this.client.on(method, event => this.activity.recordDomMutation(method, event)));
       }
-      for (const method of ["Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished", "Network.loadingFailed"]) {
+      for (const method of ["Network.requestWillBeSent", "Network.responseReceived", "Network.dataReceived", "Network.loadingFinished", "Network.loadingFailed"]) {
         this.disposers.push(this.client.on(method, event => this.activity.recordNetworkEvent(method, event)));
       }
       await this.client.send("Page.enable");
@@ -276,7 +279,7 @@ export class BrowserSession {
     for (const method of ["DOM.childNodeInserted", "DOM.childNodeRemoved", "DOM.attributeModified", "DOM.attributeRemoved", "DOM.characterDataModified", "DOM.childNodeCountUpdated", "DOM.shadowRootPushed", "DOM.shadowRootPopped", "DOM.pseudoElementAdded", "DOM.pseudoElementRemoved", "DOM.inlineStyleInvalidated", "DOM.distributedNodesUpdated"]) {
       frame.disposers.push(client.on(method, event => this.activity.recordDomMutation(method, { ...event, frameTargetId: frame.targetId })));
     }
-    for (const method of ["Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished", "Network.loadingFailed"]) {
+    for (const method of ["Network.requestWillBeSent", "Network.responseReceived", "Network.dataReceived", "Network.loadingFinished", "Network.loadingFailed"]) {
       frame.disposers.push(client.on(method, event => this.activity.recordNetworkEvent(method, event, { frameTargetId: frame.targetId })));
     }
   }
@@ -314,12 +317,15 @@ export class BrowserSession {
     }
   }
 
-  async getOutOfProcessFrames() {
+  async getOutOfProcessFrames({ onCdpRoundTrip } = {}) {
     this.#assertTargetAttached();
     let expected = new Set(this.frameSessions.keys());
     if (!this.ownsTransport && this.frameAttachmentAvailable) {
       try {
-        const { targetInfos = [] } = await this.transport.send("Target.getTargets");
+        const startedAt = Date.now();
+        let targetInfos = [];
+        try { ({ targetInfos = [] } = await this.transport.send("Target.getTargets")); }
+        finally { onCdpRoundTrip?.(Date.now() - startedAt); }
         const iframeTargets = targetInfos.filter(item => item?.type === "iframe" && typeof item.targetId === "string");
         const parents = new Set([this.target.id]);
         let expanded = true;
@@ -414,7 +420,70 @@ export class BrowserSession {
     });
   }
 
-  async click(candidate) {
+  /** Revalidate one exact observed backend node without recapturing a DOMSnapshot. */
+  async validateObservedCandidate(candidate, { action, expectedUrl } = {}) {
+    this.#assertTargetAttached();
+    if (!candidate || candidate.targetId !== this.target.id
+      || candidate.documentGeneration !== this.documentGeneration
+      || !Number.isInteger(candidate.backendNodeId)) return { status: "stale", reasonCode: "candidate_binding_mismatch" };
+    const frame = candidate.frameTargetId ? this.frameSessions.get(candidate.frameTargetId) : null;
+    if (candidate.frameTargetId && (frame?.status !== "ready" || frame.targetId !== candidate.frameTargetId)) {
+      return { status: "stale", reasonCode: "candidate_frame_unavailable" };
+    }
+    const client = frame?.client ?? this.client;
+    try {
+      const described = await client.send("DOM.describeNode", { backendNodeId: candidate.backendNodeId, depth: 0, pierce: true });
+      const node = described.node;
+      if (!node?.backendNodeId || node.backendNodeId !== candidate.backendNodeId
+        || String(node.nodeName ?? "").toLowerCase() !== String(candidate.tag ?? "").toLowerCase()) {
+        return { status: "stale", reasonCode: "candidate_node_identity_changed" };
+      }
+      const attributes = Object.fromEntries((node.attributes ?? []).reduce((pairs, value, index, values) => {
+        if (index % 2 === 0) pairs.push([value, values[index + 1] ?? ""]);
+        return pairs;
+      }, []));
+      if (candidate.type != null && String(attributes.type ?? "").toLowerCase() !== String(candidate.type).toLowerCase()) {
+        return { status: "stale", reasonCode: "candidate_type_changed" };
+      }
+      if (candidate.href) {
+        let currentHref;
+        try { currentHref = new URL(attributes.href ?? "", expectedUrl ?? this.target.url).href; }
+        catch { return { status: "stale", reasonCode: "candidate_href_invalid" }; }
+        let observedHref;
+        try { observedHref = new URL(candidate.href, expectedUrl ?? this.target.url).href; }
+        catch { return { status: "stale", reasonCode: "candidate_href_invalid" }; }
+        if (sanitizeUrl(currentHref) !== sanitizeUrl(observedHref)) return { status: "stale", reasonCode: "candidate_href_changed" };
+      }
+      const resolved = await client.send("DOM.resolveNode", { backendNodeId: candidate.backendNodeId });
+      const objectId = resolved.object?.objectId;
+      if (!objectId) return { status: "stale", reasonCode: "candidate_resolution_unavailable" };
+      let current;
+      try {
+        const checked = await client.send("Runtime.callFunctionOn", {
+          objectId,
+          functionDeclaration: "function(expected){const r=this.getBoundingClientRect(),s=getComputedStyle(this),label=(this.getAttribute('aria-label')||this.title||Array.from(this.labels??[]).map(l=>l.innerText||l.textContent||'').join(' ')||this.innerText||this.textContent||this.getAttribute('name')||'').replace(/\\s+/g,' ').trim();const x=r.left+r.width/2,y=r.top+r.height/2;let top=document.elementFromPoint(x,y);for(let depth=0;top&&top.shadowRoot&&depth<8;depth++){const inner=top.shadowRoot.elementFromPoint(x,y);if(!inner||inner===top)break;top=inner}return {connected:this.isConnected,visible:r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)>0&&s.pointerEvents!=='none',disabled:this.disabled===true||this.getAttribute('aria-disabled')==='true',readOnly:this.readOnly===true,label,labelMatches:!expected||!label||label.toLocaleLowerCase()===expected.toLocaleLowerCase(),occluded:!!top&&top!==this&&!this.contains(top)}}",
+          arguments: [{ value: candidate.name ?? "" }], returnByValue: true, awaitPromise: false
+        });
+        current = checked.result?.value;
+      } finally { await client.send("Runtime.releaseObject", { objectId }).catch(() => {}); }
+      if (!current?.connected || !current.visible || current.disabled
+        || (["fill", "type"].includes(action) && current.readOnly)
+        || !current.labelMatches || (["click", "toggle"].includes(action) && current.occluded)) {
+        return { status: "stale", reasonCode: "candidate_interaction_state_changed" };
+      }
+      const routeResult = await this.client.send("Runtime.evaluate", {
+        expression: "location.href", returnByValue: true, awaitPromise: false, userGesture: false
+      });
+      const url = routeResult.result?.value;
+      if (typeof expectedUrl === "string" && url !== expectedUrl) return { status: "stale", reasonCode: "page_route_changed" };
+      return { status: "valid", targetId: this.target.id, frameTargetId: candidate.frameTargetId ?? null,
+        documentGeneration: this.documentGeneration, backendNodeId: candidate.backendNodeId, url, attributes };
+    } catch {
+      return { status: "unavailable", reasonCode: "candidate_validation_unavailable" };
+    }
+  }
+
+  async click(candidate, { beforeDispatch = null } = {}) {
     this.#assertTargetAttached();
     assertControlAllowed(candidate, "click");
     if (candidate.targetId !== this.target.id) throw new Error("Candidate belongs to a different browser target.");
@@ -444,13 +513,117 @@ export class BrowserSession {
     if (!quad || quad.length < 8) throw new Error("The selected page element has no usable layout box.");
     const x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4;
     const y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
+    await beforeDispatch?.({ candidate, frameTargetId: frame?.targetId ?? null });
+    this.#assertTargetAttached();
+    if (candidate.documentGeneration !== this.documentGeneration) throw new Error("Candidate became stale immediately before click dispatch.");
     await client.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
     await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
     await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
     return { dispatched: true, at: { x, y }, backendNodeId: candidate.backendNodeId, frameTargetId: frame?.targetId ?? null };
   }
 
-  async scroll(target) {
+  /** Set one exact observed native checkbox to a caller-selected state. */
+  async setCheckboxState(candidate, checked, { beforeDispatch = null } = {}) {
+    this.#assertTargetAttached();
+    assertControlAllowed(candidate, "toggle");
+    if (typeof checked !== "boolean") throw new Error("Checkbox state must be an explicit boolean.");
+    if (candidate?.targetId !== this.target.id || candidate?.documentGeneration !== this.documentGeneration
+      || String(candidate?.tag ?? "").toLowerCase() !== "input"
+      || String(candidate?.type ?? "").toLowerCase() !== "checkbox" || candidate?.frameTargetId) {
+      throw new Error("Setting filter state requires the exact fresh native checkbox on the authorized target.");
+    }
+    const { node } = await this.client.send("DOM.describeNode", { backendNodeId: candidate.backendNodeId, depth: 0, pierce: true });
+    if (!node?.backendNodeId || node.backendNodeId !== candidate.backendNodeId
+      || String(node.nodeName ?? "").toLowerCase() !== "input") throw new Error("The selected checkbox no longer exists.");
+    const resolved = await this.client.send("DOM.resolveNode", { backendNodeId: candidate.backendNodeId });
+    const objectId = resolved.object?.objectId;
+    if (!objectId) throw new Error("The selected checkbox could not be revalidated.");
+    try {
+      const validation = await this.client.send("Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: "function(expectedLabel){const r=this.getBoundingClientRect(),s=getComputedStyle(this),label=(this.getAttribute('aria-label')||this.labels?.[0]?.innerText||this.getAttribute('name')||'').replace(/\\s+/g,' ').trim();return {connected:this.isConnected,checkbox:this.type==='checkbox',disabled:this.disabled===true||this.getAttribute('aria-disabled')==='true',visible:r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)>0&&s.pointerEvents!=='none',labelMatches:!expectedLabel||!label||label.toLocaleLowerCase()===expectedLabel.toLocaleLowerCase(),checked:this.checked===true}}",
+        arguments: [{ value: candidate.name ?? "" }], returnByValue: true, awaitPromise: false
+      });
+      const current = validation.result?.value;
+      if (!current?.connected || !current.checkbox || current.disabled || !current.visible || !current.labelMatches) {
+        throw new Error("The selected checkbox is no longer the same visible, enabled control.");
+      }
+      await beforeDispatch?.({ candidate, currentChecked: current.checked, desiredChecked: checked });
+      this.#assertTargetAttached();
+      if (candidate.documentGeneration !== this.documentGeneration) throw new Error("Checkbox became stale immediately before dispatch.");
+      if (current.checked !== checked) {
+        const changed = await this.client.send("Runtime.callFunctionOn", {
+          objectId,
+          functionDeclaration: "function(desired){if(!this.isConnected||this.disabled||this.type!=='checkbox')return {changed:false,checked:null};this.checked=desired;this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}));return {changed:true,checked:this.checked===true}}",
+          arguments: [{ value: checked }], returnByValue: true, awaitPromise: false
+        });
+        const state = changed.result?.value;
+        if (state?.changed !== true || state.checked !== checked) throw new Error("The requested filter state could not be applied exactly.");
+      }
+      return { dispatched: true, changed: current.checked !== checked, checked };
+    } finally { await this.client.send("Runtime.releaseObject", { objectId }).catch(() => {}); }
+  }
+
+  /** Compare a checkbox state in-page and return only a boolean. */
+  async verifyCheckboxState(candidate, expectedChecked) {
+    this.#assertTargetAttached();
+    if (typeof expectedChecked !== "boolean" || candidate?.targetId !== this.target.id
+      || candidate?.documentGeneration !== this.documentGeneration || candidate?.frameTargetId
+      || String(candidate?.tag ?? "").toLowerCase() !== "input"
+      || String(candidate?.type ?? "").toLowerCase() !== "checkbox") {
+      throw new Error("Checkbox verification requires an exact fresh native checkbox.");
+    }
+    const resolved = await this.client.send("DOM.resolveNode", { backendNodeId: candidate.backendNodeId });
+    const objectId = resolved.object?.objectId;
+    if (!objectId) return { verified: false, matches: false };
+    try {
+      const result = await this.client.send("Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: "function(expected){const r=this.getBoundingClientRect(),s=getComputedStyle(this);return {valid:this.isConnected&&this.type==='checkbox'&&r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&!this.disabled,matches:this.checked===expected}}",
+        arguments: [{ value: expectedChecked }], returnByValue: true, awaitPromise: false
+      });
+      return { verified: result.result?.value?.valid === true, matches: result.result?.value?.matches === true };
+    } finally { await this.client.send("Runtime.releaseObject", { objectId }).catch(() => {}); }
+  }
+
+  async navigateObservedLinkInSameTarget(candidate, { beforeDispatch = null } = {}) {
+    this.#assertTargetAttached();
+    assertControlAllowed(candidate, "click");
+    if (candidate.targetId !== this.target.id) throw new Error("Candidate belongs to a different browser target.");
+    if (candidate.documentGeneration !== this.documentGeneration) throw new Error("Candidate belongs to a stale document generation; observe again before acting.");
+    if (candidate.frameTargetId) throw new Error("Same-target navigation is limited to links in the leased root frame.");
+    if (String(candidate.tag ?? "").toLowerCase() !== "a" || typeof candidate.href !== "string" || !candidate.href) {
+      throw new Error("Same-target navigation requires a fresh observed anchor link.");
+    }
+    const { node } = await this.client.send("DOM.describeNode", { backendNodeId: candidate.backendNodeId, depth: 0, pierce: true });
+    if (!node?.backendNodeId) throw new Error("The selected page link no longer exists.");
+    const resolved = await this.client.send("DOM.resolveNode", { backendNodeId: candidate.backendNodeId });
+    if (!resolved.object?.objectId) throw new Error("The selected page link could not be revalidated.");
+    const validation = await this.client.send("Runtime.callFunctionOn", {
+      objectId: resolved.object.objectId,
+      functionDeclaration: "function(){const r=this.getBoundingClientRect();const s=getComputedStyle(this);return {connected:this.isConnected,visible:r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)>0&&s.pointerEvents!=='none',tag:this.tagName.toLowerCase(),href:this.href}}",
+      returnByValue: true,
+      awaitPromise: false
+    });
+    const current = validation.result?.value;
+    if (!current?.connected || !current.visible || current.tag !== "a") {
+      throw new Error("The selected link changed or is no longer visible before same-target navigation.");
+    }
+    let observedHref;
+    let currentHref;
+    try {
+      observedHref = new URL(candidate.href, this.target.url).href;
+      currentHref = new URL(current.href).href;
+    } catch { throw new Error("The selected page link has an invalid destination."); }
+    if (sanitizeUrl(currentHref) !== observedHref) throw new Error("The selected page link destination changed after observation.");
+    await beforeDispatch?.({ candidate, href: currentHref, sameTargetNavigation: true });
+    this.#assertTargetAttached();
+    if (candidate.documentGeneration !== this.documentGeneration) throw new Error("Candidate became stale immediately before same-target navigation.");
+    await this.client.send("Page.navigate", { url: observedHref });
+    return { dispatched: true, navigationMode: "same_target", backendNodeId: candidate.backendNodeId };
+  }
+
+  async scroll(target, { beforeDispatch = null } = {}) {
     this.#assertTargetAttached();
     const location = await this.client.send("Runtime.evaluate", {
       expression: "location.href",
@@ -507,6 +680,9 @@ export class BrowserSession {
       } else {
         throw new Error("The selected scroll region has an unsupported identity.");
       }
+      await beforeDispatch?.({ target });
+      this.#assertTargetAttached();
+      if (target.documentGeneration !== this.documentGeneration) throw new Error("Scroll target became stale immediately before dispatch.");
       await client.send("Input.dispatchMouseEvent", { type: "mouseWheel", x, y, deltaX: 0, deltaY });
       return { dispatched: true, targetIdentity: target.identity, beforeScrollTop, requestedDeltaY: deltaY, frameTargetId: frame?.targetId ?? null };
     } finally {
@@ -514,14 +690,28 @@ export class BrowserSession {
     }
   }
 
-  async typeSearchPhrase(candidate, phrase) {
+  async typeSearchPhrase(candidate, phrase, observation = null, { beforeDispatch = null } = {}) {
     this.#assertTargetAttached();
     assertControlAllowed(candidate, "type");
-    if (typeof phrase !== "string" || !phrase.trim() || phrase.length > 500) throw new Error("Search text is empty or exceeds the 500-character input limit.");
+    if (typeof phrase !== "string" || !phrase.trim() || phrase.length > ACTION_VALUE_LIMITS.type) throw new Error(`Search text is empty or exceeds the ${ACTION_VALUE_LIMITS.type}-character input limit.`);
     if (candidate.targetId !== this.target.id) throw new Error("Candidate belongs to a different browser target.");
     if (candidate.frameTargetId) throw new Error("Search text entry is limited to the main frame.");
     if (candidate.documentGeneration !== this.documentGeneration) throw new Error("Candidate belongs to a stale document generation; observe again before acting.");
-    if (candidate.tag !== "input" || String(candidate.type ?? "").toLowerCase() !== "search") throw new Error("Text entry is limited to a native search input.");
+    let observedOrigin = null;
+    try { observedOrigin = new URL(observation?.page?.url ?? "").origin; }
+    catch { /* A bounded same-origin query-field contract requires a valid observation URL. */ }
+    const nativeSearch = candidate.tag === "input" && String(candidate.type ?? "").toLowerCase() === "search";
+    const sameOriginQueryField = candidate.tag === "input"
+      && String(candidate.type ?? "").toLowerCase() === "text"
+      && candidate.queryField === true
+      && candidate.formMethod === "get"
+      && candidate.formTargetSameContext === true
+      && Boolean(candidate.formIdentity)
+      && Boolean(observedOrigin)
+      && candidate.formActionOrigin === observedOrigin;
+    if (!nativeSearch && !sameOriginQueryField) {
+      throw new Error("Text entry is limited to a native search input or an observed same-origin GET query field.");
+    }
     const { node } = await this.client.send("DOM.describeNode", { backendNodeId: candidate.backendNodeId, depth: 0, pierce: true });
     if (!node?.backendNodeId) throw new Error("The selected search input no longer exists.");
     await this.client.send("DOM.scrollIntoViewIfNeeded", { backendNodeId: candidate.backendNodeId });
@@ -529,17 +719,31 @@ export class BrowserSession {
     if (!resolved.object?.objectId) throw new Error("The selected search input could not be revalidated.");
     const validation = await this.client.send("Runtime.callFunctionOn", {
       objectId: resolved.object.objectId,
-      functionDeclaration: "function(expectedLabel){const r=this.getBoundingClientRect();const s=getComputedStyle(this);const x=r.left+r.width/2,y=r.top+r.height/2;let top=document.elementFromPoint(x,y);for(let depth=0;top&&top.shadowRoot&&depth<8;depth++){const inner=top.shadowRoot.elementFromPoint(x,y);if(!inner||inner===top)break;top=inner}const label=(this.getAttribute('aria-label')||this.title||Array.from(this.labels??[]).map(label=>label.innerText||label.textContent||'').join(' ')||this.getAttribute('name')||'').replace(/\\s+/g,' ').trim();return {connected:this.isConnected,visible:r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)>0&&s.pointerEvents!=='none',type:String(this.type||'').toLowerCase(),disabled:this.disabled===true,readOnly:this.readOnly===true,label,occluded:!!top&&top!==this&&!this.contains(top),labelMatches:!expectedLabel||!label||label.toLocaleLowerCase()===expectedLabel.toLocaleLowerCase()}}",
+      functionDeclaration: "function(expectedLabel){const r=this.getBoundingClientRect();const s=getComputedStyle(this);const x=r.left+r.width/2,y=r.top+r.height/2;let top=document.elementFromPoint(x,y);for(let depth=0;top&&top.shadowRoot&&depth<8;depth++){const inner=top.shadowRoot.elementFromPoint(x,y);if(!inner||inner===top)break;top=inner}const label=(this.getAttribute('aria-label')||this.title||Array.from(this.labels??[]).map(label=>label.innerText||label.textContent||'').join(' ')||this.getAttribute('name')||'').replace(/\\s+/g,' ').trim();const form=this.form;let formActionOrigin=null;let formTargetSameContext=false;if(form){try{formActionOrigin=new URL(form.action||location.href,location.href).origin}catch{}const target=String(this.getAttribute('formtarget')||form.target||'').trim().toLowerCase();formTargetSameContext=!target||target==='_self'}return {connected:this.isConnected,visible:r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)>0&&s.pointerEvents!=='none',type:String(this.type||'').toLowerCase(),name:this.getAttribute('name'),formMethod:form?String(this.getAttribute('formmethod')||form.method||'get').toLowerCase():null,formActionOrigin,formTargetSameContext,disabled:this.disabled===true,readOnly:this.readOnly===true,label,occluded:!!top&&top!==this&&!this.contains(top),labelMatches:!expectedLabel||!label||label.toLocaleLowerCase()===expectedLabel.toLocaleLowerCase()}}",
       arguments: [{ value: candidate.name ?? "" }],
       returnByValue: true,
       awaitPromise: false
     });
     const current = validation.result?.value;
-    if (!current?.connected || current.type !== "search" || current.disabled || current.readOnly) throw new Error("The selected search input is no longer editable.");
+    const liveNativeSearch = current?.type === "search";
+    const liveSameOriginQueryField = sameOriginQueryField
+      && current?.type === "text"
+      && current.name === "q"
+      && current.formMethod === "get"
+      && current.formTargetSameContext === true
+      && current.formActionOrigin === observedOrigin
+      && current.formMethod === candidate.formMethod
+      && current.formActionOrigin === candidate.formActionOrigin
+      && current.formTargetSameContext === candidate.formTargetSameContext;
+    if (!current?.connected || (!liveNativeSearch && !liveSameOriginQueryField) || current.disabled || current.readOnly) throw new Error("The selected search input is no longer editable under its observed search contract.");
     if (!current.visible) throw new Error("The selected search input is no longer visible.");
     if (!current.labelMatches) throw new Error("The selected search input label changed; observe and plan again.");
     if (current.occluded) throw new Error("The selected search input is occluded.");
+    await beforeDispatch?.({ candidate });
+    this.#assertTargetAttached();
+    if (candidate.documentGeneration !== this.documentGeneration) throw new Error("Search input became stale immediately before dispatch.");
     await this.client.send("DOM.focus", { backendNodeId: candidate.backendNodeId });
+    await beforeDispatch?.({ candidate });
     const selectionModifier = process.platform === "darwin"
       ? { key: "Meta", code: "MetaLeft", virtualKeyCode: 91, flag: 4 }
       : { key: "Control", code: "ControlLeft", virtualKeyCode: 17, flag: 2 };
@@ -550,14 +754,17 @@ export class BrowserSession {
     } finally {
       await this.client.send("Input.dispatchKeyEvent", { type: "keyUp", key: selectionModifier.key, code: selectionModifier.code, windowsVirtualKeyCode: selectionModifier.virtualKeyCode, nativeVirtualKeyCode: selectionModifier.virtualKeyCode }).catch(() => {});
     }
+    await beforeDispatch?.({ candidate });
+    this.#assertTargetAttached();
+    if (candidate.documentGeneration !== this.documentGeneration) throw new Error("Search input became stale before text insertion.");
     await this.client.send("Input.insertText", { text: phrase });
     return { dispatched: true, backendNodeId: candidate.backendNodeId };
   }
 
-  async fillField(candidate, value) {
+  async fillField(candidate, value, { beforeDispatch = null } = {}) {
     this.#assertTargetAttached();
     assertControlAllowed(candidate, "fill");
-    if (typeof value !== "string" || value.length > 2000) throw new Error("Field value exceeds the 2000-character input limit.");
+    if (typeof value !== "string" || value.length > ACTION_VALUE_LIMITS.fill) throw new Error(`Field value exceeds the ${ACTION_VALUE_LIMITS.fill}-character input limit.`);
     if (candidate.targetId !== this.target.id) throw new Error("Candidate belongs to a different browser target.");
     if (candidate.frameTargetId) throw new Error("Field text entry is limited to the main frame.");
     if (candidate.documentGeneration !== this.documentGeneration) throw new Error("Candidate belongs to a stale document generation; observe again before acting.");
@@ -590,15 +797,44 @@ export class BrowserSession {
     if (current.occluded) throw new Error("The selected form field is occluded.");
     const sensitiveTypes = new Set(["password", "file", "hidden", "submit", "button", "image", "reset"]);
     if (sensitiveTypes.has(current.type)) throw new Error(`fillField does not support input type '${current.type}'.`);
+    await beforeDispatch?.({ candidate });
+    this.#assertTargetAttached();
+    if (candidate.documentGeneration !== this.documentGeneration) throw new Error("Form field became stale immediately before dispatch.");
     await this.client.send("DOM.focus", { backendNodeId: candidate.backendNodeId });
+    await beforeDispatch?.({ candidate });
     await replaceFocusedText(this.client, value);
     return { dispatched: true, backendNodeId: candidate.backendNodeId, valueLength: value.length };
   }
 
-  async selectOption(candidate, value) {
+  async #isOptionControlledByCombobox(combobox, option, expectedValue) {
+    const comboboxResolved = await this.client.send("DOM.resolveNode", { backendNodeId: combobox.backendNodeId });
+    const optionResolved = await this.client.send("DOM.resolveNode", { backendNodeId: option.backendNodeId });
+    const comboboxObjectId = comboboxResolved.object?.objectId;
+    const optionObjectId = optionResolved.object?.objectId;
+    if (!comboboxObjectId || !optionObjectId) {
+      if (comboboxObjectId) await this.client.send("Runtime.releaseObject", { objectId: comboboxObjectId }).catch(() => {});
+      if (optionObjectId) await this.client.send("Runtime.releaseObject", { objectId: optionObjectId }).catch(() => {});
+      return false;
+    }
+    try {
+      const result = await this.client.send("Runtime.callFunctionOn", {
+        objectId: comboboxObjectId,
+        functionDeclaration: "function(option,expected){const role=(option.getAttribute('role')||'').toLowerCase();const label=(option.getAttribute('aria-label')||option.innerText||option.textContent||'').replace(/\\s+/g,' ').trim();const ids=(String(this.getAttribute('aria-controls')||'')+' '+String(this.getAttribute('aria-owns')||'')).trim().split(/\\s+/).filter(Boolean);const controlled=ids.some(id=>{const menu=document.getElementById(id);return !!menu&&(menu===option||menu.contains(option))});const rect=option.getBoundingClientRect(),style=getComputedStyle(option);return {valid:this.isConnected&&option.isConnected&&this.getAttribute('aria-expanded')==='true'&&role==='option'&&label===expected&&(this.contains(option)||controlled)&&rect.width>0&&rect.height>0&&style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)>0&&option.getAttribute('aria-disabled')!=='true'&&!option.hasAttribute('disabled')}}",
+        arguments: [{ objectId: optionObjectId }, { value: expectedValue }],
+        returnByValue: true,
+        awaitPromise: false
+      });
+      return result.result?.value?.valid === true;
+    } finally {
+      await this.client.send("Runtime.releaseObject", { objectId: optionObjectId }).catch(() => {});
+      await this.client.send("Runtime.releaseObject", { objectId: comboboxObjectId }).catch(() => {});
+    }
+  }
+
+  async selectOption(candidate, value, { actionEnvelope = null, authorizeSuboperation = null, beforeDispatch = null } = {}) {
     this.#assertTargetAttached();
     assertControlAllowed(candidate, "select");
-    if (typeof value !== "string" || value.length > 500) throw new Error("Select value exceeds the 500-character limit.");
+    if (typeof value !== "string" || value.length > ACTION_VALUE_LIMITS.select) throw new Error(`Select value exceeds the ${ACTION_VALUE_LIMITS.select}-character limit.`);
     if (candidate.targetId !== this.target.id) throw new Error("Candidate belongs to a different browser target.");
     if (candidate.frameTargetId) throw new Error("Select is limited to the main frame.");
     if (candidate.documentGeneration !== this.documentGeneration) throw new Error("Candidate belongs to a stale document generation; observe again before acting.");
@@ -606,18 +842,118 @@ export class BrowserSession {
       if (String(candidate.role ?? "").toLowerCase() !== "combobox") {
         throw new Error("selectOption requires a native select or an observed ARIA combobox.");
       }
-      await this.click(candidate);
+      const allowedSuboperations = ["open_observed_combobox", "select_exact_controlled_option"];
+      if (actionEnvelope?.type !== "aria_combobox_select"
+        || actionEnvelope.version !== 1
+        || actionEnvelope.action !== "select"
+        || actionEnvelope.targetId !== this.target.id
+        || actionEnvelope.candidateIdentity !== candidate.identity
+        || actionEnvelope.documentGeneration !== this.documentGeneration
+        || actionEnvelope.value !== value
+        || !Array.isArray(actionEnvelope.allowedSuboperations)
+        || actionEnvelope.allowedSuboperations.length !== allowedSuboperations.length
+        || !allowedSuboperations.every((suboperation, index) => actionEnvelope.allowedSuboperations[index] === suboperation)
+        || typeof authorizeSuboperation !== "function") {
+        throw new Error("ARIA combobox selection requires an approved two-step action envelope.");
+      }
+
+      const authorize = async (stage, suboperation, target, menuCandidate = candidate) => {
+        const decision = await authorizeSuboperation({
+          stage,
+          suboperation,
+          candidate: target,
+          menuCandidate,
+          actionEnvelope
+        });
+        if (decision?.allowed !== true) return decision ?? { allowed: false, reason: "Composite selection suboperation was not authorized." };
+        return decision;
+      };
+      const complete = async (suboperation, target, menuCandidate = candidate) => {
+        const decision = await authorize("completed", suboperation, target, menuCandidate);
+        if (decision?.allowed !== true) throw new Error(decision?.reason ?? "Composite selection suboperation could not be recorded.");
+      };
+
+      const openStep = "open_observed_combobox";
+      const openAuthorization = await authorize("prepare", openStep, candidate);
+      if (openAuthorization?.allowed !== true || openAuthorization.candidate?.identity !== candidate.identity) {
+        return { dispatched: false, selected: false, selectionStatus: "refused", reason: openAuthorization?.reason ?? "The combobox changed before it could be opened." };
+      }
+      const openedCombobox = openAuthorization.candidate;
+      try {
+        await this.click(openedCombobox, {
+          beforeDispatch: async () => {
+            const decision = await authorize("dispatch", openStep, openedCombobox);
+            if (decision?.allowed !== true) {
+              const error = new Error(decision?.reason ?? "Opening the combobox was refused before dispatch.");
+              error.compositeSuboperationRefused = true;
+              throw error;
+            }
+          }
+        });
+      } catch (error) {
+        if (error?.compositeSuboperationRefused) {
+          return { dispatched: false, selected: false, selectionStatus: "refused", reason: String(error.message ?? error) };
+        }
+        throw error;
+      }
+      await complete(openStep, openedCombobox);
+
       const opened = await this.observe();
       if (opened.targetId !== this.target.id) throw new Error("The opened combobox menu belongs to a different browser target.");
-      const options = (opened.candidates ?? []).filter(option => option.targetId === this.target.id
+      const currentCombobox = (opened.candidates ?? []).find(option => option.identity === candidate.identity
+        && option.targetId === this.target.id
+        && option.documentGeneration === this.documentGeneration
+        && option.role === "combobox");
+      if (!currentCombobox) {
+        return { dispatched: true, selected: false, selectionStatus: "unresolved", reason: "The opened combobox could not be reidentified in fresh evidence.", completedSuboperations: [openStep] };
+      }
+      const visibleOptions = (opened.candidates ?? []).filter(option => option.targetId === this.target.id
         && option.documentGeneration === this.documentGeneration
         && option.frameTargetId == null && option.visible === true && option.disabled !== true
         && String(option.role ?? "").toLowerCase() === "option" && option.name === value);
-      if (options.length !== 1) {
-        return { dispatched: true, selected: false, selectionStatus: "unresolved", reason: "The open combobox did not expose exactly one visible option with the caller's exact value." };
+      const relatedOptions = [];
+      for (const option of visibleOptions) {
+        if (await this.#isOptionControlledByCombobox(currentCombobox, option, value)) relatedOptions.push(option);
       }
-      const selected = await this.click(options[0]);
-      return { ...selected, selected: true, selectionStatus: "selected", selectedLabelMatches: true };
+      if (relatedOptions.length !== 1) {
+        return { dispatched: true, selected: false, selectionStatus: "unresolved", reason: "The opened combobox did not expose exactly one visible, related option with the caller's exact value.", completedSuboperations: [openStep] };
+      }
+      const selectStep = "select_exact_controlled_option";
+      const optionAuthorization = await authorize("prepare", selectStep, relatedOptions[0], currentCombobox);
+      if (optionAuthorization?.allowed !== true
+        || optionAuthorization.candidate?.identity !== relatedOptions[0].identity
+        || optionAuthorization.menuCandidate?.identity !== currentCombobox.identity) {
+        return { dispatched: true, selected: false, selectionStatus: "refused_after_open", reason: optionAuthorization?.reason ?? "The option or combobox changed before selection.", completedSuboperations: [openStep] };
+      }
+      const selectedOption = optionAuthorization.candidate;
+      const selectedCombobox = optionAuthorization.menuCandidate;
+      if (!await this.#isOptionControlledByCombobox(selectedCombobox, selectedOption, value)) {
+        return { dispatched: true, selected: false, selectionStatus: "unresolved", reason: "The exact option is no longer controlled by the opened combobox.", completedSuboperations: [openStep] };
+      }
+      try {
+        const selected = await this.click(selectedOption, {
+          beforeDispatch: async () => {
+            if (!await this.#isOptionControlledByCombobox(selectedCombobox, selectedOption, value)) {
+              const error = new Error("The selected option is no longer related to the opened combobox.");
+              error.compositeSuboperationRefused = true;
+              throw error;
+            }
+            const decision = await authorize("dispatch", selectStep, selectedOption, selectedCombobox);
+            if (decision?.allowed !== true) {
+              const error = new Error(decision?.reason ?? "Option selection was refused before dispatch.");
+              error.compositeSuboperationRefused = true;
+              throw error;
+            }
+          }
+        });
+        await complete(selectStep, selectedOption, selectedCombobox);
+        return { ...selected, selected: true, selectionStatus: "selected", selectedLabelMatches: true, completedSuboperations: [openStep, selectStep] };
+      } catch (error) {
+        if (error?.compositeSuboperationRefused) {
+          return { dispatched: true, selected: false, selectionStatus: "refused_after_open", reason: String(error.message ?? error), completedSuboperations: [openStep] };
+        }
+        throw error;
+      }
     }
     const resolved = await this.client.send("DOM.resolveNode", { backendNodeId: candidate.backendNodeId });
     const objectId = resolved.object?.objectId;
@@ -634,6 +970,9 @@ export class BrowserSession {
       if (!current?.connected || current.disabled) throw new Error("The selected dropdown is no longer available.");
       if (!current.matchFound) throw new Error(`Option '${value}' not found in dropdown.`);
       if (!current.labelMatches) throw new Error("The selected dropdown label changed; observe and plan again.");
+      await beforeDispatch?.({ candidate });
+      this.#assertTargetAttached();
+      if (candidate.documentGeneration !== this.documentGeneration) throw new Error("Dropdown became stale immediately before dispatch.");
       await this.client.send("Runtime.callFunctionOn", {
         objectId,
         functionDeclaration: "function(index){this.selectedIndex=index;this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}));return this.selectedIndex}",
@@ -683,7 +1022,7 @@ export class BrowserSession {
     }
   }
 
-  async uploadFile(candidate, filePaths) {
+  async uploadFile(candidate, filePaths, { beforeDispatch = null, grantToken = null } = {}) {
     this.#assertTargetAttached();
     assertControlAllowed(candidate, "upload");
     if (!Array.isArray(filePaths) || filePaths.length === 0 || filePaths.length > 10) {
@@ -694,6 +1033,10 @@ export class BrowserSession {
     if (String(candidate.tag ?? "").toLowerCase() !== "input" || String(candidate.type ?? "").toLowerCase() !== "file") {
       throw new Error("uploadFile is limited to input[type=file] elements.");
     }
+    if (!isFileUploadDispatchToken(grantToken, { targetId: this.target.id, candidateIdentity: candidate.identity, filePaths })) {
+      throw new Error("File uploads require a one-use scoped grant for this exact input and approved staged file.");
+    }
+    if (typeof beforeDispatch !== "function") throw new Error("File uploads require an immediate grant and target-lease recheck before dispatch.");
     const resolved = await this.client.send("DOM.resolveNode", { backendNodeId: candidate.backendNodeId });
     const objectId = resolved.object?.objectId;
     if (!objectId) throw new Error("The selected file input could not be resolved.");
@@ -709,6 +1052,9 @@ export class BrowserSession {
       if (!current?.connected || current.disabled) throw new Error("The selected file input is no longer available.");
       if (!current.labelMatches) throw new Error("The selected file input label changed; observe and plan again.");
       if (!current.multiple && filePaths.length > 1) throw new Error("The selected file input does not accept multiple files.");
+      await beforeDispatch?.({ candidate });
+      this.#assertTargetAttached();
+      if (candidate.documentGeneration !== this.documentGeneration) throw new Error("File input became stale immediately before dispatch.");
       await this.client.send("DOM.setFileInputFiles", {
         files: filePaths.map(path => String(path).slice(0, 4096)),
         backendNodeId: candidate.backendNodeId
@@ -720,7 +1066,7 @@ export class BrowserSession {
   async detectSpaNavigation(beforeUrl) {
     this.#assertTargetAttached();
     if (typeof beforeUrl !== "string" || !beforeUrl) throw new Error("detectSpaNavigation requires a beforeUrl.");
-    const observation = await this.observe();
+    const observation = await this.observe({ profile: "lightweight" });
     const currentUrl = observation?.page?.url;
     if (typeof currentUrl !== "string" || !currentUrl) return { isSpaNavigation: false, reason: "No current page URL." };
     try {
@@ -754,7 +1100,7 @@ export class BrowserSession {
     try {
       const result = await this.client.send("Runtime.callFunctionOn", {
         objectId,
-        functionDeclaration: "function(query){const norm=value=>String(value??'').normalize('NFKC').trim().toLocaleLowerCase();const labels=[document.title,...Array.from(document.querySelectorAll('h1,h2,[role=heading]'),element=>element.textContent)];const resultState=labels.some(label=>/\\b(?:search results?|results? for|no results)\\b/i.test(norm(label)));const field=Array.from(document.querySelectorAll('input[type=search]')).find(element=>{const r=element.getBoundingClientRect(),s=getComputedStyle(element);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'});const fieldMatches=field&&norm(field.value)===norm(query);const content=norm(document.body?.innerText);return Boolean(resultState&&(fieldMatches||content.includes(norm(query))))}",
+        functionDeclaration: "function(query){const norm=value=>String(value??'').normalize('NFKC').trim().toLocaleLowerCase();const labels=[document.title,...Array.from(document.querySelectorAll('h1,h2,[role=heading]'),element=>element.textContent)];const resultHeading=labels.some(label=>/\\b(?:search results?|results? for|no results)\\b/i.test(norm(label)));const field=Array.from(document.querySelectorAll('input[type=search],input[name=q][type=text],[role=searchbox]')).find(element=>{const r=element.getBoundingClientRect(),s=getComputedStyle(element);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'});const fieldMatches=field&&norm(field.value)===norm(query);let urlQuery='';try{urlQuery=new URL(location.href).searchParams.get('q')||''}catch{}const urlMatches=norm(urlQuery)===norm(query);const resultLinks=document.querySelectorAll('main a[href],#links a[href],[data-testid*=result] a[href]').length>0;const resultState=resultHeading||(urlMatches&&resultLinks);const content=norm(document.body?.innerText);return Boolean(resultState&&(fieldMatches||urlMatches||content.includes(norm(query))))}",
         arguments: [{ value: phrase }],
         returnByValue: true,
         awaitPromise: false

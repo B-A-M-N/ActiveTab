@@ -38,13 +38,15 @@ import { fileURLToPath } from "node:url";
 
 import { launchOwnedChrome } from "../src/browser/ownedChrome.js";
 import { InterventionStore } from "../src/runtime/interventions.js";
-import { RunStateStore, blockingQualificationRuns } from "../src/testing/runState.js";
+import { RunStateStore } from "../src/testing/runState.js";
 import { loadEnvironmentBinding } from "../src/testing/profiles.js";
 import { qualifyCloudAgent, shouldKeepOwnedBrowserOpen } from "../src/testing/qualifyCloudAgent.js";
+import { selectQualificationRunState } from "../src/testing/qualificationRunSelection.js";
 import { listTargets, resolveAuthorizedTarget } from "../src/browser/targets.js";
 import { BrowserSession } from "../src/browser/session.js";
 import { selectAuthorizedStagingTarget } from "../src/testing/qualifyTarget.js";
 import { createDecisionRuntime } from "../src/decisions/runtime.js";
+import { preflightModelCapabilities, writeModelPreflightSummary } from "../src/navigation/modelPreflight.js";
 
 const args = process.argv.slice(2);
 function arg(name, fallback = null) {
@@ -200,63 +202,20 @@ async function main() {
     await interventions.init();
     runStore = new RunStateStore(runStoreDir);
     await runStore.init();
-    const relevantRun = run => run.workflowId === "cloud-agent-staging-qualification"
-      && run.environmentId === binding.environmentId
-      && (!run.profileId || run.profileId === profileId);
-    const pendingRuns = [...new Map([...runStore.listSuspended(), ...runStore.listActive()]
-      .filter(relevantRun).map(run => [run.runId, run])).values()];
-
-    let selectedDiscardId = discardRunId;
-    if (!selectedDiscardId && process.env.ACTIVETAB_DISCARD_SUSPENDED_RUN === "1" && pendingRuns.length === 1) {
-      selectedDiscardId = pendingRuns[0].runId;
-    }
-    if (selectedDiscardId) {
-      const abandoned = pendingRuns.find(run => run.runId === selectedDiscardId);
-      if (!abandoned) {
-        console.error(`[qualification] --discard-run '${selectedDiscardId}' does not identify a pending run for profile '${profileId}'.`);
-        process.exit(3);
-      }
-      await runStore.update(abandoned.runId, {
-        status: "abandoned",
-        pendingInterventionId: null,
-        suspendedStepId: null,
-        resumeCursor: null
-      });
-      console.error(`[qualification] Explicitly abandoned suspended run ${abandoned.runId}; its report and intervention records remain available.`);
-    }
-
-    if (resumeRunId) {
-      const candidate = pendingRuns.find(run => run.runId === resumeRunId);
-      if (!candidate || !candidate.resumeCursor || !candidate.pendingInterventionId) {
-        console.error(`[qualification] Run '${resumeRunId}' has no resumable human-authentication cursor for profile '${profileId}'.`);
-        process.exit(3);
-      }
-      if (candidate.mode && candidate.mode !== mode) {
-        console.error(`[qualification] Run '${resumeRunId}' was created in ${candidate.mode} mode; refusing to resume it in ${mode} mode.`);
-        process.exit(3);
-      }
-      if (candidate.profileId && candidate.profileId !== profileId) {
-        console.error(`[qualification] Run '${resumeRunId}' belongs to profile '${candidate.profileId}', not '${profileId}'.`);
-        process.exit(3);
-      }
-      resumeRunState = candidate;
-      if (mode === "owned" && !resumeRunState.target?.targetId) {
-        console.error(`[qualification] Run '${resumeRunId}' has no exact owned browser target to resume.`);
-        process.exit(3);
-      }
-      if (requestedTargetId && requestedTargetId !== resumeRunState.target?.targetId) {
-        console.error(`[qualification] --target-id does not match run '${resumeRunId}' exact target '${resumeRunState.target?.targetId ?? "unknown"}'.`);
-        process.exit(3);
-      }
-    } else {
-      const remaining = blockingQualificationRuns(pendingRuns, { selectedDiscardId });
-      if (remaining.length) {
-        console.error(`[qualification] ${remaining.length} unfinished run(s) exist in ${runStoreDir}; refusing to start a replacement run.`);
-        for (const run of remaining) console.error(`  runId=${run.runId} status=${run.status} pendingIntervention=${run.pendingInterventionId ?? "none"} suspendedStep=${run.suspendedStepId ?? "none"}`);
-        console.error("  Resume with --resume-run-id=<runId>, or explicitly abandon one with --discard-run=<runId>.");
-        process.exit(3);
-      }
-    }
+    const selection = await selectQualificationRunState({
+      runStore,
+      binding,
+      profileId,
+      mode,
+      resumeRunId,
+      discardRunId,
+      discardSinglePending: process.env.ACTIVETAB_DISCARD_SUSPENDED_RUN === "1",
+      requestedTargetId,
+      runStoreDir
+    });
+    for (const message of selection.messages) console.error(`[qualification] ${message}`);
+    if (!selection.ok) process.exit(selection.exitCode);
+    resumeRunState = selection.resumeRunState;
   }
 
   let owned = null;
@@ -446,6 +405,9 @@ async function main() {
     }
   }
 }
+
+const modelPreflight = await preflightModelCapabilities();
+writeModelPreflightSummary(modelPreflight);
 
 main().catch(error => {
   console.error(`qualify-staging failed: ${String(error?.message ?? error).slice(0, 500)}`);

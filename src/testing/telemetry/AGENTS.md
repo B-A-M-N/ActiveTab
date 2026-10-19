@@ -16,6 +16,7 @@ The testing layer. `RunDecisionRecorder` links workflow operations to the shared
 - Preserve uncertainty when dispatch or verification cannot be reconciled; never convert missing evidence into success.
 - Keep telemetry projections bounded and exclude raw goals, form values, page text, credentials, cookies, and tokens.
 - A Jev refusal or unavailable reviewer is handled by the decision runtime's advisory contract; recorder extraction must not change that behavior.
+- Pre-action Jev routing requires a meaningful trusted target-role or purpose code plus image evidence bound to the exact observation. The recorder passes the caller-owned purpose code through when present; without sufficient evidence it records an explicit skip and leaves admission to deterministic policy.
 
 ## Verification
 

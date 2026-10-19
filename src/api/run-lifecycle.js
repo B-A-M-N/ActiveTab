@@ -112,8 +112,13 @@ export class RunLifecycle {
         // able to read its report.
         await this.#emitReport(taskId, reporter);
         if (this.isCurrent(taskId, controller)) {
-          this.running.delete(taskId);
-          await this.store.persist(taskId);
+          // stopAll() drains this map, so retain the worker until its final
+          // atomic journal write settles.
+          try {
+            await this.store.persist(taskId);
+          } finally {
+            if (this.isCurrent(taskId, controller)) this.running.delete(taskId);
+          }
         }
       }
     })();

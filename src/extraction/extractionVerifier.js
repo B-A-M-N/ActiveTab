@@ -1,5 +1,6 @@
-export function verifyExtractionResult(result) {
-  if (!result || result.completeness !== "complete") {
+function verifyExtractionShape(result, { allowObservedPartial = false } = {}) {
+  const observedPartial = allowObservedPartial && result?.completeness === "observed_partial";
+  if (!result || (result.completeness !== "complete" && !observedPartial)) {
     return { status: "incomplete", reason: "Extraction did not meet every completeness check." };
   }
   if (!result.verification || typeof result.verification !== "object" || Array.isArray(result.verification)) {
@@ -8,14 +9,28 @@ export function verifyExtractionResult(result) {
   if (!Array.isArray(result.records) || result.records.length !== result.verification.recordCount) {
     return { status: "incomplete", reason: "Output record count does not match its verification receipt." };
   }
-  const countComplete = result.verification.completionPolicy === "exact_count"
-    ? result.records.length === result.verification.expectedRecords
-    : result.verification.completionPolicy === "pagination_exhausted" && result.verification.paginationExhausted === true;
+  const countComplete = observedPartial
+    ? result.verification.completionPolicy === "observed_only"
+      && result.verification.completenessStatus === "observed_partial"
+      && result.verification.completenessClaimed === false
+      && result.verification.expectedRecords === null
+    : result.verification.completionPolicy === "exact_count"
+      ? result.records.length === result.verification.expectedRecords
+      : result.verification.completionPolicy === "pagination_exhausted" && result.verification.paginationExhausted === true;
   if (!countComplete || result.verification.pageCount < 1) {
     return { status: "incomplete", reason: "Output does not satisfy its declared count-completion policy or contains no page evidence." };
   }
+  const expectedObservedOverflow = observedPartial
+    && result.verification.overflow === true
+    && result.verification.completionPolicy === "observed_only"
+    && result.verification.completionReasonCode === "visible_record_limit_reached"
+    && Number.isInteger(result.verification.maxRecords)
+    && result.verification.maxRecords > 0
+    && result.records.length === result.verification.maxRecords;
   if (result.verification.invalidRows !== 0 || result.verification.duplicateKeys !== 0
-    || (result.verification.invalidUniqueKeys ?? 0) !== 0 || result.verification.overflow
+    || (result.verification.invalidUniqueKeys ?? 0) !== 0
+    || (result.verification.overflow && !expectedObservedOverflow)
+    || (observedPartial && result.verification.completionReasonCode === "visible_record_limit_reached" && !expectedObservedOverflow)
     || (result.verification.failures?.length ?? 0) > 0) {
     return { status: "incomplete", reason: "Extraction contains invalid rows, duplicate keys, or a record-limit overflow." };
   }
@@ -53,19 +68,21 @@ export function verifyExtractionResult(result) {
       return { status: "incomplete", reason: "A record contains missing or undeclared fields." };
     }
   }
-  if (!Array.isArray(result.verification.uniqueBy) || result.verification.uniqueBy.length === 0
+  if (!Array.isArray(result.verification.uniqueBy) || (!observedPartial && result.verification.uniqueBy.length === 0)
     || result.verification.uniqueBy.some(name => !Object.hasOwn(fields, name))) {
     return { status: "incomplete", reason: "Output uniqueness contract is missing or malformed." };
   }
-  const uniqueKeys = new Set();
-  for (const record of result.records) {
-    const values = result.verification.uniqueBy.map(name => record[name]);
-    if (values.some(value => value === null || value === undefined || value === "")) {
-      return { status: "incomplete", reason: "A record is missing a declared uniqueness key." };
+  if (result.verification.uniqueBy.length > 0) {
+    const uniqueKeys = new Set();
+    for (const record of result.records) {
+      const values = result.verification.uniqueBy.map(name => record[name]);
+      if (values.some(value => value === null || value === undefined || value === "")) {
+        return { status: "incomplete", reason: "A record is missing a declared uniqueness key." };
+      }
+      const key = JSON.stringify(values);
+      if (uniqueKeys.has(key)) return { status: "incomplete", reason: "Output contains duplicate records under its uniqueness contract." };
+      uniqueKeys.add(key);
     }
-    const key = JSON.stringify(values);
-    if (uniqueKeys.has(key)) return { status: "incomplete", reason: "Output contains duplicate records under its uniqueness contract." };
-    uniqueKeys.add(key);
   }
   for (const record of result.records) {
     for (const [name, field] of Object.entries(fields)) {
@@ -81,5 +98,16 @@ export function verifyExtractionResult(result) {
       if (!valid) return { status: "incomplete", reason: `Field '${name}' does not match its declared type.` };
     }
   }
-  return { status: "complete", reason: "Schema, field provenance, counts, uniqueness, and completeness checks passed." };
+  return observedPartial
+    ? { status: "valid_observed_partial", reason: "Visible records passed schema, provenance, uniqueness, and row validation; collection completeness is unknown." }
+    : { status: "complete", reason: "Schema, field provenance, counts, uniqueness, and completeness checks passed." };
+}
+
+export function verifyExtractionResult(result) {
+  return verifyExtractionShape(result);
+}
+
+/** Validate visible row structure without turning it into a completeness claim. */
+export function verifyObservedPartialExtractionResult(result) {
+  return verifyExtractionShape(result, { allowObservedPartial: true });
 }

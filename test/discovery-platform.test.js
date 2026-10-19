@@ -8,6 +8,7 @@ const fixtureLease = async () => {};
 
 const environment = buildEnvironmentBinding({
   profile_id: "freeinference-staging",
+  authentication_realms: [{ realm_id: "agents-session", scope: ["agents"], separate_credentials: true }],
   environment: {
     environment_id: "freeinference-staging",
     platform: "freeinference",
@@ -60,7 +61,9 @@ test("cross-origin navigation inside the platform is recorded and verified", asy
   // Same-origin navigation within the platform: pages accumulate, no child
   // application boundary is crossed, and platform identity is preserved.
   assert.equal(result.capabilityMap.platform, "freeinference");
-  assert.ok(result.capabilityMap.pages.length >= 2, "both staging pages recorded");
+  assert.ok(result.capabilityMap.pages.length >= 1, "the mapped application route is recorded");
+  assert.ok(result.discoveries.some(item => item.type === "initial_observation" && item.url === main.page.url), "the unclassified platform entry remains in the discovery evidence");
+  assert.ok(result.capabilityMap.pages.some(item => item.url === agents.page.url), "the route-matched application page is retained");
   assert.equal((result.capabilityMap.childApplications ?? []).length, 0);
 });
 

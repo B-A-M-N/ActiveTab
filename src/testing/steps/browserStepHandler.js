@@ -11,6 +11,8 @@ export class BrowserStepHandler {
     collector = null,
     correlator = null,
     operationAuthorizer = null,
+    fileUploadGrantStore = null,
+    principalId = null,
     resolveWorkflowValue,
     createTelemetryHooks,
     emitTraceEvent,
@@ -22,6 +24,8 @@ export class BrowserStepHandler {
     this.collector = collector;
     this.correlator = correlator;
     this.operationAuthorizer = operationAuthorizer;
+    this.fileUploadGrantStore = fileUploadGrantStore;
+    this.principalId = principalId;
     this.resolveWorkflowValue = resolveWorkflowValue ?? (value => value);
     this.createTelemetryHooks = createTelemetryHooks ?? (async () => null);
     this.emitTraceEvent = emitTraceEvent ?? (() => {});
@@ -41,7 +45,10 @@ export class BrowserStepHandler {
       return { status: STEP_STATUS.BLOCKED, reason };
     }
     const preObservation = await this.session.observe();
-    const telemetry = await this.createTelemetryHooks(receipt, "navigate");
+    const telemetry = await this.createTelemetryHooks(receipt, "navigate", null, null, {
+      destination: url,
+      expectedUrlPattern: step.expectedUrlPattern ?? null
+    });
     this.emitTraceEvent({ eventId: `step:${step.id}:start`, runId: receipt.runId, stepId: step.id, event: "step_start", actionType: "navigate" });
     let authResult;
     try {
@@ -147,7 +154,14 @@ export class BrowserStepHandler {
       return { status: STEP_STATUS.BLOCKED, reason };
     }
     const decisionContext = this.operationAuthorizer?.decisionContext?.(action.operationId) ?? null;
-    const telemetry = await this.createTelemetryHooks(receipt, action.type, candidate, decisionContext);
+    const telemetry = await this.createTelemetryHooks(receipt, action.type, candidate, decisionContext, {
+      goal: step.goal ?? null,
+      target: action.target ?? null,
+      value: action.value ?? null,
+      uploadRequested: action.type === "upload",
+      postcondition: action.postcondition ?? null,
+      verifyValue: action.verifyValue === true
+    });
     this.emitTraceEvent({ eventId: `step:${step.id}:dispatch`, runId: receipt.runId, stepId: step.id, event: "action_dispatch", actionType: action.type, backendNodeId: candidate.backendNodeId });
     let dispatchResult;
     let authResult;
@@ -159,7 +173,9 @@ export class BrowserStepHandler {
         action: action.type,
         candidate,
         value: action.value ?? null,
-        filePaths: action.filePaths ?? null,
+        uploadGrantStore: this.fileUploadGrantStore,
+        uploadGrantId: action.uploadGrantId ?? null,
+        principalId: this.principalId,
         localFixture: this.localFixture,
         operationId: action.operationId ?? null,
         operationAuthorizer: this.operationAuthorizer,

@@ -9,11 +9,30 @@ import { once } from "node:events";
 import { listTargets, resolveAuthorizedTarget } from "../src/browser/targets.js";
 import { connectChromeAuto, listChromeTargets, resolveChromeTarget } from "../src/browser/chrome-autoconnect.js";
 import { BrowserSession } from "../src/browser/session.js";
+import { executeAuthorizedAction } from "../src/runtime/authorizedExecutor.js";
 import { FixtureNavigationEngine as NavigationEngine } from "../test-support/fixtureNavigationEngine.js";
 import { clickObservedElement } from "../src/navigation/observedAction.js";
 import { TaskJournal } from "../src/state/journal.js";
+import { CapabilityService } from "../src/capabilities/capabilityService.js";
+import { runApiShapeFixtureQualification } from "../test-lab/fixtures/api-shape-twin/oracle.js";
+import { jpegDimensions, isJevImageSizeSupported } from "../src/decisions/imagePreparation.js";
 
 const fixtureLease = async () => {};
+
+function isolatedModelEnvironment(overrides, guardDirectory) {
+  const env = { ...process.env, ...overrides };
+  for (const name of [
+    "ACTIVETAB_MODEL_ENDPOINT", "ACTIVETAB_SEMANTIC_ENDPOINT", "ACTIVETAB_WORKFLOW_ENDPOINT",
+    "ACTIVETAB_MODEL", "ACTIVETAB_SEMANTIC_MODEL", "ACTIVETAB_WORKFLOW_MODEL",
+    "ACTIVETAB_MODEL_API_KEY", "ACTIVETAB_SEMANTIC_API_KEY", "ACTIVETAB_WORKFLOW_API_KEY",
+    "ACTIVETAB_MODEL_IMAGE_INPUT", "ACTIVETAB_MODEL_ALLOW_SCREENSHOTS", "ACTIVETAB_JEV_ALLOW_IMAGES",
+    "OPENROUTER_API_KEY", "JEV_API_KEY"
+  ]) delete env[name];
+  // The CLI child exercises local CDP recovery and must never inherit a
+  // developer's model keys or discover the home JEV.txt credential.
+  env.ACTIVETAB_JEV_KEY_FILE = join(guardDirectory, "missing-JEV.txt");
+  return env;
+}
 
 const chromePath = process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
 const fixture = await readFile(new URL("./fixtures/navigation.html", import.meta.url));
@@ -52,6 +71,14 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
       if (request.url?.startsWith("/api/account?")) {
         response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         response.end(JSON.stringify({ loaded: true, access_token: "fixture-response-secret" }));
+        return;
+      }
+      if (request.url === "/api/orders") {
+        response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        response.end(JSON.stringify({ orders: [
+          { id: 101, total: 12.5, status: "open", api_token: "fixture-api-secret-alpha" },
+          { id: 102, total: 20, status: "paid", api_token: "fixture-api-secret-beta" }
+        ] }));
         return;
       }
       response.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
@@ -103,6 +130,20 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
       await new Promise(resolve => setTimeout(resolve, 100));
     }
     assert.equal(directObservation.page.title, "Demo shop", "direct page-level CDP remains supported");
+    for (const viewport of [
+      { width: 2560, height: 1440 },
+      { width: 1920, height: 1080 },
+      { width: 1280, height: 720 },
+      { width: 280, height: 280 }
+    ]) {
+      await session.client.send("Emulation.setDeviceMetricsOverride", { ...viewport, deviceScaleFactor: 1, mobile: false });
+      const visualObservation = await session.observe({ profile: "visual", prepareForJev: true });
+      const screenshot = session.observer.getEvidence(visualObservation.evidenceId, { includeScreenshot: true }).screenshotBase64;
+      const dimensions = jpegDimensions(Buffer.from(screenshot, "base64"));
+      assert.deepEqual(visualObservation.viewport, viewport);
+      assert.equal(isJevImageSizeSupported(dimensions), true, `${viewport.width}x${viewport.height} is prepared within Jev's configured image bounds`);
+    }
+    await session.client.send("Emulation.clearDeviceMetricsOverride");
     await session.close();
     session = undefined;
 
@@ -142,7 +183,7 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     assert.equal(first.page.title, "Demo shop");
     assert.equal(first.targetId, session.target.id, "each real CDP observation is bound to its selected browser target");
     await session.client.send("Runtime.evaluate", {
-      expression: "globalThis.__activetabGetterRuns = 0; globalThis.__activetabRuntimeState__ = { publicLabel: 'runtime fixture', nested: { apiToken: 'runtime-fixture-secret' }, largeValue: 'x'.repeat(5000) }; Object.defineProperty(globalThis.__activetabRuntimeState__, 'lazyValue', { enumerable: true, get() { globalThis.__activetabGetterRuns++; return 'getter-must-not-run'; } }); void 0;",
+      expression: "globalThis.__activetabGetterRuns = 0; globalThis.__activetabRuntimeState__ = { publicLabel: 'runtime fixture', nested: { apiToken: 'runtime-fixture-secret' }, largeValue: 'x'.repeat(4095) + '😀' + 'y'.repeat(1000) }; Object.defineProperty(globalThis.__activetabRuntimeState__, 'lazyValue', { enumerable: true, get() { globalThis.__activetabGetterRuns++; return 'getter-must-not-run'; } }); void 0;",
       returnByValue: true
     });
     const sectionChoices = first.candidates.filter(candidate => candidate.name === "Continue" && ["Billing history", "Shipping history"].includes(candidate.contextName));
@@ -163,9 +204,20 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     const runtimeSecret = await session.observer.inspectRuntimeState(first.evidenceId, { path: ["__activetabRuntimeState__", "nested", "apiToken"], includeSensitiveValues: true });
     assert.equal(runtimeSecret.result.selected.value, "runtime-fixture-secret", "a caller can explicitly request one selected runtime primitive");
     const largeRuntimeValue = await session.observer.inspectRuntimeState(first.evidenceId, { path: ["__activetabRuntimeState__", "largeValue"], includeSensitiveValues: true });
-    assert.equal(largeRuntimeValue.result.selected.valueLength, 5000);
-    assert.equal(largeRuntimeValue.result.selected.valueRedacted, true, "strings above the transfer cap expose length without transferring their contents");
-    assert.equal(JSON.stringify(largeRuntimeValue).includes("x".repeat(4096)), false);
+    assert.equal(largeRuntimeValue.result.selected.type, "string");
+    assert.equal(largeRuntimeValue.result.selected.valueLength, 5097);
+    assert.equal(largeRuntimeValue.result.selected.valueOffset, 0);
+    assert.equal(largeRuntimeValue.result.selected.valueComplete, false, "long selected strings are paged instead of truncated or omitted");
+    assert.equal(largeRuntimeValue.result.selected.valueRedacted, undefined, "explicit local inspection does not mislabel an available page as redacted");
+    assert.equal(largeRuntimeValue.result.selected.value, "x".repeat(4095), "the first page ends before a split Unicode surrogate pair");
+    const largeRuntimeValuePage2 = await session.observer.inspectRuntimeState(first.evidenceId, {
+      path: ["__activetabRuntimeState__", "largeValue"],
+      includeSensitiveValues: true,
+      offset: largeRuntimeValue.result.selected.nextOffset
+    });
+    assert.equal(largeRuntimeValuePage2.result.selected.value, "😀" + "y".repeat(1000));
+    assert.equal(largeRuntimeValuePage2.result.selected.valueComplete, true);
+    assert.equal(largeRuntimeValue.result.selected.value + largeRuntimeValuePage2.result.selected.value, "x".repeat(4095) + "😀" + "y".repeat(1000), "the bounded pages reconstruct the complete original runtime value exactly");
     const safeRuntimeEvidence = session.observer.getEvidence(first.evidenceId, { facets: ["runtimeState"] });
     assert.equal(JSON.stringify(safeRuntimeEvidence).includes("runtime-fixture-secret"), false, "runtime values remain redacted when retained evidence is retrieved by default");
     const selectedRuntimeEvidence = session.observer.getEvidence(first.evidenceId, { facets: ["runtimeState"], includeSensitiveRuntimeValues: true });
@@ -175,7 +227,8 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     assert.equal(selectedDetail.domSnapshot, undefined, "callers can retrieve only a selected element facet");
     assert.equal(selectedDetail.selectedElement.name, "Open account");
     const selectedBillingControl = sectionChoices.find(candidate => candidate.contextName === "Billing history");
-    const callerScreenshot = session.observer.getEvidence(first.evidenceId, { facets: ["page"], includeScreenshot: true });
+    const callerVisualObservation = await session.observe({ profile: "visual" });
+    const callerScreenshot = session.observer.getEvidence(callerVisualObservation.evidenceId, { facets: ["page"], includeScreenshot: true });
     assert.equal(typeof callerScreenshot.screenshotBase64, "string", "the caller can retrieve visual evidence locally before choosing an identity");
     const callerAction = await clickObservedElement(session, { goal: "Open the billing history page", evidenceId: first.evidenceId, backendNodeId: selectedBillingControl.backendNodeId, assertExecutionLease: fixtureLease });
     assert.equal(callerAction.status, "action_dispatched");
@@ -186,7 +239,8 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     assert.equal(ambiguousRun.attempts, 0);
     const ambiguousChoices = ambiguousRun.targetResolution.candidates.filter(candidate => candidate.contextName === "Ambiguous route");
     assert.equal(ambiguousChoices.length, 2, "the unresolved result exposes both target-scoped handles from retained evidence");
-    const ambiguityScreenshot = session.observer.getEvidence(ambiguousRun.targetResolution.evidenceId, { facets: ["page"], includeScreenshot: true });
+    const ambiguityVisualObservation = await session.observe({ profile: "visual" });
+    const ambiguityScreenshot = session.observer.getEvidence(ambiguityVisualObservation.evidenceId, { facets: ["page"], includeScreenshot: true });
     assert.equal(typeof ambiguityScreenshot.screenshotBase64, "string", "the caller can inspect the retained screenshot before selecting one candidate");
     const selectedAmbiguousCandidate = [...ambiguousChoices].sort((left, right) => left.bounds.x - right.bounds.x)[0];
     const selectedDetails = session.observer.getEvidence(ambiguousRun.targetResolution.evidenceId, {
@@ -254,7 +308,8 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     const blockedTitle = await session.client.send("Runtime.evaluate", { expression: "document.title", returnByValue: true });
     assert.equal(blockedTitle.result.value, "Shadow preferences", "the blocked target's click handler did not run");
     await session.client.send("Runtime.evaluate", { expression: "document.querySelector('#cover').style.display='none'" });
-    assert.ok(first.coverage.domSnapshot && first.coverage.accessibility && first.coverage.screenshot);
+    assert.ok(first.coverage.domSnapshot && first.coverage.accessibility);
+    assert.equal(first.coverage.screenshot, false, "the default interaction profile does not capture a screenshot");
     assert.ok(first.candidates.some(candidate => candidate.name === "Open account"), JSON.stringify({ frames: first.frames, candidates: first.candidates, generation: first.documentGeneration }));
     const journal = new TaskJournal(join(journalDir, "task.json"));
     await session.close();
@@ -284,7 +339,7 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
       cwd: process.cwd(),
       encoding: "utf8",
       timeout: 15_000,
-      env: { ...process.env, ACTIVETAB_CRASH_TARGET: JSON.stringify(crashTarget), ACTIVETAB_CRASH_JOURNAL: journal.path }
+      env: isolatedModelEnvironment({ ACTIVETAB_CRASH_TARGET: JSON.stringify(crashTarget), ACTIVETAB_CRASH_JOURNAL: journal.path }, profileDir)
     });
     assert.equal(crashedProcess.status, 73, `the child process terminates after native click dispatch: ${crashedProcess.stderr}`);
     const interruptedState = await journal.read();
@@ -297,13 +352,13 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     const mismatchedResume = spawnSync(process.execPath, ["src/cli.js", "resume", "--journal", journal.path, "--goal", "Close the account", "--endpoint", endpoint], {
       cwd: process.cwd(),
       encoding: "utf8",
-      env: { ...process.env, ACTIVETAB_AUTHORIZED_TARGET_ID: target.id }
+      env: isolatedModelEnvironment({ ACTIVETAB_AUTHORIZED_TARGET_ID: target.id }, profileDir)
     });
     assert.notEqual(mismatchedResume.status, 0, "the CLI refuses a different goal before attaching to the browser");
     assert.match(mismatchedResume.stderr, /does not match the task journal's goal fingerprint/);
-    const resumeProcess = spawn(process.execPath, ["src/cli.js", "resume", "--journal", journal.path, "--goal", "Open the account page", "--endpoint", endpoint], {
+    const resumeProcess = spawn(process.execPath, ["src/cli.js", "resume", "--journal", journal.path, "--goal", "Open the account page", "--planner-mode", "deterministic", "--endpoint", endpoint], {
       cwd: process.cwd(),
-      env: { ...process.env, ACTIVETAB_AUTHORIZED_TARGET_ID: target.id },
+      env: isolatedModelEnvironment({ ACTIVETAB_AUTHORIZED_TARGET_ID: target.id }, profileDir),
       stdio: ["ignore", "pipe", "pipe"]
     });
     let resumeStdout = "";
@@ -344,21 +399,92 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     assert.equal(JSON.stringify(bodyHidden).includes("fixture-response-secret"), false);
     const bodySelected = await session.observer.inspectNetworkResponse(archiveResult.evidenceId, { requestId: accountRequest.requestId, includeSensitive: true });
     assert.equal(bodySelected.responseBody.status, "included", "CDP can retrieve one selected buffered application response");
-    assert.ok(bodySelected.responseBody.data.includes("fixture-response-secret"), "explicit sensitive-data opt-in returns the selected local fixture body");
+    assert.equal(JSON.stringify(bodySelected).includes("fixture-response-secret"), false, "credential redaction applies to the complete selected response report");
+    const bodyWithCredentials = await session.observer.inspectNetworkResponse(archiveResult.evidenceId, {
+      requestId: accountRequest.requestId,
+      includeSensitive: true,
+      includeCredentialValues: true,
+      view: "source"
+    });
+    assert.equal(bodyWithCredentials.responseBody.credentialValuesIncluded, true);
+    assert.equal(bodyWithCredentials.responseBody.truncated, false);
+    assert.ok(bodyWithCredentials.responseBody.data.includes("fixture-response-secret"), "the explicit local view exposes the complete credential value for diagnosis");
+    assert.equal(bodyWithCredentials.responseBody.credentialDetails.items.some(item => Object.hasOwn(item, "value")), false, "credential metadata describes the value without duplicating it");
+    await session.client.send("Runtime.evaluate", {
+      expression: "fetch('/api/orders').then(response => response.json()).then(data => { document.body.dataset.apiRows = String(data.orders.length); })",
+      returnByValue: true,
+      awaitPromise: true
+    });
+    await session.waitForChange();
+    const apiCapabilityService = new CapabilityService({ runApiQualification: runApiShapeFixtureQualification });
+    const apiScope = {
+      environment: {
+        environmentId: "cdp-api-fixture",
+        authorizedOrigins: [new URL(session.target.url).origin],
+        applications: [{ applicationId: "orders-fixture", origin: new URL(session.target.url).origin }]
+      },
+      principalId: "cdp-api-test-principal"
+    };
+    const apiDiscovery = await apiCapabilityService.discoverObservedApis({
+      session,
+      ...apiScope
+    });
+    const orderRequest = apiDiscovery.candidates.find(candidate => candidate.endpointPath === "/api/orders");
+    assert.ok(orderRequest, "discovery observes the page's completed same-origin JSON GET");
+    assert.equal(JSON.stringify(apiDiscovery).includes("fixture-api-secret"), false, "discovery never reads or returns response values");
+    const apiInspection = await apiCapabilityService.inspectObservedApi(orderRequest.candidateId, { session, ...apiScope });
+    assert.equal(apiInspection.status, "candidate");
+    const orderSchema = apiInspection.candidates.find(candidate => JSON.stringify(candidate.collectionPath) === JSON.stringify(["orders"]));
+    assert.ok(orderSchema, "explicit response selection derives a record shape");
+    assert.deepEqual(orderSchema.fields.map(field => [field.name, field.type, field.readEligible]), [
+      ["id", "integer", true], ["total", "number", true], ["status", "string", true], ["api_token", "string", false]
+    ]);
+    assert.equal(JSON.stringify(orderSchema).includes("fixture-api-secret"), false, "schema evidence contains credential metadata without credential values");
+    const apiQualification = await apiCapabilityService.qualifyObservedApi(orderSchema.candidateId, {
+      variants: 30,
+      principalId: apiScope.principalId
+    });
+    assert.equal(apiQualification.status, "qualified", JSON.stringify(apiQualification));
+    assert.equal(apiQualification.candidate.qualification.variantCount, 30);
+    assert.equal(apiQualification.candidate.qualification.evidenceRefs.length, 30);
+    const privacyAdversary = structuredClone(orderSchema);
+    privacyAdversary.fields.find(field => field.name === "api_token").readEligible = true;
+    const rejectedShape = await runApiShapeFixtureQualification({ candidate: privacyAdversary, variants: 3 });
+    assert.ok(rejectedShape.variants.every(variant => variant.schemaMatch === false && variant.privacyBoundaryPassed === false), "the independent oracle rejects credential-field eligibility drift");
     assert.ok(activity.lifecycleEvents.length > 0, "native CDP retained page and DOM lifecycle events");
     assert.ok(activity.domMutations.length > 0, "native CDP retained real DOM mutation events from the fixture navigation");
     assert.ok(activity.domMutations.some(mutation => mutation.event === "DOM.childNodeInserted" || mutation.event === "DOM.childNodeRemoved"), "the verified archive action changed the DOM and emitted structural mutation evidence");
     const searchResult = await new NavigationEngine(session, { maxActions: 2, maxRecoveries: 1 }).run("Search for invoices");
-    assert.equal(searchResult.status, "succeeded", "explicit search intent can submit a matching native form");
+    assert.equal(searchResult.status, "succeeded", `explicit search intent can submit the observed GET form: ${JSON.stringify(searchResult)}`);
     assert.equal(searchResult.page.title, "Search results");
     const customControls = await session.observe();
     const modelControl = customControls.candidates.find(candidate => candidate.role === "combobox" && candidate.name === "Model");
     const taskEditor = customControls.candidates.find(candidate => candidate.role === "textbox" && candidate.name === "Task instructions");
     assert.ok(modelControl, "the observer exposes the fixture's custom ARIA combobox");
     assert.ok(taskEditor, "the observer exposes the fixture's contenteditable textbox");
-    const modelSelection = await session.selectOption(modelControl, "GLM5.3-flash");
-    assert.equal(modelSelection.selectionStatus, "selected", "the browser opens the combobox and selects one exact visible option");
+    await assert.rejects(() => session.selectOption(modelControl, "GLM5.3-flash"), /approved two-step action envelope/, "the composite control refuses direct session dispatch without executor admission");
+    const modelSelection = await executeAuthorizedAction({
+      session,
+      localFixture: true,
+      goal: "Select the requested model",
+      action: "select",
+      candidate: modelControl,
+      value: "GLM5.3-flash",
+      operationId: "test.local_fixture_model_select",
+      operationAuthorizer: {
+        authorize({ action, candidate, value, observation }) {
+          const allowed = action === "select" && candidate?.identity === modelControl.identity
+            && String(candidate?.role ?? "").toLowerCase() === "combobox"
+            && value === "GLM5.3-flash" && observation?.page?.url?.startsWith("http://127.0.0.1:");
+          return { allowed, category: "test_local_fixture_select", reason: "The test capability is limited to the observed model combobox and exact fixture option." };
+        }
+      },
+      assertExecutionLease: fixtureLease
+    });
+    assert.equal(modelSelection.status, "dispatched", JSON.stringify(modelSelection));
+    assert.equal(modelSelection.dispatchResult.selectionStatus, "selected", "the approved envelope opens the combobox and selects one exact related visible option");
     assert.equal((await session.verifyControlValue(modelControl, "GLM5.3-flash")).matches, true, "custom model selection is verified without returning the selected value");
+    assert.equal((await session.client.send("Runtime.evaluate", { expression: "document.querySelector('#model-picker').dataset.unrelatedSelection ?? ''", returnByValue: true })).result.value, "", "an unrelated visible option with the same label is not clicked");
     await session.fillField(taskEditor, "caller-authored fixture task");
     assert.equal((await session.verifyControlValue(taskEditor, "caller-authored fixture task")).matches, true, "contenteditable text entry is verified in-process");
     await session.client.send("Page.reload", { ignoreCache: true });
@@ -375,7 +501,8 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     const state = await journal.read();
     assert.equal(state.status, "succeeded");
     if (process.env.ACTIVETAB_SAVE_DEMO_SCREENSHOT) {
-      const evidence = session.observer.getEvidence(resumedObservation.evidenceId, { includeScreenshot: true });
+      const screenshotObservation = await session.observe({ profile: "visual" });
+      const evidence = session.observer.getEvidence(screenshotObservation.evidenceId, { includeScreenshot: true });
       await writeFile(process.env.ACTIVETAB_SAVE_DEMO_SCREENSHOT, Buffer.from(evidence.screenshotBase64, "base64"));
     }
     assert.equal(state.attempts.length, 2);

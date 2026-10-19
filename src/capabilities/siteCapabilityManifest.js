@@ -24,6 +24,7 @@ export function validateSiteCapabilityManifest(manifest, { requireQualified = fa
   } catch { errors.push("origin must be an exact HTTP(S) origin."); }
   if (typeof manifest.principalId !== "string" || !manifest.principalId || manifest.principalId.length > 128) errors.push("principalId must bind the capability to a verified principal.");
   const contract = manifest.extractionContract;
+  if (contract?.scopeKind !== undefined) errors.push("Ephemeral observed-read contracts cannot be persisted as site capabilities.");
   const validation = validateExtractionContract(contract);
   if (!validation.valid) errors.push(...validation.errors.map(error => `extractionContract: ${error}`));
   if (manifest.kind === "visible_html_table" && (contract?.recordGroup !== undefined || contract?.fields?.some(field => typeof field?.sourceHeader !== "string"))) {
@@ -46,6 +47,34 @@ export function validateSiteCapabilityManifest(manifest, { requireQualified = fa
       if (!isDigest(qualification.evidenceDigest)) errors.push("Qualified capabilities require an evidence digest.");
       if (!Number.isInteger(qualification.variantCount) || qualification.variantCount < 3 || qualification.variantCount > 1000) errors.push("Qualified capabilities require at least three bounded fixture variants.");
       if (!Array.isArray(qualification.evidenceRefs) || qualification.evidenceRefs.length < 1 || qualification.evidenceRefs.length > 32) errors.push("Qualified capabilities require bounded evidence references.");
+      if (!new Set(["resolver", "integration", "outcome", "live"]).has(qualification.level)) errors.push("Qualified capabilities require an explicit qualification level.");
+      if (qualification.level !== "resolver") errors.push("Visible extraction manifests support resolver-level qualification only; application outcomes require a separate benchmark receipt.");
+      for (const field of ["providerId", "providerIdentity", "sourceRevision", "oracleReference"]) {
+        if (typeof qualification[field] !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(qualification[field])) {
+          errors.push(`Qualified capabilities require a bounded ${field}.`);
+        }
+      }
+      if (!Number.isSafeInteger(qualification.scenarioSeed) || qualification.scenarioSeed < 0) errors.push("Qualified capabilities require a non-negative scenario seed.");
+      const cleanup = qualification.cleanupResult;
+      if (!cleanup || typeof cleanup !== "object" || !new Set(["verified", "unverified", "not_applicable"]).has(cleanup.status)) {
+        errors.push("Qualified capabilities require a cleanup result.");
+      } else {
+        if (Object.keys(cleanup).some(key => !["status", "reasonCode"].includes(key))) errors.push("Qualification cleanup result contains unsupported fields.");
+        if (cleanup.status === "not_applicable" && (typeof cleanup.reasonCode !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$/.test(cleanup.reasonCode))) {
+          errors.push("Not-applicable cleanup requires a structural reason code.");
+        }
+      }
+      if (typeof qualification.independentApplicationOutcome !== "boolean") errors.push("Qualified capabilities must state whether an independent application outcome was checked.");
+      if ((qualification.level === "resolver" || qualification.level === "integration") && qualification.independentApplicationOutcome !== false) {
+        errors.push("Resolver and integration qualifications cannot claim an independent application outcome.");
+      }
+      if ((qualification.level === "outcome" || qualification.level === "live") && qualification.independentApplicationOutcome !== true) {
+        errors.push("Outcome and live qualifications require an independent application outcome.");
+      }
+      if (qualification.level === "live" && (typeof qualification.liveAuthorizationRef !== "string"
+        || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(qualification.liveAuthorizationRef))) {
+        errors.push("Live qualification requires a scoped authorization reference.");
+      }
     }
   }
   return { valid: errors.length === 0, errors };

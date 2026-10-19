@@ -42,6 +42,11 @@ import { CapabilityQualifier } from "../capabilities/capabilityQualifier.js";
 import { loadExtractionFieldPolicy } from "../capabilities/fieldPolicy.js";
 import { loadEnvironmentBinding } from "../testing/profiles.js";
 import { qualifyExtractionManifest } from "../../test-lab/fixtures/extractionQualification.js";
+import { preflightModelCapabilities, writeModelPreflightSummary } from "../navigation/modelPreflight.js";
+import { RunLocalPublicReadApprovalBroker } from "../capabilities/publicReadApprovalBroker.js";
+
+const modelPreflight = await preflightModelCapabilities();
+writeModelPreflightSummary(modelPreflight);
 
 const port = parseInt(process.env.ACTIVETAB_API_PORT ?? "9377", 10);
 const taskStoreDir = process.env.ACTIVETAB_TASK_DIR;
@@ -54,10 +59,18 @@ const capabilityRegistry = await new CapabilityRegistry({
   directory: process.env.ACTIVETAB_CAPABILITY_DIR ?? join(process.cwd(), ".activetab", "capabilities")
 }).init();
 const extractionFieldPolicy = await loadExtractionFieldPolicy(process.env.ACTIVETAB_EXTRACTION_POLICY_FILE);
+const publicReadApprovalBroker = new RunLocalPublicReadApprovalBroker({ publicFieldPolicy: extractionFieldPolicy.publicFieldPolicy });
 const capabilityService = new CapabilityService({
   registry: capabilityRegistry,
   qualifier: new CapabilityQualifier({ runQualification: qualifyExtractionManifest }),
   classifyField: extractionFieldPolicy.classifyField,
+  authorizeRead: extractionFieldPolicy.authorizeRead,
+  authorizeRelease: extractionFieldPolicy.authorizeRelease,
+  classifyPublicField: extractionFieldPolicy.classifyPublicField,
+  publicFieldPolicy: extractionFieldPolicy.publicFieldPolicy,
+  authorizePublicRead: extractionFieldPolicy.authorizePublicRead,
+  authorizePublicRelease: extractionFieldPolicy.authorizePublicRelease,
+  approvePublicRead: (proposal, options) => publicReadApprovalBroker.request(proposal, options),
   authorizePagination: extractionFieldPolicy.authorizePagination
 });
 const resolveEnvironmentBinding = async () => {
@@ -119,6 +132,7 @@ process.env.ACTIVETAB_REPORT_DIR ??= join(process.env.ACTIVETAB_TASK_DIR ?? join
 const api = createApiServer({
   port, taskStoreDir, navigationRunner, decisionRuntime,
   capabilityRegistry, capabilityService, authorizeExtractionField, authorizeExtractionRelease,
+  publicReadApprovalBroker,
   executorName: process.env.ACTIVETAB_REMOTE_PEER_URL ? "remote-peer" : "local",
   reportDir: process.env.ACTIVETAB_REPORT_DIR
 });

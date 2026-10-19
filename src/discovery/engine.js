@@ -8,11 +8,12 @@ import { KnowledgeStore } from "./knowledgeStore.js";
 import { URL } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 import { authorizePlannedAction } from "../navigation/actionPolicy.js";
-import { verifyObservedUrl } from "../environments/model.js";
+import { resolveObservedApplication, verifyObservedUrl } from "../environments/model.js";
 import { sanitizeUrl } from "../browser/urlPrivacy.js";
 import { isOperatorProhibitedNavigation } from "../runtime/controlRestrictions.js";
 import { executeAuthorizedAction } from "../runtime/authorizedExecutor.js";
 import { adjudicatePreActionReview } from "../decisions/adjudication.js";
+import { selectPreActionDecisionRoute } from "../decisions/callPolicy.js";
 
 const SAFE_CONTROL_ROLES = new Set(["link", "tab", "button", "menuitem", "menuitemradio", "menuitemcheckbox"]);
 const SAFE_SUBMIT_CONTROLS = false;
@@ -64,9 +65,9 @@ export class ApplicationDiscoveryEngine {
     const environmentId = String(this.environment?.environmentId ?? "").toLowerCase();
     const environmentClass = this.environment?.environmentClass
       ?? (environmentId.includes("production") ? "production" : environmentId.includes("staging") ? "staging" : environmentId ? "local" : "unknown");
-    const configuredApplicationId = this.environment?.applications?.find(application => application.origin === origin)?.applicationId;
-    const applicationId = typeof configuredApplicationId === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$/.test(configuredApplicationId)
-      ? configuredApplicationId
+    const initialApplication = this.environment ? resolveObservedApplication(this.environment, observation.page.url) : { status: "unmatched" };
+    const applicationId = initialApplication.status === "matched"
+      ? initialApplication.applicationId
       : `app_${createHash("sha256").update(origin).digest("hex").slice(0, 16)}`;
     const episode = this.decisionRuntime?.startEpisode({
       runId,
@@ -78,7 +79,7 @@ export class ApplicationDiscoveryEngine {
       workflowKind: "application_discovery"
     });
     this.capabilityMap = new ApplicationCapabilityMap({
-      applicationId: origin,
+      applicationId,
       origin,
       ...(this.environment ? { platform: this.environment.platform, environmentId: this.environment.environmentId } : {})
     });
@@ -151,7 +152,7 @@ export class ApplicationDiscoveryEngine {
         } : null;
         if (telemetry) {
           try {
-            const review = await this.decisionRuntime.reviewBeforeAction({
+            const reviewInput = {
               episodeId: episode.episodeId,
               runId,
               stepId: telemetry.stepId,
@@ -163,7 +164,31 @@ export class ApplicationDiscoveryEngine {
               expectedOutcomeClass: "destination_observed",
               candidate: target,
               signal: this.signal
+            };
+            const route = selectPreActionDecisionRoute({
+              riskClass: "navigation",
+              uncertaintyClass: "resolved",
+              visualEvidenceAvailable: false,
+              reviewIntentAvailable: true
             });
+            this.decisionRuntime.recordInferenceRoute({
+              episodeId: episode.episodeId,
+              runId,
+              stepId: telemetry.stepId,
+              decisionId: telemetry.decisionId,
+              observationId: observation.evidenceId,
+              route: route.route,
+              reasonCode: route.reasonCode,
+              providers: route.providers,
+              visualEvidenceUsed: route.visualEvidenceUsed
+            });
+            let review;
+            if (route.route === "jev_only") {
+              review = await this.decisionRuntime.reviewBeforeAction(reviewInput);
+            } else {
+              this.decisionRuntime.recordReviewSkipped({ ...reviewInput, reasonCode: route.reasonCode });
+              review = { decisionId: telemetry.decisionId, authorizesOperation: false };
+            }
             const adjudication = adjudicatePreActionReview(review);
             if (!adjudication.allowed) {
               await this.decisionRuntime.recordPolicy({
@@ -267,7 +292,7 @@ export class ApplicationDiscoveryEngine {
             } catch { /* dispatch already happened; retain the browser flow */ }
           }
           await this.session.waitForChange(3_000);
-          const postObservation = await this.session.observe();
+          const postObservation = await this.session.observe({ profile: "lightweight" });
           if (postObservation?.page?.url) {
             if (telemetry) {
               try {
@@ -291,9 +316,11 @@ export class ApplicationDiscoveryEngine {
               const verified = verifyObservedUrl(this.environment, postObservation.page.url);
               const childOrigin = new URL(postObservation.page.url).origin;
               const crossedOrigin = childOrigin !== new URL(currentUrl).origin;
+              const currentApplication = resolveObservedApplication(this.environment, currentUrl);
+              const nextApplication = resolveObservedApplication(this.environment, postObservation.page.url);
               if (crossedOrigin) {
                 this.capabilityMap.recordChildApplication({
-                  applicationId: childOrigin,
+                  applicationId: nextApplication.status === "matched" ? nextApplication.applicationId : childOrigin,
                   origin: childOrigin,
                   entryFrom: currentUrl
                 });
@@ -305,8 +332,8 @@ export class ApplicationDiscoveryEngine {
                 this.capabilityMap.markChildVerified(childOrigin);
                 this.discoveries.push({ type: "cross_origin_verified", from: currentUrl, to: postObservation.page.url });
               }
-              // Detect a new authentication boundary (login/consent screen at
-              // a different realm) and pause instead of bypassing it.
+              // Authentication and anti-automation boundaries are meaningful
+              // even when the profile does not map their exact URL path.
               const { classifyHumanHandoff } = await import("../navigation/handoff.js");
               const handoff = classifyHumanHandoff(postObservation);
               if (handoff && (handoff.category === "authentication" || handoff.category === "anti_automation")) {
@@ -316,6 +343,26 @@ export class ApplicationDiscoveryEngine {
                 }
                 observation = postObservation;
                 break; // hold at the boundary; a human must authorize/authenticate
+              }
+              if (currentApplication.status !== "matched" && nextApplication.status === "matched") {
+                this.capabilityMap = new ApplicationCapabilityMap({
+                  applicationId: nextApplication.applicationId,
+                  origin: nextApplication.origin,
+                  platform: this.environment.platform,
+                  environmentId: this.environment.environmentId
+                });
+              } else if (nextApplication.status !== "matched"
+                || currentApplication.applicationId !== nextApplication.applicationId
+                || currentApplication.authenticationRealm !== nextApplication.authenticationRealm) {
+                this.discoveries.push({
+                  type: "application_identity_changed",
+                  fromApplicationId: currentApplication.applicationId ?? null,
+                  toApplicationId: nextApplication.applicationId ?? null,
+                  fromRealm: currentApplication.authenticationRealm ?? null,
+                  toRealm: nextApplication.authenticationRealm ?? null,
+                  observedUrl: sanitizeUrl(postObservation.page.url, { base: postObservation.page.url })
+                });
+                break;
               }
             }
             this.visitedUrls.add(postObservation.page.url);

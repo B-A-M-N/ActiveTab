@@ -220,6 +220,7 @@ async function attachThroughPopup(client, broker, extensionId, tabTargetId, popu
 
 test("visible extension attaches, observes, navigates, and recovers its disposable Chrome tab", { timeout: 120_000 }, async t => {
   if (process.env.ACTIVETAB_VISIBLE_CHROME !== "1") { t.skip("set ACTIVETAB_VISIBLE_CHROME=1 to launch the real Chrome window for extension integration"); return; }
+  if (process.env.ACTIVETAB_HEADLESS === "1") { t.skip("the visible extension fixture requires headed Chrome; unset ACTIVETAB_HEADLESS=1 to run it"); return; }
   if (!process.env.DISPLAY) { t.skip("extension integration requires a visible desktop display"); return; }
   let chrome;
   let connection;

@@ -16,6 +16,8 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile, readFile, readdir, rename, open } from "node:fs/promises";
 import { join, dirname } from "node:path";
+import { projectInput } from "./input-projection.js";
+import { findTemplate } from "./templates.js";
 
 export const TERMINAL_STATUSES = new Set(["finished", "failed", "canceled"]);
 
@@ -46,15 +48,24 @@ export class TaskStore {
       if (!entry.isFile() || !/^[0-9a-f-]{36}\.json$/.test(entry.name)) continue;
       try {
         const task = JSON.parse(await readFile(join(this.baseDir, entry.name), "utf8"));
+        let changed = false;
+        const projectedInput = projectInput(task?.input, findTemplate(task?.template_id)?.input_schema);
+        if (JSON.stringify(projectedInput) !== JSON.stringify(task?.input)) {
+          task.input = projectedInput;
+          changed = true;
+        }
         if (task?.status === "running" || task?.status === "created" || task?.status === "queued") {
           task.status = "reconciling";
           task.error = "interrupted: the API server restarted while this task was running; its remote outcome must be reconciled before retry or completion.";
           task.updated_at = new Date().toISOString();
-          await this.#writeAtomic(entry.name, task);
+          changed = true;
         }
         // Suspended (human-blocked) runs survive restarts: they are reloaded
         // for intervention re-evaluation, never auto-failed (P0-3/P1-4).
-        if (task && typeof task.task_id === "string") this.tasks.set(task.task_id, task);
+        if (task && typeof task.task_id === "string") {
+          this.tasks.set(task.task_id, task);
+          if (changed) await this.#writeAtomic(entry.name, task);
+        }
       } catch { /* Unreadable records are left for explicit local inspection. */ }
     }
   }
@@ -71,13 +82,13 @@ export class TaskStore {
     await rename(temp, path);
   }
 
-  create(templateId, input, botId = null) {
+  create(templateId, input, botId = null, inputSchema = findTemplate(templateId)?.input_schema) {
     const taskId = randomUUID();
     const task = {
       task_id: taskId,
       template_id: templateId,
       bot_id: botId,
-      input,
+      input: projectInput(input, inputSchema),
       status: "created",
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
@@ -136,6 +147,11 @@ export class TaskStore {
   async load(taskId) {
     try {
       const task = JSON.parse(await readFile(join(this.baseDir, `${taskId}.json`), "utf8"));
+      const projectedInput = projectInput(task?.input, findTemplate(task?.template_id)?.input_schema);
+      if (JSON.stringify(projectedInput) !== JSON.stringify(task?.input)) {
+        task.input = projectedInput;
+        await this.#writeAtomic(`${taskId}.json`, task);
+      }
       if (task?.status === "running" || task?.status === "queued") {
         task.status = "reconciling";
         task.error = task.error ?? "interrupted: this task was not running in a live process; its outcome must be reconciled.";

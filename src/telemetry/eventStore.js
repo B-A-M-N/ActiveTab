@@ -31,7 +31,7 @@ function ensurePrivateDatabasePath(databasePath) {
 export class DecisionEventStore {
   #authenticateTrainingApprover;
 
-  constructor({ databasePath = resolve(process.cwd(), ".activetab", "telemetry", "decision-events.sqlite"), busyTimeoutMs = 5000, authenticateTrainingApprover } = {}) {
+  constructor({ databasePath = process.env.ACTIVETAB_TELEMETRY_DB ?? resolve(process.cwd(), ".activetab", "telemetry", "decision-events.sqlite"), busyTimeoutMs = 5000, authenticateTrainingApprover } = {}) {
     if (typeof databasePath !== "string" || !databasePath) throw new Error("DecisionEventStore requires a database path.");
     this.databasePath = databasePath === ":memory:" ? databasePath : ensurePrivateDatabasePath(databasePath);
     this.#authenticateTrainingApprover = authenticateTrainingApprover;
@@ -86,14 +86,14 @@ export class DecisionEventStore {
     if (this.databasePath !== ":memory:") chmodSync(this.databasePath, 0o600);
   }
 
-  startEpisode({ runId = randomUUID(), workflowId, applicationId, environmentClass = "unknown", executionMode = "agent_directed", policyVersion = "unknown", workflowKind = "browser_workflow" }) {
+  startEpisode({ runId = randomUUID(), workflowId, applicationId, environmentClass = "unknown", executionMode = "agent_directed", policyVersion = "unknown", workflowKind = "browser_workflow", trainingEligibility = TRAINING_ELIGIBILITY.PENDING }) {
     if (!isSafeTelemetryCode(workflowId, { maxLength: 96 })) throw new Error("Episode workflowId must be a bounded stable identifier.");
     const episodeId = randomUUID();
     const createdAt = new Date().toISOString();
     const started = createDecisionEvent({
       episodeId, runId, eventType: "episode.started", occurredAt: createdAt,
       payload: { workflowKind, applicationId, environmentClass, executionMode, policyVersion },
-      trainingEligibility: TRAINING_ELIGIBILITY.PENDING
+      trainingEligibility
     });
     this.db.exec("BEGIN IMMEDIATE");
     try {

@@ -3,6 +3,7 @@ import { classifyHumanHandoff } from "./handoff.js";
 import { randomUUID } from "node:crypto";
 import { executeAuthorizedAction } from "../runtime/authorizedExecutor.js";
 import { adjudicatePreActionReview } from "../decisions/adjudication.js";
+import { selectPreActionDecisionRoute } from "../decisions/callPolicy.js";
 
 export async function clickObservedElement(session, { goal, evidenceId, backendNodeId, frameTargetId = null, decisionRuntime = null, environment = null, localFixture = false, assertExecutionLease = null } = {}) {
   if (typeof goal !== "string" || !goal.trim() || goal.length > 2_000) throw new Error("A non-empty caller goal of at most 2,000 characters is required.");
@@ -45,32 +46,41 @@ export async function clickObservedElement(session, { goal, evidenceId, backendN
   if (!authorization.authorized) return { status: "needs_human", category: authorization.category, reason: authorization.reason, evidenceId: before.evidenceId, targetIdentity: target.identity, ...(episode ? { decisionEpisodeId: episode.episodeId } : {}) };
 
   if (episode) {
-    const reviewRequired = target.submitsForm === true
-      || ((target.tag === "a" || target.role === "link") && typeof target.href === "string");
-    const review = reviewRequired
-      ? await decisionRuntime.reviewBeforeAction({
+    const targetIsLink = (target.tag === "a" || target.role === "link") && typeof target.href === "string";
+    const reviewInput = {
           episodeId: episode.episodeId,
           runId,
           stepId,
           decisionId,
           observation: before,
           operation: "click",
-          operationClass: target.submitsForm === true ? "form_submission" : "navigation",
-          targetRole: target.submitsForm === true ? "form_submit_control" : "navigation_link",
-          expectedOutcomeClass: target.submitsForm === true ? "browser_state_change" : "destination_observed",
+          operationClass: target.submitsForm === true ? "shared_mutation" : targetIsLink ? "navigation" : "read",
+          targetRole: target.submitsForm === true ? "form_submit_control" : targetIsLink ? "navigation_link" : "observed_browser_target",
+          expectedOutcomeClass: target.submitsForm === true ? "browser_state_change" : targetIsLink ? "destination_observed" : "browser_state_change",
           candidate: target
-        })
+        };
+    const route = selectPreActionDecisionRoute({
+      actionAdmitted: authorization.authorized,
+      reviewRequired: target.submitsForm === true,
+      riskClass: target.submitsForm === true ? "shared_mutation" : targetIsLink ? "navigation" : "read",
+      uncertaintyClass: "resolved"
+    });
+    decisionRuntime.recordInferenceRoute({
+      episodeId: episode.episodeId,
+      runId,
+      stepId,
+      decisionId,
+      observationId: before.evidenceId,
+      route: route.route,
+      reasonCode: route.reasonCode,
+      providers: route.providers,
+      visualEvidenceUsed: false
+    });
+    const review = route.route === "jev_only"
+      ? await decisionRuntime.reviewBeforeAction(reviewInput)
       : (decisionRuntime.recordReviewSkipped({
-          episodeId: episode.episodeId,
-          runId,
-          stepId,
-          decisionId,
-          observation: before,
-          operation: "click",
-          operationClass: "browser_disclosure",
-          targetRole: "observed_browser_target",
-          expectedOutcomeClass: "browser_state_change",
-          reasonCode: "policy_boundary_not_triggered"
+          ...reviewInput,
+          reasonCode: route.reasonCode
         }), { decisionId, authorizesOperation: false });
     const adjudication = adjudicatePreActionReview(review);
     if (!adjudication.allowed) {

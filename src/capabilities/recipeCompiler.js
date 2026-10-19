@@ -1,4 +1,4 @@
-import { validateExtractionContract } from "../extraction/extractionContract.js";
+import { normalizeHeader, validateExtractionContract } from "../extraction/extractionContract.js";
 import { validateSiteCapabilityManifest } from "./siteCapabilityManifest.js";
 
 /** Compile an observed table and caller-authored field contract into a candidate recipe. */
@@ -29,8 +29,11 @@ export function compileTableRecipe({ candidate, capabilityId, capabilityVersion 
     return { ...field, dataClass };
   });
   if (pagination !== undefined) {
-    if (pagination?.kind !== "rel_next_same_path"
-      || !candidate.paginationMethods?.includes("rel_next_same_path")
+    const supportedKinds = new Set(["rel_next_same_path", "explicit_next_same_path", "page_number_query", "virtualized_list"]);
+    if (!supportedKinds.has(pagination?.kind)
+      || !candidate.paginationMethods?.includes(pagination.kind)
+      || (pagination.kind === "page_number_query" && !candidate.paginationQueryParameters?.includes(pagination.queryParameter))
+      || (pagination.kind === "virtualized_list" && candidate.kind !== "visible_html_table")
       || typeof authorizePagination !== "function"
       || authorizePagination(Object.freeze({
         origin: candidate.origin,
@@ -38,6 +41,7 @@ export function compileTableRecipe({ candidate, capabilityId, capabilityVersion 
         applicationId: candidate.applicationId,
         pagePath: candidate.pagePath,
         kind: pagination.kind,
+        ...(pagination.queryParameter ? { queryParameter: pagination.queryParameter } : {}),
         maxPages: pagination.maxPages
       })) !== true) {
       throw new Error("Pagination was not discovered and explicitly permitted by the trusted application policy.");
@@ -57,7 +61,7 @@ export function compileTableRecipe({ candidate, capabilityId, capabilityVersion 
     ...(expectedRecords === undefined ? {} : { expectedRecords }),
     completionPolicy,
     uniqueBy: [...uniqueBy],
-    ...(pagination ? { pagination: { kind: pagination.kind, maxPages: pagination.maxPages } } : {})
+    ...(pagination ? { pagination: { kind: pagination.kind, ...(pagination.queryParameter ? { queryParameter: pagination.queryParameter } : {}), maxPages: pagination.maxPages } } : {})
   };
   const contractCheck = validateExtractionContract(extractionContract);
   if (!contractCheck.valid) throw new Error(`Extraction contract is invalid: ${contractCheck.errors.join(" ")}`);
@@ -111,8 +115,10 @@ export function compileRecordGroupRecipe({ candidate, capabilityId, capabilityVe
     return { ...field, sourceTagName, dataClass };
   });
   if (pagination !== undefined) {
-    if (pagination?.kind !== "rel_next_same_path"
-      || !candidate.paginationMethods?.includes("rel_next_same_path")
+    const supportedKinds = new Set(["rel_next_same_path", "explicit_next_same_path", "page_number_query"]);
+    if (!supportedKinds.has(pagination?.kind)
+      || !candidate.paginationMethods?.includes(pagination.kind)
+      || (pagination.kind === "page_number_query" && !candidate.paginationQueryParameters?.includes(pagination.queryParameter))
       || typeof authorizePagination !== "function"
       || authorizePagination(Object.freeze({
         origin: candidate.origin,
@@ -120,6 +126,7 @@ export function compileRecordGroupRecipe({ candidate, capabilityId, capabilityVe
         applicationId: candidate.applicationId,
         pagePath: candidate.pagePath,
         kind: pagination.kind,
+        ...(pagination.queryParameter ? { queryParameter: pagination.queryParameter } : {}),
         maxPages: pagination.maxPages
       })) !== true) {
       throw new Error("Pagination was not discovered and explicitly permitted by the trusted application policy.");
@@ -140,7 +147,7 @@ export function compileRecordGroupRecipe({ candidate, capabilityId, capabilityVe
     ...(expectedRecords === undefined ? {} : { expectedRecords }),
     completionPolicy,
     uniqueBy: [...uniqueBy],
-    ...(pagination ? { pagination: { kind: pagination.kind, maxPages: pagination.maxPages } } : {})
+    ...(pagination ? { pagination: { kind: pagination.kind, ...(pagination.queryParameter ? { queryParameter: pagination.queryParameter } : {}), maxPages: pagination.maxPages } } : {})
   };
   const contractCheck = validateExtractionContract(extractionContract);
   if (!contractCheck.valid) throw new Error(`Extraction contract is invalid: ${contractCheck.errors.join(" ")}`);
@@ -166,4 +173,76 @@ export function compileRecordGroupRecipe({ candidate, capabilityId, capabilityVe
 export function compileVisibleExtractionRecipe(options = {}) {
   if (options.candidate?.kind === "visible_record_group") return compileRecordGroupRecipe(options);
   return compileTableRecipe(options);
+}
+
+/** Compile a run-local read contract without creating a persistent site capability. */
+export function compileEphemeralObservedReadContract({ candidate, fields, classifyField, maxRecords, uniqueBy = [] } = {}) {
+  if (!candidate || !new Set(["visible_html_table", "visible_record_group"]).has(candidate.kind)
+    || candidate.qualificationStatus !== "candidate" || typeof candidate.principalId !== "string" || !candidate.principalId) {
+    throw new Error("Ephemeral extraction requires a bound current-observation candidate.");
+  }
+  if (typeof classifyField !== "function" || !Array.isArray(fields) || fields.length < 1 || fields.length > 32
+    || !Number.isInteger(maxRecords) || maxRecords < 1 || maxRecords > 10_000) {
+    throw new Error("Ephemeral extraction requires trusted field classification and bounded fields and records.");
+  }
+  const classifiedFields = fields.map(field => {
+    let sourceHeader;
+    if (candidate.kind === "visible_html_table" && typeof field.sourceHeader === "string") {
+      sourceHeader = candidate.headers?.find(header => normalizeHeader(header) === normalizeHeader(field.sourceHeader));
+      if (!sourceHeader) throw new Error(`Source header '${field.sourceHeader}' was not present in the observed table.`);
+    } else if (candidate.kind === "visible_record_group" && typeof field.sourceKey === "string"
+      && candidate.fields?.some(source => source.sourceKey === field.sourceKey)) {
+      sourceHeader = null;
+    } else {
+      throw new Error(`Field '${field.name}' does not map to a source observed on this candidate.`);
+    }
+    const classification = classifyField(Object.freeze({
+      applicationId: candidate.applicationId ?? null,
+      environmentId: candidate.environmentId ?? null,
+      origin: candidate.origin,
+      fieldName: field.name,
+      ...(sourceHeader ? { sourceHeader } : { sourceKey: field.sourceKey }),
+      type: field.type
+    }));
+    if (!new Set(["public", "personal", "sensitive", "credential"]).has(classification)) {
+      throw new Error(`Field '${field.name}' has no trusted sensitivity classification.`);
+    }
+    return {
+      name: field.name,
+      ...(sourceHeader ? { sourceHeader } : {
+        sourceKey: field.sourceKey,
+        sourceTagName: candidate.fields.find(source => source.sourceKey === field.sourceKey)?.sourceTagName
+      }),
+      type: field.type,
+      required: field.required,
+      dataClass: classification
+    };
+  });
+  // A partial page read preserves every visible record. A displayed field
+  // such as title or name is not a safe uniqueness key, so only assert
+  // uniqueness when the caller supplied an explicit key.
+  const effectiveUniqueBy = [...uniqueBy];
+  const publicScope = candidate.environmentId == null && candidate.applicationId == null;
+  const contract = {
+    version: 1,
+    scopeKind: "ephemeral_observed_read",
+    id: "ephemeral.observed_records",
+    origin: candidate.origin,
+    pagePath: candidate.pagePath,
+    environmentId: publicScope ? null : candidate.environmentId,
+    applicationId: publicScope ? null : candidate.applicationId,
+    principalId: candidate.principalId,
+    fields: classifiedFields,
+    maxRecords,
+    minRecords: 0,
+    expectedRecords: Math.min(candidate.visibleRowCount, maxRecords),
+    completionPolicy: "exact_count",
+    uniqueBy: [...effectiveUniqueBy],
+    ...(candidate.kind === "visible_record_group" ? {
+      recordGroup: structuredClone(candidate.recordGroup)
+    } : {})
+  };
+  const validation = validateExtractionContract(contract);
+  if (!validation.valid) throw new Error(`Ephemeral extraction contract is invalid: ${validation.errors.join(" ")}`);
+  return Object.freeze(contract);
 }

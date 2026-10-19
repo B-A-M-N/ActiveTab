@@ -65,7 +65,18 @@
               "authentication_realm": { "type": "string" },
               "candidate_entry": { "type": ["string", "null"] },
               "status": { "type": "string", "enum": ["candidate", "verified"] },
-              "final_origin": { "type": ["string", "null"], "description": "Observed final origin; set only from live navigation evidence." }
+              "final_origin": { "type": ["string", "null"], "description": "Observed final origin; set only from live navigation evidence." },
+              "workflow_operations": {
+                "type": "object",
+                "properties": {
+                  "fill": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,95}$" },
+                  "select": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,95}$" },
+                  "toggle": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,95}$" },
+                  "apply_filter": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,95}$" }
+                },
+                "additionalProperties": false,
+                "description": "Optional trusted operation IDs for native form and filter controls. Registration does not grant authorization; the runtime still requires caller-bound inputs and an independent operation authorizer."
+              }
             }
           }
         }

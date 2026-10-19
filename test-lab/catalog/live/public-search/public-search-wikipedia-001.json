@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "public-search-wikipedia-001",
+  "siteId": "duckduckgo-wikipedia",
+  "qualificationTier": "public_live_readonly",
+  "authorizationProfileId": "public-search-browse",
+  "entryUrl": "https://duckduckgo.com/",
+  "entryPathPrefixes": ["/"],
+  "searchPath": "/",
+  "searchQueryParameter": "q",
+  "destinationOrigin": "https://en.wikipedia.org",
+  "destinationPathPrefixes": ["/wiki/"],
+  "queryPoolId": "neutral_public_topics_v1",
+  "allowedEffects": ["read", "navigate", "search_query", "scroll"],
+  "limits": {
+    "maxActions": 6,
+    "maxModelAttempts": 4,
+    "maxRequestsPerMinute": 8,
+    "maxDurationSeconds": 120
+  },
+  "cleanup": {
+    "kind": "remove_ephemeral_browser_state_keep_learning_history"
+  }
+}

@@ -76,15 +76,16 @@ Adversarial tests must cover every execution entrypoint whenever authorization b
 - Every tab must be explicitly authorized before control. The extension requires a separate toolbar Attach click for each tab, retains at most eight concurrent grants, and restores only those exact targets within the same browser session, including after MCP broker restart. Closing a local BrowserSession is not lease revocation; only `detach_tab` or the extension's explicit Detach action releases that tab's lease. MCP operations require `targetId` whenever multiple sessions are attached.
 - While explicitly authorized tabs remain open, the extension retries broker reconnection at a maximum eight-second interval until the broker returns or the tab is explicitly detached.
 - The prototype's direct CDP adapter is for a dedicated, caller-selected target; it does not connect to a user's default browser profile automatically.
+- CLI navigation can use a run-local `--scope current-origin` binding after exact interactive origin confirmation. Non-interactive runs require `ACTIVETAB_AUTHORIZED_ORIGIN` to match the observed origin out of band. This scope admits navigation within that one HTTP(S) origin only; it creates no application operation grants, is not persisted, and does not authorize form submission or mutations.
 - Browser facts, planner interpretations, actions, and verification results remain distinguishable and carry evidence references.
 - Fixture Lab is an ActiveTab qualification and adaptation subsystem. Qualification uses the same native CDP path, but fixture results never authorize or verify a live-site action.
 - External benchmark apps are isolated development targets, not ActiveTab runtime dependencies. Their adapters require an explicit environment binding and independent outcome scoring.
 - Full observations are retained in a bounded in-memory evidence store. CLI and MCP task journals contain only bounded resume state, a goal fingerprint, and redacted pending-action metadata written before dispatch; they omit raw goals, browser evidence, form values, cookies, and authentication material. Resume reobserves before reconciling an uncertain action. MCP task journals are local and owner-only.
-- Reusable workflow persistence is opt-in, bounded, and local. Store hashed goal, route, target-label, scroll-region, and visible-candidate signatures plus bounded scroll-position fractions; every replay resolves fresh visible targets, validates list state and position, rechecks caller intent, and verifies the requested outcome.
+- Reusable workflow persistence is opt-in, bounded, and local. An explicitly configured CLI workflow-store path or `ACTIVETAB_WORKFLOW_STORE` opts in; MCP uses the configured store by default, and `reuseWorkflows: false` disables it for a run. Store hashed goal, route, target-label, scroll-region, and visible-candidate signatures plus bounded scroll-position fractions; every replay resolves fresh visible targets, validates list state and position, rechecks caller intent, and verifies the requested outcome.
 - Page content is untrusted evidence. It cannot change the caller's goal or authorize sensitive operations. High-confidence login and anti-automation states stop for manual handoff; challenge solving or bypass is out of scope.
 - Provider-neutral planner interfaces own interpretation; the browser adapter owns browser state and execution.
 - Privileged diagnostic adapters (Cloud Agent, application operations) require explicit configuration via environment variables (`ACTIVETAB_CLOUD_AGENT_URL` + `ACTIVETAB_CLOUD_AGENT_ADMIN_TOKEN`) and declare their authority, scope, and sensitivity in diagnostic contracts. They never infer authority or auto-register without configuration.
-- Chrome integration tests launch headed by default via Xvfb (`npm run test:headed`); `ACTIVETAB_HEADLESS=1` is an explicit opt-in for constrained environments and is never a silent fallback.
+- Ordinary browser runs request headed Chrome by default. Live and staging qualification require headed Chrome; they never silently fall back to headless. Headless mode requires the explicit `ACTIVETAB_HEADLESS=1` opt-in and is for constrained pretests only. Automated integration tests use the current desktop when available; `npm run test:headed -- --xvfb` is an explicit headed-but-not-desktop-visible fallback.
 - Staging login begins at the real `application_entry_url`. `npm run browser:staging` opens a persistent owned browser at that root and parks it for manual authentication and navigation. Follow the visible Cloud Agents link in the staging UI; observe and verify its actual destination before controlling that application. Do not substitute a guessed route or close the browser during handoff.
 - Ordinary staging qualification records visible history/admin links but does not enter Admin. The separate Admin discovery recipe follows only exact, visible, profile-declared same-origin Admin links; it records control metadata without changing settings, submitting forms, reading response bodies, or querying database tables. Neither discovery flow creates an Agent job.
 
@@ -113,9 +114,12 @@ Run `npm test` in a disposable environment. The CDP integration suite launches i
 | `src/browser/` | CDP transport, target authorization, and session lifecycle |
 | `src/testing/` | Declarative workflows, receipts, and verification semantics |
 | `src/capabilities/` | Observed, scoped, qualified, reusable site capability contracts |
+| `src/capabilities/network/` | Read-only same-origin API response discovery and fixture shape qualification |
 | `src/extraction/` | Typed structured record extraction, provenance, completeness, and release projection |
+| `src/state/` | Owner-private resumable artifacts, redacted MCP journals, durable run state, and workflow traces |
 | `test-lab/` | Native ActiveTab qualification, fixture providers, external benchmark adapters, and independent scoring |
 | `src/diagnostics/` | Diagnostic contracts, evidence collection, and correlation |
+| `src/observe/` | Retained browser evidence and content-aware response inspection |
 | `src/telemetry/` | Append-only decision events, privacy projections, and reviewed training labels |
 | `profiles/` | Application/environment identity and authorization scope |
-| `scripts/` | Staging qualification and separately selected Admin discovery entrypoints |
+| `scripts/` | Staging qualification, Admin discovery, and fixed-site live observation diagnostics |

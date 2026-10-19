@@ -58,9 +58,15 @@ test("external visual selection clicks only an identity still present in fresh a
     clicks: 0,
     observer: {
       getEvidence(evidenceId, options) {
-        assert.equal(evidenceId, "visual-evidence");
-        assert.deepEqual(options, { facets: ["selectedElement"], backendNodeId: 4, frameTargetId: null });
-        return { status: "available", selectedElement: selected };
+        if (evidenceId === "visual-evidence") {
+          assert.deepEqual(options, { facets: ["selectedElement"], backendNodeId: 4, frameTargetId: null });
+          return { status: "available", selectedElement: selected };
+        }
+        if (evidenceId === "fresh-observation") {
+          assert.deepEqual(options, { facets: ["page"], includeSensitiveUrlData: true });
+          return { status: "available", page: { url: "https://shop.example.test/" } };
+        }
+        return { status: "expired" };
       }
     },
     async observe() { return { evidenceId: "fresh-observation", targetId: "tab-1", page: { url: "https://shop.example.test/", title: "Invoices" }, headings: [], candidates: [selected] }; },

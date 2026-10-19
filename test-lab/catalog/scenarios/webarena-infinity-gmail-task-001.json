@@ -3,6 +3,14 @@
   "scenario_id": "webarena-infinity-gmail-task-001",
   "site_family": "webarena-infinity-gmail",
   "seed": 41001,
+  "qualification": {
+    "level": "outcome",
+    "provider_id": "webarena_infinity_gmail",
+    "provider_identity": "webarena_infinity_gmail_state_oracle_v1",
+    "source_revision": "1ca77813bf8d8e4011aa3fb1f740f70d78bd522d",
+    "oracle_reference": "webarena_gmail_email_read_state_oracle_v1",
+    "independent_application_outcome": true
+  },
   "application": {
     "build": "webarena-infinity-1ca77813bf8d8e4011aa3fb1f740f70d78bd522d"
   },
