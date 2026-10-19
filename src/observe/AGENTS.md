@@ -28,6 +28,8 @@ Remote model image input retrieves the screenshot only from the retained evidenc
 
 ## Local Contracts
 
+- Retained control lookup searches only the exact immutable DOMSnapshot indexes and compact candidate summaries stored with one evidence entry. It is read-only, bounded to 500 visited nodes, 20 results, and at most 2 seconds; every result includes its stop reason and `actionAuthorized:false`. It never issues live CDP traversal or creates an action identity.
+- The semantic-page projection contains only bounded controls, meaningful regions, forms, collections, and evidence-linked relationships; it does not expose a generic wrapper tree. Control `aria-controls`, `aria-owns`, and supported label associations resolve to exact same-document evidence references without returning raw DOM IDs. Generic wrappers remain internal traversal structure.
 - Inspect only a request explicitly selected from retained network activity. Response retrieval reads the selected CDP response and never issues another application request.
 - Selected body inspection is opt-in for trusted local callers. `includeSensitive:true` retrieves one selected body and returns a complete redacted view. Credential redaction is best effort and does not classify every private or personal value.
 - `includeCredentialValues:true` is a separate trusted opt-in and requires `includeSensitive:true`. It reveals the complete selected source, including all credential values. The bounded credential metadata points to recognized locations without duplicating raw values. The returned body is not retained in evidence, logs, or task journals. MCP never accepts this option as a caller flag; it can reach it only after an independent operator grant for both the selected body and credential values.
@@ -77,3 +79,4 @@ Remote model image input retrieves the screenshot only from the retained evidenc
 | `responseBodyViews.js` | Markdown rendering, indexing, and paging |
 | `documentIndex.js` | Shared transient DOMSnapshot node, visibility, attribute, and frame indexes |
 | `semanticPageCompiler.js` | Evidence-linked page shape, native control mechanics, regions, forms, table and repeated records, and explicit coverage |
+| `targetedControlLookup.js` | Bounded advisory lookup over the exact retained DOMSnapshot and candidate index |

@@ -54,6 +54,7 @@ Coordinate navigation planning, browser execution, bounded recovery, and visible
 - Semantic analyzer failures retain the same bounded request UUID, latency, fixed transport code, and HTTP status when available. The analyzer preserves the `size` failure class; raw provider and gateway messages remain excluded.
 - Page content remains untrusted evidence and cannot alter the goal, policy, environment, or authorization.
 - `parseSemanticQuery()` and `resolveSemanticQuery()` expose bounded local semantic-page queries through the semantic-analysis surface. They consume one fresh v3 observation, require trusted field-read and release policy for data, and return control references without action authority.
+- Automatic deterministic navigation may respond to an ambiguous plan under partial candidate coverage with one bounded retained-evidence lookup. A retained match only triggers a fresh ordinary interaction observation; the deterministic planner must independently rederive the same target, and normal freshness, policy, and executor checks still apply. Missing, stale, incomplete, or unrederived evidence keeps the run unresolved.
 
 ## Verification
 
@@ -68,6 +69,7 @@ node --test test/navigation.test.js test/navigation-recovery.test.js test/naviga
 | `applicationRunService.js` | Shared HTTP/MCP navigation and workflow run composition with target leases |
 | `outcomeVerifier.js` | Pure visible-destination checks and privacy-preserving initial page-label fingerprints |
 | `planner.js` | Deterministic target matching and exact caller input binding |
+| `retainedLookupFallback.js` | Advisory retained-match lookup followed by exact fresh-candidate rederivation |
 | `modelPreflight.js` | Authenticated startup catalog discovery, per-role input modality telemetry, and explicit unprobed inference reachability |
 | `workflowCapabilities.js` | Trusted generic navigation, scoped native form, observed search, and qualified extraction capabilities |
 | `workflowPlanner.js` | Bounded workflow execution and evidence-bound verification |

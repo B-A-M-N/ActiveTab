@@ -916,6 +916,100 @@ test("semantic control type prefers native input attributes when accessibility r
   assert.equal(page.controls[0].classification.value, "checkbox");
 });
 
+test("semantic projection omits deep generic wrappers while retaining exact controls and ARIA and label relationships", () => {
+  const strings = [];
+  const stringIds = new Map();
+  const stringIndex = value => {
+    const normalized = String(value);
+    if (!stringIds.has(normalized)) {
+      stringIds.set(normalized, strings.length);
+      strings.push(normalized);
+    }
+    return stringIds.get(normalized);
+  };
+  const nodes = [];
+  const add = (tag, parentIndex, attributes = {}, text = "") => {
+    const index = nodes.length;
+    const backendNodeId = index + 100;
+    nodes.push({
+      nodeName: stringIndex(tag), parentIndex, backendNodeId,
+      nodeValue: stringIndex(text), textValue: stringIndex(text),
+      attributes: Object.entries(attributes).flatMap(([name, value]) => [stringIndex(name), stringIndex(value)])
+    });
+    return { index, backendNodeId };
+  };
+  const addLabel = (parentIndex, text) => {
+    const label = add("LABEL", parentIndex, { for: "project-name" });
+    add("#text", label.index, {}, text);
+    return label;
+  };
+  const root = add("#document", -1);
+  const main = add("MAIN", root.index);
+  const alpha = add("SECTION", main.index, { "aria-label": "Service Alpha" });
+  let wrapperParent = alpha.index;
+  for (let depth = 0; depth < 12; depth++) wrapperParent = add("DIV", wrapperParent).index;
+  const trigger = add("BUTTON", wrapperParent, {
+    id: "alpha-trigger", role: "combobox", "aria-label": "Open actions",
+    "aria-controls": "alpha-menu", "aria-owns": "alpha-menu"
+  });
+  const menu = add("DIV", alpha.index, { id: "alpha-menu", role: "listbox", "aria-label": "Service actions" });
+  const deploy = add("DIV", menu.index, { role: "option", "aria-label": "Deploy" });
+  const iconOnly = add("BUTTON", alpha.index, { type: "button" });
+  addLabel(alpha.index, "Project name");
+  const input = add("INPUT", alpha.index, { id: "project-name", type: "text" });
+  const beta = add("SECTION", main.index, { "aria-label": "Service Beta" });
+  const secondDeploy = add("BUTTON", beta.index, { type: "button", "aria-label": "Deploy" });
+  const snapshot = {
+    strings,
+    documents: [{
+      frameId: stringIndex("root-frame"),
+      nodes: {
+        nodeName: nodes.map(node => node.nodeName), nodeValue: nodes.map(node => node.nodeValue),
+        textValue: nodes.map(node => node.textValue), parentIndex: nodes.map(node => node.parentIndex),
+        attributes: nodes.map(node => node.attributes), backendNodeId: nodes.map(node => node.backendNodeId)
+      },
+      layout: { nodeIndex: nodes.map((_, index) => index), bounds: nodes.map(() => [0, 0, 80, 20]) }
+    }]
+  };
+  const candidates = [
+    [trigger, "combobox", "button", "Open actions"],
+    [deploy, "option", "div", "Deploy"],
+    [iconOnly, "button", "button", ""],
+    [input, "textbox", "input", "Project name"],
+    [secondDeploy, "button", "button", "Deploy"]
+  ].map(([node, role, tag, name], index) => ({
+    identity: `candidate-${index + 1}`, targetId: "target", frameId: "root-frame",
+    backendNodeId: node.backendNodeId, role, tag, name, contextName: null,
+    visible: true, disabled: false, contentEditable: false
+  }));
+  const page = compileSemanticPageModel({
+    observationId: "deep-wrapper-observation", targetId: "target", documentGeneration: 4,
+    page: { url: "https://catalog.example/services", title: "Services" }, domSnapshot: snapshot, candidates
+  });
+
+  const triggerControl = page.controls.find(control => control.targetRef === "candidate-1");
+  const iconControl = page.controls.find(control => control.targetRef === "candidate-3");
+  const projectName = page.controls.find(control => control.targetRef === "candidate-4");
+  const deployControls = page.controls.filter(control => control.label.value === "Deploy");
+  const menuRef = `root:0:${menu.backendNodeId}`;
+  assert.equal(page.regions.length, 3, "only the meaningful main and section regions are projected; generic wrappers are omitted");
+  assert.equal(page.controls.length, candidates.length);
+  assert.equal(page.controls.some(control => control.targetRef === "candidate-2"), true, "an actionable menu descendant remains separately addressable");
+  assert.deepEqual(triggerControl.ariaRelationships, {
+    controls: { status: "observed", evidenceRefs: [menuRef], unresolvedCount: 0, truncated: false },
+    owns: { status: "observed", evidenceRefs: [menuRef], unresolvedCount: 0, truncated: false }
+  });
+  assert.deepEqual(projectName.labelAssociation, {
+    source: "html_label_for", status: "observed", evidenceRefs: [`root:0:${nodes.find(node => strings[node.nodeName] === "LABEL").backendNodeId}`],
+    unresolvedCount: 0, truncated: false
+  });
+  assert.equal(iconControl.label.status, "unknown", "an icon-only control stays present without an invented label");
+  assert.equal(deployControls.length, 2, "same-label controls are not merged across their separate section scopes");
+  assert.notEqual(deployControls[0].targetRef, deployControls[1].targetRef);
+  assert.notEqual(deployControls[0].regionRef, deployControls[1].regionRef);
+  assert.equal(Object.hasOwn(page, "tree"), false, "the semantic page does not expose a redundant generic-wrapper tree");
+});
+
 test("semantic interactions describe browser mechanics without implying authorization or unsafe control behavior", () => {
   const page = compileSemanticPageModel({
     observationId: "observation-interactions",

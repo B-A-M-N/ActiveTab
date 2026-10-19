@@ -20,7 +20,7 @@ function assertControlAllowed(candidate, actionType) {
   if (isOperatorProhibitedControl(candidate, actionType)) throw new Error(operatorProhibitedControlReason());
 }
 
-async function replaceFocusedText(client, value) {
+async function replaceFocusedText(client, value, { beforeReplace = null, afterDelete = null } = {}) {
   const modifier = process.platform === "darwin"
     ? { key: "Meta", code: "MetaLeft", keyCode: 91, flag: 4 }
     : { key: "Control", code: "ControlLeft", keyCode: 17, flag: 2 };
@@ -43,13 +43,18 @@ async function replaceFocusedText(client, value) {
       windowsVirtualKeyCode: modifier.keyCode, nativeVirtualKeyCode: modifier.keyCode
     }).catch(() => {});
   }
+  await beforeReplace?.();
+  if (value) {
+    await client.send("Input.insertText", { text: value });
+    return;
+  }
   await client.send("Input.dispatchKeyEvent", {
     type: "keyDown", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8
   });
   await client.send("Input.dispatchKeyEvent", {
     type: "keyUp", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8
   });
-  if (value) await client.send("Input.insertText", { text: value });
+  await afterDelete?.();
 }
 
 const IFRAME_TARGET_FILTER = [{ type: "iframe", exclude: false }];
@@ -254,6 +259,34 @@ export class BrowserSession {
     if (!this.attached || this.targetLifecycle !== "attached") throw new Error("Browser target session is not attached.");
   }
 
+  async #assertFocusedCandidate(candidate, action) {
+    this.#assertTargetAttached();
+    if (candidate?.targetId !== this.target.id || candidate?.documentGeneration !== this.documentGeneration) {
+      throw new Error(`The ${action} target became stale before text delivery.`);
+    }
+    let resolved;
+    try {
+      resolved = await this.client.send("DOM.resolveNode", { backendNodeId: candidate.backendNodeId });
+    } catch {
+      throw new Error(`The ${action} target could not be resolved after focus.`);
+    }
+    const objectId = resolved.object?.objectId;
+    if (!objectId) throw new Error(`The ${action} target could not be resolved after focus.`);
+    try {
+      const response = await this.client.send("Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: "function(){const root=this.getRootNode();const active=root.activeElement;return {connected:this.isConnected===true,focused:active===this||(this.isContentEditable===true&&active instanceof Element&&this.contains(active))}}",
+        returnByValue: true,
+        awaitPromise: false
+      });
+      const state = response.result?.value;
+      if (state?.connected !== true) throw new Error(`The ${action} target was replaced after focus.`);
+      if (state?.focused !== true) throw new Error(`Focus moved away from the ${action} target before text delivery.`);
+    } finally {
+      await this.client.send("Runtime.releaseObject", { objectId }).catch(() => {});
+    }
+  }
+
   #bindFrameEvents(frame) {
     const client = frame.client;
     const recordLifecycle = (method, event) => this.activity.recordLifecycleEvent(method, { ...event, frameTargetId: frame.targetId });
@@ -372,6 +405,11 @@ export class BrowserSession {
       this.latestEvidenceId = observation.evidenceId;
     }
     return observation;
+  }
+
+  async queryAccessibility(evidenceId, query) {
+    this.#assertTargetAttached();
+    return this.observer.queryAccessibility(evidenceId, query);
   }
 
   #onDialogOpening(event) {
@@ -744,20 +782,13 @@ export class BrowserSession {
     if (candidate.documentGeneration !== this.documentGeneration) throw new Error("Search input became stale immediately before dispatch.");
     await this.client.send("DOM.focus", { backendNodeId: candidate.backendNodeId });
     await beforeDispatch?.({ candidate });
-    const selectionModifier = process.platform === "darwin"
-      ? { key: "Meta", code: "MetaLeft", virtualKeyCode: 91, flag: 4 }
-      : { key: "Control", code: "ControlLeft", virtualKeyCode: 17, flag: 2 };
-    await this.client.send("Input.dispatchKeyEvent", { type: "keyDown", key: selectionModifier.key, code: selectionModifier.code, windowsVirtualKeyCode: selectionModifier.virtualKeyCode, nativeVirtualKeyCode: selectionModifier.virtualKeyCode });
-    try {
-      await this.client.send("Input.dispatchKeyEvent", { type: "keyDown", key: "a", code: "KeyA", modifiers: selectionModifier.flag, windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65 });
-      await this.client.send("Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", modifiers: selectionModifier.flag, windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65 });
-    } finally {
-      await this.client.send("Input.dispatchKeyEvent", { type: "keyUp", key: selectionModifier.key, code: selectionModifier.code, windowsVirtualKeyCode: selectionModifier.virtualKeyCode, nativeVirtualKeyCode: selectionModifier.virtualKeyCode }).catch(() => {});
-    }
-    await beforeDispatch?.({ candidate });
-    this.#assertTargetAttached();
-    if (candidate.documentGeneration !== this.documentGeneration) throw new Error("Search input became stale before text insertion.");
-    await this.client.send("Input.insertText", { text: phrase });
+    await this.#assertFocusedCandidate(candidate, "search input");
+    await replaceFocusedText(this.client, phrase, {
+      beforeReplace: async () => {
+        await beforeDispatch?.({ candidate });
+        await this.#assertFocusedCandidate(candidate, "search input");
+      }
+    });
     return { dispatched: true, backendNodeId: candidate.backendNodeId };
   }
 
@@ -802,7 +833,14 @@ export class BrowserSession {
     if (candidate.documentGeneration !== this.documentGeneration) throw new Error("Form field became stale immediately before dispatch.");
     await this.client.send("DOM.focus", { backendNodeId: candidate.backendNodeId });
     await beforeDispatch?.({ candidate });
-    await replaceFocusedText(this.client, value);
+    await this.#assertFocusedCandidate(candidate, "form field");
+    await replaceFocusedText(this.client, value, {
+      beforeReplace: async () => {
+        await beforeDispatch?.({ candidate });
+        await this.#assertFocusedCandidate(candidate, "form field");
+      },
+      afterDelete: () => this.#assertFocusedCandidate(candidate, "form field")
+    });
     return { dispatched: true, backendNodeId: candidate.backendNodeId, valueLength: value.length };
   }
 

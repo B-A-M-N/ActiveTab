@@ -7,6 +7,12 @@ function semanticPage() {
   return {
     schemaVersion: 3,
     evidence: { observationId: "obs-1", targetId: "tab-1", documentGeneration: 7 },
+    candidateCoverage: {
+      pageCandidateCount: 1, returnedCandidateCount: 1, omittedCandidateCount: 0,
+      pageCoverage: "complete", selectionScope: "page", scopeCandidateCount: 1, scopeCoverage: "complete"
+    },
+    coverage: { outOfProcessFrames: "complete", closedShadowRoots: "complete" },
+    warnings: [],
     page: { origin: "https://catalog.example" },
     regions: [{ ref: "region-main", kind: "main", tag: "main", label: { value: "Catalog" } }],
     forms: [{ ref: "form-search", method: "get", controlRefs: ["control-search"] }],
@@ -100,4 +106,32 @@ test("element queries return fresh target references without granting action aut
   assert.equal(result.actionAuthorized, false);
   page.controls.push({ ...page.controls[0], targetRef: "control-search-2" });
   assert.equal(resolveSemanticQuery(page, "find the search box in the main search form").status, "ambiguous");
+});
+
+test("element queries do not claim absence or uniqueness from incomplete candidate or frame coverage", () => {
+  const complete = semanticPage();
+  complete.controls = [];
+  const absent = resolveSemanticQuery(complete, "find the missing button");
+  assert.equal(absent.status, "not_found");
+  assert.equal(absent.reasonCode, "control_not_observed");
+  assert.equal(absent.actionAuthorized, false);
+
+  const truncated = semanticPage();
+  truncated.candidateCoverage.pageCoverage = "partial";
+  const omittedUnique = resolveSemanticQuery(truncated, "find the search box");
+  assert.equal(omittedUnique.status, "incomplete", "one projected match cannot establish uniqueness after truncation");
+  assert.equal(omittedUnique.candidateCount, 1);
+  assert.equal(omittedUnique.reasonCode, "candidate_limit");
+
+  const missingFromPartialPage = semanticPage();
+  missingFromPartialPage.controls = [];
+  missingFromPartialPage.candidateCoverage.pageCoverage = "partial";
+  const unresolved = resolveSemanticQuery(missingFromPartialPage, "find the missing button");
+  assert.equal(unresolved.status, "incomplete");
+  assert.equal(unresolved.reasonCode, "candidate_limit");
+
+  const unavailableFrame = semanticPage();
+  unavailableFrame.controls = [];
+  unavailableFrame.coverage.outOfProcessFrames = "incomplete";
+  assert.equal(resolveSemanticQuery(unavailableFrame, "find the missing button").reasonCode, "frame_unavailable");
 });

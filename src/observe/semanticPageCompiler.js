@@ -10,6 +10,7 @@ const MAX_SEMANTIC_HEADINGS = 100;
 const MAX_SEMANTIC_TABLE_RECORDS = 64;
 const MAX_SEMANTIC_TABLE_FIELDS = 16;
 const MAX_SEMANTIC_TABLE_FIELD_TEXT = 180;
+const MAX_ARIA_RELATION_IDS = 16;
 const MAX_JSONLD_SCRIPTS = 8;
 const MAX_JSONLD_SCRIPT_BYTES = 16 * 1024;
 const MAX_JSONLD_TOTAL_BYTES = 64 * 1024;
@@ -443,6 +444,75 @@ function evidenceRef(index, backendNodeId) {
   return Number.isInteger(index?.documentIndex) && Number.isInteger(backendNodeId)
     ? `${index.frameTargetId ?? "root"}:${index.documentIndex}:${backendNodeId}`
     : null;
+}
+
+function resolveAriaIdReferences(value, index) {
+  const source = typeof value === "string" ? value.slice(0, 2_048) : "";
+  const identifiers = source.trim().split(/\s+/u).filter(Boolean);
+  if (!identifiers.length) return null;
+  const evidenceRefs = [];
+  let unresolvedCount = 0;
+  for (const identifier of identifiers.slice(0, MAX_ARIA_RELATION_IDS)) {
+    const matches = index.elementIndexesById?.get(identifier) ?? [];
+    const nodeIndex = matches.length === 1 ? matches[0] : null;
+    const reference = Number.isInteger(nodeIndex) ? evidenceRef(index, index.backendNodeIds[nodeIndex]) : null;
+    if (reference) evidenceRefs.push(reference);
+    else unresolvedCount++;
+  }
+  const truncated = identifiers.length > MAX_ARIA_RELATION_IDS || source.length >= 2_048;
+  if (truncated) unresolvedCount += Math.max(0, identifiers.length - MAX_ARIA_RELATION_IDS) || 1;
+  return Object.freeze({
+    status: unresolvedCount ? evidenceRefs.length ? "partial" : "unknown" : "observed",
+    evidenceRefs: Object.freeze(evidenceRefs),
+    unresolvedCount,
+    truncated
+  });
+}
+
+function controlLabelAssociation(nodeIndex, index, attributes) {
+  if (Object.hasOwn(attributes, "aria-labelledby")) {
+    const association = resolveAriaIdReferences(attributes["aria-labelledby"], index);
+    if (association) return Object.freeze({ source: "aria_labelledby", ...association });
+  }
+  const id = attributes.id;
+  const explicitLabels = typeof id === "string" && id ? index.labelIndexesByFor?.get(id) ?? [] : [];
+  if (explicitLabels.length) {
+    const evidenceRefs = explicitLabels.slice(0, MAX_ARIA_RELATION_IDS)
+      .map(labelIndex => evidenceRef(index, index.backendNodeIds[labelIndex])).filter(Boolean);
+    return Object.freeze({
+      source: "html_label_for",
+      status: explicitLabels.length === 1 && evidenceRefs.length === 1 ? "observed" : "unknown",
+      evidenceRefs: Object.freeze(evidenceRefs),
+      unresolvedCount: Math.max(0, explicitLabels.length - evidenceRefs.length),
+      truncated: explicitLabels.length > MAX_ARIA_RELATION_IDS
+    });
+  }
+  let parent = index.parents[nodeIndex];
+  for (let depth = 0; depth < 64 && Number.isInteger(parent) && parent >= 0; depth++) {
+    if (index.tags[parent] === "LABEL") {
+      const reference = evidenceRef(index, index.backendNodeIds[parent]);
+      return Object.freeze({
+        source: "html_label_wrapping",
+        status: reference ? "observed" : "unknown",
+        evidenceRefs: Object.freeze(reference ? [reference] : []),
+        unresolvedCount: reference ? 0 : 1,
+        truncated: false
+      });
+    }
+    parent = index.parents[parent];
+  }
+  return null;
+}
+
+function controlAriaRelationships(attributes, index) {
+  const relationships = {};
+  if (Object.hasOwn(attributes, "aria-controls")) {
+    relationships.controls = resolveAriaIdReferences(attributes["aria-controls"], index);
+  }
+  if (Object.hasOwn(attributes, "aria-owns")) {
+    relationships.owns = resolveAriaIdReferences(attributes["aria-owns"], index);
+  }
+  return Object.keys(relationships).length ? Object.freeze(relationships) : null;
 }
 
 function boundedMetadataValue(value) {
@@ -990,6 +1060,8 @@ export function compileSemanticPageModel({
     const recordRef = Number.isInteger(nodeIndex) ? recordForNode(index, nodeIndex, collectionRef) : null;
     const formRef = typeof candidate.formIdentity === "string" ? candidate.formIdentity : null;
     const attributes = Number.isInteger(nodeIndex) ? index.attributes[nodeIndex] : {};
+    const labelAssociation = Number.isInteger(nodeIndex) ? controlLabelAssociation(nodeIndex, index, attributes) : null;
+    const ariaRelationships = Number.isInteger(nodeIndex) ? controlAriaRelationships(attributes, index) : null;
     const labelValue = typeof candidate.name === "string" && candidate.name.trim() ? candidate.name.trim().slice(0, 300) : null;
     const control = Object.freeze({
       targetRef: candidate.identity,
@@ -999,6 +1071,8 @@ export function compileSemanticPageModel({
       identityEvidence: "fresh_dom_accessibility_candidate",
       classification: { value: controlKind(candidate), status: controlKind(candidate) === "unknown" ? "unknown" : "observed" },
       label: { value: labelValue, status: labelValue ? "observed" : "unknown", source: labelValue ? "dom_accessibility_name" : null },
+      ...(labelAssociation ? { labelAssociation } : {}),
+      ...(ariaRelationships ? { ariaRelationships } : {}),
       role: String(candidate.role ?? "unknown").slice(0, 64),
       tag: String(candidate.tag ?? "unknown").slice(0, 32),
       type: typeof candidate.type === "string" ? candidate.type.slice(0, 32) : null,
@@ -1028,6 +1102,9 @@ export function compileSemanticPageModel({
         ref: formRef,
         method: candidate.formMethod ?? null,
         actionOrigin: candidate.formActionOrigin ?? null,
+        evidenceRef: Number.isInteger(candidate.formBackendNodeId) ? evidenceRef(index, candidate.formBackendNodeId) : null,
+        frameId: index?.frameId ?? candidate.frameId ?? null,
+        frameTargetId: index?.frameTargetId ?? candidate.frameTargetId ?? null,
         controlRefs: [],
         submitControlRefs: []
       };
@@ -1045,6 +1122,9 @@ export function compileSemanticPageModel({
     ref: form.ref,
     method: form.method,
     actionOrigin: form.actionOrigin,
+    evidenceRef: form.evidenceRef,
+    frameId: form.frameId,
+    frameTargetId: form.frameTargetId,
     controlRefs: Object.freeze(form.controlRefs.slice(0, controlLimit)),
     submitControlRefs: Object.freeze(form.submitControlRefs.slice(0, 32)),
     effect: "unknown"
@@ -1093,6 +1173,14 @@ export function compileSemanticPageModel({
     collections: normalizedCollections,
     headings: normalizedHeadings
   });
+  const frameFailures = Number(coverage?.outOfProcessFramesUnavailable ?? 0)
+    + Number(coverage?.outOfProcessFrameAttachmentFailures ?? 0)
+    + Number(coverage?.outOfProcessFramesOmitted ?? 0);
+  const outOfProcessFrameCoverage = coverage?.outOfProcessFramesCaptured !== true
+    ? "unknown"
+    : frameFailures > 0 ? "incomplete" : "complete";
+  const closedShadowRootCoverage = coverage?.closedShadowDom === true ? "complete" : "unavailable";
+  if (outOfProcessFrameCoverage === "incomplete") warnings.push("frame_coverage_incomplete");
   return Object.freeze({
     schemaVersion: 3,
     evidence: Object.freeze({ observationId, targetId, documentGeneration }),
@@ -1110,6 +1198,10 @@ export function compileSemanticPageModel({
       selectionScope: candidateCoverage?.selectionScope ?? "page",
       scopeCandidateCount: candidateCoverage?.scopeCandidateCount ?? controls.length,
       scopeCoverage: candidateCoverage?.scopeCoverage ?? "complete"
+    }),
+    coverage: Object.freeze({
+      outOfProcessFrames: outOfProcessFrameCoverage,
+      closedShadowRoots: closedShadowRootCoverage
     }),
     regions: Object.freeze(normalizedRegions),
     forms: Object.freeze(normalizedForms),

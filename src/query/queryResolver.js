@@ -43,6 +43,28 @@ function safeTokens(value) {
     .filter(token => !stopwords.has(token));
 }
 
+function elementSearchIncompleteReasons(page) {
+  const reasons = [];
+  const candidates = page?.candidateCoverage;
+  if (!candidates) reasons.push("candidate_coverage_unknown");
+  else {
+    if (candidates.pageCoverage !== "complete") {
+      reasons.push(candidates.pageCoverage === "partial" ? "candidate_limit" : "candidate_coverage_unknown");
+    }
+    if (candidates.selectionScope !== "page") reasons.push("candidate_scope_limited");
+    if (candidates.scopeCoverage !== "complete") reasons.push("candidate_limit");
+  }
+  const frameCoverage = page?.coverage?.outOfProcessFrames;
+  if (frameCoverage !== "complete") reasons.push(frameCoverage === "incomplete" ? "frame_unavailable" : "frame_coverage_unknown");
+  const shadowCoverage = page?.coverage?.closedShadowRoots;
+  if (shadowCoverage !== "complete" || page?.warnings?.includes("closed_shadow_dom_not_observed")) {
+    reasons.push(shadowCoverage === "unavailable" || page?.warnings?.includes("closed_shadow_dom_not_observed")
+      ? "closed_shadow_root"
+      : "closed_shadow_coverage_unknown");
+  }
+  return [...new Set(reasons)];
+}
+
 function resolveElement(page, query) {
   if (query.role === "form") return { status: "unsupported", reasonCode: "forms_are_scope_only" };
   const forms = new Map((page.forms ?? []).map(form => [form.ref, form]));
@@ -61,9 +83,18 @@ function resolveElement(page, query) {
     const available = new Set(safeTokens(scopeText));
     return (!scopeTerms.includes("form") || Boolean(form)) && scopeTerms.every(term => available.has(term));
   });
+  const incompleteReasons = elementSearchIncompleteReasons(page);
+  if (incompleteReasons.length) return {
+    status: "incomplete",
+    reasonCode: incompleteReasons[0],
+    incompletenessReasons: incompleteReasons,
+    candidateCount: candidates.length,
+    actionAuthorized: false
+  };
   if (candidates.length !== 1) return {
     status: candidates.length ? "ambiguous" : "not_found",
     candidateCount: candidates.length,
+    reasonCode: candidates.length ? "multiple_observed_controls" : "control_not_observed",
     actionAuthorized: false
   };
   const control = candidates[0];

@@ -501,6 +501,49 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     assert.equal((await session.client.send("Runtime.evaluate", { expression: "document.querySelector('#model-picker').dataset.unrelatedSelection ?? ''", returnByValue: true })).result.value, "", "an unrelated visible option with the same label is not clicked");
     await session.fillField(taskEditor, "caller-authored fixture task");
     assert.equal((await session.verifyControlValue(taskEditor, "caller-authored fixture task")).matches, true, "contenteditable text entry is verified in-process");
+    await session.client.send("Runtime.evaluate", {
+      expression: `(() => {
+        const section = document.createElement("section");
+        const replaceOnFocus = document.createElement("input");
+        replaceOnFocus.type = "text";
+        replaceOnFocus.value = "preserve on focus replacement";
+        replaceOnFocus.setAttribute("aria-label", "Replace on focus");
+        replaceOnFocus.addEventListener("focus", () => replaceOnFocus.replaceWith(replaceOnFocus.cloneNode()));
+        const replaceOnSelect = document.createElement("input");
+        replaceOnSelect.type = "text";
+        replaceOnSelect.value = "preserve on shortcut replacement";
+        replaceOnSelect.setAttribute("aria-label", "Replace on select shortcut");
+        replaceOnSelect.addEventListener("keyup", event => {
+          if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") replaceOnSelect.replaceWith(replaceOnSelect.cloneNode());
+        });
+        const partial = document.createElement("input");
+        partial.type = "text";
+        partial.maxLength = 3;
+        partial.setAttribute("aria-label", "Partial value field");
+        section.append(replaceOnFocus, replaceOnSelect, partial);
+        (document.querySelector("main") ?? document.body).prepend(section);
+      })()`,
+      returnByValue: true
+    });
+    const textDeliveryObservation = await session.observe({ profile: "interaction" });
+    const controlNamed = name => textDeliveryObservation.candidates.find(candidate => candidate.name === name);
+    const replaceOnFocus = controlNamed("Replace on focus");
+    const replaceOnSelect = controlNamed("Replace on select shortcut");
+    const partialValueField = controlNamed("Partial value field");
+    assert.ok(replaceOnFocus && replaceOnSelect && partialValueField, "the observer retains the exact text-delivery test controls");
+    // The test targets the post-focus identity guard; omit the display label
+    // here because its live accessible name can include browser-derived text.
+    await assert.rejects(() => session.fillField({ ...replaceOnFocus, name: "" }, "must not be delivered"), /replaced after focus|could not be resolved after focus/);
+    await assert.rejects(() => session.fillField({ ...replaceOnSelect, name: "" }, "must not be delivered"), /replaced after focus|could not be resolved after focus/);
+    const replacementValues = await session.client.send("Runtime.evaluate", {
+      expression: "[...document.querySelectorAll('input[aria-label^=\"Replace on\"]')].map(input => input.value)",
+      returnByValue: true
+    });
+    assert.deepEqual(replacementValues.result.value, ["preserve on focus replacement", "preserve on shortcut replacement"], "replacement after focus or select-all prevents text delivery to the new target");
+    await session.fillField(partialValueField, "four");
+    const partialValueVerification = await session.verifyControlValue(partialValueField, "four");
+    assert.equal(partialValueVerification.verified, true);
+    assert.equal(partialValueVerification.matches, false, "exact read-back detects text truncated by a native field constraint");
     await session.client.send("Page.reload", { ignoreCache: true });
     await session.waitForChange(5_000);
     const resetObservation = await session.observe();

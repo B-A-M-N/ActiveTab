@@ -4,6 +4,7 @@ import { createUtf8OffsetIndex, indexMarkdownDocument, inspectResponseBody, reda
 import { MAX_RESPONSE_BODY_BYTES, MAX_RESPONSE_MARKDOWN_BYTES } from "./responseBodyShared.js";
 import { planJevImagePreparation } from "../decisions/imagePreparation.js";
 import { compileSemanticPageModel, rankInteractionCandidates } from "./semanticPageCompiler.js";
+import { queryRetainedControls } from "./targetedControlLookup.js";
 import { buildDocumentIndex, documentIndexFor } from "./documentIndex.js";
 
 const STYLE_NAMES = ["display", "visibility", "opacity", "pointer-events", "position", "z-index"];
@@ -29,6 +30,7 @@ const MAX_RUNTIME_VALUE_CHUNK_LENGTH = 16_384;
 const MAX_RUNTIME_RECORD_BYTES = 512 * 1024;
 const MAX_RUNTIME_RECORDS_PER_EVIDENCE = 8;
 const MAX_RUNTIME_EVIDENCE_BYTES_PER_PAGE = 1024 * 1024;
+const MAX_RETAINED_LOOKUP_CANDIDATES = 10_000;
 const OBSERVATION_PROFILES = new Set(["lightweight", "interaction", "structural", "visual"]);
 const RUNTIME_PATH_INSPECTOR = `function(path, failureMarker, includeSensitiveValues, valueOffset, valueChunkLength) {
   let current = this;
@@ -107,6 +109,37 @@ function jsonByteLength(root) {
         bytes += Buffer.byteLength(JSON.stringify(key)) + 1;
         stack.push(item);
       }
+    }
+  }
+  return bytes;
+}
+
+function retainDocumentTraversalIndex(index) {
+  if (!index) return null;
+  return {
+    snapshot: index.snapshot,
+    frameTargetId: index.frameTargetId,
+    parentFrameId: index.parentFrameId,
+    documents: index.documents.map(document => document ? {
+      snapshot: index.snapshot,
+      documentIndex: document.documentIndex,
+      frameId: document.frameId,
+      sourceDocument: document.sourceDocument,
+      children: document.children,
+      backendNodeIndexes: document.backendNodeIndexes
+    } : null)
+  };
+}
+
+function estimateLookupIndexBytes(index) {
+  if (!index?.available) return 0;
+  let bytes = jsonByteLength(index.candidates);
+  for (const frame of index.frames) {
+    for (const document of frame.documents ?? []) {
+      if (!document) continue;
+      const nodeCount = document.sourceDocument?.nodes?.nodeName?.length ?? 0;
+      // Account for retained parent/child and backend-node lookup structures.
+      bytes += nodeCount * 64 + (document.children?.size ?? 0) * 40;
     }
   }
   return bytes;
@@ -448,6 +481,7 @@ function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, {
 } = {}) {
   const axFacts = accessibleFacts(axTree);
   const candidates = [];
+  const candidateLocations = [];
   const headings = [];
   const frameSummaries = [];
   const sharedIndex = documentIndexFor(snapshot, suppliedIndex, { frameTargetId, parentFrameId });
@@ -588,6 +622,7 @@ function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, {
         submitsForm: submitsByDefault && associatedWithForm,
         ...(formAttributes && Number.isInteger(formBackendNodeId) ? {
           formIdentity: `${targetId}:${frameTargetId ?? "root"}:${frameId}:${formBackendNodeId}:${generation}`,
+          formBackendNodeId,
           formMethod,
           formActionOrigin,
           formTargetSameContext
@@ -597,6 +632,7 @@ function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, {
         bounds: rect ?? null,
         evidence: { source: "DOMSnapshot + Accessibility tree", backendNodeId }
       });
+      candidateLocations.push({ documentIndex: indexedDocument.documentIndex, nodeIndex: index });
     }
   }
   const selection = rankInteractionCandidates(candidates, selectionGoal, { maxCandidates: candidateLimit });
@@ -608,6 +644,26 @@ function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, {
     returnedCandidateCount: selection.candidates.length,
     returnedScopeCandidateCount: selection.returnedScopeCandidateCount,
     scopeCandidateIdentities: [...selection.scopeCandidateIdentities],
+    lookupCandidates: candidates.map((candidate, candidateIndex) => {
+      const location = candidateLocations[candidateIndex];
+      return {
+        identity: candidate.identity,
+        targetId: candidate.targetId,
+        documentGeneration: candidate.documentGeneration,
+        frameTargetId: candidate.frameTargetId ?? null,
+        frameId: candidate.frameId,
+        documentIndex: location.documentIndex,
+        nodeIndex: location.nodeIndex,
+        backendNodeId: candidate.backendNodeId,
+        role: candidate.role,
+        tag: candidate.tag,
+        name: candidate.name,
+        contextName: candidate.contextName,
+        visible: candidate.visible,
+        disabled: candidate.disabled,
+        bounds: candidate.bounds
+      };
+    }),
     headings: headings.slice(0, 100),
     headingCount: headings.length,
     frames: frameSummaries
@@ -686,6 +742,21 @@ export class BrowserObserver {
     this.networkSignalState = new Map();
     this.responseProjectionCache = new Map();
     this.responseProjectionCacheBytes = 0;
+  }
+
+  async queryAccessibility(id, query) {
+    const stored = this.evidence.get(id);
+    if (!stored) return { status: "expired", evidenceId: id, actionAuthorized: false };
+    return queryRetainedControls({
+      session: this.session,
+      evidence: stored.evidence,
+      lookupIndex: stored.lookupIndex,
+      input: query
+    });
+  }
+
+  async lookupRetainedCandidates(id, { targetTokens, maxNodes = 500, maxResults = 20, timeoutMs = 1_500 } = {}) {
+    return this.queryAccessibility(id, { targetTokens, maxNodes, maxResults, timeoutMs });
   }
 
   async inspectRuntimeState(id, {
@@ -833,6 +904,7 @@ export class BrowserObserver {
       const originalRecords = records.slice();
       const originalRuntimeBytes = currentRuntimeBytes;
       const originalEntryBytes = stored.byteLength;
+      const originalSerializedBytes = stored.serializedByteLength;
       const originalTotalBytes = this.evidenceBytes;
       while (records.length && (records.length >= MAX_RUNTIME_RECORDS_PER_EVIDENCE || (stored.evidence.runtimeStateBytes ?? 0) + recordBytes > MAX_RUNTIME_EVIDENCE_BYTES_PER_PAGE)) {
         const removed = records.shift();
@@ -845,12 +917,14 @@ export class BrowserObserver {
       else {
         records.push(record);
         stored.evidence.runtimeStateBytes = (stored.evidence.runtimeStateBytes ?? 0) + recordBytes;
-        stored.byteLength = jsonByteLength(stored.evidence);
+        stored.serializedByteLength = jsonByteLength(stored.evidence);
+        stored.byteLength = stored.serializedByteLength + (stored.lookupIndexBytes ?? 0);
         this.evidenceBytes = originalTotalBytes + stored.byteLength - originalEntryBytes;
         if (stored.byteLength > this.maxEvidenceBytes || this.evidenceBytes > this.maxEvidenceBytes) {
           records.splice(0, records.length, ...originalRecords);
           stored.evidence.runtimeStateBytes = originalRuntimeBytes;
           stored.byteLength = originalEntryBytes;
+          stored.serializedByteLength = originalSerializedBytes;
           this.evidenceBytes = originalTotalBytes;
           retained = false;
         }
@@ -1028,7 +1102,7 @@ export class BrowserObserver {
         candidateLimit,
         documentIndex: rootDocumentIndex
       })
-      : { candidates: [], candidateCount: 0, taskRelevantCandidateCount: 0, scopeCandidateCount: 0, returnedCandidateCount: 0, returnedScopeCandidateCount: 0, scopeCandidateIdentities: [], headings: [], headingCount: 0, frames: [] };
+      : { candidates: [], lookupCandidates: [], candidateCount: 0, taskRelevantCandidateCount: 0, scopeCandidateCount: 0, returnedCandidateCount: 0, returnedScopeCandidateCount: 0, scopeCandidateIdentities: [], headings: [], headingCount: 0, frames: [] };
     const childDerived = deriveInteraction ? frameSnapshots.map((frame, frameIndex) => buildCandidates(
       frame.domSnapshot,
       frame.accessibilityTree,
@@ -1060,6 +1134,21 @@ export class BrowserObserver {
       headings: [...mainDerived.headings, ...childDerived.flatMap(frame => frame.headings)].slice(0, 100),
       frames: [...mainDerived.frames, ...childDerived.flatMap(frame => frame.frames)]
     };
+    const allLookupCandidates = [
+      ...mainDerived.lookupCandidates,
+      ...childDerived.flatMap(frame => frame.lookupCandidates)
+    ];
+    const lookupIndex = {
+      available: deriveInteraction && Boolean(rootDocumentIndex),
+      candidateCount: allLookupCandidates.length,
+      candidateCoverage: deriveInteraction && allLookupCandidates.length <= MAX_RETAINED_LOOKUP_CANDIDATES ? "complete" : "incomplete",
+      candidates: allLookupCandidates.slice(0, MAX_RETAINED_LOOKUP_CANDIDATES),
+      frames: rootDocumentIndex ? [
+        retainDocumentTraversalIndex(rootDocumentIndex),
+        ...frameDocumentIndexes.map(retainDocumentTraversalIndex)
+      ] : []
+    };
+    const lookupIndexBytes = estimateLookupIndexBytes(lookupIndex);
     const returnedScopeCandidateCount = mainDerived.scopeCandidateIdentities
       .concat(...childDerived.map(frame => frame.scopeCandidateIdentities))
       .filter(identity => derived.candidates.some(candidate => candidate.identity === identity)).length;
@@ -1149,10 +1238,12 @@ export class BrowserObserver {
       coverage
     }) : null;
     metrics.semanticCompilationMs = deriveSemantic ? performance.now() - semanticCompilationStartedAt : 0;
-    const byteLength = jsonByteLength(evidence);
+    evidence.semanticPage = semanticPage;
+    const serializedByteLength = jsonByteLength(evidence);
+    const byteLength = serializedByteLength + lookupIndexBytes;
     let retained = byteLength <= this.maxEvidenceBytes;
     if (retained) {
-      this.evidence.set(id, { evidence, byteLength });
+      this.evidence.set(id, { evidence, byteLength, serializedByteLength, lookupIndexBytes, lookupIndex });
       this.evidenceBytes += byteLength;
       while (this.evidence.size > this.evidenceLimit || this.evidenceBytes > this.maxEvidenceBytes) {
         const oldestId = this.evidence.keys().next().value;
@@ -1180,7 +1271,7 @@ export class BrowserObserver {
       frames: derived.frames,
       outOfProcessFrameGeometry: frameSnapshots.map(frame => frame.frameGeometry).filter(Boolean),
       headings: derived.headings,
-      candidates: derived.candidates.map(({ evidence: _e, attributes: _attributes, documentUrl: _documentUrl, recordContext: _recordContext, ...candidate }) => candidate),
+      candidates: derived.candidates.map(({ evidence: _e, attributes: _attributes, documentUrl: _documentUrl, formBackendNodeId: _formBackendNodeId, recordContext: _recordContext, ...candidate }) => candidate),
       scrollTargets,
       candidateCount: derived.candidates.length,
       candidateCoverage,
@@ -1202,7 +1293,8 @@ export class BrowserObserver {
         documentIndexBuildMs: metrics.documentIndexBuildMs ?? 0,
         candidateDerivationMs: metrics.candidateDerivationMs ?? 0,
         semanticCompilationMs: metrics.semanticCompilationMs ?? 0,
-        serializedEvidenceBytes: byteLength,
+        serializedEvidenceBytes: serializedByteLength,
+        retainedLookupIndexBytes: retained ? lookupIndexBytes : 0,
         retainedEvidenceBytes: retained ? byteLength : 0,
         peakRetainedEvidenceBytes: this.peakRetainedEvidenceBytes,
         screenshotBase64Bytes: screenshot === null ? 0 : Buffer.byteLength(screenshot, "ascii"),

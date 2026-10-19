@@ -18,6 +18,7 @@ import { hasVerifiedOutcome, pageLabelHashes } from "./outcomeVerifier.js";
 import { discoverVisibleNextPage } from "../extraction/recordResolver.js";
 import { bindVisualEvidence, isBoundVisualEvidence } from "./visualEvidence.js";
 import { revalidateVisualGrounding } from "./visualGrounder.js";
+import { reobserveFromRetainedLookup } from "./retainedLookupFallback.js";
 
 function pageChangeWaitBaseline(observation, scrollTarget) {
   return {
@@ -1557,6 +1558,22 @@ export class NavigationEngine {
           };
         } else {
           let localPlan = await this.deterministicPlanner.plan(goal, planningObservation, planningOptions);
+          if (localPlan.status === "ambiguous" && !candidateExpansionAttempted
+            && latest.candidateCoverage?.pageCoverage === "partial") {
+            const expectedTargets = goalExpectation(goal).targetTokens;
+            const fallback = await reobserveFromRetainedLookup({
+              session: this.session,
+              goal,
+              observation: latest,
+              targetTokens: expectedTargets
+            });
+            candidateExpansionAttempted = fallback.status !== "not_needed";
+            if (fallback.status === "refreshed") {
+              latest = fallback.observation;
+              planningObservation = filterPlanningObservation(latest);
+              localPlan = await this.deterministicPlanner.plan(goal, planningObservation, planningOptions);
+            }
+          }
           if (searchPhrase) {
             const routeDecisionId = randomUUID();
             this.decisionRuntime?.recordInferenceRoute?.({

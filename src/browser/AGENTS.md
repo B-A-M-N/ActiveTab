@@ -17,6 +17,7 @@ ActiveTab's browser control plane. Every effectful browser action ultimately dis
 - Candidate link projections may expose `opensNewTarget` as a boolean. Following a link that declares another target is refused by default because its browser behavior can create an unleased target. A trusted run may explicitly select same-target navigation for an observed root-frame anchor; the session revalidates the exact current destination, document generation, and lease before `Page.navigate`.
 - `BrowserSession.observe()` defaults to the interaction profile and does not capture screenshots. Route/lifecycle-only work may request `lightweight`; structural inspection requests `structural`; screenshot evidence requires `visual` or the explicit `includeScreenshot:true` option. Only interaction/visual profiles produce fresh action candidates.
 - Exact native field/selector verification may compare a caller-provided value inside the browser process, but only returns a boolean and never exposes the field value in observations or receipts.
+- Text entry verifies that the exact observed candidate remains connected and focused after `DOM.focus` and again after selection, immediately before replacement input. A replaced or blurred target stops delivery; no alternate target is selected. Exact value read-back remains a separate verification step, and partial or uncertain input must be reconciled rather than automatically repeated.
 - Filter checkbox control accepts only an exact caller-selected checked/unchecked state for a fresh native checkbox. It returns no field value and remains behind trusted profile operation authorization.
 - ARIA combobox selection is a composite effect. It requires an executor-approved envelope limited to opening the exact observed combobox and selecting one exact visible option controlled by that still-open combobox; the executor rechecks target lease, page/application binding, and fresh candidate identity before each suboperation.
 - Search, fill, and select value limits come from `actionLimits.js` and must match planning and workflow validation; oversized exact values are refused without truncation.
@@ -59,6 +60,7 @@ Integration tests launch disposable Chrome headed by default. Test launch paths 
 | Path | Purpose |
 |------|---------|
 | `actionLimits.js` | Shared exact-value size limits for browser dispatch and planning |
+| `session.js` | Authorized CDP target lifecycle, fresh candidate revalidation, focus-checked text delivery, and in-process value verification |
 | `browserEnvironment.js` | Bounded environment configuration and pre-navigation initialization for newly owned Chromium targets |
 | `targets.js` | Loopback CDP discovery, exact target authorization, and owned startup-target resolution |
 | `targetReattachment.js` | Lease-bound recovery of one exact loopback CDP target with fresh post-navigation evidence |
