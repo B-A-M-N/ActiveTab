@@ -14,17 +14,18 @@
 set -euo pipefail
 
 USE_XVFB=0
+NODE_ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --xvfb) USE_XVFB=1 ;;
-    *) echo "Unknown argument: $arg" >&2; exit 2 ;;
+    *) NODE_ARGS+=("$arg") ;;
   esac
 done
 
 if [[ "${ACTIVETAB_HEADLESS:-}" == "1" ]]; then
   echo "ACTIVETAB_HEADLESS=1: explicit operator opt-in for headless execution."
   export DISPLAY="${DISPLAY:-}"  # no display needed
-  npm test
+  node --test "${NODE_ARGS[@]}"
   exit $?
 fi
 
@@ -43,6 +44,11 @@ if [[ "$USE_XVFB" == "1" ]]; then
     DISPLAY_NUM=$((DISPLAY_NUM + 1))
   done
   export DISPLAY=":${DISPLAY_NUM}"
+  # Physical monitor offsets do not map onto this 1600x1000 virtual screen.
+  # Keep the disposable browser fully inside Xvfb regardless of the desktop
+  # display configured in .env.local.
+  export ACTIVETAB_CHROME_DISPLAY=main
+  export ACTIVETAB_CHROME_MAIN_POSITION=0,0
   echo "Starting Xvfb on ${DISPLAY} (graphical rendering; not visible on the operator's desktop)..."
   Xvfb "${DISPLAY}" -screen 0 1600x1000x24 -nolisten tcp &
   XVFB_PID=$!
@@ -68,4 +74,4 @@ else
   echo "Using current display ${DISPLAY} (headed, desktop-visible)."
 fi
 
-npm test
+node --test "${NODE_ARGS[@]}"

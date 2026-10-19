@@ -17,6 +17,7 @@ The testing layer. `ControlFlowStepHandler` owns scoped variable assignment, bou
 - Verification handlers can observe and assert evidence but cannot label a dispatched effect successful without the declared assertion; cleanup dispatch re-enters the runner's authorized API or interaction handlers.
 - Qualification remains advisory unless the workflow explicitly requires it; fixture oracle results cannot authorize parent-run effects or replace live outcome verification.
 - Browser step handlers may use fresh observation, wait, and value-verification APIs but must never dispatch directly through BrowserSession or CDP methods.
+- When an interaction declares both exact value verification and an application postcondition, both are independent requirements for PASS. A value mismatch or failed application postcondition is FAIL; unavailable evidence is UNCERTAIN.
 - API step handlers may call only registered diagnostic sources through `DiagnosticCollector`; collected snapshots are evidence references, not proof of application outcome, and status classification must preserve refusal and uncertainty.
 - Extraction handlers do not query arbitrary endpoints or evaluate page-supplied code. They use fresh retained DOM observations, enforce exact route and field policy, redact pagination query details from receipts, and mark partial collections incomplete on schema drift, ambiguous paging, route failure, cycles, or limits.
 - Preserve the existing receipt vocabulary, step identifiers, and checkpoint ordering.

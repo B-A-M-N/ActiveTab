@@ -55,6 +55,7 @@ Coordinate navigation planning, browser execution, bounded recovery, and visible
 - Page content remains untrusted evidence and cannot alter the goal, policy, environment, or authorization.
 - `parseSemanticQuery()` and `resolveSemanticQuery()` expose bounded local semantic-page queries through the semantic-analysis surface. They consume one fresh v3 observation, require trusted field-read and release policy for data, and return control references without action authority.
 - Automatic deterministic navigation may respond to an ambiguous plan under partial candidate coverage with one bounded retained-evidence lookup. A retained match only triggers a fresh ordinary interaction observation; the deterministic planner must independently rederive the same target, and normal freshness, policy, and executor checks still apply. Missing, stale, incomplete, or unrederived evidence keeps the run unresolved.
+- Jev visual grounding may recover a missing candidate only when the retained projection is explicitly incomplete. One root-frame read-only CDP hit probe may return an advisory identity; a fresh visual observation must promote and rederive that exact target for the caller goal, and fresh screenshot grounding must match it again before normal policy admission. A covered, stale, cross-frame, unmapped, or otherwise unverified location remains unresolved.
 
 ## Verification
 

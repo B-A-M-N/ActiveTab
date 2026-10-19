@@ -382,6 +382,55 @@ test("trusted target resolution is appended as a validated evidence-linked event
   } finally { runtime.close(); }
 });
 
+test("target lookup telemetry records bounded binding and disposition without page content", () => {
+  const store = createStore();
+  const runtime = createDecisionRuntime({
+    eventStore: store,
+    jevClient: { async decide() { throw new Error("No model review is requested by target lookup telemetry."); } },
+    semanticAnalyzer: null
+  });
+  try {
+    const episode = runtime.startEpisode({ runId: "run_target_lookup", workflowId: "lookup_test", applicationId: "fixture_app", environmentClass: "local" });
+    const event = runtime.recordTargetLookup({
+      episodeId: episode.episodeId,
+      runId: episode.runId,
+      stepId: "step_lookup",
+      decisionId: "decision_lookup",
+      observationId: "observation_lookup",
+      lookupMode: "cdp_dom_location",
+      lookupStatus: "candidate",
+      targetId: "authorized_target_1",
+      documentGeneration: 8,
+      frameScope: "root",
+      frameTargetId: null,
+      frameId: "root_frame_1",
+      returnedCount: 1,
+      visitedNodeCount: 3,
+      stopReason: "candidate_found_at_hit_location",
+      elapsedMs: 12,
+      nextActionDisposition: "deferred"
+    });
+    const stored = store.getEvents(episode.episodeId).at(-1);
+    assert.equal(stored.eventType, "target.lookup");
+    assert.equal(stored.schemaVersion, 3);
+    assert.equal(stored.observationId, "observation_lookup");
+    assert.equal(stored.payload.frameScope, "root");
+    assert.equal(stored.payload.frameTargetId, null);
+    assert.equal(stored.payload.visitedNodeCount, 3);
+    assert.equal(stored.payload.nextActionDisposition, "deferred");
+    assert.equal(store.verifyEpisodeChain(episode.episodeId).ok, true);
+    assert.throws(() => store.append({
+      episodeId: episode.episodeId,
+      runId: episode.runId,
+      stepId: "step_lookup",
+      decisionId: "decision_lookup_leak",
+      observationId: "observation_lookup",
+      eventType: "target.lookup",
+      payload: { ...event.payload, pageText: "must not be retained" }
+    }), /not allowed/);
+  } finally { runtime.close(); }
+});
+
 test("semantic GLM annotations and Jev review are automatically recorded against one decision and observation", async () => {
   const store = createStore();
   try {

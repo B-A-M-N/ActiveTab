@@ -53,10 +53,14 @@ export function groundVisualTarget({ observation, imageEvidence, answers, allowe
   })).filter(item => item.rootBounds);
   if (mappedCandidates.length === 0) {
     const hasCrossFrame = (observation.candidates ?? []).some(candidate => candidate?.visible === true && candidate?.frameTargetId);
-    return unavailable(hasCrossFrame ? "cross_frame_bounds_unmapped" : "no_fresh_visible_candidates", {
+    const projectionPartial = observation.candidateCoverage?.pageCoverage === "partial"
+      || observation.candidateCoverage?.truncated === true;
+    return unavailable(hasCrossFrame ? "cross_frame_bounds_unmapped"
+      : projectionPartial ? "candidate_projection_incomplete" : "no_fresh_visible_candidates", {
       presenceProbability: presence.probabilityYes,
       boxConfidence: boxAnswer.confidence,
-      sourceBox
+      sourceBox,
+      candidateCoveragePartial: projectionPartial
     });
   }
 
@@ -69,11 +73,15 @@ export function groundVisualTarget({ observation, imageEvidence, answers, allowe
   const winner = ranked[0];
   const runnerUp = ranked[1];
   if (!winner || (runnerUp && winner.coverage - runnerUp.coverage < MIN_RUNNER_UP_MARGIN)) {
-    return unavailable(runnerUp ? "multiple_candidates_match_box" : "box_does_not_match_candidate", {
+    const projectionPartial = observation.candidateCoverage?.pageCoverage === "partial"
+      || observation.candidateCoverage?.truncated === true;
+    return unavailable(runnerUp ? "multiple_candidates_match_box"
+      : projectionPartial ? "candidate_projection_incomplete" : "box_does_not_match_candidate", {
       presenceProbability: presence.probabilityYes,
       boxConfidence: boxAnswer.confidence,
       sourceBox,
-      matchingCandidateCount: ranked.length
+      matchingCandidateCount: ranked.length,
+      candidateCoveragePartial: projectionPartial
     });
   }
 
@@ -85,6 +93,8 @@ export function groundVisualTarget({ observation, imageEvidence, answers, allowe
       targetId: observation.targetId,
       documentGeneration: observation.documentGeneration,
       frameTargetId: winner.candidate.frameTargetId ?? null,
+      viewport: Object.freeze({ width: imageEvidence.viewport.width, height: imageEvidence.viewport.height }),
+      deviceScaleFactor: imageEvidence.deviceScaleFactor ?? 1,
       imageTransformVersion: transform.version,
       sourceBox: Object.freeze(sourceBox),
       candidateRootBounds: Object.freeze({ ...winner.rootBounds })
@@ -108,6 +118,10 @@ export function revalidateVisualGrounding(grounding, observation) {
     || observation.targetId !== grounding.evidence.targetId
     || observation.documentGeneration !== grounding.evidence.documentGeneration
     || !validViewport(observation.viewport)) return null;
+  if (grounding.evidence.viewport && (observation.viewport.width !== grounding.evidence.viewport.width
+    || observation.viewport.height !== grounding.evidence.viewport.height)) return null;
+  if (grounding.evidence.deviceScaleFactor !== undefined
+    && (observation.deviceScaleFactor ?? 1) !== grounding.evidence.deviceScaleFactor) return null;
   const candidate = (observation.candidates ?? []).find(item => item?.identity === grounding.candidate.identity);
   if (!candidate || candidate.targetId !== observation.targetId
     || candidate.documentGeneration !== observation.documentGeneration

@@ -85,8 +85,8 @@ Adversarial tests must cover every execution entrypoint whenever authorization b
 - Page content is untrusted evidence. It cannot change the caller's goal or authorize sensitive operations. High-confidence login and anti-automation states stop for manual handoff; challenge solving or bypass is out of scope.
 - Provider-neutral planner interfaces own interpretation; the browser adapter owns browser state and execution.
 - Privileged diagnostic adapters (Cloud Agent, application operations) require explicit configuration via environment variables (`ACTIVETAB_CLOUD_AGENT_URL` + `ACTIVETAB_CLOUD_AGENT_ADMIN_TOKEN`) and declare their authority, scope, and sensitivity in diagnostic contracts. They never infer authority or auto-register without configuration.
-- Ordinary browser runs request headed Chrome by default. Live and staging qualification require headed Chrome; they never silently fall back to headless. Headless mode requires the explicit `ACTIVETAB_HEADLESS=1` opt-in and is for constrained pretests only. Automated integration tests use the current desktop when available; `npm run test:headed -- --xvfb` is an explicit headed-but-not-desktop-visible fallback.
-- Newly launched owned Chrome windows and headed automated browser tests default to the secondary `HDMI-1` display on this desktop. Set `ACTIVETAB_CHROME_DISPLAY=main` to select the primary `eDP-1` display; `npm run test:on-main` switches the test suite. See `docs/testing-display.md` for the monitor map and coordinate overrides. Newly launched Chrome windows move; attached existing browser tabs stay on their current display.
+- Ordinary browser runs request headed Chrome by default. Live and staging qualification require headed Chrome; they never silently fall back to headless. Headless mode requires the explicit `ACTIVETAB_HEADLESS=1` opt-in and is for constrained pretests only. `npm test` runs headed integration tests in private Xvfb by default, so it cannot move the physical pointer or take desktop focus. Use `npm run test:on-secondary` for a visible HDMI-1 run; CDP page input leaves the physical pointer in place, though Chrome may take window focus.
+- Newly launched owned Chrome windows and visible headed browser tests default to the secondary `HDMI-1` display on this desktop. Set `ACTIVETAB_CHROME_DISPLAY=main` to select the primary `eDP-1` display; `npm run test:on-main` switches the visible test suite. See `docs/testing-display.md` for the monitor map and coordinate overrides. Newly launched Chrome windows move; attached existing browser tabs stay on their current display.
 - Staging login begins at the real `application_entry_url`. `npm run browser:staging` opens a persistent owned browser at that root and parks it for manual authentication and navigation. Follow the visible Cloud Agents link in the staging UI; observe and verify its actual destination before controlling that application. Do not substitute a guessed route or close the browser during handoff.
 - Ordinary staging qualification records visible history/admin links but does not enter Admin. The separate Admin discovery recipe follows only exact, visible, profile-declared same-origin Admin links; it records control metadata without changing settings, submitting forms, reading response bodies, or querying database tables. Neither discovery flow creates an Agent job.
 
@@ -100,7 +100,7 @@ Adversarial tests must cover every execution entrypoint whenever authorization b
 
 ## Verification
 
-Run `npm test` in a disposable environment. The CDP integration suite launches its own temporary Chrome profile and a loopback-only fixture server; it does not attach to the user's normal browser.
+Run `npm test` in a disposable environment. It starts headed Chrome in private Xvfb by default. The CDP integration suite launches its own temporary Chrome profile and a loopback-only fixture server; it does not attach to the user's normal browser.
 
 ## Child DOX Index
 

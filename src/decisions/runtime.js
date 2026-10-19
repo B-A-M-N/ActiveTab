@@ -332,6 +332,13 @@ export function createDecisionRuntime({
         payload: { resolver, roleMappings, reasonCode, evidenceRefs, inputEventIds }
       });
     },
+    recordTargetLookup({ episodeId, runId, stepId, decisionId, observationId, ...lookup }) {
+      return store.append({
+        episodeId, runId, stepId, decisionId, observationId,
+        eventType: "target.lookup", trainingEligibility: "pending",
+        payload: lookup
+      });
+    },
     recordPolicy({ episodeId, runId, stepId, decisionId, observationId, disposition, reasonCode, policyVersion = "active_policy_v1" }) {
       return store.append({
         episodeId, runId, stepId, decisionId, observationId,

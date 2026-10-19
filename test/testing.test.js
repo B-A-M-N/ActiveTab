@@ -443,6 +443,82 @@ test("scoped variables feed exact operation inputs without appearing in receipts
   assert.equal(JSON.stringify(receipt.toObject()).includes("private caller task"), false);
 });
 
+test("interaction PASS requires both exact value read-back and its declared application postcondition", async t => {
+  const runState = await createRunStateFixture();
+  t.after(() => runState.cleanup());
+  const candidate = { identity: "task-input", targetId: "fixture-target", documentGeneration: 1, backendNodeId: 31, name: "Task", role: "textbox", tag: "textarea", visible: true, disabled: false };
+  let enteredValue = null;
+  let observationCount = 0;
+  const session = {
+    target: { id: "fixture-target", url: "http://fixture.local/" },
+    attached: true,
+    async observe() {
+      return {
+        targetId: "fixture-target", documentGeneration: 1,
+        page: { url: "http://fixture.local/", title: "Composer" },
+        candidates: [candidate], evidenceId: `ev-dual-verification-${++observationCount}`
+      };
+    },
+    async fillField(_candidate, value) { enteredValue = value; return { dispatched: true }; },
+    async verifyControlValue(_candidate, value) { return { verified: true, matches: enteredValue === value }; },
+    async waitForChange() {}
+  };
+  const runner = new TestRunner({
+    session,
+    runStateStore: runState.store,
+    environment: { environmentId: "fixture-local", authorizedOrigins: ["http://fixture.local"] },
+    operationAuthorizer: { async authorize() { return { allowed: true }; } }
+  });
+  const receipt = await runner.run({
+    id: "workflow-dual-verification", name: "Dual verification",
+    steps: [{
+      id: "fill", type: "interact", action: {
+        type: "fill", operationId: "task-input", target: { identity: "task-input" },
+        value: "requested task", verifyValue: true,
+        postcondition: { type: "page_title_contains", value: "Task submitted" }
+      }
+    }]
+  }, { runId: "run-dual-verification" });
+  assert.equal(receipt.steps.find(step => step.stepId === "fill").status, STEP_STATUS.FAIL,
+    "exact field read-back cannot hide a failed declared application postcondition");
+  assert.equal(enteredValue, "requested task", JSON.stringify(receipt.toObject()));
+  assert.equal(receipt.status, RUN_STATUS.FAILED);
+});
+
+test("interaction remains UNCERTAIN when exact value read-back is unavailable despite a passing postcondition", async t => {
+  const runState = await createRunStateFixture();
+  t.after(() => runState.cleanup());
+  const candidate = { identity: "task-input", targetId: "fixture-target", documentGeneration: 1, backendNodeId: 32, name: "Task", role: "textbox", tag: "textarea", visible: true, disabled: false };
+  const session = {
+    target: { id: "fixture-target", url: "http://fixture.local/" },
+    attached: true,
+    async observe() {
+      return { targetId: "fixture-target", documentGeneration: 1, page: { url: "http://fixture.local/", title: "Task submitted" }, candidates: [candidate], evidenceId: "ev-value-readback-unavailable" };
+    },
+    async fillField() { return { dispatched: true }; },
+    async waitForChange() {}
+  };
+  const runner = new TestRunner({
+    session,
+    runStateStore: runState.store,
+    environment: { environmentId: "fixture-local", authorizedOrigins: ["http://fixture.local"] },
+    operationAuthorizer: { async authorize() { return { allowed: true }; } }
+  });
+  const receipt = await runner.run({
+    id: "workflow-value-readback-uncertain", name: "Value read-back uncertainty",
+    steps: [{
+      id: "fill", type: "interact", action: {
+        type: "fill", operationId: "task-input", target: { identity: "task-input" },
+        value: "requested task", verifyValue: true,
+        postcondition: { type: "page_title_contains", value: "Task submitted" }
+      }
+    }]
+  }, { runId: "run-value-readback-uncertain" });
+  assert.equal(receipt.steps.find(step => step.stepId === "fill").status, STEP_STATUS.UNCERTAIN);
+  assert.equal(receipt.status, RUN_STATUS.UNCERTAIN,
+    "an application postcondition cannot substitute for unavailable exact value read-back");
+});
+
 test("bounded repeat stops at the first verified condition and records iteration checkpoints", async () => {
   let observations = 0;
   const session = { async observe() { observations++; return { page: { url: "http://fixture.local/", title: "Ready" }, candidates: [], evidenceId: `ev-${observations}` }; } };

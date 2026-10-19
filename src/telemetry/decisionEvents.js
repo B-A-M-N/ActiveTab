@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { isSafeModelId, isSha256Digest, normalizeObservedRole, normalizeObservedTag, requireSafeEvidenceRefs, requireSafeTelemetryCode } from "./privacy.js";
 
-export const DECISION_EVENT_SCHEMA_VERSION = 2;
+export const DECISION_EVENT_SCHEMA_VERSION = 3;
 export const TRAINING_ELIGIBILITY = Object.freeze({ EXCLUDED: "excluded", PENDING: "pending", ELIGIBLE: "eligible" });
 
 const EVENT_FIELDS = Object.freeze({
@@ -12,6 +12,7 @@ const EVENT_FIELDS = Object.freeze({
   "semantic.annotated": ["analyzerProvider", "analyzerModel", "annotationKind", "rubricId", "rubricVersion", "rubricHash", "semanticRole", "candidateRef", "resultCode", "confidence", "uncertaintyCode", "inputFingerprint", "inputEventIds", "evidenceRefs", "usage"],
   "semantic.failed": ["analyzerProvider", "analyzerModel", "annotationKind", "rubricId", "rubricVersion", "rubricHash", "failureCode", "inputFingerprint", "inputEventIds", "clientRequestId", "providerLatencyMs", "transportCode", "httpStatus"],
   "target.resolved": ["resolver", "roleMappings", "reasonCode", "evidenceRefs", "inputEventIds"],
+  "target.lookup": ["lookupMode", "lookupStatus", "targetId", "documentGeneration", "frameScope", "frameTargetId", "frameId", "returnedCount", "visitedNodeCount", "stopReason", "elapsedMs", "nextActionDisposition"],
   "decision.input_captured": ["inputKind", "inputProjection", "rubricIds", "rubricVersion", "rubricHash", "inputFingerprint", "inputModality", "planHash", "taskContractHash", "capabilityCatalogHash", "bindingHash", "targetId", "documentGeneration", "reviewPolicyVersion"],
   "decision.skipped": ["reasonCode", "inputEventIds"],
   "decision.predicted": ["provider", "model", "modelSnapshot", "rubricId", "rubricVersion", "rubricHash", "questionType", "answer", "reviewDisposition", "inputFingerprint", "inputEventIds", "usage"],
@@ -61,7 +62,11 @@ const ENUMS = {
   route: new Set(["deterministic", "jev_only", "semantic_only", "jev_then_semantic", "semantic_then_jev", "abstain"]),
   inputModality: new Set(["text_only", "text_plus_visual", "unknown"]),
   capabilityStatus: new Set(["available", "unknown", "unavailable"]),
-  capabilitySource: new Set(["authenticated_catalog", "configured_fallback"])
+  capabilitySource: new Set(["authenticated_catalog", "configured_fallback"]),
+  lookupMode: new Set(["retained_snapshot", "cdp_dom_location"]),
+  lookupStatus: new Set(["unique", "not_found", "ambiguous", "incomplete", "candidate", "unavailable", "stale", "invalid", "expired", "no_hint", "refreshed"]),
+  frameScope: new Set(["root", "page", "unknown"]),
+  nextActionDisposition: new Set(["deferred", "permitted", "refused"])
 };
 
 function normalizeWorkflowPlanProjection(value) {
@@ -607,7 +612,7 @@ function normalizePayload(eventType, payload) {
     else if (field === "planProjection") out[field] = normalizeWorkflowPlanProjection(value);
     else if (field === "inputKind") out[field] = validateEnum(value, field);
     else if (field === "reviewDisposition") out[field] = validateEnum(value, field);
-    else if (["candidateCount", "visibleCount", "stepCount", "attemptNumber", "maxAttempts", "observationAttempts"].includes(field)) {
+    else if (["candidateCount", "visibleCount", "stepCount", "attemptNumber", "maxAttempts", "observationAttempts", "returnedCount", "visitedNodeCount"].includes(field)) {
       if (!Number.isInteger(value) || value < 0 || value > 10_000) throw new Error(`Telemetry field '${field}' must be a bounded non-negative integer.`);
       out[field] = value;
       if (["attemptNumber", "maxAttempts"].includes(field) && (value < 1 || value > 4)) throw new Error(`Telemetry field '${field}' must be between 1 and 4.`);
@@ -654,6 +659,8 @@ function normalizePayload(eventType, payload) {
       out[field] = safeCode(value, field, 64);
     } else if (field === "targetId") {
       out[field] = safeCode(value, field, 128);
+    } else if (field === "frameTargetId" || field === "frameId") {
+      out[field] = value === null ? null : safeCode(value, field, 128);
     } else if (field === "rubricHash") {
       if (!isSha256Digest(value)) throw new Error("Telemetry rubricHash must be a SHA-256 digest.");
       out[field] = value.toLowerCase();
@@ -686,6 +693,9 @@ function normalizePayload(eventType, payload) {
       out[field] = value.toLowerCase();
     } else if (field === "providerLatencyMs") {
       if (!Number.isInteger(value) || value < 0 || value > 300_000) throw new Error("Telemetry providerLatencyMs must be a bounded non-negative integer.");
+      out[field] = value;
+    } else if (field === "elapsedMs") {
+      if (!Number.isInteger(value) || value < 0 || value > 120_000) throw new Error("Telemetry elapsedMs must be a bounded non-negative integer.");
       out[field] = value;
     } else if (field === "httpStatus") {
       if (!Number.isInteger(value) || value < 100 || value > 599) throw new Error("Telemetry httpStatus must be a valid HTTP status code.");
@@ -755,7 +765,7 @@ function normalizePayload(eventType, payload) {
     } else if (field === "answer") out[field] = normalizeAnswer(value, payload.questionType);
     else if (field === "model" || field === "modelSnapshot" || field === "analyzerModel") out[field] = safeModelId(value, field);
     else if (field === "status" && eventType === "verification.completed") out[field] = validateEnum(value, "verificationStatus");
-    else if (field === "annotationKind" || field === "observationErrorClass") out[field] = validateEnum(value, field);
+    else if (["annotationKind", "observationErrorClass", "lookupMode", "lookupStatus", "frameScope", "nextActionDisposition"].includes(field)) out[field] = validateEnum(value, field);
     else if (field === "workflowKind" || field === "applicationId" || field === "environmentClass" || field === "executionMode" || field === "operationClass" || field === "disposition" || field === "dispatchStatus" || field === "status" || field === "cleanupStatus" || field === "questionType" || field === "sourceClass" || field === "correctionType" || field === "failureCode" || field === "qualificationStatus" || field === "route") {
       out[field] = validateEnum(value, field) ?? safeCode(value, field);
       if (!ENUMS[field]) out[field] = safeCode(value, field);
@@ -771,6 +781,7 @@ function normalizePayload(eventType, payload) {
     "semantic.annotated": ["analyzerProvider", "analyzerModel", "annotationKind", "rubricId", "semanticRole", "resultCode", "confidence", "evidenceRefs"],
     "semantic.failed": ["analyzerProvider", "analyzerModel", "annotationKind", "rubricId", "failureCode"],
     "target.resolved": ["resolver", "roleMappings", "reasonCode", "evidenceRefs"],
+    "target.lookup": ["lookupMode", "lookupStatus", "targetId", "documentGeneration", "frameScope", "frameTargetId", "frameId", "returnedCount", "visitedNodeCount", "stopReason", "elapsedMs", "nextActionDisposition"],
     "decision.input_captured": ["inputKind", "inputProjection", "rubricIds", "inputFingerprint"],
     "decision.skipped": ["reasonCode", "inputEventIds"],
     "decision.predicted": ["provider", "model", "rubricId", "rubricVersion", "questionType", "answer"],
@@ -829,8 +840,11 @@ export function createDecisionEvent(input) {
   const trainingEligibility = input.trainingEligibility ?? TRAINING_ELIGIBILITY.PENDING;
   if (!Object.values(TRAINING_ELIGIBILITY).includes(trainingEligibility)) throw new Error("Unsupported training eligibility.");
   if (trainingEligibility === TRAINING_ELIGIBILITY.ELIGIBLE && eventType !== "label.approved") throw new Error("Only independently approved labels may be training eligible.");
-  if (["semantic.input_captured", "semantic.annotated", "semantic.failed", "target.resolved", "decision.input_captured", "decision.skipped", "decision.predicted", "decision.failed", "planner.predicted", "planner.failed", "policy.adjudicated", "execution.reserved", "execution.dispatched", "execution.reconciliation_required", "execution.observed", "verification.completed", "correction.recorded", "label.proposed", "label.approved", "qualification.started", "qualification.completed", "workflow.plan_synthesized", "workflow.plan_failed", "inference.route_selected", "inference.attempted", "model.capability_preflight"].includes(eventType) && !input.decisionId) {
+  if (["semantic.input_captured", "semantic.annotated", "semantic.failed", "target.resolved", "target.lookup", "decision.input_captured", "decision.skipped", "decision.predicted", "decision.failed", "planner.predicted", "planner.failed", "policy.adjudicated", "execution.reserved", "execution.dispatched", "execution.reconciliation_required", "execution.observed", "verification.completed", "correction.recorded", "label.proposed", "label.approved", "qualification.started", "qualification.completed", "workflow.plan_synthesized", "workflow.plan_failed", "inference.route_selected", "inference.attempted", "model.capability_preflight"].includes(eventType) && !input.decisionId) {
     throw new Error(`Telemetry event '${eventType}' requires a stable decisionId.`);
+  }
+  if (eventType === "target.lookup" && (!input.stepId || !input.observationId)) {
+    throw new Error("Target lookup telemetry requires its step and source observation identities.");
   }
   const occurredAt = input.occurredAt ?? new Date().toISOString();
   if (!Number.isFinite(Date.parse(occurredAt))) throw new Error("Decision event timestamp must be valid ISO date text.");

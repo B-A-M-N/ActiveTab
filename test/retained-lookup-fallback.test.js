@@ -21,8 +21,9 @@ function makeSession({ lookupResult, refreshed, lookupError, observeError } = {}
         calls.lookup.push(args);
         if (lookupError) throw lookupError;
         return lookupResult ?? {
+          status: "unique", matchCount: 1,
           evidenceId: "obs-1", targetId: "tab-1", documentGeneration: 7,
-          matches: [{ identity: "candidate-1", actionAuthorized: false }],
+          matches: [{ identity: "candidate-1", frameId: "frame-root", frameTargetId: null, actionAuthorized: false }],
           visitedNodeCount: 250, stopReason: "node_budget"
         };
       }
@@ -52,6 +53,22 @@ test("retained identity only triggers fresh observation and must be rederived", 
   assert.deepEqual(calls.lookup[0], ["obs-1", { targetTokens: ["profile"], maxNodes: 500, maxResults: 20, timeoutMs: 1_500 }]);
   assert.deepEqual(calls.observe[0], [{ profile: "interaction", selectionGoal: "save the profile", candidateLimit: 384 }]);
   assert.equal("actionAuthorized" in result, false);
+  assert.deepEqual({
+    mode: result.lookupTelemetry.lookupMode,
+    status: result.lookupTelemetry.lookupStatus,
+    targetId: result.lookupTelemetry.targetId,
+    frameScope: result.lookupTelemetry.frameScope,
+    frameId: result.lookupTelemetry.frameId,
+    returnedCount: result.lookupTelemetry.returnedCount,
+    visitedNodeCount: result.lookupTelemetry.visitedNodeCount,
+    stopReason: result.lookupTelemetry.stopReason,
+    nextActionDisposition: result.lookupTelemetry.nextActionDisposition
+  }, {
+    mode: "retained_snapshot", status: "refreshed", targetId: "tab-1", frameScope: "page",
+    frameId: "frame-root", returnedCount: 1, visitedNodeCount: 250,
+    stopReason: "retained_match_rederived", nextActionDisposition: "deferred"
+  });
+  assert.ok(Number.isInteger(result.lookupTelemetry.elapsedMs));
 });
 
 test("an advisory identity omitted from the fresh ordinary observation stays unusable", async () => {

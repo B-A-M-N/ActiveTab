@@ -32,6 +32,7 @@ const MAX_RUNTIME_RECORDS_PER_EVIDENCE = 8;
 const MAX_RUNTIME_EVIDENCE_BYTES_PER_PAGE = 1024 * 1024;
 const MAX_RETAINED_LOOKUP_CANDIDATES = 10_000;
 const OBSERVATION_PROFILES = new Set(["lightweight", "interaction", "structural", "visual"]);
+const keyForNode = (frameTargetId, documentIndex, nodeIndex) => `${frameTargetId ?? "root"}:${documentIndex}:${nodeIndex}`;
 const RUNTIME_PATH_INSPECTOR = `function(path, failureMarker, includeSensitiveValues, valueOffset, valueChunkLength) {
   let current = this;
   for (let index = 0; index < path.length; index++) {
@@ -477,6 +478,7 @@ function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, {
   outOfProcess = false,
   selectionGoal = "",
   candidateLimit = 200,
+  priorityCandidateIdentities = [],
   documentIndex: suppliedIndex = null
 } = {}) {
   const axFacts = accessibleFacts(axTree);
@@ -635,7 +637,10 @@ function buildCandidates(snapshot, axTree, rootFrameId, generation, targetId, {
       candidateLocations.push({ documentIndex: indexedDocument.documentIndex, nodeIndex: index });
     }
   }
-  const selection = rankInteractionCandidates(candidates, selectionGoal, { maxCandidates: candidateLimit });
+  const selection = rankInteractionCandidates(candidates, selectionGoal, {
+    maxCandidates: candidateLimit,
+    priorityCandidateIdentities
+  });
   return {
     candidates: [...selection.candidates],
     candidateCount: candidates.length,
@@ -757,6 +762,105 @@ export class BrowserObserver {
 
   async lookupRetainedCandidates(id, { targetTokens, maxNodes = 500, maxResults = 20, timeoutMs = 1_500 } = {}) {
     return this.queryAccessibility(id, { targetTokens, maxNodes, maxResults, timeoutMs });
+  }
+
+  getHitTestContext(id) {
+    const stored = this.evidence.get(id);
+    if (!stored) return { status: "expired", evidenceId: id };
+    const evidence = stored.evidence;
+    if (evidence.targetId !== this.session.target?.id
+      || evidence.documentGeneration !== this.session.documentGeneration) {
+      return { status: "stale", reasonCode: "stale_document", evidenceId: id };
+    }
+    const mutationCount = this.session.activity?.totalDomMutations;
+    if (!Number.isInteger(mutationCount) || mutationCount !== evidence.activity?.totalDomMutations) {
+      return { status: "stale", reasonCode: Number.isInteger(mutationCount) ? "dom_changed_since_observation" : "dom_freshness_unavailable", evidenceId: id };
+    }
+    if (evidence.observationProfile !== "visual" || typeof evidence.screenshotBase64 !== "string") {
+      return { status: "unavailable", reasonCode: "visual_evidence_unavailable", evidenceId: id };
+    }
+    if (!stored.lookupIndex?.available) return { status: "unavailable", reasonCode: "retained_lookup_unavailable", evidenceId: id };
+    return {
+      status: "available",
+      evidenceId: id,
+      targetId: evidence.targetId,
+      documentGeneration: evidence.documentGeneration,
+      viewport: structuredClone(evidence.viewport),
+      viewportScroll: structuredClone(evidence.viewportScroll ?? { x: 0, y: evidence.scrollTargets?.[0]?.scrollTop ?? 0 }),
+      deviceScaleFactor: evidence.deviceScaleFactor,
+      rootFrameId: evidence.frameTree?.frame?.id ?? null,
+      domMutationCount: evidence.activity.totalDomMutations
+    };
+  }
+
+  resolveCandidateForHitNode(id, { backendNodeId, frameId, x, y } = {}) {
+    const stored = this.evidence.get(id);
+    if (!stored) return { status: "expired", reasonCode: "evidence_expired" };
+    const evidence = stored.evidence;
+    const lookupIndex = stored.lookupIndex;
+    if (evidence.targetId !== this.session.target?.id
+      || evidence.documentGeneration !== this.session.documentGeneration) {
+      return { status: "stale", reasonCode: "stale_document" };
+    }
+    if (!Number.isInteger(this.session.activity?.totalDomMutations)
+      || this.session.activity.totalDomMutations !== evidence.activity?.totalDomMutations) {
+      return { status: "stale", reasonCode: "dom_changed_since_observation" };
+    }
+    if (!Number.isInteger(backendNodeId) || typeof frameId !== "string" || !frameId
+      || !Number.isFinite(x) || !Number.isFinite(y)) {
+      return { status: "invalid", reasonCode: "hit_test_binding_invalid" };
+    }
+    const rootFrameId = evidence.frameTree?.frame?.id;
+    if (!rootFrameId || frameId !== rootFrameId) return { status: "unavailable", reasonCode: "frame_unavailable" };
+    const rootIndex = lookupIndex?.frames?.find(frame => frame.frameTargetId === null);
+    const documents = rootIndex?.documents?.filter(document => document?.frameId === frameId) ?? [];
+    if (documents.length !== 1) return { status: "unavailable", reasonCode: "snapshot_unavailable" };
+    const document = documents[0];
+    if (document.snapshot !== rootIndex.snapshot || document.snapshot !== evidence.domSnapshot) {
+      return { status: "stale", reasonCode: "snapshot_binding_mismatch" };
+    }
+    const startNodeIndex = document.backendNodeIndexes?.get(backendNodeId);
+    if (!Number.isInteger(startNodeIndex)) return { status: "unavailable", reasonCode: "hit_node_not_in_retained_snapshot" };
+    const candidateByNode = new Map((lookupIndex.candidates ?? []).map(candidate => [
+      keyForNode(candidate.frameTargetId, candidate.documentIndex, candidate.nodeIndex), candidate
+    ]));
+    const parentIndexes = document.sourceDocument?.nodes?.parentIndex ?? [];
+    const visited = new Set();
+    let nodeIndex = startNodeIndex;
+    for (let depth = 0; depth < 16 && Number.isInteger(nodeIndex) && nodeIndex >= 0; depth++) {
+      if (visited.has(nodeIndex)) return { status: "unavailable", reasonCode: "snapshot_cycle" };
+      visited.add(nodeIndex);
+      const candidate = candidateByNode.get(keyForNode(null, document.documentIndex, nodeIndex));
+      if (candidate) {
+        if (candidate.targetId !== evidence.targetId || candidate.documentGeneration !== evidence.documentGeneration
+          || candidate.frameTargetId !== null || candidate.frameId !== frameId) {
+          return { status: "stale", reasonCode: "candidate_binding_mismatch" };
+        }
+        if (candidate.visible !== true || candidate.disabled === true) {
+          return { status: "unavailable", reasonCode: "hit_candidate_not_actionable" };
+        }
+        const bounds = candidate.bounds;
+        if (!bounds || x < bounds.x - 2 || y < bounds.y - 2
+          || x > bounds.x + bounds.width + 2 || y > bounds.y + bounds.height + 2) {
+          return { status: "unavailable", reasonCode: "hit_candidate_bounds_mismatch" };
+        }
+        return {
+          status: "candidate",
+          candidateHint: {
+            identity: candidate.identity,
+            targetId: candidate.targetId,
+            documentGeneration: candidate.documentGeneration,
+            frameTargetId: candidate.frameTargetId,
+            frameId: candidate.frameId,
+            backendNodeId: candidate.backendNodeId
+          },
+          visitedNodeCount: visited.size,
+          reasonCode: "candidate_found_at_hit_location"
+        };
+      }
+      nodeIndex = parentIndexes[nodeIndex];
+    }
+    return { status: "unavailable", visitedNodeCount: visited.size, reasonCode: "no_actionable_candidate_at_hit_location" };
   }
 
   async inspectRuntimeState(id, {
@@ -933,12 +1037,17 @@ export class BrowserObserver {
     return { ...structuredClone(record), retained };
   }
 
-  async capture({ profile = "interaction", includeScreenshot, includeRawInResponse = false, prepareForJev = false, selectionGoal = "", candidateLimit = 200 } = {}) {
+  async capture({ profile = "interaction", includeScreenshot, includeRawInResponse = false, prepareForJev = false, selectionGoal = "", candidateLimit = 200, priorityCandidateIdentities = [] } = {}) {
     if (!OBSERVATION_PROFILES.has(profile)) throw new Error(`profile must be one of: ${[...OBSERVATION_PROFILES].join(", ")}.`);
     if (includeScreenshot !== undefined && typeof includeScreenshot !== "boolean") throw new Error("includeScreenshot must be a boolean.");
     if (typeof prepareForJev !== "boolean") throw new Error("prepareForJev must be a boolean.");
     if (typeof selectionGoal !== "string" || selectionGoal.length > 2_048) throw new Error("selectionGoal must be a string no longer than 2048 characters.");
     if (!Number.isInteger(candidateLimit) || candidateLimit < 200 || candidateLimit > 384) throw new Error("candidateLimit must be an integer from 200 to 384.");
+    if (!Array.isArray(priorityCandidateIdentities) || priorityCandidateIdentities.length > 4
+      || priorityCandidateIdentities.some(identity => typeof identity !== "string" || !identity || identity.length > 256)) {
+      throw new Error("priorityCandidateIdentities must contain at most four bounded exact candidate identities.");
+    }
+    priorityCandidateIdentities = [...new Set(priorityCandidateIdentities)];
     const captureStartedAt = Date.now();
     const memoryBefore = process.memoryUsage();
     const metrics = { cdpRoundTrips: 0, totalCdpRoundTripMs: 0, domSnapshotCount: 0, cdpRoundTripDurations: [] };
@@ -950,7 +1059,7 @@ export class BrowserObserver {
     const captureScreenshot = includeScreenshot ?? profile === "visual";
     const runtimeExpression = profile === "lightweight"
       ? "JSON.stringify({url:location.href,title:document.title,readyState:document.readyState})"
-      : "JSON.stringify({url:location.href,title:document.title,readyState:document.readyState,scrollTop:document.scrollingElement?.scrollTop??0,maxScrollTop:Math.max(0,(document.scrollingElement?.scrollHeight??0)-(document.scrollingElement?.clientHeight??innerHeight)),viewportHeight:innerHeight,viewportWidth:innerWidth,deviceScaleFactor:window.devicePixelRatio||1})";
+      : "JSON.stringify({url:location.href,title:document.title,readyState:document.readyState,scrollTop:document.scrollingElement?.scrollTop??0,scrollLeft:document.scrollingElement?.scrollLeft??0,scrollX,scrollY,maxScrollTop:Math.max(0,(document.scrollingElement?.scrollHeight??0)-(document.scrollingElement?.clientHeight??innerHeight)),viewportHeight:innerHeight,viewportWidth:innerWidth,deviceScaleFactor:window.devicePixelRatio||1})";
     const [{ frameTree }, snapshot, ax, runtime] = await Promise.all([
       client.send("Page.getFrameTree"),
       captureStructure
@@ -962,9 +1071,14 @@ export class BrowserObserver {
     const pageState = JSON.parse(runtime.result?.value ?? "{}" );
     const deviceScaleFactor = Number.isFinite(pageState.deviceScaleFactor) && pageState.deviceScaleFactor > 0 && pageState.deviceScaleFactor <= 8
       ? pageState.deviceScaleFactor : 1;
+    const viewportScroll = {
+      x: Number.isFinite(pageState.scrollX) ? pageState.scrollX : Number(pageState.scrollLeft ?? 0),
+      y: Number.isFinite(pageState.scrollY) ? pageState.scrollY : Number(pageState.scrollTop ?? 0)
+    };
     const activity = this.session.activity.snapshot();
     const scrollState = {
       scrollTop: Number(pageState.scrollTop ?? 0),
+      scrollLeft: Number(pageState.scrollLeft ?? 0),
       maxScrollTop: Number(pageState.maxScrollTop ?? 0),
       viewportHeight: Number(pageState.viewportHeight ?? 0),
       viewportWidth: Number(pageState.viewportWidth ?? 0),
@@ -973,6 +1087,9 @@ export class BrowserObserver {
       canScrollUp: Number(pageState.scrollTop ?? 0) > 2
     };
     delete pageState.scrollTop;
+    delete pageState.scrollLeft;
+    delete pageState.scrollX;
+    delete pageState.scrollY;
     delete pageState.maxScrollTop;
     delete pageState.viewportHeight;
     delete pageState.viewportWidth;
@@ -1100,6 +1217,7 @@ export class BrowserObserver {
       ? buildCandidates(snapshot, ax.nodes, rootFrameId, this.session.documentGeneration, this.session.target.id, {
         selectionGoal,
         candidateLimit,
+        priorityCandidateIdentities,
         documentIndex: rootDocumentIndex
       })
       : { candidates: [], lookupCandidates: [], candidateCount: 0, taskRelevantCandidateCount: 0, scopeCandidateCount: 0, returnedCandidateCount: 0, returnedScopeCandidateCount: 0, scopeCandidateIdentities: [], headings: [], headingCount: 0, frames: [] };
@@ -1115,6 +1233,7 @@ export class BrowserObserver {
         outOfProcess: true,
         selectionGoal,
         candidateLimit,
+        priorityCandidateIdentities,
         documentIndex: frameDocumentIndexes[frameIndex]
       }
     )) : [];
@@ -1126,9 +1245,12 @@ export class BrowserObserver {
       ? mainDerived.scopeCandidateCount + childDerived.reduce((total, frame) => total + frame.scopeCandidateCount, 0)
       : observedCandidateCount;
     const combinedCandidates = [...mainDerived.candidates, ...childDerived.flatMap(frame => frame.candidates)];
-    const priorityCandidateIdentities = mainDerived.scopeCandidateIdentities
+    const combinedPriorityCandidateIdentities = mainDerived.scopeCandidateIdentities
       .concat(...childDerived.map(frame => frame.scopeCandidateIdentities));
-    const combinedRanking = rankInteractionCandidates(combinedCandidates, selectionGoal, { maxCandidates: candidateLimit, priorityCandidateIdentities });
+    const combinedRanking = rankInteractionCandidates(combinedCandidates, selectionGoal, {
+      maxCandidates: candidateLimit,
+      priorityCandidateIdentities: [...combinedPriorityCandidateIdentities, ...priorityCandidateIdentities]
+    });
     const derived = {
       candidates: [...combinedRanking.candidates],
       headings: [...mainDerived.headings, ...childDerived.flatMap(frame => frame.headings)].slice(0, 100),
@@ -1199,6 +1321,7 @@ export class BrowserObserver {
       capturedAt: new Date().toISOString(),
       documentGeneration: this.session.documentGeneration,
       viewport: { width: scrollState.viewportWidth, height: scrollState.viewportHeight },
+      viewportScroll,
       deviceScaleFactor,
       observationProfile: profile,
       coverage,

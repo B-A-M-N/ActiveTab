@@ -17,7 +17,7 @@ import { classifyTaskRequest, requiresCompositeReadWorkflow, resolveTaskIntent, 
 import { hasVerifiedOutcome, pageLabelHashes } from "./outcomeVerifier.js";
 import { discoverVisibleNextPage } from "../extraction/recordResolver.js";
 import { bindVisualEvidence, isBoundVisualEvidence } from "./visualEvidence.js";
-import { revalidateVisualGrounding } from "./visualGrounder.js";
+import { groundVisualTarget, revalidateVisualGrounding } from "./visualGrounder.js";
 import { reobserveFromRetainedLookup } from "./retainedLookupFallback.js";
 
 function pageChangeWaitBaseline(observation, scrollTarget) {
@@ -1068,17 +1068,106 @@ export class NavigationEngine {
         imageEvidence: captured.imageEvidence,
         signal: abortSignal
       });
+      let finalAssessment = assessment;
+      let candidateDiscoveryIdentity = null;
+      let finalVisualImageEvidence = captured.imageEvidence;
+      if (assessment?.status === "reviewed"
+        && assessment.grounding?.status === "unavailable"
+        && assessment.grounding?.reasonCode === "candidate_projection_incomplete"
+        && typeof this.session.probeVisualCandidateAtPoint === "function") {
+        const box = assessment.grounding.sourceBox;
+        const x = Number.isFinite(box?.left) && Number.isFinite(box?.right) ? Math.round((box.left + box.right) / 2) : null;
+        const y = Number.isFinite(box?.top) && Number.isFinite(box?.bottom) ? Math.round((box.top + box.bottom) / 2) : null;
+        if (x !== null && y !== null) {
+          const hitStartedAt = performance.now();
+          const hit = await this.session.probeVisualCandidateAtPoint(captured.observation.evidenceId, { x, y }).catch(() => ({
+            status: "unavailable", reasonCode: "hit_probe_failed",
+            elapsedMs: Math.max(0, Math.round(performance.now() - hitStartedAt)), actionAuthorized: false
+          }));
+          try {
+            this.decisionRuntime?.recordTargetLookup?.({
+              episodeId: decisionEpisodeId,
+              runId: decisionRunId,
+              stepId,
+              decisionId,
+              observationId: captured.observation.evidenceId,
+              lookupMode: "cdp_dom_location",
+              lookupStatus: ["candidate", "unavailable", "stale", "invalid", "expired"].includes(hit.status) ? hit.status : "unavailable",
+              targetId: captured.observation.targetId,
+              documentGeneration: captured.observation.documentGeneration,
+              frameScope: "root",
+              frameTargetId: hit.candidateHint?.frameTargetId ?? null,
+              frameId: hit.frameId ?? hit.candidateHint?.frameId ?? null,
+              returnedCount: hit.status === "candidate" ? 1 : 0,
+              visitedNodeCount: hit.visitedNodeCount ?? 0,
+              stopReason: hit.reasonCode ?? "hit_probe_unavailable",
+              elapsedMs: hit.elapsedMs ?? 0,
+              nextActionDisposition: "deferred"
+            });
+          } catch { /* lookup telemetry never changes target admission */ }
+          const hint = hit?.candidateHint;
+          if (hit?.status === "candidate" && hint?.targetId === captured.observation.targetId
+            && hint?.documentGeneration === captured.observation.documentGeneration
+            && typeof hint.identity === "string") {
+            const promotedObservation = await this.session.observe({
+              profile: "visual",
+              prepareForJev: true,
+              selectionGoal: goal,
+              candidateLimit: 384,
+              priorityCandidateIdentities: [hint.identity]
+            }).catch(() => null);
+            const promotedCandidate = (promotedObservation?.candidates ?? []).find(candidate => candidate.identity === hint.identity
+              && candidate.targetId === hint.targetId
+              && candidate.documentGeneration === hint.documentGeneration
+              && candidate.frameTargetId === hint.frameTargetId);
+            if (promotedCandidate) {
+              const promotedRetained = this.session.observer?.getEvidence?.(promotedObservation.evidenceId, {
+                facets: ["page"], includeScreenshot: true
+              });
+              const promotedImageEvidence = bindVisualEvidence(promotedObservation, promotedRetained);
+              const refreshedPlan = await this.deterministicPlanner.plan(goal, filterPlanningObservation(promotedObservation)).catch(() => null);
+              const refreshedTargets = refreshedPlan?.status === "planned" ? [refreshedPlan.action?.target]
+                : refreshedPlan?.candidates ?? [];
+              const targetStillMatchesIntent = refreshedTargets.some(candidate => candidate?.identity === hint.identity);
+              if (promotedImageEvidence && targetStillMatchesIntent) {
+                const reprojection = groundVisualTarget({
+                  observation: promotedObservation,
+                  imageEvidence: promotedImageEvidence,
+                  answers: assessment.answers,
+                  allowedCandidateIds: refreshedTargets.map(candidate => candidate.identity).filter(Boolean)
+                });
+                if (reprojection.status === "grounded" && reprojection.candidate.identity === hint.identity) {
+                  finalAssessment = { ...assessment, grounding: reprojection, candidateDiscoveryMode: "bounded_cdp_location_probe" };
+                  candidateDiscoveryIdentity = hint.identity;
+                }
+              }
+            }
+          }
+        }
+      }
       // Inference may take long enough for the page to change. Reobserve and
       // resolve the suggested identity again before offering it to the normal
       // policy and authorized-execution path. Reobserve after failed or
       // abstaining requests too, so a later GLM fallback sees current evidence.
-      const freshObservation = await this.session.observe({ selectionGoal: goal });
-      const candidate = assessment?.status === "reviewed" && assessment.grounding?.status === "grounded"
-        ? revalidateVisualGrounding(assessment.grounding, freshObservation)
+      const freshObservation = await this.session.observe({
+        selectionGoal: goal,
+        ...(candidateDiscoveryIdentity ? {
+          profile: "visual",
+          prepareForJev: true,
+          candidateLimit: 384,
+          priorityCandidateIdentities: [candidateDiscoveryIdentity]
+        } : {})
+      });
+      if (candidateDiscoveryIdentity) {
+        const retained = this.session.observer?.getEvidence?.(freshObservation.evidenceId, { facets: ["page"], includeScreenshot: true });
+        finalVisualImageEvidence = bindVisualEvidence(freshObservation, retained);
+      }
+      const candidate = finalAssessment?.status === "reviewed" && finalAssessment.grounding?.status === "grounded"
+        ? revalidateVisualGrounding(finalAssessment.grounding, freshObservation)
         : null;
       if (!candidate) return {
-        assessment: assessment?.status === "reviewed" && assessment.grounding?.status === "grounded" ? {
-          ...assessment,
+        assessment: finalAssessment?.status === "reviewed" && finalAssessment.grounding?.status === "grounded" ? {
+          ...finalAssessment,
           grounding: {
             status: "unavailable",
             reasonCode: "stale_after_inference",
@@ -1087,7 +1176,7 @@ export class NavigationEngine {
           }
         } : assessment,
         grounding: null,
-        imageEvidence: captured.imageEvidence,
+        imageEvidence: finalVisualImageEvidence,
         observation: freshObservation
       };
       if (candidate) {
@@ -1097,18 +1186,18 @@ export class NavigationEngine {
           stepId,
           decisionId,
           observationId: freshObservation.evidenceId,
-          resolver: "jev_box_candidate_intersection",
+          resolver: candidateDiscoveryIdentity ? "cdp_hit_test_then_jev_box_candidate_intersection" : "jev_box_candidate_intersection",
           roleMappings: [{ role: targetRoleCode, candidateRef: candidate.identity }],
-          reasonCode: "advisory_box_matched_fresh_candidate",
+          reasonCode: candidateDiscoveryIdentity ? "bounded_location_candidate_rederived_and_box_matched" : "advisory_box_matched_fresh_candidate",
           evidenceRefs: [captured.observation.evidenceId, freshObservation.evidenceId],
           inputEventIds: assessment.inputEventIds ?? []
         });
       }
       return {
-        assessment,
-        grounding: assessment.grounding,
+        assessment: finalAssessment,
+        grounding: finalAssessment.grounding,
         candidate,
-        imageEvidence: captured.imageEvidence,
+        imageEvidence: finalVisualImageEvidence,
         observation: freshObservation
       };
     };
@@ -1567,6 +1656,18 @@ export class NavigationEngine {
               observation: latest,
               targetTokens: expectedTargets
             });
+            if (fallback.lookupTelemetry && this.decisionRuntime?.recordTargetLookup && decisionEpisodeId) {
+              try {
+                this.decisionRuntime.recordTargetLookup({
+                  episodeId: decisionEpisodeId,
+                  runId: decisionRunId,
+                  stepId: decisionStepId(),
+                  decisionId: randomUUID(),
+                  observationId: latest.evidenceId,
+                  ...fallback.lookupTelemetry
+                });
+              } catch { /* lookup telemetry never changes target admission */ }
+            }
             candidateExpansionAttempted = fallback.status !== "not_needed";
             if (fallback.status === "refreshed") {
               latest = fallback.observation;

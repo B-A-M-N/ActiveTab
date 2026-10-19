@@ -520,8 +520,47 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
         partial.type = "text";
         partial.maxLength = 3;
         partial.setAttribute("aria-label", "Partial value field");
-        section.append(replaceOnFocus, replaceOnSelect, partial);
+
+        const modal = document.createElement("div");
+        modal.id = "focus-theft-modal";
+        modal.style.cssText = "display:none;position:fixed;inset:0;z-index:99999;background:white";
+        const modalInput = document.createElement("input");
+        modalInput.type = "text";
+        modalInput.value = "preserve modal value";
+        modalInput.setAttribute("aria-label", "Modal focus destination");
+        modal.append(modalInput);
+        const focusVictim = document.createElement("input");
+        focusVictim.type = "text";
+        focusVictim.value = "preserve focus victim value";
+        focusVictim.setAttribute("aria-label", "Focus stolen by modal");
+        focusVictim.addEventListener("focus", () => { modal.style.display = "block"; modalInput.focus(); });
+
+        const shadowHost = document.createElement("div");
+        const shadowRoot = shadowHost.attachShadow({ mode: "open" });
+        const shadowInput = document.createElement("input");
+        shadowInput.type = "text";
+        shadowInput.value = "original shadow value";
+        shadowInput.setAttribute("aria-label", "Shadow text field");
+        shadowRoot.append(shadowInput);
+
+        const childEditor = document.createElement("div");
+        childEditor.setAttribute("contenteditable", "true");
+        childEditor.setAttribute("role", "textbox");
+        childEditor.setAttribute("aria-label", "Focused child editor");
+        const editableChild = document.createElement("span");
+        editableChild.tabIndex = 0;
+        editableChild.textContent = "original child editor value";
+        childEditor.append(editableChild);
+        childEditor.addEventListener("focus", () => editableChild.focus());
+
+        const keyFailure = document.createElement("input");
+        keyFailure.type = "text";
+        keyFailure.value = "preserve value after key failure";
+        keyFailure.setAttribute("aria-label", "Key failure field");
+
+        section.append(replaceOnFocus, replaceOnSelect, partial, focusVictim, shadowHost, childEditor, keyFailure);
         (document.querySelector("main") ?? document.body).prepend(section);
+        document.body.append(modal);
       })()`,
       returnByValue: true
     });
@@ -530,7 +569,12 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     const replaceOnFocus = controlNamed("Replace on focus");
     const replaceOnSelect = controlNamed("Replace on select shortcut");
     const partialValueField = controlNamed("Partial value field");
-    assert.ok(replaceOnFocus && replaceOnSelect && partialValueField, "the observer retains the exact text-delivery test controls");
+    const focusVictim = controlNamed("Focus stolen by modal");
+    const shadowTextField = controlNamed("Shadow text field");
+    const childEditor = controlNamed("Focused child editor");
+    const keyFailureField = controlNamed("Key failure field");
+    assert.ok(replaceOnFocus && replaceOnSelect && partialValueField && focusVictim && shadowTextField && childEditor && keyFailureField,
+      "the observer retains the exact text-delivery controls, including shadow and contenteditable targets");
     // The test targets the post-focus identity guard; omit the display label
     // here because its live accessible name can include browser-derived text.
     await assert.rejects(() => session.fillField({ ...replaceOnFocus, name: "" }, "must not be delivered"), /replaced after focus|could not be resolved after focus/);
@@ -540,6 +584,43 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
       returnByValue: true
     });
     assert.deepEqual(replacementValues.result.value, ["preserve on focus replacement", "preserve on shortcut replacement"], "replacement after focus or select-all prevents text delivery to the new target");
+    await assert.rejects(() => session.fillField({ ...focusVictim, name: "" }, "must not enter modal target"), /Focus moved away from the form field/,
+      "a synchronous modal focus change stops delivery before text insertion");
+    const focusValues = await session.client.send("Runtime.evaluate", {
+      expression: "({victim:document.querySelector('[aria-label=\\\"Focus stolen by modal\\\"]')?.value,modal:document.querySelector('#focus-theft-modal input')?.value})",
+      returnByValue: true
+    });
+    assert.deepEqual(focusValues.result.value, { victim: "preserve focus victim value", modal: "preserve modal value" });
+    await session.client.send("Runtime.evaluate", { expression: "document.querySelector('#focus-theft-modal').style.display='none'" });
+
+    await session.fillField(shadowTextField, "updated shadow value");
+    assert.equal((await session.verifyControlValue(shadowTextField, "updated shadow value")).matches, true,
+      "focus validation supports an exact native text control inside an open Shadow DOM");
+    await session.fillField(childEditor, "updated child editor value");
+    assert.equal((await session.verifyControlValue(childEditor, "updated child editor value")).matches, true,
+      "a contenteditable host may retain focus through its identified focused descendant");
+
+    const client = session.client;
+    const originalSend = client.send;
+    let keyDownDispatches = 0;
+    client.send = async function(method, params = {}, sessionId = null) {
+      if (method === "Input.dispatchKeyEvent" && params.type === "keyDown" && ++keyDownDispatches === 2) {
+        throw new Error("injected CDP failure after modifier key dispatch");
+      }
+      return originalSend.call(this, method, params, sessionId);
+    };
+    try {
+      await assert.rejects(() => session.fillField(keyFailureField, "must not be retried"), /injected CDP failure/);
+    } finally {
+      client.send = originalSend;
+    }
+    assert.equal(keyDownDispatches, 2);
+    const keyFailureValue = await session.client.send("Runtime.evaluate", {
+      expression: "document.querySelector('[aria-label=\\\"Key failure field\\\"]')?.value",
+      returnByValue: true
+    });
+    assert.equal(keyFailureValue.result.value, "preserve value after key failure", "a partial key-dispatch failure never proceeds to text insertion");
+
     await session.fillField(partialValueField, "four");
     const partialValueVerification = await session.verifyControlValue(partialValueField, "four");
     assert.equal(partialValueVerification.verified, true);
@@ -549,7 +630,7 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     const resetObservation = await session.observe();
     assert.equal(resetObservation.page.title, "Demo shop", "the next navigation task starts from the fixture's initial page state");
     const sectionRun = await new NavigationEngine(session, { maxActions: 1, maxRecoveries: 0 }).run("Open the billing history page");
-    assert.equal(sectionRun.status, "succeeded", "native observations and deterministic planning resolve repeated labels from their section context");
+    assert.equal(sectionRun.status, "succeeded", `native observations and deterministic planning resolve repeated labels from their section context: ${JSON.stringify(sectionRun)}`);
     assert.equal(sectionRun.page.title, "Billing history");
     const virtualizedRun = await new NavigationEngine(session, { operationAuthorizer: fixtureButtonAuthorizer, maxActions: 10, maxScrolls: 8, maxRecoveries: 0 }).run("Open invoice 24 page");
     assert.equal(virtualizedRun.status, "succeeded", `native wheel input reveals and opens an item rendered only after scrolling: ${JSON.stringify(virtualizedRun)}`);
@@ -564,6 +645,88 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     }
     assert.equal(state.attempts.length, 2);
     assert.equal(JSON.stringify(state).includes("fixture-secret"), false, "journal does not persist form values");
+
+    await session.client.send("Runtime.evaluate", {
+      expression: "(() => { const section=document.createElement('section'); section.id='retained-hit-test-fixture'; for(let i=0;i<220;i++){const button=document.createElement('button');button.textContent='Overflow fixture '+i;section.append(button);} const target=document.createElement('button');target.id='retained-hit-target';target.setAttribute('aria-label','Overflow hit target');target.style.cssText='position:fixed;right:24px;top:24px;z-index:10000;width:180px;height:48px;transform:translate(0px, 2px) scale(1.02)';section.append(target);document.body.append(section);return true; })()",
+      returnByValue: true
+    });
+    const partialVisualObservation = await session.observe({ profile: "visual" });
+    assert.equal(partialVisualObservation.candidateCoverage.truncated, true,
+      "the fixture exceeds the bounded candidate projection");
+    assert.equal(partialVisualObservation.candidates.some(candidate => candidate.name === "Overflow hit target"), false,
+      "the visible target is absent from the original candidate projection");
+    const hitPoint = await session.client.send("Runtime.evaluate", {
+      expression: "(() => { const rect=document.querySelector('#retained-hit-target').getBoundingClientRect(); return {x:Math.floor(rect.left+rect.width/2),y:Math.floor(rect.top+rect.height/2)}; })()",
+      returnByValue: true
+    });
+    const hitTestScroll = await session.client.send("Runtime.evaluate", {
+      expression: "({x:scrollX,y:scrollY})", returnByValue: true
+    });
+    let hitTests = 0;
+    let inputCommands = 0;
+    let hitTestParams;
+    const hitTestClient = session.client;
+    const sendBeforeHitTest = hitTestClient.send;
+    hitTestClient.send = async function(method, params = {}, sessionId = null) {
+      if (method === "DOM.getNodeForLocation") { hitTests++; hitTestParams = params; }
+      if (method.startsWith("Input.")) inputCommands++;
+      return sendBeforeHitTest.call(this, method, params, sessionId);
+    };
+    let hitResolution;
+    try {
+      hitResolution = await session.probeVisualCandidateAtPoint(partialVisualObservation.evidenceId, hitPoint.result.value);
+    } finally {
+      hitTestClient.send = sendBeforeHitTest;
+    }
+    assert.equal(hitResolution.status, "candidate", JSON.stringify(hitResolution));
+    assert.equal(hitResolution.actionAuthorized, false, "the location result is advisory only");
+    assert.equal(hitTests, 1, "one bounded DOM location query resolves the candidate omitted from the projection");
+    assert.equal(hitTestParams.x, Math.round(hitPoint.result.value.x + hitTestScroll.result.value.x), "viewport hit coordinates are translated by the retained page scroll offset");
+    assert.equal(hitTestParams.y, Math.round(hitPoint.result.value.y + hitTestScroll.result.value.y), "viewport hit coordinates are translated by the retained page scroll offset");
+    assert.equal(inputCommands, 0, "candidate discovery emits no page or desktop input");
+    const promotedVisualObservation = await session.observe({
+      profile: "visual",
+      candidateLimit: 384,
+      priorityCandidateIdentities: [hitResolution.candidateHint.identity]
+    });
+    const promotedHitCandidate = promotedVisualObservation.candidates.find(candidate => candidate.identity === hitResolution.candidateHint.identity);
+    assert.equal(promotedHitCandidate?.name, "Overflow hit target",
+      "a new observation independently derives the exact hit-tested target identity");
+
+    await session.client.send("Runtime.evaluate", {
+      expression: "window.scrollTo(scrollX,scrollY+24)", returnByValue: true
+    });
+    const staleScrollHit = await session.probeVisualCandidateAtPoint(partialVisualObservation.evidenceId, hitPoint.result.value);
+    assert.equal(staleScrollHit.status, "stale", "a page scroll after visual evidence invalidates the old hit-test binding");
+    assert.equal(staleScrollHit.reasonCode, "page_scroll_changed");
+    await session.client.send("Runtime.evaluate", {
+      expression: `window.scrollTo(${hitTestScroll.result.value.x},${hitTestScroll.result.value.y})`, returnByValue: true
+    });
+
+    await session.client.send("Runtime.evaluate", {
+      expression: "(() => { const target=document.querySelector('#retained-hit-target').getBoundingClientRect(); const overlay=document.createElement('div'); overlay.id='retained-hit-test-overlay'; overlay.style.cssText='position:fixed;z-index:10001;pointer-events:auto;background:rgba(0,0,0,.1);left:'+target.left+'px;top:'+target.top+'px;width:'+target.width+'px;height:'+target.height+'px'; document.body.append(overlay); })()",
+      returnByValue: true
+    });
+    const coveredVisualObservation = await session.observe({ profile: "visual" });
+    const coveredHit = await session.probeVisualCandidateAtPoint(coveredVisualObservation.evidenceId, hitPoint.result.value);
+    assert.equal(coveredHit.status, "unavailable");
+    assert.equal(coveredHit.reasonCode, "no_actionable_candidate_at_hit_location");
+    assert.equal(coveredHit.actionAuthorized, false);
+
+    await session.client.send("Runtime.evaluate", { expression: "document.querySelector('#retained-hit-test-overlay').remove()" });
+    const viewportBoundObservation = await session.observe({ profile: "visual" });
+    await session.client.send("Emulation.setDeviceMetricsOverride", {
+      width: viewportBoundObservation.viewport.width - 1,
+      height: viewportBoundObservation.viewport.height,
+      deviceScaleFactor: viewportBoundObservation.deviceScaleFactor ?? 1,
+      mobile: false
+    });
+    const shiftedViewportHit = await session.probeVisualCandidateAtPoint(viewportBoundObservation.evidenceId, hitPoint.result.value);
+    assert.equal(shiftedViewportHit.status, "stale");
+    assert.equal(shiftedViewportHit.reasonCode, "viewport_or_scale_changed");
+    await session.client.send("Emulation.clearDeviceMetricsOverride");
+    await session.client.send("Runtime.evaluate", { expression: "document.querySelector('#retained-hit-test-fixture').remove()" });
+
     const beforeTabClose = await session.observe();
     assert.ok(beforeTabClose.candidates.some(candidate => candidate.name === "Open account"));
     const nativeClickBeforeTabClose = session.click.bind(session);

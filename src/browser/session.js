@@ -412,6 +412,98 @@ export class BrowserSession {
     return this.observer.queryAccessibility(evidenceId, query);
   }
 
+  async probeVisualCandidateAtPoint(evidenceId, { x, y, timeoutMs = 1_500 } = {}) {
+    this.#assertTargetAttached();
+    if (!Number.isSafeInteger(x) || !Number.isSafeInteger(y)
+      || !Number.isInteger(timeoutMs) || timeoutMs < 50 || timeoutMs > 2_000) {
+      return { status: "invalid", reasonCode: "hit_test_input_invalid", evidenceId, actionAuthorized: false };
+    }
+    const startedAt = performance.now();
+    const context = this.observer.getHitTestContext(evidenceId);
+    if (context.status !== "available") return { ...context, actionAuthorized: false };
+    if (context.targetId !== this.target.id || context.documentGeneration !== this.documentGeneration) {
+      return { status: "stale", reasonCode: "stale_document", evidenceId, actionAuthorized: false };
+    }
+    if (x < 0 || y < 0 || x >= context.viewport.width || y >= context.viewport.height) {
+      return { status: "invalid", reasonCode: "hit_test_point_outside_viewport", evidenceId, actionAuthorized: false };
+    }
+
+    let viewport;
+    try {
+      const result = await this.client.send("Runtime.evaluate", {
+        expression: "({width:innerWidth,height:innerHeight,deviceScaleFactor:window.devicePixelRatio||1,scrollX,scrollY})",
+        returnByValue: true,
+        awaitPromise: false
+      });
+      viewport = result.result?.value;
+    } catch {
+      return { status: "unavailable", reasonCode: "viewport_recheck_failed", evidenceId, actionAuthorized: false };
+    }
+    if (context.targetId !== this.target.id || context.documentGeneration !== this.documentGeneration
+      || this.activity.totalDomMutations !== context.domMutationCount) {
+      return { status: "stale", reasonCode: "page_changed_before_hit_test", evidenceId, actionAuthorized: false };
+    }
+    if (viewport?.width !== context.viewport.width || viewport?.height !== context.viewport.height
+      || viewport?.deviceScaleFactor !== context.deviceScaleFactor) {
+      return { status: "stale", reasonCode: "viewport_or_scale_changed", evidenceId, actionAuthorized: false };
+    }
+    if (viewport?.scrollX !== context.viewportScroll?.x || viewport?.scrollY !== context.viewportScroll?.y) {
+      return { status: "stale", reasonCode: "page_scroll_changed", evidenceId, actionAuthorized: false };
+    }
+
+    let timer;
+    let hit;
+    try {
+      hit = await Promise.race([
+        this.client.send("DOM.getNodeForLocation", {
+          x: Math.round(x + context.viewportScroll.x),
+          y: Math.round(y + context.viewportScroll.y),
+          includeUserAgentShadowDOM: false,
+          ignorePointerEventsNone: false
+        }),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("hit_test_deadline")), timeoutMs);
+        })
+      ]);
+    } catch (error) {
+      const deadline = error?.message === "hit_test_deadline";
+      return {
+        status: "unavailable",
+        reasonCode: deadline ? "hit_test_deadline" : "cdp_hit_test_failed",
+        elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+        evidenceId,
+        actionAuthorized: false
+      };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+
+    this.#assertTargetAttached();
+    if (context.targetId !== this.target.id || context.documentGeneration !== this.documentGeneration
+      || this.activity.totalDomMutations !== context.domMutationCount) {
+      return { status: "stale", reasonCode: "page_changed_during_hit_test", evidenceId, actionAuthorized: false };
+    }
+    const resolution = this.observer.resolveCandidateForHitNode(evidenceId, {
+      backendNodeId: hit.backendNodeId,
+      frameId: hit.frameId,
+      x: x + context.viewportScroll.x,
+      y: y + context.viewportScroll.y
+    });
+    return {
+      ...resolution,
+      evidenceId,
+      targetId: context.targetId,
+      documentGeneration: context.documentGeneration,
+      frameId: hit.frameId ?? resolution.candidateHint?.frameId ?? null,
+      point: { x, y },
+      hitBackendNodeId: Number.isInteger(hit.backendNodeId) ? hit.backendNodeId : null,
+      visitedNodeCount: resolution.visitedNodeCount ?? 0,
+      elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      lookupMode: "single_cdp_dom_hit_test",
+      actionAuthorized: false
+    };
+  }
+
   #onDialogOpening(event) {
     this.pendingDialog = {
       type: event?.type ?? "alert",
@@ -812,7 +904,7 @@ export class BrowserSession {
     if (!resolved.object?.objectId) throw new Error("The selected form field could not be revalidated.");
     const validation = await this.client.send("Runtime.callFunctionOn", {
       objectId: resolved.object.objectId,
-      functionDeclaration: "function(expectedLabel){const r=this.getBoundingClientRect(),s=getComputedStyle(this);let top=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2);const label=(this.getAttribute('aria-label')||this.title||Array.from(this.labels??[]).map(l=>l.innerText||l.textContent||'').join(' ')||this.getAttribute('name')||'').replace(/\s+/g,' ').trim();return {connected:this.isConnected,visible:r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)>0&&s.pointerEvents!=='none',tag:this.tagName.toLowerCase(),type:String(this.type||'').toLowerCase(),editable:this.isContentEditable===true,role:this.getAttribute('role')||'',disabled:this.disabled===true,readOnly:this.readOnly===true,label,occluded:!!top&&top!==this&&!this.contains(top),labelMatches:!expectedLabel||!label||label.toLocaleLowerCase()===expectedLabel.toLocaleLowerCase()}}",
+      functionDeclaration: "function(expectedLabel){const r=this.getBoundingClientRect(),s=getComputedStyle(this);let top=this.ownerDocument.elementFromPoint(r.left+r.width/2,r.top+r.height/2);for(let depth=0;top&&depth<8;depth++){const shadow=top.shadowRoot;if(!shadow)break;const inner=shadow.elementFromPoint(r.left+r.width/2,r.top+r.height/2);if(!inner||inner===top)break;top=inner}const label=(this.getAttribute('aria-label')||this.title||Array.from(this.labels??[]).map(l=>l.innerText||l.textContent||'').join(' ')||this.getAttribute('name')||'').replace(/\s+/g,' ').trim();return {connected:this.isConnected,visible:r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)>0&&s.pointerEvents!=='none',tag:this.tagName.toLowerCase(),type:String(this.type||'').toLowerCase(),editable:this.isContentEditable===true,role:this.getAttribute('role')||'',disabled:this.disabled===true,readOnly:this.readOnly===true,label,occluded:!!top&&top!==this&&!this.contains(top),labelMatches:!expectedLabel||!label||label.toLocaleLowerCase()===expectedLabel.toLocaleLowerCase()}}",
       arguments: [{ value: candidate.name ?? "" }],
       returnByValue: true,
       awaitPromise: false

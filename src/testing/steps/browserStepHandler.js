@@ -222,24 +222,31 @@ export class BrowserStepHandler {
     const actionPostcondition = action.postcondition
       ? evaluateAssertion(action.postcondition, { observation: postObservation, collector: this.collector, correlator: this.correlator })
       : null;
+    const verificationStatuses = [];
+    if (action.verifyValue === true) {
+      verificationStatuses.push(valueVerification?.verified === true
+        ? valueVerification.matches === true ? STEP_STATUS.PASS : STEP_STATUS.FAIL
+        : STEP_STATUS.UNCERTAIN);
+    }
+    if (actionPostcondition) verificationStatuses.push(actionPostcondition.status);
     let status = authResult.telemetryError || authResult.operationError
       ? STEP_STATUS.UNCERTAIN
-      : action.verifyValue === true
-        ? valueVerification?.verified ? valueVerification.matches ? STEP_STATUS.PASS : STEP_STATUS.FAIL : STEP_STATUS.UNCERTAIN
-        : actionPostcondition
-          ? actionPostcondition.status
-          : STEP_STATUS.UNCERTAIN;
-    let reason = action.verifyValue === true
-      ? valueVerification?.matches === true
+      : verificationStatuses.includes(STEP_STATUS.FAIL) ? STEP_STATUS.FAIL
+        : verificationStatuses.includes(STEP_STATUS.UNCERTAIN) || verificationStatuses.length === 0 ? STEP_STATUS.UNCERTAIN
+          : STEP_STATUS.PASS;
+    const verificationReasons = [];
+    if (action.verifyValue === true) {
+      verificationReasons.push(valueVerification?.matches === true
         ? `Interaction '${action.type}' value was verified locally.`
         : valueVerification?.verified
           ? `Interaction '${action.type}' value did not match the caller-supplied value.`
-          : `Interaction '${action.type}' was dispatched, but its exact value could not be verified.`
-      : actionPostcondition
-        ? actionPostcondition.reason
-        : stateChanged
-          ? `Interaction '${action.type}' changed page state, but no independent postcondition was supplied.`
-          : `Interaction '${action.type}' was dispatched, but no independent postcondition was supplied.`;
+          : `Interaction '${action.type}' was dispatched, but its exact value could not be verified.`);
+    }
+    if (actionPostcondition) verificationReasons.push(actionPostcondition.reason);
+    if (verificationReasons.length === 0) verificationReasons.push(stateChanged
+      ? `Interaction '${action.type}' changed page state, but no independent postcondition was supplied.`
+      : `Interaction '${action.type}' was dispatched, but no independent postcondition was supplied.`);
+    let reason = verificationReasons.join(" ");
     if (telemetry) {
       try {
         await telemetry.recordVerification({

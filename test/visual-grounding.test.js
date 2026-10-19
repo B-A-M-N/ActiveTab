@@ -9,15 +9,16 @@ import { resolve } from "node:path";
 const screenshotBase64 = readFileSync(resolve("docs/assets/first-run.jpg")).toString("base64");
 const screenshotDimensions = jpegDimensions(Buffer.from(screenshotBase64, "base64"));
 
-function visualObservation({ evidenceId = "visual_obs_1", generation = 3, targetId = "target_visual", candidates } = {}) {
+function visualObservation({ evidenceId = "visual_obs_1", generation = 3, targetId = "target_visual", deviceScaleFactor = 1, candidates } = {}) {
   const viewport = { width: screenshotDimensions.width * 2, height: screenshotDimensions.height * 2 };
   return {
     evidenceId,
     targetId,
     documentGeneration: generation,
     viewport,
+    deviceScaleFactor,
     candidates,
-    visualEvidence: { evidenceId, targetId, documentGeneration: generation, viewport, screenshotBase64 }
+    visualEvidence: { evidenceId, targetId, documentGeneration: generation, viewport, deviceScaleFactor, screenshotBase64 }
   };
 }
 
@@ -179,4 +180,42 @@ test("visual grounding rejects missing, stale, disabled, and disallowed candidat
   assert.equal(groundVisualTarget({ ...args, allowedCandidateIds: ["different_id"] }).reasonCode, "no_fresh_visible_candidates");
   const disabled = visualObservation({ candidates: [visualCandidate("button_target", 350, 220, { disabled: true })] });
   assert.equal(groundVisualTarget({ ...args, observation: disabled, imageEvidence: disabled.visualEvidence }).reasonCode, "no_fresh_visible_candidates");
+});
+
+test("visual grounding marks a missing candidate as projection-incomplete and requires unchanged viewport on revalidation", () => {
+  const incomplete = visualObservation({ candidates: [] });
+  incomplete.candidateCoverage = { pageCoverage: "partial", truncated: true };
+  const answers = {
+    target_present: { type: "noul", probabilityYes: 0.94 },
+    target_box: { type: "box", confidence: 0.91, box: { left: 0.2, top: 0.2, right: 0.4, bottom: 0.4 } }
+  };
+  const unavailable = groundVisualTarget({
+    observation: incomplete,
+    imageEvidence: incomplete.visualEvidence,
+    answers
+  });
+  assert.equal(unavailable.reasonCode, "candidate_projection_incomplete");
+  assert.deepEqual(unavailable.sourceBox, {
+    left: incomplete.viewport.width * 0.2,
+    top: incomplete.viewport.height * 0.2,
+    right: incomplete.viewport.width * 0.4,
+    bottom: incomplete.viewport.height * 0.4
+  });
+  assert.equal(unavailable.authorizesOperation, false);
+
+  const observed = visualObservation({ candidates: [visualCandidate("button_target", 350, 220)] });
+  const grounded = groundVisualTarget({
+    observation: observed,
+    imageEvidence: observed.visualEvidence,
+    answers,
+    allowedCandidateIds: ["button_target"]
+  });
+  assert.equal(grounded.status, "grounded");
+  const shifted = visualObservation({ evidenceId: "visual_obs_shifted", candidates: [visualCandidate("button_target", 350, 220)] });
+  shifted.viewport = { width: observed.viewport.width - 1, height: observed.viewport.height };
+  assert.equal(revalidateVisualGrounding(grounded, shifted), null,
+    "a same-document viewport shift invalidates the old visual coordinate binding");
+  const rescaled = visualObservation({ evidenceId: "visual_obs_rescaled", deviceScaleFactor: 2, candidates: [visualCandidate("button_target", 350, 220)] });
+  assert.equal(revalidateVisualGrounding(grounded, rescaled), null,
+    "a same-document device-scale-factor change invalidates the old visual coordinate binding");
 });
