@@ -72,7 +72,7 @@ Headed browser tests use the secondary `HDMI-1` display by default. To run the f
 npm run test:headed
 ```
 
-This uses the current desktop and positions newly launched ActiveTab Chrome windows on `HDMI-1`. Owned Chrome launches and `npm test` use the same secondary-screen default. Set `ACTIVETAB_CHROME_DISPLAY=main` or run `npm run test:on-main` to switch browser launches and tests to the primary `eDP-1` display. `npm run test:headed -- --xvfb` explicitly uses a virtual X display and is not visible on either physical screen. See [docs/testing-display.md](docs/testing-display.md) for the current monitor map, coordinates, and overrides.
+This uses the current desktop and positions ActiveTab-owned Chrome windows on `HDMI-1`. Set `ACTIVETAB_CHROME_DISPLAY=main` in `.env.local` to switch launches and tests to the primary `eDP-1` display, or run `npm run test:on-main` for one test run. Reusing or reattaching an explicitly owned ActiveTab browser profile reapplies the selected position. An extension-attached or default-profile browser is not moved. `npm run test:headed -- --xvfb` explicitly uses a virtual X display and is not visible on either physical screen. See [docs/testing-display.md](docs/testing-display.md) for the current monitor map, coordinates, and overrides.
 
 For headed Chrome with a visible desktop display, use:
 

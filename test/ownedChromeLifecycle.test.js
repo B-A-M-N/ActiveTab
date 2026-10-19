@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { once } from "node:events";
 import { launchOwnedChrome } from "../src/browser/ownedChrome.js";
+import { resolveChromeWindowPosition } from "../src/browser/chromeWindowPlacement.js";
 import { listTargets } from "../src/browser/targets.js";
 
 test("an active profile lock preserves its CDP handoff and refuses a second Chrome launch", async t => {
@@ -51,6 +52,61 @@ test("keeping Chrome open requires an explicit persistent profile", async () => 
 });
 
 const chromeExecutable = process.env.CHROME_PATH ?? process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
+
+test("the selected secondary display is reapplied when reusing an owned Chrome profile", {
+  skip: !existsSync(chromeExecutable)
+    || (process.env.ACTIVETAB_CHROME_DISPLAY ?? "secondary") !== "secondary"
+    || Boolean(process.env.ACTIVETAB_CHROME_WINDOW_POSITION),
+  timeout: 60_000
+}, async () => {
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+    response.end("<!doctype html><title>Reusable display fixture</title><main>Ready</main>");
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+
+  const initialUrl = `http://127.0.0.1:${server.address().port}/`;
+  const profileDir = await mkdtemp(join(tmpdir(), "activetab-display-reuse-"));
+  const selectedPosition = resolveChromeWindowPosition();
+  const initialPosition = { x: selectedPosition.x + 20, y: selectedPosition.y + 20 };
+  let firstOwner = null;
+  let reusedOwner = null;
+
+  try {
+    firstOwner = await launchOwnedChrome({
+      initialUrl,
+      headed: true,
+      userDataDir: profileDir,
+      preserveProfile: true,
+      windowPosition: `${initialPosition.x},${initialPosition.y}`
+    });
+    assert.deepEqual(
+      { left: firstOwner.windowBounds.left, top: firstOwner.windowBounds.top },
+      { left: initialPosition.x, top: initialPosition.y },
+      "the fixture starts on the secondary display"
+    );
+
+    reusedOwner = await launchOwnedChrome({
+      initialUrl,
+      userDataDir: profileDir,
+      preserveProfile: true,
+      reuseExisting: true
+    });
+    assert.equal(reusedOwner.reusedExisting, true);
+    assert.equal(reusedOwner.readiness.positionedWindowCount, 1);
+    assert.deepEqual(
+      { left: reusedOwner.windowBounds.left, top: reusedOwner.windowBounds.top },
+      { left: selectedPosition.x, top: selectedPosition.y },
+      "profile reuse reapplies the configured secondary-display position"
+    );
+  } finally {
+    await reusedOwner?.close();
+    await firstOwner?.close();
+    await new Promise(resolve => server.close(resolve));
+    await rm(profileDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
 
 test("owned Chrome reattaches to the exact authorized page without reloading or closing it", {
   skip: !existsSync(chromeExecutable),

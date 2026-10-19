@@ -128,10 +128,23 @@ function findChromeBinary(env = process.env) {
 async function applyOwnedWindowPosition(client, targetId, position) {
   const current = await client.send("Browser.getWindowForTarget", { targetId });
   if (!Number.isInteger(current.windowId)) throw new Error("Chrome did not expose the owned window ID for display placement.");
+  const originalWindowState = current.bounds?.windowState;
+  if (originalWindowState && originalWindowState !== "normal") {
+    await client.send("Browser.setWindowBounds", {
+      windowId: current.windowId,
+      bounds: { windowState: "normal" }
+    });
+  }
   await client.send("Browser.setWindowBounds", {
     windowId: current.windowId,
-    bounds: { left: position.x, top: position.y, windowState: "normal" }
+    bounds: { left: position.x, top: position.y }
   });
+  if (originalWindowState && originalWindowState !== "normal") {
+    await client.send("Browser.setWindowBounds", {
+      windowId: current.windowId,
+      bounds: { windowState: originalWindowState }
+    });
+  }
   const moved = await client.send("Browser.getWindowForTarget", { targetId });
   if (moved.bounds?.left !== position.x || moved.bounds?.top !== position.y) {
     throw new Error("Chrome did not place the owned window at the requested desktop coordinates.");
@@ -285,6 +298,9 @@ export async function launchOwnedChrome({
         if (!observedOrigin || !existingOriginAllowlist.has(observedOrigin)) {
           throw new Error(`The existing page changed to an unauthorized origin while attaching (${observedOrigin ?? "unavailable"}).`);
         }
+        const windowBounds = windowPosition && headed !== false
+          ? await applyOwnedWindowPosition(existingChrome.client, attachExistingTargetId, windowPosition)
+          : null;
         let closed = false;
         let closeResult = null;
         return {
@@ -295,8 +311,9 @@ export async function launchOwnedChrome({
           browserVersion: existingChrome.browserVersion,
           launchMode: "reattached to exact existing headed Chrome target",
           displayMode,
+          windowBounds,
           profileDir,
-          readiness: { phase: "reattached-existing-target", targetId: attachExistingTargetId, origin: observedOrigin },
+          readiness: { phase: "reattached-existing-target", targetId: attachExistingTargetId, origin: observedOrigin, windowBounds },
           reusedExisting: false,
           attachedExisting: true,
           signal,
@@ -319,7 +336,24 @@ export async function launchOwnedChrome({
       throw new Error("Chrome is already running with this profile. Refusing to navigate or replace the open browser; select its exact authorized page with attachExistingTargetId, or use open-only reuse.");
     }
     let pageTargets;
-    try { pageTargets = await listTargets(existingChrome.endpoint); }
+    let windowBounds = null;
+    let positionedWindowCount = 0;
+    try {
+      pageTargets = await listTargets(existingChrome.endpoint);
+      if (windowPosition && headed !== false) {
+        const positionedWindowIds = new Set();
+        for (const pageTarget of pageTargets) {
+          if (pageTarget.type !== "page") continue;
+          const window = await existingChrome.client.send("Browser.getWindowForTarget", { targetId: pageTarget.id });
+          if (!Number.isInteger(window.windowId)) throw new Error("Chrome did not expose a window ID for an existing owned page.");
+          if (positionedWindowIds.has(window.windowId)) continue;
+          const bounds = await applyOwnedWindowPosition(existingChrome.client, pageTarget.id, windowPosition);
+          positionedWindowIds.add(window.windowId);
+          positionedWindowCount++;
+          if (!windowBounds) windowBounds = bounds;
+        }
+      }
+    }
     catch (error) {
       await existingChrome.close().catch(() => {});
       throw error;
@@ -334,8 +368,9 @@ export async function launchOwnedChrome({
       browserVersion: existingChrome.browserVersion,
       launchMode: "reused existing headed Chrome",
       displayMode,
+      windowBounds,
       profileDir,
-      readiness: { phase: "reused-existing-browser" },
+      readiness: { phase: "reused-existing-browser", positionedWindowCount, windowBounds },
       reusedExisting: true,
       pageTargets,
       signal,
