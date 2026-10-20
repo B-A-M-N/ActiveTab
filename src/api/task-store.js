@@ -30,8 +30,11 @@ export const SUSPENDED_STATUSES = new Set([
 ]);
 
 export class TaskStore {
-  constructor(baseDir) {
+  constructor(baseDir, { maxRecords = 1_000 } = {}) {
     this.baseDir = baseDir;
+    this.maxRecords = Number.isInteger(maxRecords) && maxRecords >= 1
+      ? Math.min(maxRecords, 10_000)
+      : 1_000;
     this.tasks = new Map();
   }
 
@@ -83,6 +86,11 @@ export class TaskStore {
   }
 
   create(templateId, input, botId = null, inputSchema = findTemplate(templateId)?.input_schema) {
+    if (this.tasks.size >= this.maxRecords) {
+      throw Object.assign(new Error(`Task storage is full (${this.maxRecords} records).`), {
+        code: "TASK_STORE_FULL"
+      });
+    }
     const taskId = randomUUID();
     const task = {
       task_id: taskId,

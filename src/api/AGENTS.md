@@ -14,6 +14,9 @@ Owns local HTTP composition and endpoint-family adapters.
 - Authentication and operator identity come from server-owned authenticators. Request bodies contain caller input only and cannot select trusted identity, knowledge storage, or grant configuration.
 - Durable run-state and target lease operations use the configured stores and existing coordinators.
 - Legacy run creation fails closed when the server-owned executor is unavailable. The peer endpoint keeps its separate peer-token authentication; it does not rely on the local API token.
+- Compatibility and peer run JSON roots must be non-null objects. Missing or invalid required fields return 400 without creating a task. Preparation that can run without a task ID happens before task creation; later preparation or scheduling failure is persisted as a bounded failed record before the handler responds.
+- Task capacity is enforced in `TaskStore.create` as the synchronous admission point, with route-level checks retained for quick refusal. Capacity is scoped to one `TaskStore` process; it is not a cross-process quota when multiple API processes share a task directory.
+- Shutdown closes HTTP admission, persists cancellation intent before aborting active test-run controllers, and waits on one settlement promise that is replaced when a run resumes. If a worker does not settle within the configured bound, it remains nonterminal for reconciliation and resource closure is deferred until its settlement; shutdown never manufactures a terminal receipt.
 - Route extraction preserves method/path matching, status codes, response bodies, authentication order, redaction, and error behavior. Output-file serving remains behind API authentication and retains its path, extension, and size checks.
 - The discovery routes use server-composed environment, principal, and canonical knowledge directory. Discovery holds the current target lease for its run.
 
@@ -31,3 +34,4 @@ Owns local HTTP composition and endpoint-family adapters.
 | `routes/catalog.js` | Authenticated bot, template, and region catalog reads with compatibility response shapes |
 | `routes/runExecution.js` | Compatibility run creation and peer execution using server-owned lifecycle, stores, executor, and extraction release policy |
 | `outputFileHandler.js` | API-authenticated bounded reads of task output files with allowlisted extensions and MIME types |
+| `shutdownCoordinator.js` | Bounded API shutdown, persisted cancellation-before-abort, settlement waiting, and deferred owned-resource closure |

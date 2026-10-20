@@ -55,6 +55,7 @@ import { createLegacyRunRoutes } from "./routes/legacyRuns.js";
 import { createCatalogRoutes } from "./routes/catalog.js";
 import { createRunExecutionHandlers } from "./routes/runExecution.js";
 import { createOutputFileHandler } from "./outputFileHandler.js";
+import { createShutdownCoordinator } from "./shutdownCoordinator.js";
 
 const DEFAULT_PORT = 9377;
 const API_PREFIX = "/v3/bots";
@@ -64,9 +65,10 @@ const MAX_TASK_RECORDS = 1_000;
 // the run as finished.
 const TERMINAL = new Set(["finished", "failed", "canceled"]);
 
-export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKnowledgeDir = join(stateDirectory(), "discovery-knowledge"), discoveryEnvironment = null, discoveryPrincipalId = null, navigationRunner, decisionRuntime = null, qualificationService = null, capabilityRegistry = null, capabilityService = null, authorizeExtractionField = null, authorizeExtractionRelease = null, apiToken, operatorToken = process.env.ACTIVETAB_OPERATOR_TOKEN ?? null, operatorId = process.env.ACTIVETAB_OPERATOR_ID ?? null, operatorAuthenticator = null, evidenceReleaseStore: suppliedEvidenceReleaseStore = null, evidenceReleaseDatabasePath = process.env.ACTIVETAB_EVIDENCE_RELEASE_DB ?? join(stateDirectory(), "evidence-releases.sqlite"), fileUploadGrantStore: suppliedFileUploadGrantStore = null, interventionStore: suppliedInterventionStore = null, publicReadApprovalBroker = null, host = "127.0.0.1", maxTasks = MAX_TASK_RECORDS, executorName, reportDir, testSessionResolver = null, testEnvironmentResolver = null, testProfileIdResolver = null, testPrincipalResolver = null, runStateStore: suppliedRunStateStore = null } = {}) {
+export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKnowledgeDir = join(stateDirectory(), "discovery-knowledge"), discoveryEnvironment = null, discoveryPrincipalId = null, navigationRunner, decisionRuntime = null, qualificationService = null, capabilityRegistry = null, capabilityService = null, authorizeExtractionField = null, authorizeExtractionRelease = null, apiToken, operatorToken = process.env.ACTIVETAB_OPERATOR_TOKEN ?? null, operatorId = process.env.ACTIVETAB_OPERATOR_ID ?? null, operatorAuthenticator = null, evidenceReleaseStore: suppliedEvidenceReleaseStore = null, evidenceReleaseDatabasePath = process.env.ACTIVETAB_EVIDENCE_RELEASE_DB ?? join(stateDirectory(), "evidence-releases.sqlite"), fileUploadGrantStore: suppliedFileUploadGrantStore = null, interventionStore: suppliedInterventionStore = null, publicReadApprovalBroker = null, host = "127.0.0.1", maxTasks = MAX_TASK_RECORDS, shutdownTimeoutMs = 10_000, executorName, reportDir, testSessionResolver = null, testEnvironmentResolver = null, testProfileIdResolver = null, testPrincipalResolver = null, runStateStore: suppliedRunStateStore = null } = {}) {
   const configuredKnowledgeDir = resolve(discoveryKnowledgeDir);
-  const store = new TaskStore(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"));
+  const maxTaskRecords = Number.isInteger(maxTasks) && maxTasks >= 1 ? Math.min(maxTasks, 10_000) : MAX_TASK_RECORDS;
+  const store = new TaskStore(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"), { maxRecords: maxTaskRecords });
   const lifecycle = new RunLifecycle({ store, navigationRunner, executorName, reportDir });
   const token = apiToken ?? process.env.ACTIVETAB_API_TOKEN ?? null;
   const authorizeMutation = createMutationAuthorizer(token);
@@ -80,10 +82,10 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
     }
     return evidenceReleaseStore;
   }
-  const maxTaskRecords = Number.isInteger(maxTasks) && maxTasks >= 1 ? Math.min(maxTasks, 10_000) : MAX_TASK_RECORDS;
   const diagnostics = createDiagnostics();
   const runQualificationService = qualificationService ?? createQualificationRuntime({ decisionRuntime });
   const testRuns = new Map();
+  const ownsRunStateStore = !suppliedRunStateStore;
   const runStateStore = suppliedRunStateStore ?? new RunStateStore(
     process.env.ACTIVETAB_RUN_STATE_DIR ?? join(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"), "..", "runs")
   );
@@ -116,6 +118,23 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
       revokeGrant: grantId => grantStore.revoke(grantId)
     }
   });
+  let shuttingDown = false;
+  let resourceClosePromise = null;
+
+  function closeOwnedResources() {
+    resourceClosePromise ??= Promise.resolve().then(() => {
+      decisionRuntime?.close();
+      if (ownsEvidenceReleaseStore) evidenceReleaseStore?.close();
+      if (ownsRunStateStore) runStateStore.close();
+    });
+    return resourceClosePromise;
+  }
+
+  function rejectIfShuttingDown(res) {
+    if (!shuttingDown) return false;
+    sendError(res, 503, 99503, "The API server is shutting down.");
+    return true;
+  }
 
   function createTestVerificationContext(session) {
     return {
@@ -176,36 +195,45 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
 
   function installTestRun({ runId, session, workflow, binding, controller, collector, correlator, runner, runPromise, runCtx }) {
     const runState = trackRunResult(runPromise);
-    testRuns.set(runId, {
-      collector, correlator, controller, runPromise, runState, session, runner, workflow, binding,
+    const runRecord = {
+      runId, collector, correlator, controller, runPromise, runState, settlement: runState.completion, session, runner, workflow, binding,
       startedAt: new Date().toISOString(),
       resume: async () => {
+        if (shuttingDown) return { resumed: false, reason: "The API server is shutting down." };
         if (!runState.settled) return { resumed: false, reason: "Run is still executing." };
         if (!runState.receipt) return { resumed: false, reason: "Run did not produce a receipt." };
         runState.status = "RUNNING";
         runState.settled = false;
-        try {
-          const result = await runner.resume(runState.receipt, { verify: runCtx, workflow });
-          if (result.receipt) runState.receipt = result.receipt;
-          runState.status = runState.receipt?.status ?? "UNKNOWN";
-          return result;
-        } catch (error) {
-          runState.status = runState.receipt?.status ?? "UNCERTAIN";
-          runState.error = error;
-          throw error;
-        } finally { runState.settled = true; }
+        const resumption = (async () => {
+          try {
+            const result = await runner.resume(runState.receipt, { verify: runCtx, workflow });
+            if (result.receipt) runState.receipt = result.receipt;
+            runState.status = runState.receipt?.status ?? "UNKNOWN";
+            return result;
+          } catch (error) {
+            runState.status = runState.receipt?.status ?? "UNCERTAIN";
+            runState.error = error;
+            throw error;
+          } finally { runState.settled = true; }
+        })();
+        runRecord.runPromise = resumption;
+        runRecord.settlement = resumption.then(() => undefined, () => undefined);
+        runState.completion = runRecord.settlement;
+        return await resumption;
       },
       getState: async () => runState.status,
       getVerificationContext: () => runCtx,
       cancel: async () => {
-        await runStateStore.requestCancellation(runId).catch(() => {});
+        await runStateStore.requestCancellation(runId);
         controller.abort();
       }
-    });
+    };
+    testRuns.set(runId, runRecord);
     return runState;
   }
 
   async function handleStartTestRun(req, res) {
+    if (rejectIfShuttingDown(res)) return;
     const body = await readBody(req);
     const workflow = body?.workflow && structuredClone(body.workflow);
     if (!workflow || typeof workflow !== "object" || !workflow.id || !Array.isArray(workflow.steps)) {
@@ -234,6 +262,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
       sendError(res, 400, 99003, `Test-run identity or environment could not be verified: ${String(error?.message ?? error).slice(0, 200)}`);
       return;
     }
+    if (rejectIfShuttingDown(res)) return;
     const runId = `test-${Date.now()}-${randomUUID().slice(0, 8)}`;
     const controller = new AbortController();
     const { collector, correlator, runner, runPromise } = applicationRunService.startWorkflowRun({
@@ -259,6 +288,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
   }
 
   async function handleResumeTestRun(req, res, runId) {
+    if (rejectIfShuttingDown(res)) return;
     const body = await readBody(req) ?? {};
     const workflow = body?.workflow && structuredClone(body.workflow);
     if (!workflow || typeof workflow !== "object" || !workflow.id || !Array.isArray(workflow.steps)) {
@@ -320,6 +350,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
     }
     const controller = new AbortController();
     const runCtx = createTestVerificationContext(session);
+    if (rejectIfShuttingDown(res)) return;
     const { collector, correlator, runner, runPromise: initialRunPromise } = applicationRunService.startWorkflowRun({
       session,
       workflow,
@@ -572,6 +603,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
     validateInput,
     buildPageDataExtractionWorkflow,
     renderGoal,
+    isShuttingDown: () => shuttingDown,
     readBody,
     sendJson,
     sendError,
@@ -580,6 +612,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
   const handleOutputFile = createOutputFileHandler({ sendError });
 
   const server = http.createServer(async (req, res) => {
+    if (rejectIfShuttingDown(res)) return;
     const requestStart = Date.now();
     res.on("finish", () => diagnostics.httpLogger(req, res, requestStart));
     const url = req.url ?? "/";
@@ -681,6 +714,18 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
     }
   });
 
+  const shutdownCoordinator = createShutdownCoordinator({
+    stopAdmission: () => { shuttingDown = true; },
+    getTestRuns: () => [...testRuns.values()],
+    ensureRunStateStore,
+    runStateStore,
+    lifecycle,
+    server,
+    closeOwnedResources,
+    logger,
+    timeoutMs: shutdownTimeoutMs
+  });
+
   return {
     server,
     store,
@@ -699,14 +744,6 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
         server.on("error", reject);
       });
     },
-    async stop() {
-      for (const run of testRuns.values()) run.controller.abort();
-      await lifecycle.stopAll();
-      return new Promise(resolvePromise => server.close(() => {
-        decisionRuntime?.close();
-        if (ownsEvidenceReleaseStore) evidenceReleaseStore?.close();
-        resolvePromise();
-      }));
-    }
+    async stop() { return await shutdownCoordinator.stop(); }
   };
 }

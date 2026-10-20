@@ -14,25 +14,54 @@ export function createRunExecutionHandlers({
   validateInput,
   buildPageDataExtractionWorkflow,
   renderGoal,
+  isShuttingDown = () => false,
   readBody,
   sendJson,
   sendError,
   logger
 } = {}) {
+  function createTask(templateId, input, botId, inputSchema, res) {
+    try { return store.create(templateId, input, botId, inputSchema); }
+    catch (error) {
+      if (error?.code !== "TASK_STORE_FULL") throw error;
+      sendError(res, 507, 99507, `Task storage is full (${maxTaskRecords} records).`);
+      return null;
+    }
+  }
+
+  async function recordSchedulingFailure(taskId, phase, res, { status = 500, code = 99500, message = null } = {}) {
+    store.update(taskId, {
+      status: "failed",
+      error: `run ${phase} failed before navigation was scheduled`,
+      finished_at: new Date().toISOString()
+    });
+    try {
+      await store.persist(taskId);
+    } catch {
+      logger.error("run.failure.persist.failed", { task: taskId, phase });
+      sendError(res, 503, 99503, "Run scheduling failed and its durable state could not be confirmed.");
+      return;
+    }
+    logger.error("run.scheduling.failed", { task: taskId, phase });
+    sendError(res, status, code, message ?? `Run ${phase} failed before navigation was scheduled; failure was recorded.`);
+  }
+
   async function handleCreateRun(req, res, { templateRun, path } = {}) {
+    if (isShuttingDown()) { sendError(res, 503, 99503, "The API server is shutting down."); return; }
     if (!executorReady) {
       // Fail closed: no executor, no acknowledged executable task.
       sendError(res, 503, 99503, "Navigation execution is unavailable on this server.");
-      return;
-    }
-    if (store.tasks.size >= maxTaskRecords) {
-      sendError(res, 507, 99507, `Task storage is full (${maxTaskRecords} records).`);
       return;
     }
     const id = templateRun ? path.split("/")[4] : path.split("/")[3];
     const template = findTemplate(id);
     if (!template) { sendError(res, 400, 99010, "bot_id is invalid."); return; }
     const body = await readBody(req);
+    if (isShuttingDown()) { sendError(res, 503, 99503, "The API server is shutting down."); return; }
+    if (!isJsonObject(body)) {
+      sendError(res, 400, 99001, "JSON request body must be an object.");
+      return;
+    }
     if (!body.input || typeof body.input !== "object" || Array.isArray(body.input)) {
       sendError(res, 400, 99001, "must not be null");
       return;
@@ -60,37 +89,56 @@ export function createRunExecutionHandlers({
       }
     }
 
-    const task = store.create(id, body.input, templateRun ? null : id, template.input_schema);
-    store.update(task.task_id, { status: "queued" });
-    await store.persist(task.task_id);
-    diagnostics.bump("runs.created");
-    logger.info("run.created", { task: task.task_id, template: id, executor: lifecycle.executorReady ? "configured" : "none" });
-
-    const extractionWorkflow = id === "local-page-data-extractor" && capabilityService
-      ? buildPageDataExtractionWorkflow(body.input, task.task_id)
-      : null;
-    const goal = extractionWorkflow
+    if (store.tasks.size >= maxTaskRecords) {
+      sendError(res, 507, 99507, `Task storage is full (${maxTaskRecords} records).`);
+      return;
+    }
+    const usesExtractionWorkflow = id === "local-page-data-extractor" && Boolean(capabilityService);
+    const goal = usesExtractionWorkflow
       ? `Go to ${body.input.url} and ${body.input.capability_id ? "extract with a qualified capability" : "discover visible structured data"}.`
       : renderGoal(template, body.input);
-    lifecycle.start(task.task_id, async controller => {
-      const result = await lifecycle.navigationRunner.run(goal, {
-        signal: controller.signal,
-        input: body.input,
-        templateId: id,
-        taskId: task.task_id,
-        inputSchema: template.input_schema,
-        ...(extractionWorkflow ? { workflow: extractionWorkflow } : {}),
-        runStateStore
+    const task = createTask(id, body.input, templateRun ? null : id, template.input_schema, res);
+    if (!task) return;
+    store.update(task.task_id, { status: "queued" });
+    await store.persist(task.task_id);
+    if (isShuttingDown()) {
+      await recordSchedulingFailure(task.task_id, "canceled during shutdown", res, {
+        status: 503, code: 99503,
+        message: "The API server is shutting down; this run was recorded as failed before scheduling."
       });
-      return extractionWorkflow
-        ? projectRunResultForRelease(result, authorizeExtractionRelease, { req, taskId: task.task_id })
-        : result;
-    });
+      return;
+    }
 
+    try {
+      const extractionWorkflow = usesExtractionWorkflow
+        ? buildPageDataExtractionWorkflow(body.input, task.task_id)
+        : null;
+      await lifecycle.start(task.task_id, async controller => {
+        const result = await lifecycle.navigationRunner.run(goal, {
+          signal: controller.signal,
+          input: body.input,
+          templateId: id,
+          taskId: task.task_id,
+          inputSchema: template.input_schema,
+          ...(extractionWorkflow ? { workflow: extractionWorkflow } : {}),
+          runStateStore
+        });
+        return extractionWorkflow
+          ? projectRunResultForRelease(result, authorizeExtractionRelease, { req, taskId: task.task_id })
+          : result;
+      });
+    } catch {
+      await recordSchedulingFailure(task.task_id, usesExtractionWorkflow ? "preparation" : "scheduling", res);
+      return;
+    }
+
+    diagnostics.bump("runs.created");
+    logger.info("run.created", { task: task.task_id, template: id, executor: lifecycle.executorReady ? "configured" : "none" });
     sendJson(res, 200, { status: "created", task_id: task.task_id });
   }
 
   async function handlePeerRun(req, res) {
+    if (isShuttingDown()) { sendError(res, 503, 99503, "The API server is shutting down."); return; }
     if (!executorReady) { sendError(res, 503, 99503, "Navigation execution is unavailable on this server."); return; }
     const peerAuth = req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : null;
     const { loadPeerTokenRing, tokenMatches } = await import("../../runtime/tokens.js");
@@ -99,25 +147,49 @@ export function createRunExecutionHandlers({
       return;
     }
     const body = await readBody(req);
+    if (isShuttingDown()) { sendError(res, 503, 99503, "The API server is shutting down."); return; }
+    if (!isJsonObject(body)) {
+      sendError(res, 400, 99001, "JSON request body must be an object.");
+      return;
+    }
     if (typeof body.goal !== "string" || !body.goal.trim() || body.goal.length > 2000) {
       sendError(res, 400, 99001, "A non-empty goal of at most 2000 characters is required.");
       return;
     }
-    const task = store.create("remote-peer-run", {}, null);
+    if (store.tasks.size >= maxTaskRecords) {
+      sendError(res, 507, 99507, `Task storage is full (${maxTaskRecords} records).`);
+      return;
+    }
+    const task = createTask("remote-peer-run", {}, null, undefined, res);
+    if (!task) return;
     store.update(task.task_id, { status: "running" });
     await store.persist(task.task_id);
+    if (isShuttingDown()) {
+      await recordSchedulingFailure(task.task_id, "canceled during shutdown", res, {
+        status: 503, code: 99503,
+        message: "The API server is shutting down; this run was recorded as failed before scheduling."
+      });
+      return;
+    }
     diagnostics.bump("runs.peer");
     logger.info("run.peer.created", { task: task.task_id });
 
-    const { controller, worker } = lifecycle.start(task.task_id, ctrl => lifecycle.navigationRunner.run(body.goal, {
-      signal: ctrl.signal,
-      input: (body.input && typeof body.input === "object" && !Array.isArray(body.input)) ? body.input : {},
-      templateId: "remote-peer-run",
-      taskId: task.task_id,
-      plannerMode: body.plannerMode,
-      workflowIntent: body.workflowIntent,
-      runStateStore
-    }));
+    let started;
+    try {
+      started = lifecycle.start(task.task_id, ctrl => lifecycle.navigationRunner.run(body.goal, {
+        signal: ctrl.signal,
+        input: (body.input && typeof body.input === "object" && !Array.isArray(body.input)) ? body.input : {},
+        templateId: "remote-peer-run",
+        taskId: task.task_id,
+        plannerMode: body.plannerMode,
+        workflowIntent: body.workflowIntent,
+        runStateStore
+      }));
+    } catch {
+      await recordSchedulingFailure(task.task_id, "scheduling", res);
+      return;
+    }
+    const { worker } = started;
 
     // Await-style peer response: heartbeats keep the socket responsive on
     // slow runs; the remote executor tolerates the leading blank lines.
@@ -139,6 +211,10 @@ export function createRunExecutionHandlers({
   }
 
   return Object.freeze({ handleCreateRun, handlePeerRun });
+}
+
+function isJsonObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function projectRunResultForRelease(result, authorizeExtractionRelease, context) {
