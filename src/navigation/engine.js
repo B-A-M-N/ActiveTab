@@ -9,7 +9,7 @@ import { isOperatorProhibitedNavigation } from "../runtime/controlRestrictions.j
 import { executeAuthorizedAction } from "../runtime/authorizedExecutor.js";
 import { adjudicatePreActionReview } from "../decisions/adjudication.js";
 import { hasReviewIntent, selectAutomaticNavigationRoute, selectPreActionDecisionRoute } from "../decisions/callPolicy.js";
-import { matchesScrollTargetSignature, matchesTargetSignature, observationSemanticFingerprint, observationStateFingerprint, routeFingerprint, scrollPositionFraction, scrollPositionMatches, scrollTargetSignature, targetSignature, visibleCandidatesFingerprint } from "../state/workflows.js";
+import { matchesScrollTargetSignature, observationSemanticFingerprint, observationStateFingerprint, routeFingerprint, scrollPositionFraction, scrollPositionMatches, scrollTargetSignature, targetSignature, visibleCandidatesFingerprint } from "../state/workflows.js";
 import { createConfiguredWorkflowSynthesizer } from "./workflowSynthesizer.js";
 import { WorkflowGraphPlanner } from "./workflowPlanner.js";
 import { createExtractionWorkflowCapabilities, createGenericWorkflowCapabilities, createObservedSearchWorkflowCapabilities, createProfileFormWorkflowCapabilities } from "./workflowCapabilities.js";
@@ -23,6 +23,7 @@ import { createNavigationRunContext } from "./runContext.js";
 import { RecoveryCoordinator } from "./recoveryCoordinator.js";
 import { ReplayCoordinator } from "./replayCoordinator.js";
 import { ActionAttemptCoordinator } from "./actionAttemptCoordinator.js";
+import { createPlanningOptions, filterPlanningObservation } from "./planningCycle.js";
 
 function pageChangeWaitBaseline(observation, scrollTarget) {
   return {
@@ -1091,7 +1092,13 @@ export class NavigationEngine {
                 facets: ["page"], includeScreenshot: true
               });
               const promotedImageEvidence = bindVisualEvidence(promotedObservation, promotedRetained);
-              const refreshedPlan = await this.deterministicPlanner.plan(goal, filterPlanningObservation(promotedObservation)).catch(() => null);
+              const refreshedPlan = await this.deterministicPlanner.plan(goal, filterPlanningObservation(promotedObservation, {
+                excludedIdentities,
+                excludedTargetSignatures,
+                excludedScrollIdentities,
+                searchPhrase,
+                searchObservation: latest
+              })).catch(() => null);
               const refreshedTargets = refreshedPlan?.status === "planned" ? [refreshedPlan.action?.target]
                 : refreshedPlan?.candidates ?? [];
               const targetStillMatchesIntent = refreshedTargets.some(candidate => candidate?.identity === hint.identity);
@@ -1494,15 +1501,14 @@ export class NavigationEngine {
     let candidateExpansionAttempted = false;
     while (state.attempts.length < this.maxActions) {
       if (await outcomeVerified() && workflowPlanCanFinish()) return await succeed();
-      const filterPlanningObservation = observation => ({
-        ...observation,
-        candidates: (observation.candidates ?? []).filter(candidate =>
-          (!excludedIdentities.has(candidate.identity) || (searchPhrase && isSearchFieldCandidate(candidate, latest))) &&
-          !excludedTargetSignatures.some(signature => matchesTargetSignature(candidate, signature))
-        ),
-        scrollTargets: (observation.scrollTargets ?? []).filter(target => !excludedScrollIdentities.has(target.identity))
+      const filterPlanning = observation => filterPlanningObservation(observation, {
+        excludedIdentities,
+        excludedTargetSignatures,
+        excludedScrollIdentities,
+        searchPhrase,
+        searchObservation: latest
       });
-      let planningObservation = filterPlanningObservation(latest);
+      let planningObservation = filterPlanning(latest);
       const candidateCoverage = latest.candidateCoverage;
       const scopeNeedsExpansion = workflowModeActive
         && !candidateExpansionAttempted
@@ -1524,7 +1530,7 @@ export class NavigationEngine {
           if (expandedObservation?.evidenceId !== previousEvidenceId
             && expandedObservation?.targetId === this.session.target.id) {
             setLatestObservation(expandedObservation);
-            planningObservation = filterPlanningObservation(latest);
+            planningObservation = filterPlanning(latest);
           }
         } catch {
           // Keep the incomplete evidence; synthesis will abstain before dispatch.
@@ -1537,14 +1543,7 @@ export class NavigationEngine {
           selectionGoal: goal,
           candidateLimit: candidateExpansionAttempted ? 384 : 200
         }));
-        planningObservation = {
-          ...latest,
-          candidates: (latest.candidates ?? []).filter(candidate =>
-            (!excludedIdentities.has(candidate.identity) || (searchPhrase && isSearchFieldCandidate(candidate, latest))) &&
-            !excludedTargetSignatures.some(signature => matchesTargetSignature(candidate, signature))
-          ),
-          scrollTargets: (latest.scrollTargets ?? []).filter(target => !excludedScrollIdentities.has(target.identity))
-        };
+        planningObservation = filterPlanning(latest);
         const visualEvidence = this.session.observer?.getEvidence?.(latest.evidenceId, {
           facets: ["page"],
           includeScreenshot: true
@@ -1560,12 +1559,15 @@ export class NavigationEngine {
       let routedVisualReview = null;
       let visualHandoffSuggested = false;
       try {
-        const previousScrollStates = [...scrollConvergenceStates.entries()].map(([identity, data]) => ({
-          identity,
-          matchingCandidateCount: data.matchingCandidateCount,
-          scrollActionsUsed: data.scrollActionsUsed
-        }));
-        const planningOptions = { excludedIdentities: [...excludedIdentities], excludedScrollIdentities: [...excludedScrollIdentities], maxScrolls: this.maxScrolls, scrollActionsUsed, previousScrollStates, signal: abortSignal, inputBindings };
+        const planningOptions = createPlanningOptions({
+          excludedIdentities,
+          excludedScrollIdentities,
+          maxScrolls: this.maxScrolls,
+          scrollActionsUsed,
+          scrollConvergenceStates,
+          signal: abortSignal,
+          inputBindings
+        });
         if (workflowModeActive || this.plannerMode !== "auto") {
           if (this.plannerMode === "model" && planner?.plannerRole) {
             const visualEvidenceUsed = planner.requiresScreenshot === true
@@ -1623,7 +1625,7 @@ export class NavigationEngine {
             candidateExpansionAttempted = fallback.status !== "not_needed";
             if (fallback.status === "refreshed") {
               setLatestObservation(fallback.observation);
-              planningObservation = filterPlanningObservation(latest);
+              planningObservation = filterPlanning(latest);
               localPlan = await this.deterministicPlanner.plan(goal, planningObservation, planningOptions);
             }
           }
@@ -1686,7 +1688,7 @@ export class NavigationEngine {
               : await classifyAmbiguousPage(planningObservation);
             if (routedVisualReview?.observation?.evidenceId) {
               setLatestObservation(routedVisualReview.observation);
-              planningObservation = filterPlanningObservation(latest);
+              planningObservation = filterPlanning(latest);
               if (routedVisualReview.imageEvidence) {
                 planningObservation.visualEvidence = routedVisualReview.imageEvidence;
                 planningObservation.screenshotBase64 = routedVisualReview.imageEvidence.screenshotBase64;
@@ -1727,7 +1729,7 @@ export class NavigationEngine {
               if (this.planner.requiresScreenshot === true && !isBoundVisualEvidence(planningObservation, planningObservation.visualEvidence)) {
                 const captured = await captureVisualObservation(planningObservation);
                 setLatestObservation(captured.observation);
-                planningObservation = filterPlanningObservation(latest);
+                planningObservation = filterPlanning(latest);
                 if (captured.imageEvidence) {
                   planningObservation.visualEvidence = captured.imageEvidence;
                   planningObservation.screenshotBase64 = captured.imageEvidence.screenshotBase64;
@@ -1740,7 +1742,7 @@ export class NavigationEngine {
             if (this.planner.requiresScreenshot === true) {
               const captured = await captureVisualObservation(planningObservation);
               setLatestObservation(captured.observation);
-              planningObservation = filterPlanningObservation(latest);
+              planningObservation = filterPlanning(latest);
               if (captured.imageEvidence) {
                 planningObservation.visualEvidence = captured.imageEvidence;
                 planningObservation.screenshotBase64 = captured.imageEvidence.screenshotBase64;

@@ -6,13 +6,13 @@ ActiveTab is being decomposed through behavior-preserving extractions. One appli
 
 | Area | Current entrypoint | Current responsibility pressure |
 | --- | --- | --- |
-| Declarative workflows | `src/testing/runner.js` (647 lines after lifecycle, telemetry, handler, dispatcher, and intervention extractions) | Workflow scheduling and collaborator coordination |
-| Navigation | `src/navigation/engine.js` (1,218 lines after outcome-verifier extraction) | Planning, browser coordination, recovery, and replay |
-| MCP transport | `src/mcp/server.js` (779 lines) | Protocol handling mixed with application orchestration |
-| HTTP transport | `src/api/local-server.js` (1,031 lines) | Routes mixed with run lifecycle and process-local service state |
-| Staging qualification | `scripts/qualify-staging.mjs` (454 lines) | Browser entry, handoff, qualification, diagnostics, reporting, and persistence |
+| Declarative workflows | `src/testing/runner.js` (654 lines after lifecycle, telemetry, handler, dispatcher, and intervention extractions) | Workflow scheduling and collaborator coordination |
+| Navigation | `src/navigation/engine.js` (2,241 lines) | Planning, browser coordination, recovery, replay, and execution coordination |
+| MCP transport | `src/mcp/server.js` (270 lines) | Protocol startup and injected handler composition |
+| HTTP transport | `src/api/local-server.js` (1,255 lines) | Routes mixed with run lifecycle and process-local service state |
+| Staging qualification | `scripts/qualify-staging.mjs` (416 lines) | Browser entry, handoff, qualification, diagnostics, reporting, and persistence |
 | FI Agent Twin | `test-lab/fixtures/fi-agent-twin/provider.js` (247 lines after frontend, HTTP, auth, persistence, and job-service extractions) | Provider lifecycle still includes application routing and independent-oracle HTTP projection |
-| Response diagnostics | `src/observe/responseBodyInspector.js` (220-line dispatcher plus focused parser, format, security, shared, and Markdown modules) | Selected-body interpretation and safe operator views |
+| Response diagnostics | `src/observe/responseBodyInspector.js` (332 lines, with focused parser, format, security, shared, and Markdown modules) | Selected-body acquisition coordination, interpretation, and safe operator views |
 
 These are extraction targets. Size alone is not evidence of a defect.
 
@@ -46,11 +46,13 @@ Extract handlers by responsibility while preserving the receipt shape, state tra
 
 ## Stage 3 — Navigation coordination
 
-Keep `TestRunner` as the top-level declarative workflow owner. `NavigationEngine` remains a subordinate navigation capability. `src/navigation/outcomeVerifier.js` now owns pure visible-destination checks and privacy-preserving initial page-label hashes; it does not verify application-side effects. `src/navigation/applicationRunService.js` is the shared MCP/HTTP run lifecycle boundary. Continue extracting planning, fresh target binding, replay, recovery, and scroll convergence behind internal interfaces. The existing authorized executor remains the only browser effect boundary. Preserve workflow synthesis and the same per-run inference budget.
+Keep `TestRunner` as the top-level declarative workflow owner. `NavigationEngine` remains a subordinate navigation capability. `src/navigation/outcomeVerifier.js` owns pure visible-destination checks and privacy-preserving initial page-label hashes; it does not verify application-side effects. `src/navigation/applicationRunService.js` is the shared MCP/HTTP run lifecycle boundary. `runContext.js` owns per-run counters, bindings, observations, and failure-derived exclusions. `ReplayCoordinator` validates stored workflow signatures and preconditions; `RecoveryCoordinator` performs bounded fresh observation and exact-target reattachment without replaying actions; `ActionAttemptCoordinator` persists attempt metadata without dispatch. The new `planningCycle.js` owns only candidate/scroll exclusion projection and bounded planner-option construction. These modules do not authorize or dispatch effects.
+
+`NavigationEngine` still owns task-intent routing, provider and visual-review coordination, candidate expansion, target freshness, policy admission, and the call into the authorized executor. At 2,241 lines it remains an active decomposition target. The next planner extraction must preserve its inference budget, visual-evidence binding, candidate identity, telemetry lineage, and abort behavior. Keep target admission and the final dispatch call in the existing authorized execution path; do not create a second planner-side action path.
 
 ## Stage 4 — Shared application services for transports
 
-The shared run service is in place for MCP and HTTP. Continue moving transport-neutral lifecycle behavior into it while MCP and HTTP retain request validation, authentication, protocol serialization, and response mapping. Cloud Agent outcome recording moves to the shared integration/verification service. Both transports must preserve identical policy and lifecycle semantics.
+The shared run service is in place for MCP and HTTP. `src/mcp/server.js` is now a 270-line protocol startup/composition module. `src/api/local-server.js` remains 1,255 lines; discovery is the only route family extracted so far, while test-run lifecycle, capability routes, evidence release, and general request dispatch remain composed there. Continue extracting endpoint families with injected server-owned dependencies while MCP and HTTP retain request validation, authentication, protocol serialization, and response mapping. Do not move leases, principals, grants, stores, or execution authority into request-controlled route data. Both transports must preserve identical policy and lifecycle semantics.
 
 ## Stage 5 — Qualification and fixture composition
 
