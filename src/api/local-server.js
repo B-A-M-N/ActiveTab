@@ -50,6 +50,7 @@ import { createCapabilityRoutes } from "./routes/capabilities.js";
 import { createInterventionRoutes } from "./routes/interventions.js";
 import { createPublicReadApprovalRoutes } from "./routes/publicReadApprovals.js";
 import { createEvidenceReleaseRoutes } from "./routes/evidenceReleases.js";
+import { createTestRunRoutes } from "./routes/testRuns.js";
 
 const DEFAULT_PORT = 9377;
 const API_PREFIX = "/v3/bots";
@@ -527,6 +528,16 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
     sendJson,
     sendError
   });
+  const handleTestRunRoute = createTestRunRoutes({
+    authorizeMutation,
+    handleStartTestRun,
+    handleGetTestRun,
+    handleResumeTestRun,
+    handleCancelTestRun,
+    handleCollectTestRunDiagnostics,
+    handleGetTestReport,
+    sendError
+  });
 
   // Executor readiness: fail closed when no real navigation runner was provided.
   const executorReady = lifecycle.executorReady;
@@ -580,25 +591,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
       // Evidence release review and grant revocation require independent operator auth.
       if (await handleEvidenceReleaseRoute(req, res, { method, path, query })) return;
 
-      // ── Test-run lifecycle (file 2 section 9) ──
-      if (method === "POST" && path === "/v1/test/runs") {
-        if (!authorizeMutation(req)) { sendError(res, 401, 99401, "Authentication required."); return; }
-        await handleStartTestRun(req, res);
-        return;
-      }
-      const testRunMatch = path.match(/^\/v1\/test\/runs\/([^/]+)(?:\/(status|cancel|diagnostics|report|resume))?$/);
-      if (testRunMatch) {
-        if (!authorizeMutation(req)) { sendError(res, 401, 99401, "Authentication required."); return; }
-        const runId = testRunMatch[1];
-        const action = testRunMatch[2] ?? "status";
-        if (method === "GET" && action === "status") { await handleGetTestRun(req, res, runId); return; }
-        if (method === "POST" && action === "resume") { await handleResumeTestRun(req, res, runId); return; }
-        if (method === "POST" && action === "cancel") { await handleCancelTestRun(req, res, runId); return; }
-        if (method === "POST" && action === "diagnostics") { await handleCollectTestRunDiagnostics(req, res, runId); return; }
-        if (method === "GET" && action === "report") { await handleGetTestReport(req, res, runId); return; }
-        sendError(res, 405, 99405, "Method not allowed for this test-run resource.");
-        return;
-      }
+      if (await handleTestRunRoute(req, res, { method, path })) return;
 
       if (path.startsWith("/v3/") || path.startsWith("/v2/")) {
         // The peer-execution endpoint authenticates with its own peer token
