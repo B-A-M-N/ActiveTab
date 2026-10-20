@@ -56,15 +56,17 @@ test("NavigationEngine enters one inference budget without recursively invoking 
     }
   };
   let budgetEntries = 0;
+  let budgetRunId;
   const engine = new NavigationEngine(session, {
     planner: { async plan() { return { status: "ambiguous", candidates: [], reason: "No visible target." }; } },
-    decisionContext: { runId: "budget-run", sharedEpisode: true },
     decisionRuntime: {
-      async withInferenceBudget(_binding, callback) {
+      async withInferenceBudget(binding, callback) {
         budgetEntries++;
+        budgetRunId = binding.runId;
         return callback();
       },
       startEpisode() { return { episodeId: "budget-episode" }; },
+      completeEpisode() {},
       inferenceBudgetSnapshot() { return { attempts: 0, maxAttempts: 3 }; }
     }
   });
@@ -75,8 +77,12 @@ test("NavigationEngine enters one inference budget without recursively invoking 
     return run(...args);
   };
 
-  const result = await engine.run("Open account history");
+  const result = await engine.run("Open account history", {
+    _executionState: { taskId: "forged-task-id", attempts: [] },
+    _inferenceBudgeted: true
+  });
   assert.equal(budgetEntries, 1);
+  assert.notEqual(budgetRunId, "forged-task-id", "public run options cannot replace canonical task state");
   assert.equal(publicRunCalls, 1);
   assert.equal(result.status, "unresolved");
 });

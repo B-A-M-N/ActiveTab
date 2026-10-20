@@ -332,7 +332,7 @@ export class NavigationEngine {
     this.maxScrolls = Math.max(0, Math.min(maxScrolls, 8));
   }
 
-  async run(goal, { resumeState, signal, workflowInputs = this.workflowInputs, workflowIntent = this.workflowIntent, inputBindings = {}, _executionState = null, _inferenceBudgeted = false } = {}) {
+  async run(goal, { resumeState, signal, workflowInputs = this.workflowInputs, workflowIntent = this.workflowIntent, inputBindings = {} } = {}) {
     const abortSignal = signal ?? this.signal;
     const throwIfAborted = () => {
       if (abortSignal?.aborted) {
@@ -351,7 +351,7 @@ export class NavigationEngine {
       && ((this.plannerMode === "workflow" && (!searchPhrase || Boolean(searchReadRequest)))
         || (this.plannerMode === "auto" && (explicitReadWorkflowRequest || taskRequest.compoundRequest || taskRequest.typedWorkflowIntent)));
     const searchSubmitAuthorizer = searchPhrase ? createSearchSubmitAuthorizer(searchPhrase) : null;
-    const state = _executionState ?? resumeState ?? newTaskState(
+    const state = resumeState ?? newTaskState(
       goal,
       this.session.target,
       this.session.target.journalEndpoint ?? this.session.target.endpoint ?? "local-cdp"
@@ -370,7 +370,7 @@ export class NavigationEngine {
       searchSubmitAuthorizer,
       state
     });
-    if (!_inferenceBudgeted && typeof this.decisionRuntime?.withInferenceBudget === "function") {
+    if (typeof this.decisionRuntime?.withInferenceBudget === "function") {
       const runId = this.decisionContext?.runId ?? state.taskId;
       return this.decisionRuntime.withInferenceBudget({ runId }, runPrepared);
     }
