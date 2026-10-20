@@ -13,6 +13,7 @@ Discover same-origin, read-only JSON API shapes from browser responses that the 
 - Qualification requires independent fixture oracles and must check schema, completeness, and privacy boundaries across every bounded variant.
 - The local API exposes network discovery, selected-response inspection, and qualification routes. No generic API fixture oracle is installed by default, so qualification reports unavailable until trusted composition supplies one.
 - API discovery does not execute, replay, paginate, or authorize requests. API operations and pagination require a separately reviewed execution contract.
+- `networkApiCapabilityService.js` owns the bounded, expiring candidate map and discovery → selected inspection → independent fixture qualification lifecycle. `CapabilityService` retains its public method delegates; the service creates no operation grants or request execution path.
 
 ## Verification
 
@@ -20,4 +21,6 @@ Discover same-origin, read-only JSON API shapes from browser responses that the 
 
 ## Child DOX Index
 
-No child DOX boundaries.
+| Path | Purpose |
+|------|---------|
+| `networkApiCapabilityService.js` | Bounded scoped candidate lifecycle and qualification orchestration |
