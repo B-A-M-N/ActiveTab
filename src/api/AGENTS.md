@@ -27,3 +27,4 @@ Owns local HTTP composition and endpoint-family adapters.
 | `routes/evidenceReleases.js` | Independent-operator-only evidence release review, audit, and grant revocation backed by the server-owned release store |
 | `routes/testRuns.js` | API-authenticated test-run route dispatch into server-owned lifecycle and reporting handlers |
 | `routes/legacyRuns.js` | Compatibility API run listing, status, detail, and cancellation after shared API authentication; task store and lifecycle stay server-owned |
+| `routes/catalog.js` | Authenticated bot, template, and region catalog reads with compatibility response shapes |

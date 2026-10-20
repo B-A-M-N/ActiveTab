@@ -459,7 +459,7 @@ test("runs report locally measured usage instead of synthetic vendor credits", a
   assert.equal(typeof detailRes.body.usage.actions, "number");
 });
 
-test("legacy run reads, cancellation, and run creation require the bearer token when configured", async () => {
+test("legacy run and catalog reads, cancellation, and run creation require the bearer token when configured", async () => {
   const token = "test-token-" + createHash("sha1").update(String(Math.random())).digest("hex").slice(0, 8);
   const secureApi = createApiServer({ port: 0, taskStoreDir: join(tempDir, "tasks-secure"), navigationRunner: MOCK_NAVIGATION_RUNNER, apiToken: token });
   const { url } = await secureApi.start();
@@ -469,6 +469,8 @@ test("legacy run reads, cancellation, and run creation require the bearer token 
     body: JSON.stringify({ input: { url: "https://example.com", review_count: 1 } })
   });
   assert.equal(unauth.status, 401);
+  const unauthCatalog = await fetch(`${url}/v3/bots`);
+  assert.equal(unauthCatalog.status, 401);
   const unauthRunList = await fetch(`${url}/v3/bots/runs`);
   assert.equal(unauthRunList.status, 401);
   const unauthCancel = await fetch(`${url}/v3/bots/runs/missing-task/cancel`, { method: "POST" });

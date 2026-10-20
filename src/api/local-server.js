@@ -53,6 +53,7 @@ import { createPublicReadApprovalRoutes } from "./routes/publicReadApprovals.js"
 import { createEvidenceReleaseRoutes } from "./routes/evidenceReleases.js";
 import { createTestRunRoutes } from "./routes/testRuns.js";
 import { createLegacyRunRoutes } from "./routes/legacyRuns.js";
+import { createCatalogRoutes } from "./routes/catalog.js";
 
 const DEFAULT_PORT = 9377;
 const API_PREFIX = "/v3/bots";
@@ -548,6 +549,13 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
     sendJson,
     sendError
   });
+  const handleCatalogRoute = createCatalogRoutes({
+    officialTemplates: OFFICIAL_TEMPLATES,
+    regions: REGIONS,
+    findTemplate,
+    sendJson,
+    sendError
+  });
 
   // Executor readiness: fail closed when no real navigation runner was provided.
   const executorReady = lifecycle.executorReady;
@@ -614,37 +622,6 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
           return;
         }
 
-        // ── GET /v3/bots ──
-        if (method === "GET" && path === API_PREFIX) {
-          const page = parseInt(query.page ?? "1", 10);
-          const limit = parseInt(query.limit ?? "20", 10);
-          const allItems = OFFICIAL_TEMPLATES.map(t => ({ bot_id: t.template_id, name: t.name, bot_type: t.bot_type, template_id: t.template_id, recommend_desc: t.recommend_desc }));
-          sendJson(res, 200, { items: allItems.slice((page - 1) * limit, page * limit), page, limit, total_count: allItems.length, total_pages: Math.ceil(allItems.length / limit) });
-          return;
-        }
-
-        // ── GET /v3/bots/templates ──
-        if (method === "GET" && path === `${API_PREFIX}/templates`) {
-          const page = parseInt(query.page ?? "1", 10);
-          const limit = parseInt(query.limit ?? "10", 10);
-          const items = OFFICIAL_TEMPLATES.map(t => ({ name: t.name, template_id: t.template_id, bot_type: t.bot_type, recommend_desc: t.recommend_desc, detail_url: t.detail_url }));
-          sendJson(res, 200, { items: items.slice((page - 1) * limit, page * limit), page, limit, total_count: items.length, total_pages: Math.ceil(items.length / limit) });
-          return;
-        }
-
-        // ── GET /v3/bots/templates/:id ──
-        if (method === "GET" && path.match(/^\/v3\/bots\/templates\/[^/]+$/)) {
-          const template = findTemplate(path.split("/").pop());
-          if (!template) { sendError(res, 400, 99010, "bot_id is invalid."); return; }
-          sendJson(res, 200, {
-            name: template.name, template_id: template.template_id, bot_type: template.bot_type,
-            description: template.recommend_desc, input_schema: template.input_schema,
-            recommend_desc: template.recommend_desc, detail_url: template.detail_url,
-            created_at: "2026-10-16T00:00:00Z", published_at: "2026-10-16T00:00:00Z"
-          });
-          return;
-        }
-
         // ── POST /v3/bots/remote/runs (peer execution; must precede :bot_id) ──
         if (method === "POST" && path === `${API_PREFIX}/remote/runs`) {
           await handlePeerRun(req, res, { store, lifecycle, executorReady, diagnostics, runStateStore });
@@ -653,25 +630,13 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
 
         if (await handleCapabilityRoute(req, res, { method, path })) return;
 
+        if (await handleCatalogRoute(req, res, { method, path, query })) return;
+
         // ── POST run creation (template and bot routes share one path) ──
         const templateRun = method === "POST" && path.match(/^\/v3\/bots\/templates\/[^/]+\/runs$/);
         const botRun = method === "POST" && path.match(/^\/v3\/bots\/[^/]+\/runs$/);
         if (templateRun || botRun) {
           await handleCreateRun(req, res, { templateRun, botRun, path, executorReady, store, lifecycle, maxTaskRecords, diagnostics, runStateStore, capabilityService, authorizeExtractionRelease });
-          return;
-        }
-
-        // ── GET /v3/bots/regions ──
-        if (method === "GET" && path === `${API_PREFIX}/regions`) {
-          sendJson(res, 200, REGIONS);
-          return;
-        }
-
-        // ── GET /v3/bots/:bot_id ──
-        if (method === "GET" && path.match(/^\/v3\/bots\/[^/]+$/) && !path.includes("templates") && !path.includes("runs") && !path.includes("regions")) {
-          const template = findTemplate(path.split("/").pop());
-          if (!template) { sendError(res, 400, 99010, "bot_id is invalid."); return; }
-          sendJson(res, 200, { bot_id: template.template_id, name: template.name, bot_type: template.bot_type, input_schema: template.input_schema, created_at: "2026-10-16T00:00:00Z" });
           return;
         }
 
