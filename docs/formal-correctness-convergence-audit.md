@@ -53,7 +53,7 @@ The repository also already has separate run-context, replay, recovery, action-a
 
 The latest complete run used `ACTIVETAB_HEADLESS=1 npm run test:isolated -- --test-concurrency=1` through an owner-private disposable state directory. It used the same `node --test` discovery and serial file execution as the isolated suite, with compatible Chrome fixtures launched as `--headless=new`.
 
-- Full suite after authenticated catalog route extraction: **858 passed, 0 failed, 5 skipped** (863 tests; 89.57 seconds).
+- Full suite after run creation/peer handler extraction: **861 passed, 0 failed, 5 skipped** (866 tests; 81.01 seconds).
 - Opt-in headless extension subset: **1 passed, 0 failed, 0 skipped**. It covers explicit popup consent through a `userGesture` handler call, exact-tab grants, Native Messaging, CDP observation, and protected-route cookie preservation.
 - Headless OOPIF fixture: direct and nested frame recovery plus root-page scroll passed.
 

@@ -13,6 +13,7 @@ Owns local HTTP composition and endpoint-family adapters.
 - Route handlers do not create alternate browser execution or policy paths. Browser effects use the existing application run service or authorized executor.
 - Authentication and operator identity come from server-owned authenticators. Request bodies contain caller input only and cannot select trusted identity, knowledge storage, or grant configuration.
 - Durable run-state and target lease operations use the configured stores and existing coordinators.
+- Legacy run creation fails closed when the server-owned executor is unavailable. The peer endpoint keeps its separate peer-token authentication; it does not rely on the local API token.
 - Route extraction preserves method/path matching, status codes, response bodies, authentication order, redaction, and error behavior.
 - The discovery routes use server-composed environment, principal, and canonical knowledge directory. Discovery holds the current target lease for its run.
 
@@ -28,3 +29,4 @@ Owns local HTTP composition and endpoint-family adapters.
 | `routes/testRuns.js` | API-authenticated test-run route dispatch into server-owned lifecycle and reporting handlers |
 | `routes/legacyRuns.js` | Compatibility API run listing, status, detail, and cancellation after shared API authentication; task store and lifecycle stay server-owned |
 | `routes/catalog.js` | Authenticated bot, template, and region catalog reads with compatibility response shapes |
+| `routes/runExecution.js` | Compatibility run creation and peer execution using server-owned lifecycle, stores, executor, and extraction release policy |
