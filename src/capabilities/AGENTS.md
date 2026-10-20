@@ -45,5 +45,6 @@ node --test test/extraction.test.js test/capability-api.test.js
 | Path | Purpose |
 |------|---------|
 | `runLocalPublicReadGrants.js` | Exact-scope one-shot public-read grant issue, verification, expiry, and consumption |
+| `observedReadSupport.js` | Pure field selection, semantic role mapping, retained route lookup, and candidate source binding for ephemeral observed reads |
 | `network/` | Read-only observed API response discovery and independent shape qualification |
 | `network/networkApiCapabilityService.js` | Bounded candidate ownership for observed API discovery, inspection, and qualification |
