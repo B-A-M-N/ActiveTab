@@ -6,7 +6,7 @@ Own durable run bindings, execution and browser-target leases, step checkpoints,
 
 ## Ownership
 
-The testing layer. `RunStateCoordinator` owns persistence and execution-lease lifecycle for a workflow run. `InterventionCoordinator` owns durable human handoffs, resume ownership, completion-predicate evaluation, and continuation from the suspended step. `TestRunner` remains the top-level workflow coordinator and wires these services to the same workflow execution callbacks.
+The testing layer. `RunStateCoordinator` owns run persistence and execution-lease lifecycle for a workflow run. `RunStateStore` delegates SQLite browser-target lease storage to `BrowserTargetLeaseStore`, which owns fencing-token allocation and lease renewal mechanics. `InterventionCoordinator` owns durable human handoffs, resume ownership, completion-predicate evaluation, and continuation from the suspended step. `TestRunner` remains the top-level workflow coordinator and wires these services to the same workflow execution callbacks.
 
 ## Local Contracts
 

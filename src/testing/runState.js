@@ -6,14 +6,13 @@
  */
 
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
-import { DatabaseSync } from "node:sqlite";
 import { mkdir, writeFile, readFile, readdir, rename, open, lstat, chmod, unlink } from "node:fs/promises";
 import { join, dirname, resolve } from "node:path";
 import { hostname } from "node:os";
+import { BrowserTargetLeaseStore } from "./targetLeaseStore.js";
 
 const MAX_RUN_STATE_BYTES = 64 * 1024;
 const LOCK_WAIT_MS = 2500;
-const TARGET_LEASE_TTL_MS = 30_000;
 const IMMUTABLE_FIELDS = Object.freeze([
   "runId", "schemaVersion", "createdAt", "workflowId", "workflowVersion", "workflowHash",
   "environmentId", "authenticationRealm", "profileId", "principalId", "policyVersion", "goalFingerprint",
@@ -162,8 +161,10 @@ export class RunStateStore {
     this.baseDir = resolve(baseDir);
     this.lockWaitMs = Math.max(100, Math.min(30_000, Number(lockWaitMs) || LOCK_WAIT_MS));
     this.runs = new Map();
-    this.targetLeaseDb = null;
+    this.targetLeaseStore = new BrowserTargetLeaseStore(this.baseDir);
   }
+
+  get targetLeaseDb() { return this.targetLeaseStore.db; }
 
   async init() {
     await mkdir(this.baseDir, { recursive: true, mode: 0o700 });
@@ -171,42 +172,7 @@ export class RunStateStore {
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Run state directory must be a real directory, not a symlink.");
     await chmod(this.baseDir, 0o700);
     await this.#reload();
-    await this.#initTargetLeaseDb();
-  }
-
-  async #initTargetLeaseDb() {
-    if (this.targetLeaseDb) return;
-    const path = join(this.baseDir, "target-leases.sqlite");
-    try {
-      const file = await open(path, "wx", 0o600);
-      await file.close();
-    } catch (error) {
-      if (error.code !== "EEXIST") throw error;
-    }
-    const stat = await lstat(path);
-    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Target lease database must be a regular file, not a symlink.");
-    await chmod(path, 0o600);
-    this.targetLeaseDb?.close();
-    this.targetLeaseDb = new DatabaseSync(path);
-    this.targetLeaseDb.exec(`
-      PRAGMA busy_timeout = 5000;
-      PRAGMA synchronous = FULL;
-      PRAGMA journal_mode = WAL;
-      CREATE TABLE IF NOT EXISTS target_lease_counters (
-        target_key TEXT PRIMARY KEY,
-        fencing_token INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS target_leases (
-        target_key TEXT PRIMARY KEY,
-        owner_id TEXT NOT NULL,
-        run_id TEXT NOT NULL,
-        host TEXT NOT NULL,
-        pid INTEGER NOT NULL,
-        fencing_token INTEGER NOT NULL,
-        heartbeat_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL
-      );
-    `);
+    await this.targetLeaseStore.init();
   }
 
   async #effectFingerprintKey(runId) {
@@ -242,8 +208,7 @@ export class RunStateStore {
   }
 
   close() {
-    this.targetLeaseDb?.close();
-    this.targetLeaseDb = null;
+    this.targetLeaseStore.close();
   }
 
   async #reload() {
@@ -367,74 +332,8 @@ export class RunStateStore {
    * Acquire exclusive control of one exact browser target across local
    * ActiveTab processes. The fencing token advances whenever ownership moves.
    */
-  async acquireTargetLease(targetId, runId, { ttlMs = TARGET_LEASE_TTL_MS } = {}) {
-    safeIdentifier(String(targetId ?? ""), "targetId");
-    safeIdentifier(String(runId ?? ""), "runId");
-    if (!this.targetLeaseDb) throw new Error("RunStateStore must be initialized before acquiring a target lease.");
-    if (!Number.isInteger(ttlMs) || ttlMs < 1000 || ttlMs > 300_000) throw new Error("Target lease TTL must be between 1000 and 300000 ms.");
-    const targetKey = createHash("sha256").update(String(targetId)).digest("hex");
-    const db = this.targetLeaseDb;
-    const ownerId = randomUUID();
-    const now = Date.now();
-    let fencingToken;
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      const current = db.prepare("SELECT * FROM target_leases WHERE target_key = ?").get(targetKey);
-      const sameHostOwnerAlive = current?.host === hostname()
-        ? processIsAlive(current.pid)
-        : null;
-      if (current && current.expires_at > now && sameHostOwnerAlive !== false) {
-        const error = new Error(`Browser target '${targetId}' already has an active run owner.`);
-        error.code = "RUN_TARGET_LEASE_HELD";
-        throw error;
-      }
-      if (current?.host === hostname() && sameHostOwnerAlive !== false) {
-        const error = new Error(`Browser target '${targetId}' has an expired lease whose owner process is still alive.`);
-        error.code = "RUN_TARGET_LEASE_HELD";
-        throw error;
-      }
-      const counter = db.prepare("SELECT fencing_token FROM target_lease_counters WHERE target_key = ?").get(targetKey);
-      fencingToken = Number(counter?.fencing_token ?? 0) + 1;
-      db.prepare(`INSERT INTO target_lease_counters (target_key, fencing_token) VALUES (?, ?)
-        ON CONFLICT(target_key) DO UPDATE SET fencing_token = excluded.fencing_token`).run(targetKey, fencingToken);
-      db.prepare(`INSERT INTO target_leases (target_key, owner_id, run_id, host, pid, fencing_token, heartbeat_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(target_key) DO UPDATE SET owner_id = excluded.owner_id, run_id = excluded.run_id,
-          host = excluded.host, pid = excluded.pid, fencing_token = excluded.fencing_token,
-          heartbeat_at = excluded.heartbeat_at, expires_at = excluded.expires_at`)
-        .run(targetKey, ownerId, runId, hostname(), process.pid, fencingToken, now, now + ttlMs);
-      db.exec("COMMIT");
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
-    }
-
-    let lost = false;
-    const renew = () => {
-      if (lost) throw Object.assign(new Error("Browser target execution lease was lost."), { code: "RUN_TARGET_LEASE_LOST" });
-      const heartbeatAt = Date.now();
-      const result = db.prepare(`UPDATE target_leases SET heartbeat_at = ?, expires_at = ?
-        WHERE target_key = ? AND owner_id = ? AND fencing_token = ?`)
-        .run(heartbeatAt, heartbeatAt + ttlMs, targetKey, ownerId, fencingToken);
-      if (Number(result.changes) !== 1) {
-        lost = true;
-        throw Object.assign(new Error("Browser target execution lease was lost."), { code: "RUN_TARGET_LEASE_LOST" });
-      }
-      return fencingToken;
-    };
-    const timer = setInterval(() => {
-      try { renew(); } catch { lost = true; }
-    }, Math.max(250, Math.floor(ttlMs / 3)));
-    timer.unref?.();
-    return {
-      fencingToken,
-      async assertCurrent() { return renew(); },
-      async release() {
-        clearInterval(timer);
-        db.prepare("DELETE FROM target_leases WHERE target_key = ? AND owner_id = ? AND fencing_token = ?")
-          .run(targetKey, ownerId, fencingToken);
-      }
-    };
+  async acquireTargetLease(targetId, runId, options) {
+    return this.targetLeaseStore.acquireTargetLease(targetId, runId, options);
   }
 
   async #mutate(runId, mutate, { expectedRevision } = {}) {

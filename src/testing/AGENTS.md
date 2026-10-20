@@ -7,6 +7,7 @@ Owns declarative workflow schemas, test execution, receipts, assertions, and pos
 ## Ownership
 
 ActiveTab's testing layer. It dispatches through the authorized executor and browser session; it does not own policy decisions.
+`RunStateStore` owns the public run-state API and delegates SQLite browser-target lease persistence to `BrowserTargetLeaseStore`.
 
 ## Local Contracts
 
@@ -18,6 +19,7 @@ ActiveTab's testing layer. It dispatches through the authorized executor and bro
 - During a detached-session recovery, `assertLeaseTokenCurrent()` checks durable ownership without requiring the old CDP session to remain attached. `bindSession()` may then rebind only an attached replacement with the original target ID and endpoint; effect dispatch continues to require `assertCurrent()` against the bound session.
 - HTTP and MCP adapters create `TestRunner` instances through `ApplicationRunService`, which binds the shared browser diagnostic sources and durable `RunStateStore`; `TestRunner` remains responsible for acquiring and checking its workflow lease.
 - Durable target leases use SQLite transactions across local processes. A lease held by a dead local process can be reclaimed immediately; expired leases are not taken over while their local owner process is still alive. Effects with lost leases are refused before dispatch and any earlier dispatch still requires reconciliation.
+- `BrowserTargetLeaseStore` owns SQLite schema initialization, fencing-token allocation, heartbeat renewal, and release. `RunStateStore.acquireTargetLease()` remains the compatibility entrypoint.
 - Diagnostic `api_call` receipts preserve typed refusal/error/unavailable statuses and explicitly record that collection alone did not verify an application outcome.
 - Only an independent verified postcondition may report PASS.
 - A `qualify` step runs the configured ActiveTab qualification subsystem against an isolated fixture or benchmark target. It never substitutes fixture evidence for the parent run's live-site verification. Qualification is advisory unless the workflow explicitly marks it required; unavailable or failed optional qualification does not block later steps.
@@ -91,6 +93,7 @@ E2E vertical tests require a real Chrome environment and fixture server.
 |------|---------|
 | `execution/` | Workflow scheduling and validated type-to-handler dispatch |
 | `lifecycle/` | Durable run bindings, leases, checkpoints, interventions, and continuation |
+| `targetLeaseStore.js` | SQLite-backed exact browser-target lease ownership and fencing |
 | `steps/` | Isolated workflow control-flow step behavior |
 | `telemetry/` | Workflow decision events and durable operation receipt integration |
 | `cloudAgentEntry.js` | Cloud Agent identity hints, visible-entry workflow, readiness checks, and read-only link inventory |
