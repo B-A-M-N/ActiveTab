@@ -7,12 +7,13 @@ Owns declarative workflow schemas, test execution, receipts, assertions, and pos
 ## Ownership
 
 ActiveTab's testing layer. It dispatches through the authorized executor and browser session; it does not own policy decisions.
-`RunStateStore` owns the public run-state API and operation state transitions. It delegates owner-private JSON document storage to lifecycle `RunDocumentStore` and SQLite browser-target lease persistence to `BrowserTargetLeaseStore`.
+`RunStateStore` owns the public run-state API and durable mutation boundary. `OperationLedger` owns operation transition validation and effect-deduplication rules, and can commit only through the `RunStateStore` mutation callback. Owner-private JSON document storage belongs to lifecycle `RunDocumentStore`; SQLite browser-target lease persistence belongs to `BrowserTargetLeaseStore`.
 
 ## Local Contracts
 
 - Dispatch, observed effects, and verified postconditions are separate states. An unresolved dispatched effect yields run status `UNCERTAIN` until independent evidence reconciles it; it is not silently converted to `FAILED` or replayed.
 - Durable operation reservations bind a run-scoped keyed fingerprint of the action, resource, and caller intent. Equivalent unresolved effects are refused across replanned step or operation IDs; raw intent values remain outside run records and telemetry.
+- `operationLedger.js` owns reserve, dispatch, and reconciliation transitions. It cannot persist state independently or change the store's locking, revision, lease, or fencing-token checks.
 - Cancellation is persisted in `RunStateStore` and remains available after a worker restart. Cancellation stops future dispatches while unresolved reserved/dispatched operations remain reconciliation obligations.
 - A test run holds an exclusive durable lease for its exact browser endpoint and target ID. Continuation reacquires the target under a newer fencing token; operation reservations retain that token, and a competing run is refused before dispatch.
 - A live session may be rebound to a replacement CDP session only when both exact target ID and canonical endpoint match the existing durable lease. Rebinding does not acquire a new lease or change its fencing token; a different target or endpoint is refused.
@@ -94,6 +95,7 @@ E2E vertical tests require a real Chrome environment and fixture server.
 | `execution/` | Workflow scheduling and validated type-to-handler dispatch |
 | `lifecycle/` | Durable run bindings, leases, checkpoints, interventions, and continuation |
 | `targetLeaseStore.js` | SQLite-backed exact browser-target lease ownership and fencing |
+| `operationLedger.js` | Reserved, dispatched, uncertain, and reconciled operation state transitions |
 | `steps/` | Isolated workflow control-flow step behavior |
 | `telemetry/` | Workflow decision events and durable operation receipt integration |
 | `cloudAgentEntry.js` | Cloud Agent identity hints, visible-entry workflow, readiness checks, and read-only link inventory |
