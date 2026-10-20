@@ -24,3 +24,4 @@ Owns local HTTP composition and endpoint-family adapters.
 | `routes/capabilities.js` | Capability discovery, read, compile, qualification, listing, and revocation endpoints after shared API authentication |
 | `routes/interventions.js` | Intervention status, acknowledgement, approval, resume, cancellation, and run-state endpoints with server-owned authentication and tools |
 | `routes/publicReadApprovals.js` | Public-read requests and status under API authentication; listing and resolution require the independent operator authenticator |
+| `routes/evidenceReleases.js` | Independent-operator-only evidence release review, audit, and grant revocation backed by the server-owned release store |

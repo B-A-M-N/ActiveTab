@@ -49,6 +49,7 @@ import { createDiscoveryRoutes } from "./routes/discovery.js";
 import { createCapabilityRoutes } from "./routes/capabilities.js";
 import { createInterventionRoutes } from "./routes/interventions.js";
 import { createPublicReadApprovalRoutes } from "./routes/publicReadApprovals.js";
+import { createEvidenceReleaseRoutes } from "./routes/evidenceReleases.js";
 
 const DEFAULT_PORT = 9377;
 const API_PREFIX = "/v3/bots";
@@ -519,6 +520,13 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
     sendJson,
     sendError
   });
+  const handleEvidenceReleaseRoute = createEvidenceReleaseRoutes({
+    authenticateOperator,
+    getEvidenceReleaseStore,
+    readBody,
+    sendJson,
+    sendError
+  });
 
   // Executor readiness: fail closed when no real navigation runner was provided.
   const executorReady = lifecycle.executorReady;
@@ -569,56 +577,8 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
       // Operator and API authentication remain enforced inside the injected route.
       if (await handleInterventionRoute(req, res, { method, path, query })) return;
 
-      // Evidence releases are reviewed on the independent operator channel.
-      // The model-facing MCP process can create requests but cannot approve them.
-      if (path === "/v1/evidence/releases/requests" || path === "/v1/evidence/releases/audit"
-        || path.startsWith("/v1/evidence/releases/requests/") || path.startsWith("/v1/evidence/releases/grants/")) {
-        const authenticatedOperator = await authenticateOperator(req);
-        if (!authenticatedOperator) { sendError(res, 403, 99403, "Independent operator authentication required."); return; }
-        const releaseStore = getEvidenceReleaseStore();
-        try {
-          if (method === "GET" && path === "/v1/evidence/releases/requests") {
-            sendJson(res, 200, { requests: releaseStore.listRequests({ states: ["pending", "approved", "rejected", "expired"] }) });
-            return;
-          }
-          if (method === "GET" && path === "/v1/evidence/releases/audit") {
-            sendJson(res, 200, { events: releaseStore.audit({ limit: Math.min(Number.parseInt(query.limit ?? "200", 10) || 200, 1_000) }) });
-            return;
-          }
-          const requestMatch = path.match(/^\/v1\/evidence\/releases\/requests\/([^/]+)\/(approve|reject)$/u);
-          if (method === "POST" && requestMatch) {
-            const body = await readBody(req) ?? {};
-            if (typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(key => key !== "expectedRevision")
-              || !Number.isSafeInteger(body.expectedRevision) || body.expectedRevision < 1) {
-              sendError(res, 400, 99001, "expectedRevision is required; request scope is fixed and cannot be changed during review.");
-              return;
-            }
-            const requestId = decodeURIComponent(requestMatch[1]);
-            if (requestMatch[2] === "approve") {
-              sendJson(res, 200, releaseStore.approveRequest(requestId, { operatorId: authenticatedOperator, expectedRevision: body.expectedRevision }));
-            } else {
-              sendJson(res, 200, releaseStore.rejectRequest(requestId, { operatorId: authenticatedOperator, expectedRevision: body.expectedRevision }));
-            }
-            return;
-          }
-          const grantMatch = path.match(/^\/v1\/evidence\/releases\/grants\/([^/]+)\/revoke$/u);
-          if (method === "POST" && grantMatch) {
-            const body = await readBody(req) ?? {};
-            if (typeof body !== "object" || Array.isArray(body) || Object.keys(body).length) {
-              sendError(res, 400, 99001, "Grant revocation takes no caller-supplied scope.");
-              return;
-            }
-            sendJson(res, 200, releaseStore.revokeGrant(decodeURIComponent(grantMatch[1]), { operatorId: authenticatedOperator }));
-            return;
-          }
-          sendError(res, 404, 99404, "No such evidence-release resource.");
-        } catch (error) {
-          const message = String(error?.message ?? error).slice(0, 300);
-          sendError(res, /not found/u.test(message) ? 404 : /revision changed|already|expired/u.test(message) ? 409 : 400,
-            /not found/u.test(message) ? 99404 : /revision changed|already|expired/u.test(message) ? 99409 : 99400, message);
-        }
-        return;
-      }
+      // Evidence release review and grant revocation require independent operator auth.
+      if (await handleEvidenceReleaseRoute(req, res, { method, path, query })) return;
 
       // ── Test-run lifecycle (file 2 section 9) ──
       if (method === "POST" && path === "/v1/test/runs") {
