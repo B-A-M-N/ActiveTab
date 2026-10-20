@@ -2,6 +2,10 @@ import { discoverVisibleRecordGroups } from "../extraction/recordGroupResolver.j
 import { discoverVisibleTableSources } from "../extraction/recordResolver.js";
 import { descendantNodeIndexes, documentIndexFor } from "./documentIndex.js";
 import { compileStructuredDataHints } from "./semantic/structuredData.js";
+import { resolveFieldSemantics, semanticRoleFromText } from "./semanticFieldSemantics.js";
+import { controlInteraction, controlKind } from "./semanticControlMechanics.js";
+import { controlAriaRelationships, controlLabelAssociation, evidenceRef, frameContextKey, isNodeWithin, nearestRegion, sourceDocumentKey } from "./semanticDomRelationships.js";
+export { rankInteractionCandidates } from "./semanticCandidateRanking.js";
 
 const MAX_SEMANTIC_REGIONS = 96;
 const MAX_SEMANTIC_COLLECTIONS = 48;
@@ -11,100 +15,15 @@ const MAX_SEMANTIC_HEADINGS = 100;
 const MAX_SEMANTIC_TABLE_RECORDS = 64;
 const MAX_SEMANTIC_TABLE_FIELDS = 16;
 const MAX_SEMANTIC_TABLE_FIELD_TEXT = 180;
-const MAX_ARIA_RELATION_IDS = 16;
-const SEMANTIC_FIELD_ROLE_ALIASES = new Map([
-  ["name", "name"], ["title", "name"], ["productname", "name"], ["itemname", "name"], ["producttitle", "name"], ["itemtitle", "name"],
-  ["product", "name"], ["item", "name"], ["price", "price"], ["cost", "price"], ["amount", "price"], ["saleprice", "price"], ["listprice", "price"], ["retailprice", "price"],
-  ["description", "description"], ["summary", "description"], ["sku", "sku"], ["productid", "sku"], ["itemid", "sku"],
-  ["rating", "rating"], ["stars", "rating"], ["ratingvalue", "rating"], ["reviewscore", "rating"],
-  ["date", "date"], ["published", "date"], ["publishedtime", "date"], ["datepublished", "date"], ["updated", "date"],
-  ["author", "author"], ["creator", "author"], ["writer", "author"], ["category", "category"], ["genre", "category"], ["location", "location"], ["address", "location"],
-  ["count", "count"], ["quantity", "count"], ["stock", "count"], ["inventory", "count"], ["url", "url"], ["href", "url"], ["website", "url"],
-  ["image", "image"], ["photo", "image"], ["thumbnail", "image"], ["picture", "image"], ["brand", "brand"], ["manufacturer", "brand"], ["availability", "availability"],
-  ["country", "country"], ["nation", "country"], ["countryname", "country"], ["territory", "country"],
-  ["population", "population"], ["populationvalue", "population"], ["populationestimate", "population"]
-]);
-const SEMANTIC_FIELD_ROLE_LABELS = Object.freeze({
-  name: "Name", price: "Price", description: "Description", sku: "SKU", rating: "Rating", date: "Date",
-  author: "Author", category: "Category", location: "Location", count: "Count", url: "URL", image: "Image",
-  brand: "Brand", availability: "Availability", country: "Country", population: "Population"
-});
-const SAFE_TEXT_INPUT_TYPES = new Set(["text", "search", "email", "url", "tel", "number"]);
-const SENSITIVE_CONTROL_LABEL = /pass(word|code)?|secret|token|api.?key|credential|authorization|cookie|session|private.?key|client.?secret|csrf|xsrf/iu;
 const REGION_TAGS = new Map([
   ["MAIN", "main"], ["ARTICLE", "article"], ["SECTION", "section"],
   ["NAV", "navigation"], ["ASIDE", "complementary"], ["FORM", "form"],
   ["FIELDSET", "fieldset"], ["TABLE", "table"]
 ]);
 const REGION_ROLES = new Set(["main", "navigation", "banner", "contentinfo", "complementary", "region", "search"]);
-const TASK_SELECTION_STOPWORDS = new Set(["the", "and", "for", "from", "into", "with", "that", "this", "then", "open", "click", "find", "get", "show", "please", "page", "site", "browser", "use", "complete", "workflow", "task", "section", "sections", "step", "steps", "next", "all", "every"]);
 
 function stringAt(strings, index) {
   return Number.isInteger(index) && index >= 0 ? String(strings?.[index] ?? "") : "";
-}
-
-function taskSelectionTerms(value) {
-  if (typeof value !== "string") return [];
-  const terms = new Set((value.slice(0, 2_048).normalize("NFKC").toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? [])
-    .filter(term => !TASK_SELECTION_STOPWORDS.has(term)));
-  if (terms.has("first")) terms.add("one");
-  if (terms.has("second")) terms.add("two");
-  if (terms.has("third")) terms.add("three");
-  if (terms.has("fourth")) terms.add("four");
-  return [...terms].slice(0, 48);
-}
-
-function candidateTaskMatch(candidate, terms) {
-  if (!terms.length) return 0;
-  const text = [candidate?.name, candidate?.contextName, candidate?.recordContext, candidate?.role, candidate?.tag, candidate?.type]
-    .filter(value => typeof value === "string").join(" ").normalize("NFKC").toLowerCase();
-  const words = new Set(text.match(/[\p{L}\p{N}]{3,}/gu) ?? []);
-  return terms.reduce((count, term) => count + Number(words.has(term)), 0);
-}
-
-function candidateContextKeys(candidate) {
-  return [candidate?.contextName, candidate?.recordContext]
-    .filter(value => typeof value === "string")
-    .map(value => value.normalize("NFKC").replace(/\s+/gu, " ").trim().toLowerCase())
-    .filter(Boolean);
-}
-
-/** Rank observed controls locally without sending the selection goal to any model. */
-export function rankInteractionCandidates(candidates, selectionGoal, { maxCandidates = 200, priorityCandidateIdentities = [] } = {}) {
-  if (!Array.isArray(candidates) || !Number.isInteger(maxCandidates) || maxCandidates < 1 || maxCandidates > 1_000
-    || !Array.isArray(priorityCandidateIdentities) || priorityCandidateIdentities.length > 10_000
-    || priorityCandidateIdentities.some(identity => typeof identity !== "string" || identity.length > 256)) {
-    throw new Error("Candidate ranking requires an array and a bounded positive limit.");
-  }
-  const terms = taskSelectionTerms(selectionGoal);
-  const matches = new Map(candidates.map(candidate => [candidate, candidateTaskMatch(candidate, terms)]));
-  const priority = new Set(priorityCandidateIdentities);
-  const relevant = candidates.filter(candidate => matches.get(candidate) > 0);
-  const relevantRegions = new Set(relevant.flatMap(candidateContextKeys));
-  const scoped = terms.length && relevant.length
-    ? candidates.filter(candidate => matches.get(candidate) > 0
-      || candidateContextKeys(candidate).some(context => relevantRegions.has(context)))
-    : candidates;
-  const scopedSet = new Set(scoped);
-  const ranked = [...candidates].sort((a, b) => Number(priority.has(b?.identity)) - Number(priority.has(a?.identity))
-    || Number(scopedSet.has(b)) - Number(scopedSet.has(a))
-    || matches.get(b) - matches.get(a)
-    || Number(b?.visible === true) - Number(a?.visible === true));
-  const selected = ranked.slice(0, maxCandidates);
-  const returnedScopeCandidateCount = selected.filter(candidate => scopedSet.has(candidate)).length;
-  const hasTaskScope = terms.length > 0 && relevant.length > 0;
-  return Object.freeze({
-    candidates: Object.freeze(selected),
-    pageCandidateCount: candidates.length,
-    taskRelevantCandidateCount: relevant.length,
-    scopeCandidateCount: hasTaskScope ? scoped.length : candidates.length,
-    returnedScopeCandidateCount,
-    scopeCandidateIdentities: Object.freeze(scoped.map(candidate => candidate?.identity).filter(value => typeof value === "string")),
-    selectionScope: hasTaskScope ? "task_relevant_region" : "page",
-    pageCoverage: candidates.length <= selected.length ? "complete" : "partial",
-    scopeCoverage: (hasTaskScope ? scoped.length : candidates.length) <= returnedScopeCandidateCount ? "complete" : "incomplete",
-    truncated: candidates.length > selected.length
-  });
 }
 
 function nodeText(nodeIndex, index, maxLength = 180) {
@@ -136,65 +55,6 @@ function labelForRegion(nodeIndex, index) {
   return { value: null, source: null, status: "unknown" };
 }
 
-function controlKind(candidate) {
-  const role = String(candidate?.role ?? "").toLowerCase();
-  const tag = String(candidate?.tag ?? "").toLowerCase();
-  const type = String(candidate?.type ?? "").toLowerCase();
-  if (tag === "select") return "select";
-  if (tag === "textarea") return "text_entry";
-  if (tag === "input") {
-    if (["submit", "button", "reset", "image"].includes(type)) return "button";
-    if (type === "checkbox") return "checkbox";
-    if (type === "radio") return "radio";
-    if (type === "search") return "searchbox";
-    return "input";
-  }
-  if (["button", "link", "searchbox", "combobox", "checkbox", "radio", "switch", "tab", "menuitem", "textbox", "spinbutton", "slider"].includes(role)) return role;
-  if (tag === "a") return "link";
-  if (tag === "button") return "button";
-  return "unknown";
-}
-
-function interactionMechanic(candidate, attributes, pageUrl) {
-  const tag = String(candidate?.tag ?? "").toLowerCase();
-  const role = String(candidate?.role ?? "").toLowerCase();
-  const type = String(candidate?.type ?? attributes?.type ?? "").toLowerCase();
-  const name = [candidate?.name, candidate?.label, candidate?.ariaLabel, candidate?.contextName]
-    .filter(value => typeof value === "string").join(" ");
-
-  if (candidate?.submitsForm === true || ["submit", "image"].includes(type)) return "submit_form";
-  if (tag === "a" && role === "link") {
-    const href = attributes?.href ?? candidate?.href;
-    try {
-      const destination = new URL(href, pageUrl);
-      if (["http:", "https:"].includes(destination.protocol) && !destination.username && !destination.password) return "follow_link";
-    } catch { /* An invalid or absent href is not a navigation operation. */ }
-    return "unknown";
-  }
-  if ((tag === "input" && type === "password") || SENSITIVE_CONTROL_LABEL.test(name)) return "unknown";
-  if (tag === "textarea" || (tag === "input" && SAFE_TEXT_INPUT_TYPES.has(type))
-    || candidate?.contentEditable === true && ["textbox", "searchbox"].includes(role)) return "enter_text";
-  if (tag === "select" || role === "combobox") return "choose_option";
-  if (["checkbox", "radio", "switch"].includes(role)
-    || tag === "input" && ["checkbox", "radio"].includes(type)) return "toggle_control";
-  if (["button", "tab", "menuitem"].includes(role) || tag === "button"
-    || tag === "input" && ["button", "reset"].includes(type)) return "activate_control";
-  return "unknown";
-}
-
-function controlInteraction(candidate, attributes, pageUrl) {
-  const mechanic = interactionMechanic(candidate, attributes, pageUrl);
-  let readiness = "unknown";
-  if (candidate?.visible === false) readiness = "not_visible";
-  else if (candidate?.disabled === true || Object.hasOwn(attributes ?? {}, "disabled")) readiness = "disabled";
-  else if (candidate?.visible === true && candidate?.disabled === false && mechanic !== "unknown") readiness = "visible_enabled";
-  return Object.freeze({
-    mechanic,
-    readiness,
-    evidence: mechanic === "unknown" ? null : "native_dom_accessibility_semantics"
-  });
-}
-
 function classifyPageType({ regions, forms, collections, headings }) {
   const sections = regions.filter(region => region.kind === "section").length;
   if (sections >= 3 && headings.length >= 4) return Object.freeze({ value: "article", status: "inferred" });
@@ -214,92 +74,8 @@ function classHasToken(attributes, token) {
   return typeof attributes?.class === "string" && attributes.class.split(/[\t\n\f\r ]+/u).includes(token);
 }
 
-function semanticRoleFromText(value) {
-  const normalized = String(value ?? "").normalize("NFKC")
-    .replace(/([a-z0-9])([A-Z])/gu, "$1 $2")
-    .toLocaleLowerCase();
-  const tokens = normalized.match(/[\p{L}\p{N}]+/gu) ?? [];
-  const roles = new Set(tokens.map(token => SEMANTIC_FIELD_ROLE_ALIASES.get(token)).filter(Boolean));
-  if (roles.size > 1 && tokens.some(token => ["product", "item", "country", "nation"].includes(token))) roles.delete("name");
-  return roles.size === 1 ? [...roles][0] : null;
-}
-
-function associatedFieldLabel(nodeIndex, index) {
-  const attributes = index.attributes[nodeIndex] ?? {};
-  const labelledBy = String(attributes["aria-labelledby"] ?? "").trim().split(/\s+/u).filter(Boolean);
-  if (labelledBy.length) {
-    const labelNodes = labelledBy.map(id => {
-      const matches = index.elementIndexesById?.get(id) ?? [];
-      return matches.length === 1 ? matches[0] : null;
-    });
-    if (labelNodes.every(Number.isInteger)) {
-      const value = labelNodes.map(labelNode => nodeText(labelNode, index, 120)).filter(Boolean).join(" ").slice(0, 180);
-      if (value) return { value, status: "observed", source: "aria_labelledby" };
-    }
-  }
-
-  const id = attributes.id;
-  const explicitLabels = typeof id === "string" && id ? index.labelIndexesByFor?.get(id) ?? [] : [];
-  if (explicitLabels.length === 1) {
-    const value = nodeText(explicitLabels[0], index, 180);
-    if (value) return { value, status: "observed", source: "html_label_for" };
-  }
-
-  if (index.tags[nodeIndex] === "DD") {
-    const parent = index.parents[nodeIndex];
-    const siblings = index.children.get(parent) ?? [];
-    const position = siblings.indexOf(nodeIndex);
-    for (let cursor = position - 1; cursor >= 0; cursor--) {
-      const sibling = siblings[cursor];
-      if (index.tags[sibling] === "DT") {
-        const value = nodeText(sibling, index, 180);
-        if (value) return { value, status: "observed", source: "description_term" };
-        break;
-      }
-      if (!index.tags[sibling]?.startsWith("#")) break;
-    }
-  }
-  return null;
-}
-
 function fieldSemantics(nodeIndex, index, source = null) {
-  if (!Number.isInteger(nodeIndex) || nodeIndex < 0) return {
-    semanticRole: null, semanticRoleStatus: "unknown", label: Object.freeze({ value: null, status: "unknown", source: null })
-  };
-  const attributes = index.attributes[nodeIndex] ?? {};
-  const itemprop = String(attributes.itemprop ?? attributes.property ?? "").trim();
-  const dataRoleAttribute = Object.keys(attributes).find(attribute => /^data-(?:product-|item-)?[a-z][a-z0-9-]*$/u.test(attribute)
-    && semanticRoleFromText(attribute.slice(5)) !== null);
-  const explicitLabel = [
-    ["aria-label", "aria_label"], ["data-label", "data_label"], ["title", "title"]
-  ].find(([attribute]) => typeof attributes[attribute] === "string" && attributes[attribute].trim());
-  const associatedLabel = associatedFieldLabel(nodeIndex, index);
-  const tag = String(index.tags[nodeIndex] ?? "").toUpperCase();
-  const classRole = semanticRoleFromText(source?.sourceKey ?? attributes.class);
-  const observedRole = itemprop ? semanticRoleFromText(itemprop) : null;
-  const dataRole = dataRoleAttribute ? semanticRoleFromText(dataRoleAttribute.slice(5)) : null;
-  const observedLabel = explicitLabel
-    ? { value: attributes[explicitLabel[0]].trim().slice(0, 180), status: "observed", source: explicitLabel[1] }
-    : associatedLabel
-      ? associatedLabel
-    : itemprop && observedRole
-      ? { value: itemprop.slice(0, 180), status: "observed", source: "itemprop" }
-      : null;
-  const labelRole = observedLabel ? semanticRoleFromText(observedLabel.value) : null;
-  const semanticRole = observedRole ?? dataRole ?? (tag === "TIME" ? "date" : tag === "ADDRESS" ? "location" : null) ?? labelRole ?? classRole;
-  const semanticRoleStatus = !semanticRole ? "unknown" : observedRole ? "observed" : "inferred";
-  const label = observedLabel ?? (semanticRole
-    ? {
-      value: SEMANTIC_FIELD_ROLE_LABELS[semanticRole] ?? semanticRole,
-      status: "inferred",
-      source: dataRole ? "data_attribute_name" : tag === "TIME" || tag === "ADDRESS" ? "element_semantics" : "class_token"
-    }
-    : { value: null, status: "unknown", source: null });
-  return {
-    semanticRole,
-    semanticRoleStatus,
-    label: Object.freeze(label)
-  };
+  return resolveFieldSemantics(nodeIndex, index, source, nodeText);
 }
 
 function microdataType(attributes) {
@@ -435,108 +211,6 @@ function boundedRecordGroupSource(recordGroup) {
     itemTagName: recordGroup.itemTagName,
     itemClassToken: recordGroup.itemClassToken
   });
-}
-
-function evidenceRef(index, backendNodeId) {
-  return Number.isInteger(index?.documentIndex) && Number.isInteger(backendNodeId)
-    ? `${index.frameTargetId ?? "root"}:${index.documentIndex}:${backendNodeId}`
-    : null;
-}
-
-function resolveAriaIdReferences(value, index) {
-  const source = typeof value === "string" ? value.slice(0, 2_048) : "";
-  const identifiers = source.trim().split(/\s+/u).filter(Boolean);
-  if (!identifiers.length) return null;
-  const evidenceRefs = [];
-  let unresolvedCount = 0;
-  for (const identifier of identifiers.slice(0, MAX_ARIA_RELATION_IDS)) {
-    const matches = index.elementIndexesById?.get(identifier) ?? [];
-    const nodeIndex = matches.length === 1 ? matches[0] : null;
-    const reference = Number.isInteger(nodeIndex) ? evidenceRef(index, index.backendNodeIds[nodeIndex]) : null;
-    if (reference) evidenceRefs.push(reference);
-    else unresolvedCount++;
-  }
-  const truncated = identifiers.length > MAX_ARIA_RELATION_IDS || source.length >= 2_048;
-  if (truncated) unresolvedCount += Math.max(0, identifiers.length - MAX_ARIA_RELATION_IDS) || 1;
-  return Object.freeze({
-    status: unresolvedCount ? evidenceRefs.length ? "partial" : "unknown" : "observed",
-    evidenceRefs: Object.freeze(evidenceRefs),
-    unresolvedCount,
-    truncated
-  });
-}
-
-function controlLabelAssociation(nodeIndex, index, attributes) {
-  if (Object.hasOwn(attributes, "aria-labelledby")) {
-    const association = resolveAriaIdReferences(attributes["aria-labelledby"], index);
-    if (association) return Object.freeze({ source: "aria_labelledby", ...association });
-  }
-  const id = attributes.id;
-  const explicitLabels = typeof id === "string" && id ? index.labelIndexesByFor?.get(id) ?? [] : [];
-  if (explicitLabels.length) {
-    const evidenceRefs = explicitLabels.slice(0, MAX_ARIA_RELATION_IDS)
-      .map(labelIndex => evidenceRef(index, index.backendNodeIds[labelIndex])).filter(Boolean);
-    return Object.freeze({
-      source: "html_label_for",
-      status: explicitLabels.length === 1 && evidenceRefs.length === 1 ? "observed" : "unknown",
-      evidenceRefs: Object.freeze(evidenceRefs),
-      unresolvedCount: Math.max(0, explicitLabels.length - evidenceRefs.length),
-      truncated: explicitLabels.length > MAX_ARIA_RELATION_IDS
-    });
-  }
-  let parent = index.parents[nodeIndex];
-  for (let depth = 0; depth < 64 && Number.isInteger(parent) && parent >= 0; depth++) {
-    if (index.tags[parent] === "LABEL") {
-      const reference = evidenceRef(index, index.backendNodeIds[parent]);
-      return Object.freeze({
-        source: "html_label_wrapping",
-        status: reference ? "observed" : "unknown",
-        evidenceRefs: Object.freeze(reference ? [reference] : []),
-        unresolvedCount: reference ? 0 : 1,
-        truncated: false
-      });
-    }
-    parent = index.parents[parent];
-  }
-  return null;
-}
-
-function controlAriaRelationships(attributes, index) {
-  const relationships = {};
-  if (Object.hasOwn(attributes, "aria-controls")) {
-    relationships.controls = resolveAriaIdReferences(attributes["aria-controls"], index);
-  }
-  if (Object.hasOwn(attributes, "aria-owns")) {
-    relationships.owns = resolveAriaIdReferences(attributes["aria-owns"], index);
-  }
-  return Object.keys(relationships).length ? Object.freeze(relationships) : null;
-}
-
-function frameContextKey(frameTargetId, frameId) {
-  return `${frameTargetId ?? "root"}\u0000${frameId}`;
-}
-
-function sourceDocumentKey(frameTargetId, documentIndex) {
-  return `${frameTargetId ?? "root"}\u0000${documentIndex}`;
-}
-
-function isNodeWithin(index, nodeIndex, ancestorIndex) {
-  let current = nodeIndex;
-  for (let depth = 0; depth < 128 && Number.isInteger(current) && current >= 0; depth++) {
-    if (current === ancestorIndex) return true;
-    current = index.parents[current];
-  }
-  return false;
-}
-
-function nearestRegion(nodeIndex, index, regionsByNode) {
-  let current = nodeIndex;
-  for (let depth = 0; depth < 24 && Number.isInteger(current) && current >= 0; depth++) {
-    const ref = regionsByNode.get(current);
-    if (ref) return ref;
-    current = index.parents[current];
-  }
-  return null;
 }
 
 /** Compile fresh DOM and accessibility evidence into a bounded structural page model. */
