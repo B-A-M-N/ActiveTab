@@ -139,9 +139,10 @@ test("retained control lookup finds omitted controls without CDP traversal and p
     assert.equal(observation.candidateCoverage.pageCoverage, "partial", "the fixture exceeds the normal candidate projection limit");
 
     const omitted = await session.queryAccessibility(observation.evidenceId, {
-      role: "button", accessibleName: "Control 250", exact: true
+      role: "button", accessibleName: "Control 250", exact: true, timeoutMs: 2_000
     });
-    assert.equal(omitted.matches.length, 1, "the retained lookup sees a present control omitted from the response projection");
+    assert.equal(omitted.matches.length, 1,
+      `the retained lookup sees a present control omitted from the response projection (${JSON.stringify({ status: omitted.status, stopReason: omitted.stopReason, visitedNodeCount: omitted.visitedNodeCount })})`);
     assert.equal(omitted.matches[0].name, "Control 250");
     assert.equal(omitted.matches[0].identityEvidence, "retained_candidate_index");
     assert.equal(omitted.actionAuthorized, false);
