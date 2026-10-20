@@ -24,6 +24,7 @@ import { RecoveryCoordinator } from "./recoveryCoordinator.js";
 import { ReplayCoordinator } from "./replayCoordinator.js";
 import { ActionAttemptCoordinator } from "./actionAttemptCoordinator.js";
 import { createPlanningOptions, filterPlanningObservation } from "./planningCycle.js";
+import { expandTaskScopeObservation, shouldExpandTaskScope } from "./planningEvidence.js";
 
 function pageChangeWaitBaseline(observation, scrollTarget) {
   return {
@@ -1501,39 +1502,28 @@ export class NavigationEngine {
     let candidateExpansionAttempted = false;
     while (state.attempts.length < this.maxActions) {
       if (await outcomeVerified() && workflowPlanCanFinish()) return await succeed();
-      const filterPlanning = observation => filterPlanningObservation(observation, {
+      const filterPlanning = (observation, searchObservation = latest) => filterPlanningObservation(observation, {
         excludedIdentities,
         excludedTargetSignatures,
         excludedScrollIdentities,
         searchPhrase,
-        searchObservation: latest
+        searchObservation
       });
       let planningObservation = filterPlanning(latest);
-      const candidateCoverage = latest.candidateCoverage;
-      const scopeNeedsExpansion = workflowModeActive
-        && !candidateExpansionAttempted
-        && latest.observationProfile === "interaction"
-        && candidateCoverage?.selectionScope === "task_relevant_region"
-        && candidateCoverage.scopeCoverage === "incomplete"
-        && Number.isInteger(candidateCoverage.scopeCandidateCount)
-        && candidateCoverage.scopeCandidateCount > (candidateCoverage.returnedScopeCandidateCount ?? 0)
-        && candidateCoverage.scopeCandidateCount <= 384;
-      if (scopeNeedsExpansion) {
+      if (shouldExpandTaskScope(latest, {
+        workflowModeActive,
+        expansionAttempted: candidateExpansionAttempted
+      })) {
         candidateExpansionAttempted = true;
-        const previousEvidenceId = latest.evidenceId;
-        try {
-          const expandedObservation = await this.session.observe({
-            profile: "interaction",
-            selectionGoal: goal,
-            candidateLimit: 384
-          });
-          if (expandedObservation?.evidenceId !== previousEvidenceId
-            && expandedObservation?.targetId === this.session.target.id) {
-            setLatestObservation(expandedObservation);
-            planningObservation = filterPlanning(latest);
-          }
-        } catch {
-          // Keep the incomplete evidence; synthesis will abstain before dispatch.
+        const expansion = await expandTaskScopeObservation({
+          session: this.session,
+          observation: latest,
+          goal,
+          acceptObservation: setLatestObservation,
+          filterObservation: filterPlanning
+        });
+        if (expansion.expanded) {
+          planningObservation = expansion.planningObservation;
         }
       }
       if ((this.plannerMode !== "auto" && planner?.requiresScreenshot === true) || this.decisionRuntime?.requiresScreenshot === true) {
