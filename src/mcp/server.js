@@ -10,17 +10,14 @@ import { createDiagnosticContract, AUTHORITY, OPERATION, SENSITIVITY } from "../
 import { cloudAgentAdapterFromEnv } from "../diagnostics/adapters/cloudAgentApi.js";
 import { DiagnosticCorrelator } from "../diagnostics/correlator.js";
 import { DiagnosticReport, FINDING_LEVEL, deriveRunInvestigationStatus } from "../diagnostics/report.js";
-import { receiptFromRunState } from "../testing/receipts.js";
 import { buildDurableRunReport } from "../testing/durableRunReport.js";
-import { RunStateStore, requestRunCancellation } from "../testing/runState.js";
-import { ApplicationRunService } from "../navigation/applicationRunService.js";
+import { RunStateStore } from "../testing/runState.js";
 import { InterventionStore, InterventionWatcher } from "../runtime/interventions.js";
 import { createInterventionTools } from "../api/intervention-tools.js";
 import { AuthorizationGrantStore } from "../runtime/approvals.js";
 import { createDecisionRuntime } from "../decisions/runtime.js";
-import { trackRunResult } from "../runtime/runTracker.js";
 import { ProfileLoader } from "../testing/profiles.js";
-import { buildEnvironmentBinding, resolveObservedApplication, verifyObservedUrl } from "../environments/model.js";
+import { buildEnvironmentBinding, verifyObservedUrl } from "../environments/model.js";
 import { createCloudAgentEntryWorkflow, resolveCloudAgentEntry, verifyCloudAgentReady } from "../testing/cloudAgentEntry.js";
 import { prepareCloudAgentTask } from "../integrations/freeinference/prepareCloudAgentTask.js";
 import { verifyCloudAgentRunOutcome } from "../integrations/freeinference/cloudAgentWorkflow.js";
@@ -38,6 +35,7 @@ import { createEvidenceReleaseTools } from "./evidenceReleaseTools.js";
 import { createBrowserToolHandlers } from "./browserTools.js";
 import { createDiagnosticToolHandlers } from "./tools/diagnosticTools.js";
 import { createNavigationToolHandlers } from "./tools/navigationTools.js";
+import { createWorkflowToolHandlers } from "./tools/workflowTools.js";
 
 const modelPreflight = await preflightModelCapabilities();
 writeModelPreflightSummary(modelPreflight);
@@ -190,74 +188,20 @@ const evidenceReleaseTools = createEvidenceReleaseTools({
   serializeResult: mcpResult
 });
 
-function startWorkflowRun({ session, workflow, environment = null, operationAuthorizer = null, runId = null, controller = new AbortController(), verifyAuthentication = null, verifyEnvironment = null, profileId = null, principalId = null, existingRunStateId = null, resumeReceipt = null } = {}) {
-  const effectiveRunId = runId ?? `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const runCtx = {
-    ...interventionCtx,
-    hasAttachmentGrant: async targetId => sessions.has(targetId)
-      ? { ok: true }
-      : { ok: false, reason: `No authorized attachment grant for target '${targetId}'.` },
-    observe: async () => await session.observe().catch(() => null),
-    ...(typeof verifyAuthentication === "function" ? { verifyAuthentication } : {}),
-    ...(typeof verifyEnvironment === "function" ? { verifyEnvironment } : environment ? { verifyEnvironment: url => verifyObservedUrl(environment, url) } : {})
-  };
-  const { collector, correlator, runner, runPromise: initialRunPromise } = new ApplicationRunService({ runStateStore }).startWorkflowRun({
-    session,
-    workflow,
-    runId: effectiveRunId,
-    signal: controller.signal,
-    resumeReceipt,
-    resumeOptions: { verify: runCtx, workflow },
-    runnerOptions: {
-      interventions: interventionStore,
-      decisionRuntime,
-      qualificationService,
-      fileUploadGrantStore,
-      environment,
-      operationAuthorizer,
-      existingRunStateId,
-      profileId,
-      principalId: principalId ?? session?.principalId ?? session?.authorizationPrincipalId ?? "local_mcp_automation"
-    }
-  });
-  const runPromise = resumeReceipt
-    ? initialRunPromise.then(result => {
-        if (!result.receipt) throw new Error(result.reason ?? "The durable intervention was not independently verified.");
-        return result.receipt;
-      })
-    : initialRunPromise;
-  const runState = trackRunResult(runPromise);
-  testRuns.set(effectiveRunId, {
-    collector, correlator, controller, runState, runPromise, session, runner, workflow, environment,
-    ...(typeof verifyAuthentication === "function" ? { verifyAuthentication } : {}),
-    ...(typeof verifyEnvironment === "function" ? { verifyEnvironment } : {}),
-    startedAt: new Date().toISOString(),
-    resume: async () => {
-      if (!runState.settled) return { resumed: false, reason: "Run is still executing." };
-      if (!runState.receipt) return { resumed: false, reason: "Run did not produce a receipt.", error: String(runState.error?.message ?? runState.error ?? "unknown failure").slice(0, 300) };
-      runState.status = "RUNNING";
-      runState.settled = false;
-      try {
-        const result = await runner.resume(runState.receipt, { verify: runCtx, workflow });
-        if (result.receipt) runState.receipt = result.receipt;
-        runState.status = runState.receipt?.status ?? "UNKNOWN";
-        return result;
-      } catch (error) {
-        runState.status = runState.receipt?.status ?? "UNCERTAIN";
-        runState.error = error;
-        throw error;
-      } finally {
-        runState.settled = true;
-      }
-    },
-    getState: async () => runState.status,
-    cancel: async () => {
-      await runStateStore.requestCancellation(effectiveRunId).catch(() => {});
-      controller.abort();
-    }
-  });
-  return { status: "started", runId: effectiveRunId };
-}
+
+const workflowToolRuntime = createWorkflowToolHandlers({
+  sessions,
+  testRuns,
+  runStateStore,
+  loadEnvironmentProfile,
+  interventionContext: interventionCtx,
+  interventionStore,
+  decisionRuntime,
+  qualificationService,
+  fileUploadGrantStore,
+  verifyObservedUrl
+});
+const workflowToolHandlers = workflowToolRuntime.handlers;
 
 const tools = [
   { name: "get_runtime_capabilities", description: "Report current browser attachment, navigation scope requirements, extraction/form boundaries, workflow reuse, and catalog-preflight status for the configured inference routes. Catalog availability does not prove a live inference call will succeed; the response never returns credentials or full endpoint URLs.", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
@@ -306,6 +250,7 @@ async function callTool(name, args) {
   if (Object.hasOwn(browserToolHandlers, name)) return await browserToolHandlers[name](args);
   if (Object.hasOwn(diagnosticToolHandlers, name)) return await diagnosticToolHandlers[name](args);
   if (Object.hasOwn(navigationToolHandlers, name)) return await navigationToolHandlers[name](args);
+  if (Object.hasOwn(workflowToolHandlers, name)) return await workflowToolHandlers[name](args);
   if (name === "get_runtime_capabilities") {
     const routeFor = roles => roles.map(role => modelPreflight.routes.find(route => route.role === role)).find(Boolean) ?? null;
     const secondary = routeFor(["planner", "semantic", "workflow"]);
@@ -335,53 +280,6 @@ async function callTool(name, args) {
       workflowReuse: { status: workflowStore ? "available" : "disabled" },
       modelPreflight: { status: modelPreflight.status, telemetryRecorded: modelPreflight.telemetryRecorded === true }
     };
-  }
-  if (name === "start_test_run") {
-    const session = selectBrowserSession(sessions, args.targetId);
-    if (!session) throw new Error("No attached browser session available.");
-    const selectedProfile = await loadEnvironmentProfile(args.profileId);
-    return startWorkflowRun({ session, workflow: args.workflow, environment: selectedProfile?.environment ?? null, profileId: selectedProfile?.profile.profile_id ?? null });
-  }
-  if (name === "resume_test_run") {
-    const state = await runStateStore.getFresh(args.runId);
-    if (!state) throw new Error(`No durable test run found for runId '${args.runId}'.`);
-    if (testRuns.get(args.runId)?.runState?.settled === false) throw new Error("This run already has an active worker.");
-    if (["passed", "failed", "blocked", "canceled", "expired"].includes(state.status)) throw new Error(`Run is already terminal (${state.status}).`);
-    const unresolved = (state.pendingOperations ?? []).filter(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status));
-    if (unresolved.length) return { runId: args.runId, status: "UNCERTAIN", reason: "The DAG is suspended until every dispatched operation is independently reconciled.", operationIds: unresolved.map(operation => operation.operationId) };
-    const session = sessions.get(args.targetId);
-    if (!session || session.attached !== true || session.target?.id !== state.target?.targetId) {
-      throw new Error("Resume requires an explicitly attached session for the exact target bound to this run.");
-    }
-    const selectedProfile = await loadEnvironmentProfile(args.profileId);
-    const environment = selectedProfile?.environment ?? null;
-    const profileId = selectedProfile?.profile.profile_id ?? null;
-    const principalId = session.principalId ?? session.authorizationPrincipalId ?? "local_mcp_automation";
-    const application = session.target?.url && environment
-      ? resolveObservedApplication(environment, session.target.url)
-      : { status: "unmatched" };
-    const authenticationRealm = application.status === "matched" ? application.authenticationRealm : state.authenticationRealm ?? null;
-    if ((environment?.environmentId ?? null) !== state.environmentId
-      || profileId !== state.profileId
-      || principalId !== state.principalId
-      || authenticationRealm !== state.authenticationRealm) {
-      throw new Error("The selected profile, principal, environment, or authentication realm differs from the durable run binding.");
-    }
-    const intervention = state.pendingInterventionId ? interventionStore.get(state.pendingInterventionId) : null;
-    if (state.pendingInterventionId && (!intervention || intervention.runId !== state.runId)) {
-      throw new Error("The durable intervention required by this run is missing or mismatched.");
-    }
-    const resumeReceipt = intervention ? receiptFromRunState(state, intervention) : null;
-    return startWorkflowRun({
-      session,
-      workflow: args.workflow,
-      environment,
-      profileId,
-      principalId,
-      runId: args.runId,
-      existingRunStateId: args.runId,
-      ...(resumeReceipt ? { resumeReceipt } : {})
-    });
   }
   if (name === "enter_cloud_agent") {
     const session = selectBrowserSession(sessions, args.targetId);
@@ -419,7 +317,7 @@ async function callTool(name, args) {
         ? { authenticated: true, identity: "Cloud Agent task composer", evidenceId: ready.evidenceId }
         : { authenticated: false, reason: ready.reason };
     };
-    const started = startWorkflowRun({
+    const started = workflowToolRuntime.startWorkflowRun({
       session,
       workflow: entry.workflow,
       environment,
@@ -449,7 +347,7 @@ async function callTool(name, args) {
     const plan = await prepareCloudAgentTask({
       session, profile, request: args.request, decisionRuntime, runId, signal: controller.signal
     });
-    const started = startWorkflowRun({
+    const started = workflowToolRuntime.startWorkflowRun({
       session,
       workflow: plan.workflow,
       environment: plan.environment,
@@ -479,33 +377,6 @@ async function callTool(name, args) {
       verificationRequired: true
     });
     return { ...started, requestId: plan.requestId, verificationStatus: "pending_independent_evidence" };
-  }
-  if (name === "get_test_run") {
-    const run = testRuns.get(args.runId);
-    const durable = await runStateStore.getFresh(args.runId);
-    if (!durable) throw new Error(`No test run found for runId '${args.runId}'.`);
-    const receipt = receiptFromRunState(durable).toObject();
-    const unresolvedOperations = (durable.pendingOperations ?? []).filter(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status));
-    return {
-      ...receipt,
-      pendingInterventionId: durable.pendingInterventionId ?? null,
-      unresolvedOperationIds: unresolvedOperations.map(operation => operation.operationId),
-      cancellationRequested: durable.cancellationRequested === true,
-      workerAvailable: Boolean(run)
-    };
-  }
-  if (name === "cancel_test_run") {
-    const run = testRuns.get(args.runId);
-    const cancellation = await requestRunCancellation(runStateStore, args.runId, {
-      abort: run ? () => run.controller.abort() : undefined,
-      runPromise: run?.runPromise
-    });
-    if (!cancellation) throw new Error(`No test run found for runId '${args.runId}'.`);
-    return {
-      status: cancellation.requested ? "cancel_requested" : cancellation.run.status,
-      runId: args.runId,
-      requiresReconciliation: cancellation.requiresReconciliation
-    };
   }
   if (name === "collect_cloud_agent_run_evidence") {
     const run = testRuns.get(args.runId);
