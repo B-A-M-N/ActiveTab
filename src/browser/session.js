@@ -4,6 +4,7 @@ import { BrowserActivityRecorder } from "./activity.js";
 import { ACTION_VALUE_LIMITS } from "./actionLimits.js";
 import { BrowserObserver } from "../observe/observer.js";
 import { runVisualCandidateProbe } from "./visualCandidateProbe.js";
+import { DialogState } from "./dialogState.js";
 import { sanitizeUrl } from "./urlPrivacy.js";
 import { isOperatorProhibitedControl, operatorProhibitedControlReason } from "../runtime/controlRestrictions.js";
 import { isFileUploadDispatchToken } from "../runtime/fileUploadGrants.js";
@@ -96,6 +97,7 @@ export class BrowserSession {
     this.domEnabled = false;
     this.domSubscriptionScheduled = false;
     this.observer = new BrowserObserver(this, { evidenceLimit });
+    this.dialogState = new DialogState();
     this.pendingDialog = null;
     this.disposers = [];
   }
@@ -456,13 +458,7 @@ export class BrowserSession {
 
 
   #onDialogOpening(event) {
-    this.pendingDialog = {
-      type: event?.type ?? "alert",
-      message: String(event?.message ?? "").slice(0, 500),
-      defaultPrompt: event?.defaultPrompt ?? null,
-      url: event?.url ?? null,
-      capturedAt: new Date().toISOString()
-    };
+    this.dialogState.open(event);
     this.activity.recordLifecycleEvent("Page.javascriptDialogOpening", event);
   }
 
@@ -479,7 +475,9 @@ export class BrowserSession {
     return { dismissed: !accept, accepted: accept, type: dialog.type, message: dialog.message };
   }
 
-  get hasPendingDialog() { return this.pendingDialog !== null && this.pendingDialog !== undefined; }
+  get pendingDialog() { return this.dialogState.pending; }
+  set pendingDialog(dialog) { this.dialogState.pending = dialog; }
+  get hasPendingDialog() { return this.dialogState.hasPending; }
 
   async #subscribeDomTree(client = this.client) {
     try {
