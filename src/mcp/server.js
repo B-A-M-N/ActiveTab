@@ -16,7 +16,6 @@ import { buildDurableRunReport } from "../testing/durableRunReport.js";
 import { RunStateStore, requestRunCancellation, withTargetExecutionLease } from "../testing/runState.js";
 import { ApplicationRunService } from "../navigation/applicationRunService.js";
 import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
-import { InvestigationEngine } from "../investigation/engine.js";
 import { InterventionStore, InterventionWatcher } from "../runtime/interventions.js";
 import { createInterventionTools } from "../api/intervention-tools.js";
 import { AuthorizationGrantStore } from "../runtime/approvals.js";
@@ -39,6 +38,7 @@ import { approvePublicReadThroughApi } from "../capabilities/publicReadApprovalC
 import { FileUploadGrantStore } from "../runtime/fileUploadGrants.js";
 import { createEvidenceReleaseTools } from "./evidenceReleaseTools.js";
 import { createBrowserToolHandlers } from "./browserTools.js";
+import { createDiagnosticToolHandlers } from "./tools/diagnosticTools.js";
 
 const modelPreflight = await preflightModelCapabilities();
 writeModelPreflightSummary(modelPreflight);
@@ -101,6 +101,7 @@ const browserToolRuntime = createBrowserToolHandlers({
   decisionRuntime
 });
 const browserToolHandlers = browserToolRuntime.handlers;
+const diagnosticToolHandlers = createDiagnosticToolHandlers({ testRuns, sessions, runStateStore });
 const grantStore = new AuthorizationGrantStore({ trustedIssuer: process.env.ACTIVETAB_TRUSTED_ISSUER ?? "activetab-mcp" });
 const interventionCtx = {
   grantStore,
@@ -291,6 +292,7 @@ async function callTool(name, args) {
   // these status/acknowledgement/approval/cancellation/resume tools.
   if (Object.hasOwn(interventionTools, name)) return await interventionTools[name](args);
   if (Object.hasOwn(browserToolHandlers, name)) return await browserToolHandlers[name](args);
+  if (Object.hasOwn(diagnosticToolHandlers, name)) return await diagnosticToolHandlers[name](args);
   if (name === "get_runtime_capabilities") {
     const routeFor = roles => roles.map(role => modelPreflight.routes.find(route => route.role === role)).find(Boolean) ?? null;
     const secondary = routeFor(["planner", "semantic", "workflow"]);
@@ -492,15 +494,6 @@ async function callTool(name, args) {
       requiresReconciliation: cancellation.requiresReconciliation
     };
   }
-  if (name === "collect_diagnostics") {
-    const run = testRuns.get(args.runId);
-    if (!run) throw new Error(`No test run found for runId '${args.runId}'.`);
-    const results = await run.collector.collectAll([
-      { sourceId: "browser-network", operation: OPERATION.READ },
-      { sourceId: "browser-lifecycle", operation: OPERATION.READ }
-    ]);
-    return { runId: args.runId, results };
-  }
   if (name === "collect_cloud_agent_run_evidence") {
     const run = testRuns.get(args.runId);
     if (!run) throw new Error(`No test run found for runId '${args.runId}'.`);
@@ -625,14 +618,6 @@ async function callTool(name, args) {
       });
       return await engine.discover();
     });
-  }
-  if (name === "investigate_failure") {
-    const session = selectBrowserSession(sessions, args.targetId);
-    const run = args.runId ? testRuns.get(args.runId) : null;
-    const collector = run?.collector ?? null;
-    const correlator = run?.correlator ?? new DiagnosticCorrelator();
-    const engine = new InvestigationEngine({ collector, correlator, session, runStateStore });
-    return await engine.investigate({ subject: args.subject, reason: args.reason, runId: args.runId ?? null, stepId: args.stepId ?? null, operationId: args.operationId ?? null });
   }
   if (name === "get_test_report") {
     const run = testRuns.get(args.runId);
