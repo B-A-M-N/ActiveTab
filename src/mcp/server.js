@@ -1,10 +1,6 @@
 import { createInterface } from "node:readline";
 import { userInfo } from "node:os";
 import { join } from "node:path";
-import { listTargets, resolveAuthorizedTarget } from "../browser/targets.js";
-import { BrowserSession } from "../browser/session.js";
-import { connectChromeAuto, listChromeTargets, resolveChromeTarget } from "../browser/chrome-autoconnect.js";
-import { clickObservedElement } from "../navigation/observedAction.js";
 import { ExtensionBroker } from "../extension/broker.js";
 import { brokerSocketPath, stateDirectory } from "../extension/paths.js";
 import { WorkflowStore } from "../state/workflows.js";
@@ -33,7 +29,6 @@ import { prepareCloudAgentTask } from "../integrations/freeinference/prepareClou
 import { verifyCloudAgentRunOutcome } from "../integrations/freeinference/cloudAgentWorkflow.js";
 import { eventIdsForEvidence } from "../telemetry/evidenceRefs.js";
 import { randomUUID } from "node:crypto";
-import { assertRedactedEvidenceOnly } from "../diagnostics/evidenceReleasePolicy.js";
 import { createQualificationRuntime } from "../testing/qualificationRuntime.js";
 import { CapabilityRegistry } from "../capabilities/capabilityRegistry.js";
 import { CapabilityService } from "../capabilities/capabilityService.js";
@@ -43,6 +38,7 @@ import { preflightModelCapabilities, writeModelPreflightSummary } from "../navig
 import { approvePublicReadThroughApi } from "../capabilities/publicReadApprovalClient.js";
 import { FileUploadGrantStore } from "../runtime/fileUploadGrants.js";
 import { createEvidenceReleaseTools } from "./evidenceReleaseTools.js";
+import { createBrowserToolHandlers } from "./browserTools.js";
 
 const modelPreflight = await preflightModelCapabilities();
 writeModelPreflightSummary(modelPreflight);
@@ -75,7 +71,6 @@ const capabilityService = new CapabilityService({
 });
 const authorizeExtractionField = field => extractionFieldPolicy.authorizeRead(field);
 const authorizeExtractionRelease = field => extractionFieldPolicy.authorizeRelease(field);
-let chromeConnection;
 const autoConnect = process.env.ACTIVETAB_AUTO_CONNECT === "1";
 const extensionMode = process.env.ACTIVETAB_EXTENSION === "1";
 let extensionBroker;
@@ -96,6 +91,16 @@ let interventionWatcher = null;
 
 const interventionStore = new InterventionStore(process.env.ACTIVETAB_INTERVENTION_DIR ?? join(process.cwd(), ".activetab", "interventions"));
 const runStateStore = new RunStateStore(process.env.ACTIVETAB_RUN_STATE_DIR ?? join(process.cwd(), ".activetab", "runs"));
+const browserToolRuntime = createBrowserToolHandlers({
+  sessions,
+  endpoint,
+  autoConnect,
+  extensionMode,
+  extensionBroker,
+  runStateStore,
+  decisionRuntime
+});
+const browserToolHandlers = browserToolRuntime.handlers;
 const grantStore = new AuthorizationGrantStore({ trustedIssuer: process.env.ACTIVETAB_TRUSTED_ISSUER ?? "activetab-mcp" });
 const interventionCtx = {
   grantStore,
@@ -285,6 +290,7 @@ async function callTool(name, args) {
   // Intervention tools (P0-6): long-running and suspended runs never block
   // these status/acknowledgement/approval/cancellation/resume tools.
   if (Object.hasOwn(interventionTools, name)) return await interventionTools[name](args);
+  if (Object.hasOwn(browserToolHandlers, name)) return await browserToolHandlers[name](args);
   if (name === "get_runtime_capabilities") {
     const routeFor = roles => roles.map(role => modelPreflight.routes.find(route => route.role === role)).find(Boolean) ?? null;
     const secondary = routeFor(["planner", "semantic", "workflow"]);
@@ -314,38 +320,6 @@ async function callTool(name, args) {
       workflowReuse: { status: workflowStore ? "available" : "disabled" },
       modelPreflight: { status: modelPreflight.status, telemetryRecorded: modelPreflight.telemetryRecorded === true }
     };
-  }
-  if (name === "list_tabs") {
-    if (extensionMode) return await extensionBroker.listTabs();
-    if (!autoConnect) return await listTargets(endpoint);
-    chromeConnection ??= await connectChromeAuto();
-    return await listChromeTargets(chromeConnection);
-  }
-  if (name === "attach_tab") {
-    const existing = sessions.get(args.targetId);
-    if (existing?.attached) return { status: "attached", targetId: existing.target.id, url: existing.target.url };
-    if (existing) {
-      sessions.delete(args.targetId);
-      await existing.close();
-    }
-    let target;
-    if (extensionMode) {
-      target = await extensionBroker.resolveTarget(args.targetId);
-    } else if (autoConnect) {
-      chromeConnection ??= await connectChromeAuto();
-      target = await resolveChromeTarget(chromeConnection, args.targetId, process.env.ACTIVETAB_AUTHORIZED_TARGET_ID);
-    } else target = await resolveAuthorizedTarget(endpoint, args.targetId, process.env.ACTIVETAB_AUTHORIZED_TARGET_ID);
-    const session = await new BrowserSession(target).attach();
-    sessions.set(target.id, session);
-    return { status: "attached", targetId: target.id, url: target.url };
-  }
-  if (name === "detach_tab") {
-    const session = sessions.get(args.targetId);
-    if (!session) throw new Error("No explicitly authorized tab is attached for that targetId.");
-    sessions.delete(args.targetId);
-    try { await session.close(); }
-    finally { if (extensionMode) await extensionBroker.detach(args.targetId); }
-    return { status: "detached", targetId: args.targetId };
   }
   if (name === "start_test_run") {
     const session = selectBrowserSession(sessions, args.targetId);
@@ -710,11 +684,6 @@ async function callTool(name, args) {
     return report.redacted();
   }
   const session = selectBrowserSession(sessions, args.targetId);
-  if (name === "observe_page") {
-    assertRedactedEvidenceOnly(args, ["includeScreenshot"]);
-    if (args.profile === "visual") return await session.observe({ profile: "visual" });
-    return await session.observe({ profile: args.profile ?? "interaction", includeScreenshot: false });
-  }
   if (name === "read_page_records") {
     const loaded = await loadEnvironmentProfile(args.profileId);
     return await capabilityService.readObservedRecords({
@@ -725,42 +694,6 @@ async function callTool(name, args) {
       requestedFields: args.fields,
       maxRecords: args.maxRecords ?? 100,
       uniqueBy: args.uniqueBy ?? []
-    });
-  }
-  if (name === "get_evidence") {
-    assertRedactedEvidenceOnly(args, ["includeSensitiveFormValues", "includeSensitivePageText", "includeSensitiveUrlData", "includeSensitiveRuntimeValues", "includeScreenshot"]);
-    return session.observer.getEvidence(args.evidenceId, { facets: args.facets, backendNodeId: args.backendNodeId, frameTargetId: args.frameTargetId, includeScreenshot: false });
-  }
-  if (name === "inspect_runtime_state") {
-    assertRedactedEvidenceOnly(args, ["includeSensitiveValues"]);
-    return await session.observer.inspectRuntimeState(args.evidenceId, { path: args.path, frameTargetId: args.frameTargetId ?? null, includeSensitiveValues: false });
-  }
-  if (name === "click_observed_element") {
-    return await withTargetExecutionLease(runStateStore, session, `mcp-observed-click-${randomUUID()}`, async lease =>
-      await clickObservedElement(session, {
-        goal: args.goal,
-        evidenceId: args.evidenceId,
-        backendNodeId: args.backendNodeId,
-        frameTargetId: args.frameTargetId ?? null,
-        decisionRuntime,
-        assertExecutionLease: lease.assertCurrent
-      }));
-  }
-  if (name === "inspect_network_response") {
-    assertRedactedEvidenceOnly(args, ["includeSensitive", "includeSensitiveUrlData"]);
-    return await session.observer.inspectNetworkResponse(args.evidenceId, {
-      requestId: args.requestId,
-      // Body retrieval is local and explicitly selected by evidence and request id.
-      // The observer returns its complete content-aware projection with recognizable
-      // credentials redacted; the separate grant tool is required for raw values.
-      includeSensitive: true,
-      includeCredentialValues: false,
-      includeSensitiveUrlData: false,
-      view: args.view ?? "markdown",
-      offset: args.offset ?? 0,
-      maxBytes: args.maxBytes ?? 32 * 1024,
-      ...(args.sectionId !== undefined ? { sectionId: args.sectionId } : {}),
-      ...(args.blockId !== undefined ? { blockId: args.blockId } : {})
     });
   }
   if (name === "request_evidence_release") return await evidenceReleaseTools.requestEvidenceRelease(session, args);
@@ -909,6 +842,6 @@ for await (const line of rl) {
 interventionWatcher?.stop();
 await Promise.all([...sessions.values()].map(session => session.close()));
 decisionRuntime.close();
-await chromeConnection?.close();
+await browserToolRuntime.close();
 await extensionBroker?.close();
 evidenceReleaseStore.close();
