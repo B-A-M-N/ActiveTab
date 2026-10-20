@@ -34,14 +34,15 @@ Recent behavior-preserving slices are separate commits:
 - `1aa33d3` — resolve visual hits through exact OOPIF sessions.
 - `91ae4b3` — extract trusted workflow capability catalog compilation.
 - `cbb476d` — extract bounded workflow observation projection and local identity bindings.
+- `a770cf1` — extract bounded task-scope observation expansion with same-target freshness acceptance.
 
 The repository also already has separate run-context, replay, recovery, action-attempt, evidence-store, frame/candidate collection, browser action, capability, MCP tool, run-state, and semantic compiler components. Remaining large coordinators are documented in `architecture-decomposition.md`; their extraction must preserve the single authorized executor, target lease, evidence owner, and durable state transitions.
 
 ## Headless verification and limits
 
-The latest complete run used `ACTIVETAB_HEADLESS=1 npm run test:isolated` through an owner-private disposable state directory. It used the same `node --test` discovery and serial options as the isolated suite, with compatible Chrome fixtures launched as `--headless=new`.
+The latest complete run used `ACTIVETAB_HEADLESS=1 npm run test:isolated -- --test-concurrency=1` through an owner-private disposable state directory. It used the same `node --test` discovery and serial file execution as the isolated suite, with compatible Chrome fixtures launched as `--headless=new`.
 
-- Full suite: **821 passed, 0 failed, 5 skipped** (826 tests; 35.97 seconds).
+- Full suite: **827 passed, 0 failed, 5 skipped** (832 tests; 120.64 seconds).
 - Opt-in headless extension subset: **1 passed, 0 failed, 0 skipped**. It covers explicit popup consent through a `userGesture` handler call, exact-tab grants, Native Messaging, CDP observation, and protected-route cookie preservation.
 - Headless OOPIF fixture: direct and nested frame recovery plus root-page scroll passed.
 
@@ -51,7 +52,7 @@ No headed equivalence is claimed for skipped desktop behavior. Live/staging qual
 
 ## Next bounded slices
 
-1. Continue `NavigationEngine` extraction from its planning and attempt coordination while retaining one public run loop and the current executor.
+1. Continue `NavigationEngine` extraction from plan selection and attempt coordination while retaining one public run loop and the current executor. The bounded task-scope expansion now lives in `planningEvidence.js`; provider and visual-review coordination remain in the engine.
 2. Continue HTTP route extraction one family at a time, preserving authentication, operator identity, and sensitive-evidence release gates.
 3. Measure response acquisition/process memory as best-effort diagnostics; keep `hardMemoryBound:false` until the transport can enforce a pre-materialization limit.
 4. Run the remaining held-out application and multi-process lifecycle qualifications when their required authorized environments are available.
