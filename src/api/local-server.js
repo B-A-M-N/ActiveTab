@@ -48,6 +48,7 @@ import { FileUploadGrantStore } from "../runtime/fileUploadGrants.js";
 import { createDiscoveryRoutes } from "./routes/discovery.js";
 import { createCapabilityRoutes } from "./routes/capabilities.js";
 import { createInterventionRoutes } from "./routes/interventions.js";
+import { createPublicReadApprovalRoutes } from "./routes/publicReadApprovals.js";
 
 const DEFAULT_PORT = 9377;
 const API_PREFIX = "/v3/bots";
@@ -510,6 +511,14 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
     sendJson,
     sendError
   });
+  const handlePublicReadApprovalRoute = createPublicReadApprovalRoutes({
+    publicReadApprovalBroker,
+    authorizeMutation,
+    authenticateOperator,
+    readBody,
+    sendJson,
+    sendError
+  });
 
   // Executor readiness: fail closed when no real navigation runner was provided.
   const executorReady = lifecycle.executorReady;
@@ -555,61 +564,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
       // and engine dependencies; request JSON remains untrusted input only.
       if (await handleDiscoveryRoute(req, res, { method, path })) return;
 
-      // ── Intervention lifecycle (P0-6): status/ack/approval/resume/cancel ──
-      if (path === "/v1/public-reads/requests" || path.startsWith("/v1/public-reads/requests/")) {
-        if (!publicReadApprovalBroker) { sendError(res, 503, 99503, "public_read_approval_unavailable"); return; }
-        if (method === "POST" && path === "/v1/public-reads/requests") {
-          if (!authorizeMutation(req)) { sendError(res, 401, 99401, "Authentication required."); return; }
-          const body = await readBody(req);
-          try {
-            const request = publicReadApprovalBroker.create(body);
-            sendJson(res, 202, { requestId: request.requestId, revision: request.revision, status: request.status, expiresAt: request.expiresAt });
-          } catch (error) { sendError(res, 400, 99001, String(error?.message ?? error).slice(0, 300)); }
-          return;
-        }
-        if (method === "GET" && path === "/v1/public-reads/requests") {
-          const authenticatedOperator = await authenticateOperator(req);
-          if (!authenticatedOperator) { sendError(res, 403, 99403, "Independent operator authentication required."); return; }
-          sendJson(res, 200, { requests: publicReadApprovalBroker.listPending() });
-          return;
-        }
-        const statusMatch = path.match(/^\/v1\/public-reads\/requests\/([^/]+)\/status$/u);
-        if (method === "GET" && statusMatch) {
-          if (!authorizeMutation(req)) { sendError(res, 401, 99401, "Authentication required."); return; }
-          const request = publicReadApprovalBroker.get(decodeURIComponent(statusMatch[1]));
-          if (!request) { sendError(res, 404, 99404, "Public-read approval request was not found."); return; }
-          sendJson(res, 200, { requestId: request.requestId, revision: request.revision, status: request.status, expiresAt: request.expiresAt });
-          return;
-        }
-        const decisionMatch = path.match(/^\/v1\/public-reads\/requests\/([^/]+)\/(approve|reject)$/u);
-        if (method === "POST" && decisionMatch) {
-          const authenticatedOperator = await authenticateOperator(req);
-          if (!authenticatedOperator) { sendError(res, 403, 99403, "Independent operator authentication required."); return; }
-          const body = await readBody(req) ?? {};
-          if (!body || typeof body !== "object" || Array.isArray(body)
-            || Object.keys(body).some(key => !["expectedRevision", "approvalPhrase"].includes(key))
-            || !Number.isInteger(body.expectedRevision)
-            || (decisionMatch[2] === "approve" && typeof body.approvalPhrase !== "string")
-            || (decisionMatch[2] === "reject" && Object.hasOwn(body, "approvalPhrase"))) {
-            sendError(res, 400, 99001, "Approval requires the current revision and the exact phrase; rejection accepts only the revision.");
-            return;
-          }
-          try {
-            const request = publicReadApprovalBroker.resolve(decodeURIComponent(decisionMatch[1]), {
-              decision: decisionMatch[2], operatorId: authenticatedOperator,
-              expectedRevision: body.expectedRevision,
-              ...(body.approvalPhrase ? { approvalPhrase: body.approvalPhrase } : {})
-            });
-            sendJson(res, 200, request);
-          } catch (error) {
-            const message = String(error?.message ?? error).slice(0, 300);
-            sendError(res, /not found/u.test(message) ? 404 : 409, /not found/u.test(message) ? 99404 : 99409, message);
-          }
-          return;
-        }
-        sendError(res, 404, 99404, "No such public-read approval resource.");
-        return;
-      }
+      if (await handlePublicReadApprovalRoute(req, res, { method, path })) return;
 
       // Operator and API authentication remain enforced inside the injected route.
       if (await handleInterventionRoute(req, res, { method, path, query })) return;

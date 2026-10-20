@@ -9,7 +9,7 @@ ActiveTab is being decomposed through behavior-preserving extractions. One appli
 | Declarative workflows | `src/testing/runner.js` (654 lines after lifecycle, telemetry, handler, dispatcher, and intervention extractions) | Workflow scheduling and collaborator coordination |
 | Navigation | `src/navigation/engine.js` (2,241 lines) | Planning, browser coordination, recovery, replay, and execution coordination |
 | MCP transport | `src/mcp/server.js` (270 lines) | Protocol startup and injected handler composition |
-| HTTP transport | `src/api/local-server.js` (1,088 lines after discovery and capability route extractions) | Routes mixed with run lifecycle and process-local service state |
+| HTTP transport | `src/api/local-server.js` (1,004 lines after discovery, capability, intervention, and public-read approval route extractions) | Remaining test-run lifecycle, evidence release, and general composition |
 | Staging qualification | `scripts/qualify-staging.mjs` (416 lines) | Browser entry, handoff, qualification, diagnostics, reporting, and persistence |
 | FI Agent Twin | `test-lab/fixtures/fi-agent-twin/provider.js` (247 lines after frontend, HTTP, auth, persistence, and job-service extractions) | Provider lifecycle still includes application routing and independent-oracle HTTP projection |
 | Response diagnostics | `src/observe/responseBodyInspector.js` (332 lines, with focused parser, format, security, shared, and Markdown modules) | Selected-body acquisition coordination, interpretation, and safe operator views |
@@ -52,7 +52,7 @@ Keep `TestRunner` as the top-level declarative workflow owner. `NavigationEngine
 
 ## Stage 4 — Shared application services for transports
 
-The shared run service is in place for MCP and HTTP. `src/mcp/server.js` is a 270-line protocol startup/composition module. `src/api/local-server.js` is now 1,049 lines after extracting discovery, capability, and intervention endpoint families into injected route modules. Test-run lifecycle, evidence release, public-read approvals, and general request dispatch remain composed there. Continue extracting endpoint families with injected server-owned dependencies while MCP and HTTP retain request validation, authentication, protocol serialization, and response mapping. Do not move leases, principals, grants, stores, or execution authority into request-controlled route data. Both transports must preserve identical policy and lifecycle semantics.
+The shared run service is in place for MCP and HTTP. `src/mcp/server.js` is a 270-line protocol startup/composition module. `src/api/local-server.js` is now 1,004 lines after extracting discovery, capability, intervention, and public-read approval endpoint families into injected route modules. Test-run lifecycle, evidence release, and general request dispatch remain composed there. Continue extracting endpoint families with injected server-owned dependencies while MCP and HTTP retain request validation, authentication, protocol serialization, and response mapping. Do not move leases, principals, grants, stores, or execution authority into request-controlled route data. Both transports must preserve identical policy and lifecycle semantics.
 
 ## Stage 5 — Qualification and fixture composition
 
