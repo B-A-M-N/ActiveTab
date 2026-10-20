@@ -11,9 +11,9 @@ import { adjudicatePreActionReview } from "../decisions/adjudication.js";
 import { hasReviewIntent, selectAutomaticNavigationRoute, selectPreActionDecisionRoute } from "../decisions/callPolicy.js";
 import { matchesScrollTargetSignature, observationSemanticFingerprint, observationStateFingerprint, routeFingerprint, scrollPositionFraction, scrollPositionMatches, scrollTargetSignature, targetSignature, visibleCandidatesFingerprint } from "../state/workflows.js";
 import { createConfiguredWorkflowSynthesizer } from "./workflowSynthesizer.js";
-import { WorkflowGraphPlanner } from "./workflowPlanner.js";
 import { createExtractionWorkflowCapabilities, createGenericWorkflowCapabilities, createObservedSearchWorkflowCapabilities, createProfileFormWorkflowCapabilities } from "./workflowCapabilities.js";
-import { classifyTaskRequest, requiresCompositeReadWorkflow, resolveTaskIntent, selectTaskExecutionRoute } from "./taskIntentResolver.js";
+import { WorkflowGraphPlanner } from "./workflowPlanner.js";
+import { classifyTaskRequest, requiresCompositeReadWorkflow, resolveTaskIntent } from "./taskIntentResolver.js";
 import { hasVerifiedOutcome, pageLabelHashes } from "./outcomeVerifier.js";
 import { discoverVisibleNextPage } from "../extraction/recordResolver.js";
 import { bindVisualEvidence, isBoundVisualEvidence } from "./visualEvidence.js";
@@ -25,6 +25,7 @@ import { ReplayCoordinator } from "./replayCoordinator.js";
 import { ActionAttemptCoordinator } from "./actionAttemptCoordinator.js";
 import { createPlanningOptions, filterPlanningObservation } from "./planningCycle.js";
 import { expandTaskScopeObservation, shouldExpandTaskScope } from "./planningEvidence.js";
+import { createWorkflowRoutePlanner } from "./workflowRoutePlanner.js";
 
 function pageChangeWaitBaseline(observation, scrollTarget) {
   return {
@@ -89,13 +90,6 @@ async function dispatchThroughAuthorizedExecutor(session, options) {
   error.dispatchStatus = result.authorized ? "uncertain" : "refused";
   error.authorizationCategory = result.category ?? null;
   throw error;
-}
-
-class UnresolvedTaskRoutePlanner {
-  constructor(reason) { this.reason = reason; }
-  async plan() {
-    return { status: "ambiguous", candidates: [], reason: this.reason };
-  }
 }
 
 const REATTACH_FAILURE_CODES = new Set([
@@ -603,36 +597,24 @@ export class NavigationEngine {
         observedReadCapabilityIds: deferredReadCapabilities.map(capability => capability.id),
         searchCapabilityIds: searchWorkflowCapabilities.map(capability => capability.id)
       });
-      const executionRoute = selectTaskExecutionRoute({
+      ({ planner, effectiveWorkflowIntent } = createWorkflowRoutePlanner({
         requestedPlannerMode: this.plannerMode,
         classifiedTask: taskRequest,
         trustedCapabilities: workflowCapabilities,
-        taskResolution
-      });
-      if (searchReadRequest) {
-        effectiveWorkflowIntent = taskResolution.status === "resolved" ? taskResolution.intent : null;
-      } else if (taskResolution.status === "resolved") effectiveWorkflowIntent = taskResolution.intent;
-      if (executionRoute.kind === "unresolved") {
-        planner = new UnresolvedTaskRoutePlanner(
-          `No trusted execution route can establish the requested outcome (${executionRoute.reasonCode}); no browser action was selected.`
-        );
-      } else {
-        planner = new WorkflowGraphPlanner({
-          synthesizer,
-          capabilities: workflowCapabilities,
-          knowledge: this.workflowKnowledge,
-          inputs: effectiveWorkflowInputs,
-          taskIntent: effectiveWorkflowIntent,
-          decisionRuntime: this.decisionRuntime,
-          episodeId: decisionEpisodeId,
-          runId: decisionRunId,
-          scope: { applicationId, environmentClass, principalId: this.workflowScope?.principalId ?? this.environment?.principalId ?? "unknown" },
-          allowDeterministicShortcut: !taskRequest.explicitReadRequest && !taskRequest.compoundRequest && !taskRequest.typedWorkflowIntent
-            && profileFormCapabilities.length === 0 && callerCapabilities.length === 0 && extractionCapabilities.length === 0,
-          allowAtomicFallback: !taskRequest.explicitReadRequest && !taskRequest.compoundRequest && !taskRequest.typedWorkflowIntent,
-          fallbackPlanner: new DeterministicPlanner()
-        });
-      }
+        taskResolution,
+        workflowIntent: effectiveWorkflowIntent,
+        searchReadRequest,
+        synthesizer,
+        knowledge: this.workflowKnowledge,
+        inputs: effectiveWorkflowInputs,
+        decisionRuntime: this.decisionRuntime,
+        episodeId: decisionEpisodeId,
+        runId: decisionRunId,
+        scope: { applicationId, environmentClass, principalId: this.workflowScope?.principalId ?? this.environment?.principalId ?? "unknown" },
+        allowDeterministicShortcut: !taskRequest.explicitReadRequest && !taskRequest.compoundRequest && !taskRequest.typedWorkflowIntent
+          && profileFormCapabilities.length === 0 && callerCapabilities.length === 0 && extractionCapabilities.length === 0,
+        allowAtomicFallback: !taskRequest.explicitReadRequest && !taskRequest.compoundRequest && !taskRequest.typedWorkflowIntent
+      }));
     }
     const decisionStepId = () => this.decisionContext?.stepPrefix
       ? `${this.decisionContext.stepPrefix}_a${Math.min(999, state.attempts.length + 1)}`
