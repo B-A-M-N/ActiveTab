@@ -108,6 +108,39 @@ test("extension broker rejects missing consent, insecure pages, and unexpected e
   assert.deepEqual(await broker.listTabs(), []);
 });
 
+test("extension transport applies per-command deadlines and ignores late debugger replies", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "activetab-extension-deadline-"));
+  const broker = await new ExtensionBroker({ socketPath: join(dir, "broker.sock"), requestTimeoutMs: 1_000 }).start();
+  const extension = await connectExtension(broker.socketPath);
+  t.after(async () => { extension.destroy(); await broker.close(); await rm(dir, { recursive: true, force: true }); });
+
+  const attached = new Promise(resolve => broker.once("attached", resolve));
+  const acknowledgment = readMessage(extension);
+  extension.write(encodeNativeMessage({ kind: "attached", id: "attach-deadline", extensionId: EXTENSION_ID, target: {
+    id: "deadline-target", tabId: 23, title: "Deadline", url: "https://deadline.test/", userAuthorized: true
+  } }));
+  await attached;
+  await acknowledgment;
+  const { browserClient } = await broker.resolveTarget("deadline-target");
+
+  const expired = browserClient.send("DOM.getNodeForLocation", {}, null, { timeoutMs: 40 });
+  const expiredCommand = await readMessage(extension);
+  await assert.rejects(expired, error => error.code === "CDP_TIMEOUT"
+    && error.callerDeadlineExceeded === true
+    && error.commandMayStillComplete === true);
+  extension.write(encodeNativeMessage({ kind: "response", id: expiredCommand.id, result: { backendNodeId: 99 } }));
+
+  const current = browserClient.send("DOM.getNodeForLocation", {}, null, { timeoutMs: 500 });
+  const currentCommand = await readMessage(extension);
+  let currentSettled = false;
+  current.then(() => { currentSettled = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(currentSettled, false, "the expired command reply is not associated with the new request");
+  extension.write(encodeNativeMessage({ kind: "response", id: currentCommand.id, result: { backendNodeId: 12 } }));
+  assert.deepEqual(await current, { backendNodeId: 12 });
+  await browserClient.close();
+});
+
 test("extension transport disposal preserves leases and explicit broker detach releases only one tab", async t => {
   const dir = await mkdtemp(join(tmpdir(), "activetab-extension-multi-"));
   const broker = await new ExtensionBroker({ socketPath: join(dir, "broker.sock"), requestTimeoutMs: 1_000 }).start();

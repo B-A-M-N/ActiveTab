@@ -26,6 +26,89 @@ class MockTransport {
   }
 }
 
+async function createHitTestSession() {
+  const transport = new MockTransport();
+  const session = await new BrowserSession({
+    id: "visual-hit-test-target",
+    endpoint: "local-cdp",
+    browserClient: transport
+  }).attach();
+  const pendingQueries = [];
+  let resolutions = 0;
+  const evidenceId = "visual-evidence-1";
+  session.observer.getHitTestContext = selectedEvidenceId => ({
+    status: selectedEvidenceId === evidenceId ? "available" : "stale",
+    targetId: session.target.id,
+    documentGeneration: session.documentGeneration,
+    viewport: { width: 100, height: 80 },
+    viewportScroll: { x: 0, y: 0 },
+    deviceScaleFactor: 1,
+    domMutationCount: session.activity.totalDomMutations
+  });
+  session.observer.resolveCandidateForHitNode = (_selectedEvidenceId, hit) => {
+    resolutions++;
+    return { status: "candidate", candidateHint: { identity: `node-${hit.backendNodeId}` } };
+  };
+  const originalSend = transport.send.bind(transport);
+  transport.send = async (method, params = {}, sessionId = null, options = {}) => {
+    if (method === "Runtime.evaluate") {
+      return { result: { value: { width: 100, height: 80, deviceScaleFactor: 1, scrollX: 0, scrollY: 0 } } };
+    }
+    if (method === "DOM.getNodeForLocation") {
+      return await new Promise((resolve, reject) => {
+        let timer;
+        const cleanup = () => {
+          clearTimeout(timer);
+          options.signal?.removeEventListener("abort", onAbort);
+        };
+        const onAbort = () => {
+          cleanup();
+          reject(Object.assign(new Error("query consumer aborted"), { code: "CDP_ABORTED" }));
+        };
+        const query = {
+          params,
+          complete(result = { backendNodeId: 17, frameId: "root-frame" }) {
+            cleanup();
+            resolve(result);
+          },
+          fail(error = new Error("mock query failed")) {
+            cleanup();
+            reject(error);
+          }
+        };
+        pendingQueries.push(query);
+        if (options.signal?.aborted) onAbort();
+        else options.signal?.addEventListener("abort", onAbort, { once: true });
+        if (Number.isInteger(options.timeoutMs)) {
+          timer = setTimeout(() => {
+            cleanup();
+            reject(Object.assign(new Error("mock query deadline"), {
+              code: "CDP_TIMEOUT",
+              callerDeadlineExceeded: true,
+              commandMayStillComplete: true
+            }));
+          }, options.timeoutMs);
+        }
+      });
+    }
+    return originalSend(method, params, sessionId, options);
+  };
+  return {
+    session,
+    transport,
+    pendingQueries,
+    get resolutions() { return resolutions; },
+    evidenceId
+  };
+}
+
+async function waitForPendingQuery(pendingQueries, expectedCount = 1) {
+  for (let attempt = 0; attempt < 20 && pendingQueries.length < expectedCount; attempt++) {
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.equal(pendingQueries.length, expectedCount, "the visual query should be dispatched once");
+}
+
 test("a detached authorized tab stops observations and native actions immediately", async () => {
   const transport = new MockTransport();
   const session = await new BrowserSession({
@@ -60,4 +143,81 @@ test("a lost CDP or Native Messaging transport invalidates the current target se
   assert.equal(session.targetLifecycle, "detached");
   await assert.rejects(() => session.observe(), /authorized browser target is detached/);
   await session.close();
+});
+
+test("visual hit testing allows only one outstanding probe per target", async () => {
+  const harness = await createHitTestSession();
+  try {
+    const first = harness.session.probeVisualCandidateAtPoint(harness.evidenceId, { x: 20, y: 30, timeoutMs: 500 });
+    await waitForPendingQuery(harness.pendingQueries);
+    const second = await harness.session.probeVisualCandidateAtPoint(harness.evidenceId, { x: 21, y: 31, timeoutMs: 500 });
+    assert.equal(second.reasonCode, "hit_test_in_progress");
+    assert.equal(harness.pendingQueries.length, 1);
+
+    harness.pendingQueries[0].complete();
+    const result = await first;
+    assert.equal(result.status, "candidate");
+    assert.equal(harness.resolutions, 1);
+  } finally {
+    await harness.session.close();
+  }
+});
+
+test("visual hit-test deadline expires the consumer and ignores a later completion", async () => {
+  const harness = await createHitTestSession();
+  try {
+    const timedOut = harness.session.probeVisualCandidateAtPoint(harness.evidenceId, { x: 20, y: 30, timeoutMs: 50 });
+    await waitForPendingQuery(harness.pendingQueries);
+    const result = await timedOut;
+    assert.equal(result.status, "unavailable");
+    assert.equal(result.reasonCode, "hit_test_deadline");
+
+    harness.pendingQueries[0].complete({ backendNodeId: 99, frameId: "late-frame" });
+    assert.equal(harness.resolutions, 0);
+
+    const current = harness.session.probeVisualCandidateAtPoint(harness.evidenceId, { x: 25, y: 35, timeoutMs: 500 });
+    await waitForPendingQuery(harness.pendingQueries, 2);
+    harness.pendingQueries[1].complete({ backendNodeId: 18, frameId: "root-frame" });
+    assert.equal((await current).status, "candidate");
+    assert.equal(harness.resolutions, 1);
+  } finally {
+    await harness.session.close();
+  }
+});
+
+test("target detachment aborts a visual query consumer and prevents late resolution", async () => {
+  const harness = await createHitTestSession();
+  try {
+    const pending = harness.session.probeVisualCandidateAtPoint(harness.evidenceId, { x: 20, y: 30, timeoutMs: 500 });
+    await waitForPendingQuery(harness.pendingQueries);
+    harness.transport.emit("Target.detachedFromTarget", {
+      sessionId: "root-session",
+      targetId: "visual-hit-test-target"
+    });
+    const result = await pending;
+    assert.equal(result.status, "stale");
+    assert.equal(result.reasonCode, "target_detached");
+    harness.pendingQueries[0].complete({ backendNodeId: 99, frameId: "late-frame" });
+    assert.equal(harness.resolutions, 0);
+  } finally {
+    await harness.session.close();
+  }
+});
+
+test("a newer observation invalidates an in-flight visual result", async () => {
+  const harness = await createHitTestSession();
+  try {
+    const pending = harness.session.probeVisualCandidateAtPoint(harness.evidenceId, { x: 20, y: 30, timeoutMs: 500 });
+    await waitForPendingQuery(harness.pendingQueries);
+    harness.session.observer.capture = async () => ({ evidenceId: "visual-evidence-2" });
+    await harness.session.observe();
+
+    const result = await pending;
+    assert.equal(result.status, "stale");
+    assert.equal(result.reasonCode, "superseded_by_new_observation");
+    harness.pendingQueries[0].complete({ backendNodeId: 100, frameId: "late-frame" });
+    assert.equal(harness.resolutions, 0);
+  } finally {
+    await harness.session.close();
+  }
 });

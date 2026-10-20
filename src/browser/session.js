@@ -9,7 +9,12 @@ import { isFileUploadDispatchToken } from "../runtime/fileUploadGrants.js";
 
 function createSessionClient(transport, sessionId) {
   return {
-    send: (method, params = {}) => transport.send(method, params, sessionId()),
+    send: (method, params = {}, options = {}) => transport.send(
+      method,
+      params,
+      sessionId(),
+      options && typeof options === "object" && !Array.isArray(options) ? options : {}
+    ),
     on: (method, listener) => transport.on(method, (params, eventSessionId) => {
       if ((eventSessionId ?? null) === (sessionId() ?? null)) listener(params);
     })
@@ -74,6 +79,9 @@ export class BrowserSession {
     this.sessionId = null;
     this.client = createSessionClient(this.transport, () => this.sessionId);
     this.documentGeneration = 0;
+    this.observationGeneration = 0;
+    this.visualProbeSequence = 0;
+    this.activeVisualProbe = null;
     this.attached = false;
     this.targetLifecycle = "created";
     this.targetDetachReason = null;
@@ -239,6 +247,7 @@ export class BrowserSession {
 
   #markTargetDetached(reason) {
     if (this.targetLifecycle === "detached" || this.targetLifecycle === "closed") return;
+    this.#invalidateVisualProbe("target_detached");
     this.targetLifecycle = "detached";
     this.targetDetachReason = String(reason ?? "target detached").slice(0, 200);
     this.attached = false;
@@ -257,6 +266,12 @@ export class BrowserSession {
   #assertTargetAttached() {
     if (this.targetLifecycle === "detached") throw new Error("The authorized browser target is detached; create a fresh authorized session before continuing.");
     if (!this.attached || this.targetLifecycle !== "attached") throw new Error("Browser target session is not attached.");
+  }
+
+  #invalidateVisualProbe(reason) {
+    if (!this.activeVisualProbe) return;
+    this.activeVisualProbe.invalidatedBy = reason;
+    this.activeVisualProbe.controller.abort();
   }
 
   async #assertFocusedCandidate(candidate, action) {
@@ -397,6 +412,8 @@ export class BrowserSession {
 
   async observe(options) {
     this.#assertTargetAttached();
+    this.observationGeneration++;
+    this.#invalidateVisualProbe("superseded_by_new_observation");
     const observation = await this.observer.capture(options);
     // Observations are retained evidence. Record the session-owned evidence id
     // so diagnostic collectors can request the exact observation, rather than
@@ -418,7 +435,30 @@ export class BrowserSession {
       || !Number.isInteger(timeoutMs) || timeoutMs < 50 || timeoutMs > 2_000) {
       return { status: "invalid", reasonCode: "hit_test_input_invalid", evidenceId, actionAuthorized: false };
     }
+    if (this.activeVisualProbe) {
+      return { status: "unavailable", reasonCode: "hit_test_in_progress", evidenceId, actionAuthorized: false };
+    }
+    const active = {
+      id: ++this.visualProbeSequence,
+      evidenceId,
+      observationGeneration: this.observationGeneration,
+      controller: new AbortController(),
+      invalidatedBy: null
+    };
+    this.activeVisualProbe = active;
+    try {
+      return await this.#runVisualCandidateProbe(evidenceId, { x, y, timeoutMs, active });
+    } finally {
+      if (this.activeVisualProbe?.id === active.id) this.activeVisualProbe = null;
+    }
+  }
+
+  async #runVisualCandidateProbe(evidenceId, { x, y, timeoutMs, active }) {
     const startedAt = performance.now();
+    const staleResult = reasonCode => ({ status: "stale", reasonCode, evidenceId, actionAuthorized: false });
+    const isSuperseded = () => active.invalidatedBy !== null
+      || active.observationGeneration !== this.observationGeneration;
+    if (isSuperseded()) return staleResult(active.invalidatedBy ?? "superseded_by_new_observation");
     const context = this.observer.getHitTestContext(evidenceId);
     if (context.status !== "available") return { ...context, actionAuthorized: false };
     if (context.targetId !== this.target.id || context.documentGeneration !== this.documentGeneration) {
@@ -434,11 +474,13 @@ export class BrowserSession {
         expression: "({width:innerWidth,height:innerHeight,deviceScaleFactor:window.devicePixelRatio||1,scrollX,scrollY})",
         returnByValue: true,
         awaitPromise: false
-      });
+      }, { signal: active.controller.signal });
       viewport = result.result?.value;
     } catch {
+      if (isSuperseded()) return staleResult(active.invalidatedBy ?? "superseded_by_new_observation");
       return { status: "unavailable", reasonCode: "viewport_recheck_failed", evidenceId, actionAuthorized: false };
     }
+    if (isSuperseded()) return staleResult(active.invalidatedBy ?? "superseded_by_new_observation");
     if (context.targetId !== this.target.id || context.documentGeneration !== this.documentGeneration
       || this.activity.totalDomMutations !== context.domMutationCount) {
       return { status: "stale", reasonCode: "page_changed_before_hit_test", evidenceId, actionAuthorized: false };
@@ -451,34 +493,28 @@ export class BrowserSession {
       return { status: "stale", reasonCode: "page_scroll_changed", evidenceId, actionAuthorized: false };
     }
 
-    let timer;
     let hit;
     try {
-      hit = await Promise.race([
-        this.client.send("DOM.getNodeForLocation", {
-          x: Math.round(x + context.viewportScroll.x),
-          y: Math.round(y + context.viewportScroll.y),
-          includeUserAgentShadowDOM: false,
-          ignorePointerEventsNone: false
-        }),
-        new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error("hit_test_deadline")), timeoutMs);
-        })
-      ]);
+      hit = await this.client.send("DOM.getNodeForLocation", {
+        x: Math.round(x + context.viewportScroll.x),
+        y: Math.round(y + context.viewportScroll.y),
+        includeUserAgentShadowDOM: false,
+        ignorePointerEventsNone: false
+      }, { timeoutMs, signal: active.controller.signal });
     } catch (error) {
-      const deadline = error?.message === "hit_test_deadline";
+      if (isSuperseded()) return staleResult(active.invalidatedBy ?? "superseded_by_new_observation");
+      if (this.targetLifecycle !== "attached") return staleResult("target_detached");
       return {
         status: "unavailable",
-        reasonCode: deadline ? "hit_test_deadline" : "cdp_hit_test_failed",
+        reasonCode: error?.callerDeadlineExceeded === true ? "hit_test_deadline" : "cdp_hit_test_failed",
         elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
         evidenceId,
         actionAuthorized: false
       };
-    } finally {
-      if (timer) clearTimeout(timer);
     }
 
-    this.#assertTargetAttached();
+    if (isSuperseded()) return staleResult(active.invalidatedBy ?? "superseded_by_new_observation");
+    if (this.targetLifecycle !== "attached") return staleResult("target_detached");
     if (context.targetId !== this.target.id || context.documentGeneration !== this.documentGeneration
       || this.activity.totalDomMutations !== context.domMutationCount) {
       return { status: "stale", reasonCode: "page_changed_during_hit_test", evidenceId, actionAuthorized: false };
@@ -1304,6 +1340,7 @@ export class BrowserSession {
   }
 
   async close() {
+    this.#invalidateVisualProbe("target_closed");
     await this.#detachFrameSessions();
     for (const dispose of this.disposers.splice(0)) dispose();
     this.attached = false;

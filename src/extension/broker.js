@@ -4,6 +4,7 @@ import { lstat, mkdir, chmod, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
 import { encodeNativeMessage, NativeMessageDecoder, MAX_EXTENSION_TO_HOST_MESSAGE_BYTES } from "../../native-host/protocol.js";
 import { sanitizeUrl } from "../browser/urlPrivacy.js";
+import { CdpError } from "../cdp/client.js";
 
 export const EXTENSION_ID = "begilomabckehkhinipbibjignhdhnmc";
 export const EXTENSION_ORIGIN = `chrome-extension://${EXTENSION_ID}/`;
@@ -112,8 +113,7 @@ export class ExtensionBroker extends EventEmitter {
     if (message?.kind === "response" && Number.isInteger(message.id)) {
       const pending = this.pending.get(message.id);
       if (!pending) return;
-      this.pending.delete(message.id);
-      clearTimeout(pending.timer);
+      this.#takePending(message.id, pending);
       if (message.error) pending.reject(new Error(String(message.error.message ?? "Chrome debugger command failed")));
       else pending.resolve(message.result ?? {});
     }
@@ -132,11 +132,10 @@ export class ExtensionBroker extends EventEmitter {
     socket.destroy();
     const previous = [...this.attachedTargets.values()];
     this.attachedTargets.clear();
-    for (const pending of this.pending.values()) {
-      clearTimeout(pending.timer);
+    for (const [id, pending] of this.pending) {
+      this.#takePending(id, pending);
       pending.reject(error);
     }
-    this.pending.clear();
     if (previous.length === 0) this.emit("disconnected", { targetId: null, reason: error.message });
     else for (const target of previous) this.emit("disconnected", { targetId: target.id, reason: error.message });
   }
@@ -158,9 +157,14 @@ export class ExtensionBroker extends EventEmitter {
     };
   }
 
-  async sendCommand(targetId, method, params = {}, sessionId = null) {
+  async sendCommand(targetId, method, params = {}, sessionId = null, options = {}) {
     if (!this.socket || !this.attachedTargets.has(targetId)) throw new Error("The authorized Chrome tab is no longer attached.");
-    return this.#request({ kind: "request", method: "cdp.send", targetId, cdpMethod: method, params, sessionId });
+    const timeoutMs = options.timeoutMs ?? this.requestTimeoutMs;
+    return this.#request({ kind: "request", method: "cdp.send", targetId, cdpMethod: method, params, sessionId }, timeoutMs, {
+      signal: options.signal ?? null,
+      method,
+      callerDeadlineExceeded: Object.hasOwn(options, "timeoutMs")
+    });
   }
 
   async detach(targetId) {
@@ -169,15 +173,41 @@ export class ExtensionBroker extends EventEmitter {
     finally { this.attachedTargets.delete(targetId); }
   }
 
-  #request(message, timeoutMs = this.requestTimeoutMs) {
+  #request(message, timeoutMs = this.requestTimeoutMs, { signal = null, method = message.cdpMethod ?? message.method, callerDeadlineExceeded = false } = {}) {
     if (!this.socket || this.socket.destroyed) return Promise.reject(new Error("The ActiveTab extension is disconnected."));
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1) return Promise.reject(new RangeError("Extension CDP timeoutMs must be a positive integer."));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`Chrome debugger command timed out: ${message.cdpMethod ?? message.method}`)); }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      const pending = { resolve, reject, timer: null, signal, abortListener: null };
+      const rejectPending = error => {
+        if (!this.#takePending(id, pending)) return;
+        reject(error);
+      };
+      this.pending.set(id, pending);
+      if (signal) {
+        pending.abortListener = () => rejectPending(new CdpError(`CDP command consumer aborted: ${method}`, {
+          code: "CDP_ABORTED", method, commandMayStillComplete: true
+        }));
+        if (signal.aborted) {
+          pending.abortListener();
+          return;
+        }
+        signal.addEventListener("abort", pending.abortListener, { once: true });
+      }
+      pending.timer = setTimeout(() => rejectPending(new CdpError(`CDP command timed out: ${method}`, {
+        code: "CDP_TIMEOUT", method, timeoutMs, callerDeadlineExceeded, commandMayStillComplete: true
+      })), timeoutMs);
       try { this.#write({ ...message, id }); }
-      catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
+      catch (error) { rejectPending(error); }
     });
+  }
+
+  #takePending(id, pending) {
+    if (this.pending.get(id) !== pending) return false;
+    this.pending.delete(id);
+    clearTimeout(pending.timer);
+    if (pending.signal && pending.abortListener) pending.signal.removeEventListener("abort", pending.abortListener);
+    return true;
   }
 
   async close() {
@@ -231,11 +261,11 @@ class ExtensionCdpTransport {
     return () => listeners.delete(listener);
   }
 
-  send(method, params = {}, sessionId = null) {
+  send(method, params = {}, sessionId = null, options = {}) {
     if (this.closed) return Promise.reject(new Error("Chrome extension transport is closed."));
     if (this.disconnected) return Promise.reject(new Error("The Chrome extension connection was interrupted; attach a fresh browser session."));
     if (this.detached) return Promise.reject(new Error("The Chrome tab lease was detached; attach a fresh browser session."));
-    return this.broker.sendCommand(this.targetId, method, params, sessionId);
+    return this.broker.sendCommand(this.targetId, method, params, sessionId, options);
   }
 
   async close() {
