@@ -414,6 +414,7 @@ test("response body acquisition enforces byte limits and reports timeout or canc
   assert.equal(preflight.responseBody.status, "over_limit");
   assert.equal(preflight.responseBody.reasonCode, "reported_decoded_body_bytes_limit");
   assert.equal(preflight.responseBody.bodyRetrieved, false);
+  assert.equal(preflight.responseBody.acquisition.status, "over_limit");
   assert.equal(reportedLargeBodyReads, 0, "retained CDP byte counts reject oversized responses before retrieving the body");
 
   const encodedLargeSession = fakeSession();
@@ -450,12 +451,79 @@ test("response body acquisition enforces byte limits and reports timeout or canc
   assert.equal(actualLarge.responseBody.reasonCode, "decoded_body_bytes_limit");
   assert.equal(actualLarge.responseBody.bodyRetrieved, true);
   assert.equal(actualLarge.responseBody.bodyDecoded, false);
+  assert.equal(actualLarge.responseBody.acquisition.hardMemoryBound, false);
+
+  const unknownSizeSession = fakeSession();
+  const unknownSizeObserver = new BrowserObserver(unknownSizeSession);
+  const unknownSizeEvidence = await unknownSizeObserver.capture({ includeScreenshot: false });
+  const unknownRequest = unknownSizeObserver.evidence.get(unknownSizeEvidence.evidenceId).evidence.activity.networkRequests
+    .find(item => item.requestId === "request-1");
+  unknownRequest.encodedDataLength = null;
+  unknownRequest.decodedDataLength = 0;
+  unknownRequest.dataChunkCount = 0;
+  const unknownSizeResult = await unknownSizeObserver.inspectNetworkResponse(unknownSizeEvidence.evidenceId, {
+    requestId: "request-1", includeSensitive: true, view: "normalized"
+  });
+  assert.equal(unknownSizeResult.responseBody.status, "included");
+  assert.equal(unknownSizeResult.responseBody.acquisition.status, "size_unknown");
+  assert.equal(unknownSizeResult.responseBody.acquisition.contentTypeClass, "textual");
+  assert.equal(unknownSizeResult.responseBody.acquisition.hardMemoryBound, false);
+  assert.equal(unknownSizeResult.responseBody.acquisition.transportBehavior, "cdp_materializes_complete_body_result");
+
+  const streamingSession = fakeSession();
+  let streamingBodyReads = 0;
+  const streamingSend = streamingSession.client.send.bind(streamingSession.client);
+  streamingSession.client.send = async (method, params) => {
+    if (method === "Network.getResponseBody") streamingBodyReads++;
+    return streamingSend(method, params);
+  };
+  const streamingObserver = new BrowserObserver(streamingSession);
+  const streamingEvidence = await streamingObserver.capture({ includeScreenshot: false });
+  streamingObserver.evidence.get(streamingEvidence.evidenceId).evidence.activity.networkRequests
+    .find(item => item.requestId === "request-1").resourceType = "WebSocket";
+  const streamingResult = await streamingObserver.inspectNetworkResponse(streamingEvidence.evidenceId, {
+    requestId: "request-1", includeSensitive: true
+  });
+  assert.equal(streamingResult.responseBody.status, "unsupported");
+  assert.equal(streamingResult.responseBody.reasonCode, "streaming_request_type_unsupported");
+  assert.equal(streamingBodyReads, 0);
+
+  const concurrentSession = fakeSession();
+  const concurrentSend = concurrentSession.client.send.bind(concurrentSession.client);
+  let concurrentBodyReads = 0;
+  let releaseFirstBody;
+  concurrentSession.client.send = (method, params) => {
+    if (method !== "Network.getResponseBody") return concurrentSend(method, params);
+    concurrentBodyReads++;
+    if (concurrentBodyReads === 1) return new Promise(resolve => { releaseFirstBody = resolve; });
+    return Promise.resolve({ body: "{\"safe\":true}", base64Encoded: false });
+  };
+  const concurrentObserver = new BrowserObserver(concurrentSession);
+  const concurrentEvidence = await concurrentObserver.capture({ includeScreenshot: false });
+  const concurrentOptions = {
+    requestId: "request-1", includeSensitive: true, includeCredentialValues: true, view: "normalized"
+  };
+  const firstAcquisition = concurrentObserver.inspectNetworkResponse(concurrentEvidence.evidenceId, concurrentOptions);
+  await new Promise(resolve => setImmediate(resolve));
+  const overlappingAcquisition = await concurrentObserver.inspectNetworkResponse(concurrentEvidence.evidenceId, concurrentOptions);
+  assert.equal(overlappingAcquisition.responseBody.status, "busy");
+  assert.equal(overlappingAcquisition.responseBody.reasonCode, "session_response_body_acquisition_in_progress");
+  assert.equal(concurrentBodyReads, 1, "a second request cannot add another pending complete-body command to the same session");
+  releaseFirstBody({ body: "{\"first\":true}", base64Encoded: false });
+  assert.equal((await firstAcquisition).responseBody.status, "included");
+  assert.equal((await concurrentObserver.inspectNetworkResponse(concurrentEvidence.evidenceId, concurrentOptions)).responseBody.status, "included");
+  assert.equal(concurrentBodyReads, 2, "the session slot releases when the underlying CDP command settles");
 
   const pendingSession = fakeSession();
   const pendingSend = pendingSession.client.send.bind(pendingSession.client);
-  pendingSession.client.send = (method, params) => method === "Network.getResponseBody"
-    ? new Promise(() => {})
-    : pendingSend(method, params);
+  let pendingBodyReads = 0;
+  pendingSession.client.send = (method, params) => {
+    if (method === "Network.getResponseBody") {
+      pendingBodyReads++;
+      return new Promise(() => {});
+    }
+    return pendingSend(method, params);
+  };
   const pendingObserver = new BrowserObserver(pendingSession);
   const pendingEvidence = await pendingObserver.capture({ includeScreenshot: false });
   const timedOut = await pendingObserver.inspectNetworkResponse(pendingEvidence.evidenceId, {
@@ -463,15 +531,31 @@ test("response body acquisition enforces byte limits and reports timeout or canc
   });
   assert.equal(timedOut.responseBody.status, "timed_out");
   assert.equal(timedOut.responseBody.phase, "acquisition");
+  const afterTimeout = await pendingObserver.inspectNetworkResponse(pendingEvidence.evidenceId, {
+    requestId: "request-1", includeSensitive: true, timeoutMs: 5
+  });
+  assert.equal(afterTimeout.responseBody.status, "busy", "caller timeout leaves the unresolved CDP command slot held");
+  assert.equal(pendingBodyReads, 1);
 
+  const cancelledSession = fakeSession();
+  const cancelledSend = cancelledSession.client.send.bind(cancelledSession.client);
+  cancelledSession.client.send = (method, params) => method === "Network.getResponseBody"
+    ? new Promise(() => {})
+    : cancelledSend(method, params);
+  const cancelledObserver = new BrowserObserver(cancelledSession);
+  const cancelledEvidence = await cancelledObserver.capture({ includeScreenshot: false });
   const abortController = new AbortController();
-  const cancelledPromise = pendingObserver.inspectNetworkResponse(pendingEvidence.evidenceId, {
+  const cancelledPromise = cancelledObserver.inspectNetworkResponse(cancelledEvidence.evidenceId, {
     requestId: "request-1", includeSensitive: true, signal: abortController.signal
   });
   setImmediate(() => abortController.abort());
   const cancelled = await cancelledPromise;
   assert.equal(cancelled.responseBody.status, "cancelled");
   assert.equal(cancelled.responseBody.phase, "acquisition");
+  const afterCancellation = await cancelledObserver.inspectNetworkResponse(cancelledEvidence.evidenceId, {
+    requestId: "request-1", includeSensitive: true
+  });
+  assert.equal(afterCancellation.responseBody.status, "busy", "caller cancellation cannot permit overlapping CDP body commands");
 });
 
 test("Markdown response diagnostics can drill into nested sections and page exact indexed blocks", async () => {

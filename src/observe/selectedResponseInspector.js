@@ -1,6 +1,11 @@
 import { sanitizeUrl } from "../browser/urlPrivacy.js";
 import { createUtf8OffsetIndex, indexMarkdownDocument, inspectResponseBody, selectMarkdownRange, sliceUtf8View, redactCredentialUrl } from "./responseBodyInspector.js";
 import { MAX_RESPONSE_BODY_BYTES, MAX_RESPONSE_MARKDOWN_BYTES } from "./responseBodyShared.js";
+import {
+  readSelectedResponseBody,
+  responseBodyAcquisitionPolicy,
+  responseBodyAcquisitionResult
+} from "./networkResponseAcquisition.js";
 
 const DEFAULT_NETWORK_RESPONSE_BYTES = 32 * 1024;
 export const MAX_NETWORK_RESPONSE_CHUNK_BYTES = 256 * 1024;
@@ -49,29 +54,6 @@ function renderNetworkResponseMarkdown(request, requestEvidence, inspection) {
     inspection.markdown
   ];
   return lines.join("\n");
-}
-
-function readSelectedResponseBody(client, requestId, { signal, timeoutMs }) {
-  if (signal?.aborted) return Promise.resolve({ status: "cancelled" });
-  return new Promise(resolve => {
-    let settled = false;
-    const finish = result => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      resolve(result);
-    };
-    const onAbort = () => finish({ status: "cancelled" });
-    const timer = setTimeout(() => finish({ status: "timed_out" }), timeoutMs);
-    signal?.addEventListener("abort", onAbort, { once: true });
-    if (signal?.aborted) {
-      onAbort();
-      return;
-    }
-    Promise.resolve().then(() => client.send("Network.getResponseBody", { requestId }))
-      .then(response => finish({ status: "available", response }), () => finish({ status: "unavailable" }));
-  });
 }
 
 function estimateBase64DecodedBytes(value) {
@@ -169,42 +151,69 @@ export async function inspectNetworkResponse(observer, id, {
     });
     const client = observer.session.networkClientForTarget?.(request.frameTargetId ?? null);
     if (!client) return { status: "unavailable", evidenceId: id, request: requestEvidence, responseBody: { status: "network_session_unavailable" } };
-    if (Number.isFinite(request.decodedDataLength) && request.decodedDataLength > MAX_RESPONSE_BODY_BYTES) return {
+    const acquisitionPolicy = responseBodyAcquisitionPolicy(request, {
+      explicitBodyOptIn: includeSensitive === true
+    });
+    if (acquisitionPolicy.status === "over_limit") return {
       status: "available", evidenceId: id, request: requestEvidence,
       responseBody: {
         status: "over_limit",
-        reasonCode: "reported_decoded_body_bytes_limit",
-        reportedDecodedBytes: request.decodedDataLength,
+        reasonCode: acquisitionPolicy.reasonCode,
+        acquisition: responseBodyAcquisitionResult(acquisitionPolicy),
+        reportedDecodedBytes: acquisitionPolicy.reportedDecodedBytes,
+        reportedEncodedBytes: acquisitionPolicy.reportedEncodedBytes,
         maxDecodedBytes: MAX_RESPONSE_BODY_BYTES,
         bodyRetrieved: false
       }
     };
-    if (Number.isFinite(request.encodedDataLength) && request.encodedDataLength > MAX_RESPONSE_BODY_BYTES) return {
+    if (acquisitionPolicy.status === "refused") return {
       status: "available", evidenceId: id, request: requestEvidence,
       responseBody: {
-        status: "over_limit",
-        reasonCode: "reported_encoded_body_bytes_limit",
-        reportedEncodedBytes: request.encodedDataLength,
-        maxEncodedBytes: MAX_RESPONSE_BODY_BYTES,
+        status: "unsupported",
+        reasonCode: acquisitionPolicy.reasonCode,
+        acquisition: responseBodyAcquisitionResult(acquisitionPolicy),
         bodyRetrieved: false
       }
     };
     const acquisitionStartedAt = Date.now();
-    const acquisition = await readSelectedResponseBody(client, request.protocolRequestId, { signal, timeoutMs });
+    const acquisition = await readSelectedResponseBody(observer.session, client, request.protocolRequestId, { signal, timeoutMs });
     const acquisitionMs = Date.now() - acquisitionStartedAt;
+    if (acquisition.status === "busy") return {
+      status: "available", evidenceId: id, request: requestEvidence,
+      responseBody: {
+        status: "busy",
+        reasonCode: "session_response_body_acquisition_in_progress",
+        acquisition: responseBodyAcquisitionResult(acquisitionPolicy),
+        acquisitionMs
+      }
+    };
     if (acquisition.status === "cancelled") return {
       status: "available", evidenceId: id, request: requestEvidence,
-      responseBody: { status: "cancelled", phase: "acquisition", acquisitionMs }
+      responseBody: { status: "cancelled", phase: "acquisition", acquisition: responseBodyAcquisitionResult(acquisitionPolicy), acquisitionMs }
     };
     if (acquisition.status === "timed_out") return {
       status: "available", evidenceId: id, request: requestEvidence,
-      responseBody: { status: "timed_out", phase: "acquisition", timeoutMs, acquisitionMs }
+      responseBody: { status: "timed_out", phase: "acquisition", acquisition: responseBodyAcquisitionResult(acquisitionPolicy), timeoutMs, acquisitionMs }
     };
     if (acquisition.status !== "available") {
-      return { status: "unavailable", evidenceId: id, request: requestEvidence, responseBody: { status: "body_evicted_or_unavailable" } };
+      return {
+        status: "unavailable", evidenceId: id, request: requestEvidence,
+        responseBody: {
+          status: "body_evicted_or_unavailable",
+          acquisition: responseBodyAcquisitionResult(acquisitionPolicy),
+          acquisitionMs
+        }
+      };
     }
     const response = acquisition.response;
-    if (typeof response?.body !== "string") return { status: "unavailable", evidenceId: id, request: requestEvidence, responseBody: { status: "empty_or_unavailable" } };
+    if (typeof response?.body !== "string") return {
+      status: "unavailable", evidenceId: id, request: requestEvidence,
+      responseBody: {
+        status: "empty_or_unavailable",
+        acquisition: responseBodyAcquisitionResult(acquisitionPolicy, { bodyRetrieved: true }),
+        acquisitionMs
+      }
+    };
     const base64Encoded = response.base64Encoded === true;
     const encodedBodyBytes = Buffer.byteLength(response.body, "utf8");
     const decodedBodyEstimate = base64Encoded ? estimateBase64DecodedBytes(response.body) : encodedBodyBytes;
@@ -215,6 +224,7 @@ export async function inspectNetworkResponse(observer, id, {
       responseBody: {
         status: "over_limit",
         reasonCode: "decoded_body_bytes_limit",
+        acquisition: responseBodyAcquisitionResult(acquisitionPolicy, { bodyRetrieved: true, actualDecodedBytes: decodedBodyEstimate }),
         encodedBodyBytes,
         decodedBodyEstimate,
         maxDecodedBytes: MAX_RESPONSE_BODY_BYTES,
@@ -224,7 +234,7 @@ export async function inspectNetworkResponse(observer, id, {
     };
     if (signal?.aborted) return {
       status: "available", evidenceId: id, request: requestEvidence,
-      responseBody: { status: "cancelled", phase: "after_acquisition", acquisitionMs }
+      responseBody: { status: "cancelled", phase: "after_acquisition", acquisition: responseBodyAcquisitionResult(acquisitionPolicy, { bodyRetrieved: true, actualDecodedBytes: decodedBodyEstimate }), acquisitionMs }
     };
     const bytes = base64Encoded ? Buffer.from(response.body, "base64") : Buffer.from(response.body, "utf8");
     if (bytes.length > MAX_RESPONSE_BODY_BYTES) return {
@@ -232,6 +242,7 @@ export async function inspectNetworkResponse(observer, id, {
       responseBody: {
         status: "over_limit",
         reasonCode: "decoded_body_bytes_limit",
+        acquisition: responseBodyAcquisitionResult(acquisitionPolicy, { bodyRetrieved: true, actualDecodedBytes: bytes.length }),
         encodedBodyBytes,
         decodedBytes: bytes.length,
         maxDecodedBytes: MAX_RESPONSE_BODY_BYTES,
@@ -252,6 +263,7 @@ export async function inspectNetworkResponse(observer, id, {
       responseBody: {
         status: "over_limit",
         reasonCode: inspection.reasonCode,
+        acquisition: responseBodyAcquisitionResult(acquisitionPolicy, { bodyRetrieved: true, actualDecodedBytes: bytes.length }),
         analysis: inspection.analysis,
         credentialValuesIncluded: false,
         limits: inspection.analysis?.budgetExceeded ?? null
@@ -259,13 +271,14 @@ export async function inspectNetworkResponse(observer, id, {
     };
     if (signal?.aborted) return {
       status: "available", evidenceId: id, request: requestEvidence,
-      responseBody: { status: "cancelled", phase: "analysis", acquisitionMs, analysisMs }
+      responseBody: { status: "cancelled", phase: "analysis", acquisition: responseBodyAcquisitionResult(acquisitionPolicy, { bodyRetrieved: true, actualDecodedBytes: bytes.length }), acquisitionMs, analysisMs }
     };
     if (analysisMs > MAX_NETWORK_RESPONSE_INSPECTION_MS) return {
       status: "available", evidenceId: id, request: requestEvidence,
       responseBody: {
         status: "over_limit",
         reasonCode: "analysis_time_budget_exceeded",
+        acquisition: responseBodyAcquisitionResult(acquisitionPolicy, { bodyRetrieved: true, actualDecodedBytes: bytes.length }),
         analysisMs,
         maxAnalysisMs: MAX_NETWORK_RESPONSE_INSPECTION_MS,
         sourceBytes: bytes.length
@@ -280,6 +293,7 @@ export async function inspectNetworkResponse(observer, id, {
       responseBody: {
         status: "over_limit",
         reasonCode: "markdown_output_limit",
+        acquisition: responseBodyAcquisitionResult(acquisitionPolicy, { bodyRetrieved: true, actualDecodedBytes: bytes.length }),
         markdownBytes,
         maxMarkdownBytes: MAX_RESPONSE_MARKDOWN_BYTES,
         sourceBytes: bytes.length
@@ -287,7 +301,7 @@ export async function inspectNetworkResponse(observer, id, {
     };
     if (signal?.aborted) return {
       status: "available", evidenceId: id, request: requestEvidence,
-      responseBody: { status: "cancelled", phase: "render", acquisitionMs, analysisMs, renderMs }
+      responseBody: { status: "cancelled", phase: "render", acquisition: responseBodyAcquisitionResult(acquisitionPolicy, { bodyRetrieved: true, actualDecodedBytes: bytes.length }), acquisitionMs, analysisMs, renderMs }
     };
     if (view === "normalized" && inspection.normalizedText === null) {
       return {
@@ -296,6 +310,7 @@ export async function inspectNetworkResponse(observer, id, {
         request: requestEvidence,
         responseBody: {
           status: "normalization_unavailable",
+          acquisition: responseBodyAcquisitionResult(acquisitionPolicy, { bodyRetrieved: true, actualDecodedBytes: bytes.length }),
           format: inspection.format,
           parseMode: inspection.parseMode,
           credentialValuesIncluded: inspection.credentialValuesIncluded,
@@ -312,7 +327,7 @@ export async function inspectNetworkResponse(observer, id, {
     const indexingMs = Date.now() - indexingStartedAt;
     if (signal?.aborted) return {
       status: "available", evidenceId: id, request: requestEvidence,
-      responseBody: { status: "cancelled", phase: "indexing", acquisitionMs, analysisMs, renderMs, indexingMs }
+      responseBody: { status: "cancelled", phase: "indexing", acquisition: responseBodyAcquisitionResult(acquisitionPolicy, { bodyRetrieved: true, actualDecodedBytes: bytes.length }), acquisitionMs, analysisMs, renderMs, indexingMs }
     };
     const processingMs = Date.now() - processingStartedAt;
     if (processingMs > MAX_NETWORK_RESPONSE_INSPECTION_MS) return {
@@ -320,6 +335,7 @@ export async function inspectNetworkResponse(observer, id, {
       responseBody: {
         status: "over_limit",
         reasonCode: "total_inspection_time_budget_exceeded",
+        acquisition: responseBodyAcquisitionResult(acquisitionPolicy, { bodyRetrieved: true, actualDecodedBytes: bytes.length }),
         acquisitionMs,
         analysisMs,
         renderMs,
@@ -340,6 +356,7 @@ export async function inspectNetworkResponse(observer, id, {
       credentialValuesIncluded: inspection.credentialValuesIncluded,
       credentialDetails: inspection.credentialDetails,
       analysis: inspection.analysis,
+      acquisition: responseBodyAcquisitionResult(acquisitionPolicy, { bodyRetrieved: true, actualDecodedBytes: bytes.length }),
       markdownIndex,
       byteOffsets,
       sourceBytes: bytes.length,
@@ -428,6 +445,7 @@ export function pageResponseProjection({ evidenceId, requestEvidence, projection
         credentialRedactions: projection.credentialRedactions,
         credentialValuesIncluded: projection.credentialValuesIncluded,
         credentialDetails: projection.credentialDetails,
+        acquisition: projection.acquisition,
         analysis: projection.analysis,
         inspectionMetrics: {
           acquisitionMs: cacheHit ? 0 : projection.phaseMetrics.acquisitionMs,

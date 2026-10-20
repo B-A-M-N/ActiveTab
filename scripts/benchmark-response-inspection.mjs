@@ -5,6 +5,11 @@ import { once } from "node:events";
 import { launchOwnedChrome } from "../src/browser/ownedChrome.js";
 
 const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+const headless = process.env.ACTIVETAB_HEADLESS === "1";
+const memorySnapshot = () => {
+  const memory = process.memoryUsage();
+  return { nodeRssBytes: memory.rss, nodeHeapUsedBytes: memory.heapUsed };
+};
 const jsonOfSize = (targetBytes, value = "x") => {
   const prefix = '{"records":[{"payload":"';
   const suffix = '"}]}';
@@ -40,6 +45,7 @@ let nodeMonitorTimer;
 let chromeMonitorTimer;
 let baseline;
 let peak;
+let activeCaseMemory = null;
 
 function chromeTreeRss(rootPid) {
   try {
@@ -62,20 +68,32 @@ function chromeTreeRss(rootPid) {
 try {
   process.stderr.write("Starting owned Chrome on the local response fixture.\n");
   owned = await launchOwnedChrome({
-    initialUrl: `http://127.0.0.1:${port}/`, headed: true, displayMode: "current-display",
+    initialUrl: `http://127.0.0.1:${port}/`, headed: !headless, displayMode: "current-display",
     preserveProfile: false, reuseExisting: false
   });
   process.stderr.write(`Owned Chrome ready (${owned.browserVersion}).\n`);
   baseline = {
-    nodeRssBytes: process.memoryUsage().rss,
+    ...memorySnapshot(),
     chromeTreeRssBytes: chromeTreeRss(owned.chromeProcess.pid)
   };
   peak = { ...baseline };
   nodeMonitorTimer = setInterval(() => {
-    peak.nodeRssBytes = Math.max(peak.nodeRssBytes, process.memoryUsage().rss);
+    const memory = memorySnapshot();
+    peak.nodeRssBytes = Math.max(peak.nodeRssBytes, memory.nodeRssBytes);
+    peak.nodeHeapUsedBytes = Math.max(peak.nodeHeapUsedBytes, memory.nodeHeapUsedBytes);
+    if (activeCaseMemory) {
+      activeCaseMemory.peakNodeRssBytes = Math.max(activeCaseMemory.peakNodeRssBytes, memory.nodeRssBytes);
+      activeCaseMemory.peakNodeHeapUsedBytes = Math.max(activeCaseMemory.peakNodeHeapUsedBytes, memory.nodeHeapUsedBytes);
+    }
   }, 25);
   chromeMonitorTimer = setInterval(() => {
     peak.chromeTreeRssBytes = Math.max(peak.chromeTreeRssBytes, chromeTreeRss(owned.chromeProcess.pid));
+    if (activeCaseMemory) {
+      activeCaseMemory.peakChromeTreeRssBytes = Math.max(
+        activeCaseMemory.peakChromeTreeRssBytes,
+        chromeTreeRss(owned.chromeProcess.pid)
+      );
+    }
   }, 500);
 
   const results = [];
@@ -101,12 +119,18 @@ try {
     process.stderr.write(`Capturing retained evidence for ${caseId}.\n`);
     const observation = await owned.session.observe({ profile: "lightweight" });
     process.stderr.write(`Inspecting ${caseId} body.\n`);
-    const before = process.memoryUsage().rss;
+    const before = memorySnapshot();
+    activeCaseMemory = {
+      peakNodeRssBytes: before.nodeRssBytes,
+      peakNodeHeapUsedBytes: before.nodeHeapUsedBytes,
+      peakChromeTreeRssBytes: chromeTreeRss(owned.chromeProcess.pid)
+    };
     const inspectStartedAt = process.hrtime.bigint();
     const result = await owned.session.observer.inspectNetworkResponse(observation.evidenceId, {
       requestId: request.requestId, includeSensitive: true, view: "markdown", maxBytes: 1_024
     });
     process.stderr.write(`Inspected ${caseId} response.\n`);
+    const after = memorySnapshot();
     const responseBody = result.responseBody ?? {};
     results.push({
       caseId,
@@ -121,9 +145,13 @@ try {
       inspectWallMs: Number(process.hrtime.bigint() - inspectStartedAt) / 1e6,
       endToEndWallMs: Number(process.hrtime.bigint() - startedAt) / 1e6,
       nodeCpuMicros: process.cpuUsage(cpuStarted),
-      nodeRssBeforeBytes: before,
-      nodeRssAfterBytes: process.memoryUsage().rss
+      nodeRssBeforeBytes: before.nodeRssBytes,
+      nodeRssAfterBytes: after.nodeRssBytes,
+      nodeHeapUsedBeforeBytes: before.nodeHeapUsedBytes,
+      nodeHeapUsedAfterBytes: after.nodeHeapUsedBytes,
+      sampledPeaksDuringInspection: activeCaseMemory
     });
+    activeCaseMemory = null;
     process.stderr.write(`Finished ${caseId}: ${responseBody.status ?? result.status}.\n`);
   }
 
@@ -154,10 +182,10 @@ try {
   process.stderr.write("Response inspection measurements complete.\n");
   process.stdout.write(`${JSON.stringify({
     schemaVersion: 1,
-    mode: "owned_headed_chrome_loopback_fixture",
+    mode: headless ? "owned_headless_chrome_loopback_fixture" : "owned_headed_chrome_loopback_fixture",
     browserVersion: owned.browserVersion,
     chromePid: owned.chromeProcess.pid,
-    measurement: "Node RSS sampled every 25 ms; Chrome RSS is the owned process tree sum sampled every 500 ms",
+    measurement: "Node RSS and heapUsed sampled every 25 ms; Chrome RSS is the owned process tree sum sampled every 500 ms. Synchronous Node work can finish between samples; before/after snapshots are also reported.",
     baseline,
     peak,
     cancellation,
