@@ -70,6 +70,7 @@ node --test test/mcp-evidence-release.test.js test/mcp.test.js
 | `src/telemetry/` | Append-only decision events and offline evaluation/export |
 | `src/integrations/` | Application-specific workflow adapters over generic ActiveTab execution |
 | `src/api/` | Local HTTP composition, routing, and server-owned persistence configuration |
+| `src/api/routes/` | Incrementally extracted endpoint-family handlers; no alternate policy or run composition |
 | `src/mcp/` | MCP tool composition, exact session selection, and separately granted sensitive evidence release |
 | `src/mcp/evidenceReleaseTools.js` | Profile-bound evidence-release requests, grant verification, data retrieval, and byte charging |
 | `src/discovery/` | Evidence-driven application discovery and bounded persistent knowledge |

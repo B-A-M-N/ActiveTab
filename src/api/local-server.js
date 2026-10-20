@@ -28,15 +28,12 @@ import { sendJson, sendError, readBody, parseQuery } from "./http-utils.js";
 import { createDiagnostics } from "../runtime/diagnostics.js";
 import { logger } from "../runtime/logger.js";
 import { createDiagnosticContract, AUTHORITY, OPERATION, SENSITIVITY } from "../diagnostics/contracts.js";
-import { DiagnosticCorrelator } from "../diagnostics/correlator.js";
 import { DiagnosticReport, FINDING_LEVEL, deriveRunInvestigationStatus } from "../diagnostics/report.js";
 import { receiptFromRunState } from "../testing/receipts.js";
 import { resolveObservedApplication } from "../environments/model.js";
 import { buildDurableRunReport } from "../testing/durableRunReport.js";
-import { RunStateStore, requestRunCancellation, withTargetExecutionLease } from "../testing/runState.js";
+import { RunStateStore, requestRunCancellation } from "../testing/runState.js";
 import { ApplicationRunService } from "../navigation/applicationRunService.js";
-import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
-import { InvestigationEngine } from "../investigation/engine.js";
 import { InterventionStore } from "../runtime/interventions.js";
 import { createInterventionTools } from "./intervention-tools.js";
 import { AuthorizationGrantStore } from "../runtime/approvals.js";
@@ -48,6 +45,7 @@ import { EvidenceReleaseGrantStore } from "../runtime/evidenceReleaseGrants.js";
 import { stateDirectory } from "../extension/paths.js";
 import { RunLocalPublicReadApprovalBroker } from "../capabilities/publicReadApprovalBroker.js";
 import { FileUploadGrantStore } from "../runtime/fileUploadGrants.js";
+import { createDiscoveryRoutes } from "./routes/discovery.js";
 
 const DEFAULT_PORT = 9377;
 const API_PREFIX = "/v3/bots";
@@ -480,6 +478,20 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
     sendJson(res, 200, report.redacted());
   }
 
+  const handleDiscoveryRoute = createDiscoveryRoutes({
+    authorizeMutation,
+    readBody,
+    sendJson,
+    sendError,
+    testSessionResolver,
+    ensureRunStateStore,
+    runStateStore,
+    decisionRuntime,
+    discoveryEnvironment,
+    discoveryPrincipalId,
+    configuredKnowledgeDir
+  });
+
   // Executor readiness: fail closed when no real navigation runner was provided.
   const executorReady = lifecycle.executorReady;
   const executorDetail = executorReady ? "ready" : "unavailable: no navigation runner configured";
@@ -520,48 +532,9 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
         return;
       }
 
-      // ── Discovery and investigation (file 3 sections 2 & 6) ──
-      if (method === "POST" && path === "/v1/discover") {
-        if (!authorizeMutation(req)) { sendError(res, 401, 99401, "Authentication required."); return; }
-        const body = await readBody(req);
-        let session = null;
-        if (typeof testSessionResolver === "function") {
-          try { session = await testSessionResolver({ input: body ?? {} }); } catch { session = null; }
-        }
-        if (!session) { sendError(res, 400, 99002, "A browser session is required for discovery."); return; }
-        await ensureRunStateStore();
-        const result = await withTargetExecutionLease(runStateStore, session, `api-discovery-${randomUUID()}`, async lease => {
-          const engine = new ApplicationDiscoveryEngine({
-            session,
-            maxSteps: body?.maxSteps ?? 8,
-            maxLinksPerStep: body?.maxLinksPerStep ?? 4,
-            decisionRuntime,
-            environment: discoveryEnvironment,
-            principalId: discoveryPrincipalId,
-            assertExecutionLease: lease.assertCurrent,
-            knowledgeDir: configuredKnowledgeDir
-          });
-          return await engine.discover();
-        });
-        sendJson(res, 200, result);
-        return;
-      }
-      if (method === "POST" && path === "/v1/investigate") {
-        if (!authorizeMutation(req)) { sendError(res, 401, 99401, "Authentication required."); return; }
-        const body = await readBody(req);
-        if (!body?.subject || !body?.reason) { sendError(res, 400, 99001, "subject and reason are required."); return; }
-        await ensureRunStateStore();
-        const engine = new InvestigationEngine({ collector: null, correlator: new DiagnosticCorrelator(), runStateStore });
-        const result = await engine.investigate({
-          subject: body.subject,
-          reason: body.reason,
-          runId: body.runId ?? null,
-          stepId: body.stepId ?? null,
-          operationId: body.operationId ?? null
-        });
-        sendJson(res, 200, result);
-        return;
-      }
+      // Discovery handlers receive server-owned identity, storage, lease,
+      // and engine dependencies; request JSON remains untrusted input only.
+      if (await handleDiscoveryRoute(req, res, { method, path })) return;
 
       // ── Intervention lifecycle (P0-6): status/ack/approval/resume/cancel ──
       if (path === "/v1/public-reads/requests" || path.startsWith("/v1/public-reads/requests/")) {
