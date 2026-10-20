@@ -14,7 +14,8 @@ import { isAbsolute, join, parse, resolve, sep } from "node:path";
 const MAX_STORES = 64;
 const MAX_FILE_BYTES = 1024 * 1024;
 const STORE_FORMAT = "activetab.discovery.knowledge";
-const STORE_VERSION = 1;
+const STORE_VERSION = 2;
+const LEGACY_STORE_VERSION = 1;
 const FILE_NAME = /^[a-f0-9]{32}\.json$/u;
 const writeQueues = new Map();
 
@@ -49,12 +50,62 @@ function validScopeValue(value) {
   return value === null || typeof value === "string";
 }
 
-function validCapabilityMap(value, origin) {
+function validCapabilityMap(value, scope) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value)
+    && value.origin === scope.origin
+    && value.applicationId === scope.applicationId
+    && (value.environmentId ?? null) === scope.environmentId
+    && Array.isArray(value.pages)
+    && Array.isArray(value.controls)
+    && Array.isArray(value.networkOperations));
+}
+
+function validLegacyCapabilityMap(value, origin) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value)
     && value.origin === origin
     && Array.isArray(value.pages)
     && Array.isArray(value.controls)
     && Array.isArray(value.networkOperations));
+}
+
+function optionalScopeId(value, name) {
+  if (value === null) return null;
+  if (typeof value !== "string" || !value.trim() || value !== value.trim() || value.length > 256) {
+    throw new Error(`KnowledgeStore ${name} must be a non-empty stable identifier or null.`);
+  }
+  return value;
+}
+
+export function canonicalDiscoveryKnowledgeScope(scope) {
+  if (!scope || typeof scope !== "object" || Array.isArray(scope)) {
+    throw new Error("KnowledgeStore requires a trusted discovery knowledge scope.");
+  }
+  const { origin, environmentId, applicationId, authenticationRealm, principalId } = scope;
+  if (typeof origin !== "string") throw new Error("KnowledgeStore scope requires a canonical HTTP(S) origin.");
+  let parsedOrigin;
+  try { parsedOrigin = new URL(origin); }
+  catch { throw new Error("KnowledgeStore scope requires a canonical HTTP(S) origin."); }
+  if (!["http:", "https:"].includes(parsedOrigin.protocol)
+    || parsedOrigin.origin !== origin
+    || parsedOrigin.username
+    || parsedOrigin.password) {
+    throw new Error("KnowledgeStore scope requires a canonical HTTP(S) origin.");
+  }
+  if (typeof applicationId !== "string" || !applicationId.trim()
+    || applicationId !== applicationId.trim() || applicationId.length > 256) {
+    throw new Error("KnowledgeStore scope requires a stable applicationId.");
+  }
+  if (typeof principalId !== "string" || !principalId.trim()
+    || principalId !== principalId.trim() || principalId.length > 256) {
+    throw new Error("KnowledgeStore scope requires a stable principalId.");
+  }
+  return Object.freeze({
+    origin,
+    environmentId: optionalScopeId(environmentId, "environmentId"),
+    applicationId,
+    authenticationRealm: optionalScopeId(authenticationRealm, "authenticationRealm"),
+    principalId
+  });
 }
 
 export class KnowledgeStore {
@@ -69,7 +120,19 @@ export class KnowledgeStore {
     this.rootInitialized = false;
   }
 
-  #compositeKey({ origin, authority = null, principalScope = null }) {
+  #compositeKey(scope) {
+    const identity = JSON.stringify([
+      STORE_VERSION,
+      scope.origin,
+      scope.environmentId,
+      scope.applicationId,
+      scope.authenticationRealm,
+      scope.principalId
+    ]);
+    return createHash("sha256").update(identity).digest("hex").slice(0, 32);
+  }
+
+  #legacyCompositeKey({ origin, authority = null, principalScope = null }) {
     const identity = JSON.stringify([origin, authority, principalScope]);
     return createHash("sha256").update(identity).digest("hex").slice(0, 32);
   }
@@ -129,35 +192,65 @@ export class KnowledgeStore {
   #identifyEntry(parsed, key) {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
 
-    let identity;
-    let capabilityMap;
-    let savedAt;
     if (parsed.store === STORE_FORMAT) {
-      if (parsed.version !== STORE_VERSION || parsed.key !== key) return null;
-      identity = parsed.identity;
-      capabilityMap = parsed.capabilityMap;
-      savedAt = parsed.savedAt;
-    } else {
-      // Strictly recognize entries written by the previous store format so
-      // unrelated JSON cannot be retained or cleared as if it were ours.
-      identity = {
-        origin: parsed.origin,
-        authority: parsed.authority ?? null,
-        principalScope: parsed.principalScope ?? null
+      if (parsed.key !== key) return null;
+      if (parsed.version === STORE_VERSION) {
+        let scope;
+        try { scope = canonicalDiscoveryKnowledgeScope(parsed.identity); }
+        catch { return null; }
+        if (this.#compositeKey(scope) !== key
+          || typeof parsed.savedAt !== "string"
+          || !Number.isFinite(Date.parse(parsed.savedAt))
+          || !validCapabilityMap(parsed.capabilityMap, scope)) return null;
+        return {
+          identity: scope,
+          capabilityMap: parsed.capabilityMap,
+          savedAt: parsed.savedAt,
+          reusable: true
+        };
+      }
+      if (parsed.version !== LEGACY_STORE_VERSION) return null;
+
+      // Version 1 entries used only origin/authority/principalScope. Keep
+      // recognizing them for safe retention and clear, but never reuse them.
+      const identity = parsed.identity;
+      if (typeof identity?.origin !== "string" || !identity.origin
+        || !validScopeValue(identity.authority)
+        || !validScopeValue(identity.principalScope)
+        || this.#legacyCompositeKey(identity) !== key
+        || typeof parsed.savedAt !== "string"
+        || !Number.isFinite(Date.parse(parsed.savedAt))
+        || !validLegacyCapabilityMap(parsed.capabilityMap, identity.origin)) return null;
+      return {
+        identity,
+        capabilityMap: parsed.capabilityMap,
+        savedAt: parsed.savedAt,
+        reusable: false,
+        legacy: true
       };
-      capabilityMap = parsed;
-      savedAt = parsed.savedAt;
     }
 
-    if (typeof identity?.origin !== "string" || !identity.origin
+    // Strictly recognize entries written by the pre-envelope format so they
+    // can be removed safely, but never reuse them under a scoped key.
+    const identity = {
+      origin: parsed.origin,
+      authority: parsed.authority ?? null,
+      principalScope: parsed.principalScope ?? null
+    };
+    const capabilityMap = parsed;
+    if (typeof identity.origin !== "string" || !identity.origin
       || !validScopeValue(identity.authority)
       || !validScopeValue(identity.principalScope)
-      || typeof savedAt !== "string" || !Number.isFinite(Date.parse(savedAt))
-      || !validCapabilityMap(capabilityMap, identity.origin)
-      || this.#compositeKey(identity) !== key) {
-      return null;
+      || typeof parsed.savedAt !== "string" || !Number.isFinite(Date.parse(parsed.savedAt))
+      || !validLegacyCapabilityMap(capabilityMap, identity.origin)
+      || this.#legacyCompositeKey(identity) !== key) return null;
+    return {
+      identity,
+      capabilityMap,
+      savedAt: parsed.savedAt,
+      reusable: false,
+      legacy: true
     }
-    return { identity, capabilityMap, savedAt };
   }
 
   async #readEntry(path, key) {
@@ -223,18 +316,20 @@ export class KnowledgeStore {
     }
   }
 
-  async save(capabilityMap, { authority = null, principalScope = null } = {}) {
+  async save(capabilityMap, scopeInput) {
     if (!capabilityMap || typeof capabilityMap !== "object" || !capabilityMap.origin) {
       throw new Error("KnowledgeStore.save requires a capabilityMap with origin.");
     }
-    if (!validScopeValue(authority) || !validScopeValue(principalScope)) {
-      throw new Error("KnowledgeStore authority and principalScope must be strings or null.");
+    const scope = canonicalDiscoveryKnowledgeScope(scopeInput);
+    if (capabilityMap.origin !== scope.origin || capabilityMap.applicationId !== scope.applicationId
+      || (capabilityMap.environmentId ?? null) !== scope.environmentId
+      || !validCapabilityMap(capabilityMap, scope)) {
+      throw new Error("KnowledgeStore scope must match a complete capability map's origin, environment, and application.");
     }
 
     return await serializeByRoot(this.baseDir, async () => {
       await this.#ensureDir();
-      const identity = { origin: capabilityMap.origin, authority, principalScope };
-      const key = this.#compositeKey(identity);
+      const key = this.#compositeKey(scope);
       const path = join(this.baseDir, `${key}.json`);
       const existing = await this.#readEntry(path, key);
       if (existing.exists && !existing.owned) {
@@ -246,7 +341,7 @@ export class KnowledgeStore {
         store: STORE_FORMAT,
         version: STORE_VERSION,
         key,
-        identity,
+        identity: scope,
         savedAt,
         capabilityMap
       };
@@ -256,32 +351,37 @@ export class KnowledgeStore {
       }
       await this.#writeAtomic(path, key, json);
       await this.#enforceRetention();
-      return { origin: capabilityMap.origin, savedAt };
+      return {
+        origin: capabilityMap.origin,
+        environmentId: scope.environmentId,
+        applicationId: scope.applicationId,
+        authenticationRealm: scope.authenticationRealm,
+        savedAt
+      };
     });
   }
 
-  async load(origin, { authority = null, principalScope = null } = {}) {
-    if (typeof origin !== "string" || !origin) throw new Error("KnowledgeStore.load requires an origin.");
-    if (!validScopeValue(authority) || !validScopeValue(principalScope)) {
-      throw new Error("KnowledgeStore authority and principalScope must be strings or null.");
-    }
+  async load(scopeInput) {
+    const scope = canonicalDiscoveryKnowledgeScope(scopeInput);
     await this.#ensureDir();
-    const key = this.#compositeKey({ origin, authority, principalScope });
+    const key = this.#compositeKey(scope);
     const entry = await this.#readEntry(join(this.baseDir, `${key}.json`), key);
-    if (!entry.owned) return null;
+    if (!entry.owned || !entry.reusable) return null;
     return {
       ...entry.capabilityMap,
       savedAt: entry.savedAt,
-      authority: entry.identity.authority,
-      principalScope: entry.identity.principalScope
+      knowledgeScope: entry.identity
     };
   }
 
   async list() {
     await this.#ensureDir();
     const entries = await this.#ownedEntries();
-    return entries.map(({ origin, savedAt, capabilityMap }) => ({
+    return entries.filter(entry => entry.reusable).map(({ identity, savedAt, capabilityMap }) => ({
       origin: capabilityMap.origin,
+      environmentId: identity.environmentId,
+      applicationId: identity.applicationId,
+      authenticationRealm: identity.authenticationRealm,
       savedAt,
       revision: capabilityMap.revision,
       observationCount: capabilityMap.observationCount

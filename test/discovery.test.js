@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { ApplicationCapabilityMap, RELATIONSHIP_STRENGTH } from "../src/discovery/capabilityMap.js";
 import { ApplicationDiscoveryEngine } from "../src/discovery/engine.js";
+import { buildEnvironmentBinding } from "../src/environments/model.js";
 
 const fixtureLease = async () => {};
 
@@ -190,11 +191,22 @@ test("discovery engine respects cancellation", async () => {
   assert.ok(result.discoveries.some(d => d.type === "aborted" || d.type === "no_more_links" || d.type === "no_safe_navigations"));
 });
 
-test("discovery engine saves and reuses knowledge", async t => {
-  const { mkdtemp, rm, readFile } = await import("node:fs/promises");
+test("discovery engine saves and reuses knowledge", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
   const knowledgeDir = await mkdtemp(join(tmpdir(), "activetab-knowledge-test-"));
+  const environment = buildEnvironmentBinding({
+    profile_id: "knowledge-fixture",
+    authentication_realms: [{ realm_id: "fixture-realm", scope: ["fixture"] }],
+    environment: {
+      environment_id: "fixture-local",
+      platform: "fixture",
+      application_entry_url: "http://fixture.local/",
+      authorized_origins: ["http://fixture.local"],
+      applications: [{ application_id: "fixture-app", authentication_realm: "fixture-realm", candidate_entry: "/" }]
+    }
+  });
   try {
     const pages = [
       { page: { url: "http://fixture.local/", title: "Home" }, candidates: [{ role: "link", name: "Archive", href: "http://fixture.local/archive", visible: true }], headings: [], frames: [] },
@@ -205,18 +217,43 @@ test("discovery engine saves and reuses knowledge", async t => {
       async observe() { return pages[Math.min(observeCount, 1)]; },
       client: { async send(method) { if (method === "Page.navigate") { observeCount++; return {}; } throw new Error(`Unexpected ${method}`); } }
     };
-    const engine = new ApplicationDiscoveryEngine({ session: mockSession, maxSteps: 2, maxLinksPerStep: 2, knowledgeDir });
+    const engine = new ApplicationDiscoveryEngine({
+      session: mockSession, maxSteps: 2, maxLinksPerStep: 2, knowledgeDir, environment, principalId: "knowledge-test-principal"
+    });
     const result = await engine.discover();
     assert.ok(result.savedKnowledge, "Knowledge was saved.");
     assert.equal(result.savedKnowledge.origin, "http://fixture.local");
 
     // Second run should load prior knowledge.
-    const engine2 = new ApplicationDiscoveryEngine({ session: mockSession, maxSteps: 2, maxLinksPerStep: 2, knowledgeDir });
+    const engine2 = new ApplicationDiscoveryEngine({
+      session: mockSession, maxSteps: 2, maxLinksPerStep: 2, knowledgeDir, environment, principalId: "knowledge-test-principal"
+    });
     const result2 = await engine2.discover();
     assert.ok(result2.reusedKnowledge, "Prior knowledge was reused.");
     assert.equal(result2.reusedKnowledge.origin, "http://fixture.local");
     assert.equal(result2.reusedKnowledge.stale, true);
   } finally {
     await rm(knowledgeDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("discovery engine skips persistence when trusted application or principal scope is unavailable", async () => {
+  const { lstat, mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const parentDir = await mkdtemp(join(tmpdir(), "activetab-knowledge-unscoped-parent-"));
+  const knowledgeDir = join(parentDir, "knowledge");
+  try {
+    const engine = new ApplicationDiscoveryEngine({
+      session: { async observe() { return { page: { url: "https://unbound-application.test/" }, candidates: [] }; } },
+      knowledgeDir
+    });
+    const result = await engine.discover();
+    assert.equal(result.reusedKnowledge, null);
+    assert.equal(result.savedKnowledge, null);
+    assert.ok(result.discoveries.some(event => event.type === "knowledge_scope_unavailable"));
+    await assert.rejects(lstat(knowledgeDir), error => error?.code === "ENOENT");
+  } finally {
+    await rm(parentDir, { recursive: true, force: true });
   }
 });

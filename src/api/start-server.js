@@ -129,8 +129,11 @@ if (!navigationRunner) {
 }
 
 process.env.ACTIVETAB_REPORT_DIR ??= join(process.env.ACTIVETAB_TASK_DIR ?? join(process.cwd(), ".activetab"), "reports");
+const discoveryEnvironment = await resolveEnvironmentBinding();
+const discoveryPrincipalId = resolvePrincipal();
 const api = createApiServer({
   port, taskStoreDir, navigationRunner, decisionRuntime,
+  discoveryEnvironment, discoveryPrincipalId,
   capabilityRegistry, capabilityService, authorizeExtractionField, authorizeExtractionRelease,
   publicReadApprovalBroker,
   executorName: process.env.ACTIVETAB_REMOTE_PEER_URL ? "remote-peer" : "local",

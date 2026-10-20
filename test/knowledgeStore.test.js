@@ -6,10 +6,11 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { KnowledgeStore } from "../src/discovery/knowledgeStore.js";
 
-function capabilityMap(origin, revision = 1) {
+function capabilityMap(origin, revision = 1, { applicationId = origin, environmentId = null } = {}) {
   return {
     origin,
-    applicationId: origin,
+    applicationId,
+    ...(environmentId ? { environmentId } : {}),
     revision,
     observationCount: revision,
     pages: [],
@@ -18,7 +19,18 @@ function capabilityMap(origin, revision = 1) {
   };
 }
 
-test("knowledgeStore saves and loads capability maps by origin", async () => {
+function scopeFor(origin, overrides = {}) {
+  return {
+    origin,
+    environmentId: null,
+    applicationId: origin,
+    authenticationRealm: null,
+    principalId: "knowledge-test-principal",
+    ...overrides
+  };
+}
+
+test("knowledgeStore saves and loads capability maps by full trusted scope", async () => {
   const dir = await mkdtemp(join(tmpdir(), "activetab-knowledge-"));
   try {
     const store = new KnowledgeStore(dir);
@@ -31,9 +43,10 @@ test("knowledgeStore saves and loads capability maps by origin", async () => {
       controls: [{ key: "link:Home", name: "Home", pages: ["http://fixture.test/"] }],
       networkOperations: []
     };
-    const saved = await store.save(map);
+    const scope = scopeFor(map.origin);
+    const saved = await store.save(map, scope);
     assert.equal(saved.origin, "http://fixture.test");
-    const loaded = await store.load("http://fixture.test");
+    const loaded = await store.load(scope);
     assert.ok(loaded);
     assert.equal(loaded.revision, 3);
     assert.equal(loaded.pages[0].title, "Home");
@@ -42,11 +55,11 @@ test("knowledgeStore saves and loads capability maps by origin", async () => {
   }
 });
 
-test("knowledgeStore returns null for unknown origin", async () => {
+test("knowledgeStore returns null for an unknown trusted scope", async () => {
   const dir = await mkdtemp(join(tmpdir(), "activetab-knowledge-"));
   try {
     const store = new KnowledgeStore(dir);
-    assert.equal(await store.load("http://unknown.test"), null);
+    assert.equal(await store.load(scopeFor("http://unknown.test")), null);
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
@@ -56,12 +69,66 @@ test("knowledgeStore does not map one origin's data to another", async () => {
   const dir = await mkdtemp(join(tmpdir(), "activetab-knowledge-"));
   try {
     const store = new KnowledgeStore(dir);
-    await store.save({ origin: "http://a.test", revision: 1, observationCount: 1, pages: [], controls: [], networkOperations: [] });
-    await store.save({ origin: "http://b.test", revision: 2, observationCount: 2, pages: [], controls: [], networkOperations: [] });
-    const a = await store.load("http://a.test");
-    const b = await store.load("http://b.test");
+    const aScope = scopeFor("http://a.test");
+    const bScope = scopeFor("http://b.test");
+    await store.save(capabilityMap(aScope.origin, 1), aScope);
+    await store.save(capabilityMap(bScope.origin, 2), bScope);
+    const a = await store.load(aScope);
+    const b = await store.load(bScope);
     assert.equal(a.revision, 1);
     assert.equal(b.revision, 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("knowledgeStore isolates same-origin entries by environment, application, realm, and principal", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "activetab-knowledge-scope-"));
+  const origin = "https://shared-origin.test";
+  const baseScope = scopeFor(origin, {
+    environmentId: "staging-a",
+    applicationId: "app-a",
+    authenticationRealm: "realm-a",
+    principalId: "principal-a"
+  });
+  try {
+    const store = new KnowledgeStore(dir);
+    await store.save(capabilityMap(origin, 1, { applicationId: "app-a", environmentId: "staging-a" }), baseScope);
+    assert.equal((await store.load(baseScope)).revision, 1);
+
+    for (const variant of [
+      { ...baseScope, environmentId: "production-a" },
+      { ...baseScope, applicationId: "app-b" },
+      { ...baseScope, authenticationRealm: "realm-b" },
+      { ...baseScope, principalId: "principal-b" }
+    ]) {
+      assert.equal(await store.load(variant), null);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("knowledgeStore treats version 1 unscoped knowledge as non-reusable migration data", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "activetab-knowledge-legacy-"));
+  const origin = "https://legacy-knowledge.test";
+  const identity = { origin, authority: null, principalScope: null };
+  const key = createHash("sha256").update(JSON.stringify([origin, null, null])).digest("hex").slice(0, 32);
+  const legacyRecord = {
+    store: "activetab.discovery.knowledge",
+    version: 1,
+    key,
+    identity,
+    savedAt: new Date().toISOString(),
+    capabilityMap: capabilityMap(origin)
+  };
+  try {
+    await writeFile(join(dir, `${key}.json`), JSON.stringify(legacyRecord), { mode: 0o600 });
+    const store = new KnowledgeStore(dir);
+    assert.equal(await store.load(scopeFor(origin)), null);
+    assert.deepEqual(await store.list(), []);
+    await store.clear();
+    assert.deepEqual(await readdir(dir), []);
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
@@ -71,7 +138,8 @@ test("knowledgeStore list reports origins", async () => {
   const dir = await mkdtemp(join(tmpdir(), "activetab-knowledge-"));
   try {
     const store = new KnowledgeStore(dir);
-    await store.save({ origin: "http://x.test", revision: 1, observationCount: 1, pages: [], controls: [], networkOperations: [] });
+    const scope = scopeFor("http://x.test");
+    await store.save(capabilityMap(scope.origin), scope);
     const entries = await store.list();
     assert.equal(entries.length, 1);
     assert.equal(entries[0].origin, "http://x.test");
@@ -89,7 +157,8 @@ test("knowledgeStore requires an absolute configured root and rejects symlink ro
   await symlink(outside, linked);
   try {
     const store = new KnowledgeStore(linked);
-    await assert.rejects(store.save(capabilityMap("http://symlink.test")), /symlink/u);
+    const origin = "http://symlink.test";
+    await assert.rejects(store.save(capabilityMap(origin), scopeFor(origin)), /symlink/u);
     assert.deepEqual(await readdir(outside), []);
   } finally {
     await rm(parent, { recursive: true, force: true });
@@ -101,7 +170,8 @@ test("knowledgeStore refuses a root with non-owner permissions", async () => {
   try {
     await chmod(dir, 0o755);
     const store = new KnowledgeStore(dir);
-    await assert.rejects(store.save(capabilityMap("http://permissions.test")), /owner-only/u);
+    const origin = "http://permissions.test";
+    await assert.rejects(store.save(capabilityMap(origin), scopeFor(origin)), /owner-only/u);
   } finally {
     await chmod(dir, 0o700).catch(() => {});
     await rm(dir, { recursive: true, force: true });
@@ -114,20 +184,18 @@ test("knowledgeStore refuses non-private or symlinked entries", async () => {
   try {
     const store = new KnowledgeStore(dir);
     const map = capabilityMap("http://entry-security.test");
-    await store.save(map);
-    const key = createHash("sha256")
-      .update(JSON.stringify([map.origin, null, null]))
-      .digest("hex")
-      .slice(0, 32);
-    const entryPath = join(dir, `${key}.json`);
+    const scope = scopeFor(map.origin);
+    await store.save(map, scope);
+    const [entryName] = (await readdir(dir)).filter(file => /^[a-f0-9]{32}\.json$/u.test(file));
+    const entryPath = join(dir, entryName);
     await chmod(entryPath, 0o644);
-    await assert.rejects(store.load(map.origin), /owner-only/u);
+    await assert.rejects(store.load(scope), /owner-only/u);
     await chmod(entryPath, 0o600);
 
     await writeFile(outsideFile, "keep", { mode: 0o600 });
     await unlink(entryPath);
     await symlink(outsideFile, entryPath);
-    await assert.rejects(store.load(map.origin), /ELOOP|symbolic|symlink/iu);
+    await assert.rejects(store.load(scope), /ELOOP|symbolic|symlink/iu);
     assert.equal(await readFile(outsideFile, "utf8"), "keep");
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -139,11 +207,14 @@ test("knowledgeStore concurrent saves stay bounded and preserve valid records", 
   try {
     const store = new KnowledgeStore(dir);
     await Promise.all(Array.from({ length: 72 }, (_, index) =>
-      store.save(capabilityMap(`http://concurrent-${index}.test`, index + 1))));
+      store.save(
+        capabilityMap(`http://concurrent-${index}.test`, index + 1),
+        scopeFor(`http://concurrent-${index}.test`)
+      )));
     const entries = await store.list();
     assert.equal(entries.length, 64);
     for (const entry of entries) {
-      const loaded = await store.load(entry.origin);
+      const loaded = await store.load(scopeFor(entry.origin));
       assert.ok(loaded);
       assert.equal(loaded.origin, entry.origin);
     }
@@ -159,16 +230,14 @@ test("knowledgeStore ignores interrupted temporary writes and keeps atomic entri
   try {
     const store = new KnowledgeStore(dir);
     const original = capabilityMap("http://interrupted.test", 1);
-    await store.save(original);
-    const key = createHash("sha256")
-      .update(JSON.stringify([original.origin, null, null]))
-      .digest("hex")
-      .slice(0, 32);
-    const interruptedPath = join(dir, `.${key}.interrupted.tmp`);
+    const scope = scopeFor(original.origin);
+    await store.save(original, scope);
+    const [entryName] = (await readdir(dir)).filter(file => /^[a-f0-9]{32}\.json$/u.test(file));
+    const interruptedPath = join(dir, `.${entryName.slice(0, -5)}.interrupted.tmp`);
     await writeFile(interruptedPath, "{partial", { mode: 0o600 });
 
-    await store.save(capabilityMap(original.origin, 2));
-    assert.equal((await store.load(original.origin)).revision, 2);
+    await store.save(capabilityMap(original.origin, 2), scope);
+    assert.equal((await store.load(scope)).revision, 2);
     assert.equal(await readFile(interruptedPath, "utf8"), "{partial");
     assert.equal((await store.list()).length, 1);
   } finally {
@@ -184,7 +253,10 @@ test("knowledgeStore retention and clear preserve unrelated JSON files", async (
     const store = new KnowledgeStore(dir);
     await writeFile(unrelatedPath, unrelatedContents, { mode: 0o600 });
     await Promise.all(Array.from({ length: 66 }, (_, index) =>
-      store.save(capabilityMap(`http://retention-${index}.test`, index + 1))));
+      store.save(
+        capabilityMap(`http://retention-${index}.test`, index + 1),
+        scopeFor(`http://retention-${index}.test`)
+      )));
     assert.equal((await store.list()).length, 64);
     assert.equal(await readFile(unrelatedPath, "utf8"), unrelatedContents);
 

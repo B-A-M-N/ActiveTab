@@ -19,6 +19,8 @@ const SAFE_CONTROL_ROLES = new Set(["link", "tab", "button", "menuitem", "menuit
 const SAFE_SUBMIT_CONTROLS = false;
 const MAX_DISCOVERY_STEPS = 16;
 const MAX_LINKS_PER_STEP = 6;
+const isStableIdentity = value => typeof value === "string"
+  && value.length > 0 && value.length <= 256 && value.trim() === value;
 
 function isSafeToNavigate(control) {
   if (!control || typeof control !== "object") return false;
@@ -33,7 +35,7 @@ function isSafeToNavigate(control) {
 }
 
 export class ApplicationDiscoveryEngine {
-  constructor({ session, maxSteps = 8, maxLinksPerStep = 4, signal, knowledgeDir = null, environment = null, decisionRuntime = null, onAuthorizationBoundary = null, assertExecutionLease = null } = {}) {
+  constructor({ session, maxSteps = 8, maxLinksPerStep = 4, signal, knowledgeDir = null, environment = null, principalId = null, decisionRuntime = null, onAuthorizationBoundary = null, assertExecutionLease = null } = {}) {
     this.session = session;
     this.maxSteps = Math.max(1, Math.min(maxSteps, MAX_DISCOVERY_STEPS));
     this.maxLinksPerStep = Math.max(1, Math.min(maxLinksPerStep, MAX_LINKS_PER_STEP));
@@ -43,6 +45,7 @@ export class ApplicationDiscoveryEngine {
     // transitions are verified against the environment's authorized origins;
     // new authorization boundaries pause discovery instead of being bypassed.
     this.environment = environment;
+    this.principalId = principalId;
     this.decisionRuntime = decisionRuntime;
     this.onAuthorizationBoundary = onAuthorizationBoundary;
     this.assertExecutionLease = assertExecutionLease;
@@ -69,6 +72,20 @@ export class ApplicationDiscoveryEngine {
     const applicationId = initialApplication.status === "matched"
       ? initialApplication.applicationId
       : `app_${createHash("sha256").update(origin).digest("hex").slice(0, 16)}`;
+    const principalId = [this.session.principalId, this.session.authorizationPrincipalId, this.principalId]
+      .find(isStableIdentity) ?? null;
+    const knowledgeScope = initialApplication.status === "matched"
+      && isStableIdentity(this.environment?.environmentId)
+      && isStableIdentity(initialApplication.applicationId)
+      && isStableIdentity(principalId)
+      ? {
+          origin,
+          environmentId: this.environment.environmentId,
+          applicationId: initialApplication.applicationId,
+          authenticationRealm: initialApplication.authenticationRealm ?? null,
+          principalId
+        }
+      : null;
     const episode = this.decisionRuntime?.startEpisode({
       runId,
       workflowId: "application_discovery",
@@ -85,16 +102,38 @@ export class ApplicationDiscoveryEngine {
     });
     this.visitedUrls.add(observation.page.url);
     if (this.knowledgeStore) {
-      const prior = await this.knowledgeStore.load(origin).catch(() => null);
-      if (prior && typeof prior === "object") {
-        this.reusedKnowledge = {
-          origin,
-          revision: prior.revision ?? null,
-          observationCount: prior.observationCount ?? null,
-          savedAt: prior.savedAt ?? null,
-          stale: true
-        };
-        this.discoveries.push({ type: "reused_knowledge", origin, revision: prior.revision ?? null, requiresRevalidation: true });
+      if (!knowledgeScope) {
+        const reasonCode = initialApplication.status !== "matched"
+          ? "application_scope_unverified"
+          : !this.environment?.environmentId
+            ? "environment_scope_unverified"
+            : "principal_scope_unverified";
+        this.discoveries.push({ type: "knowledge_scope_unavailable", reasonCode });
+      } else {
+        try {
+          const prior = await this.knowledgeStore.load(knowledgeScope);
+          if (prior && typeof prior === "object") {
+            this.reusedKnowledge = {
+              origin,
+              environmentId: knowledgeScope.environmentId,
+              applicationId: knowledgeScope.applicationId,
+              authenticationRealm: knowledgeScope.authenticationRealm,
+              revision: prior.revision ?? null,
+              observationCount: prior.observationCount ?? null,
+              savedAt: prior.savedAt ?? null,
+              stale: true
+            };
+            this.discoveries.push({
+              type: "reused_knowledge",
+              origin,
+              applicationId: knowledgeScope.applicationId,
+              revision: prior.revision ?? null,
+              requiresRevalidation: true
+            });
+          }
+        } catch (error) {
+          this.discoveries.push({ type: "knowledge_load_failed", reason: String(error?.message ?? error).slice(0, 200) });
+        }
       }
     }
 
@@ -399,9 +438,9 @@ export class ApplicationDiscoveryEngine {
     }
 
     let savedKnowledge = null;
-    if (this.knowledgeStore) {
+    if (this.knowledgeStore && knowledgeScope) {
       try {
-        savedKnowledge = await this.knowledgeStore.save(this.capabilityMap.toObject());
+        savedKnowledge = await this.knowledgeStore.save(this.capabilityMap.toObject(), knowledgeScope);
       } catch (error) {
         this.discoveries.push({ type: "knowledge_save_failed", reason: String(error?.message ?? error).slice(0, 200) });
       }

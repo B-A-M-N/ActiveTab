@@ -59,7 +59,7 @@ const OUTPUT_EXTENSIONS = new Set(["json", "md", "csv", "xml"]);
 // the run as finished.
 const TERMINAL = new Set(["finished", "failed", "canceled"]);
 
-export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKnowledgeDir = join(stateDirectory(), "discovery-knowledge"), navigationRunner, decisionRuntime = null, qualificationService = null, capabilityRegistry = null, capabilityService = null, authorizeExtractionField = null, authorizeExtractionRelease = null, apiToken, operatorToken = process.env.ACTIVETAB_OPERATOR_TOKEN ?? null, operatorId = process.env.ACTIVETAB_OPERATOR_ID ?? null, operatorAuthenticator = null, evidenceReleaseStore: suppliedEvidenceReleaseStore = null, evidenceReleaseDatabasePath = process.env.ACTIVETAB_EVIDENCE_RELEASE_DB ?? join(stateDirectory(), "evidence-releases.sqlite"), fileUploadGrantStore: suppliedFileUploadGrantStore = null, interventionStore: suppliedInterventionStore = null, publicReadApprovalBroker = null, host = "127.0.0.1", maxTasks = MAX_TASK_RECORDS, executorName, reportDir, testSessionResolver = null, testEnvironmentResolver = null, testProfileIdResolver = null, testPrincipalResolver = null, runStateStore: suppliedRunStateStore = null } = {}) {
+export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKnowledgeDir = join(stateDirectory(), "discovery-knowledge"), discoveryEnvironment = null, discoveryPrincipalId = null, navigationRunner, decisionRuntime = null, qualificationService = null, capabilityRegistry = null, capabilityService = null, authorizeExtractionField = null, authorizeExtractionRelease = null, apiToken, operatorToken = process.env.ACTIVETAB_OPERATOR_TOKEN ?? null, operatorId = process.env.ACTIVETAB_OPERATOR_ID ?? null, operatorAuthenticator = null, evidenceReleaseStore: suppliedEvidenceReleaseStore = null, evidenceReleaseDatabasePath = process.env.ACTIVETAB_EVIDENCE_RELEASE_DB ?? join(stateDirectory(), "evidence-releases.sqlite"), fileUploadGrantStore: suppliedFileUploadGrantStore = null, interventionStore: suppliedInterventionStore = null, publicReadApprovalBroker = null, host = "127.0.0.1", maxTasks = MAX_TASK_RECORDS, executorName, reportDir, testSessionResolver = null, testEnvironmentResolver = null, testProfileIdResolver = null, testPrincipalResolver = null, runStateStore: suppliedRunStateStore = null } = {}) {
   const configuredKnowledgeDir = resolve(discoveryKnowledgeDir);
   const store = new TaskStore(taskStoreDir ?? join(process.cwd(), ".activetab", "tasks"));
   const lifecycle = new RunLifecycle({ store, navigationRunner, executorName, reportDir });
@@ -536,6 +536,8 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
             maxSteps: body?.maxSteps ?? 8,
             maxLinksPerStep: body?.maxLinksPerStep ?? 4,
             decisionRuntime,
+            environment: discoveryEnvironment,
+            principalId: discoveryPrincipalId,
             assertExecutionLease: lease.assertCurrent,
             knowledgeDir: configuredKnowledgeDir
           });
