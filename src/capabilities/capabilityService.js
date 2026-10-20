@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { resolveObservedApplication } from "../environments/model.js";
 import { discoverTableCapabilities } from "./capabilityDiscovery.js";
 import { compileEphemeralObservedReadContract, compileVisibleExtractionRecipe } from "./recipeCompiler.js";
@@ -10,9 +10,9 @@ import { OutputAccumulator } from "../extraction/outputAccumulator.js";
 import { projectExtractionOutput } from "../extraction/outputRelease.js";
 import { normalizeHeader } from "../extraction/extractionContract.js";
 import { buildDocumentIndex } from "../observe/documentIndex.js";
-import { AuthorizationGrantStore } from "../runtime/approvals.js";
 import { classifyObservedPublicField } from "./fieldPolicy.js";
 import { requestedLocalTransformFields } from "../extraction/recordTransformations.js";
+import { RunLocalPublicReadGrants } from "./runLocalPublicReadGrants.js";
 
 function fieldMatchesCandidate(field, candidate) {
   if (!field || typeof field !== "object" || Array.isArray(field)) return false;
@@ -57,20 +57,6 @@ function candidateSourceProjection(candidate) {
     recordGroup: candidate?.recordGroup,
     fields: candidate?.fields
   };
-}
-
-function publicReadFieldIdentity(field) {
-  return JSON.stringify({
-    name: field?.name ?? null,
-    sourceHeader: field?.sourceHeader ?? null,
-    sourceKey: field?.sourceKey ?? null,
-    type: field?.type ?? null,
-    required: field?.required ?? null
-  });
-}
-
-function grantEffect(kind, field) {
-  return `${kind}_field:${createHash("sha256").update(publicReadFieldIdentity(field)).digest("hex")}`;
 }
 
 function environmentKey(environment, origin) {
@@ -238,10 +224,14 @@ export class CapabilityService {
     this.publicReadGrantNow = publicReadGrantNow;
     this.publicReadGrantTtlMs = Math.max(1_000, Math.min(15 * 60_000, Number(publicReadGrantTtlMs) || 5 * 60_000));
     this.publicReadMaxBytes = Math.max(1024, Math.min(1024 * 1024, Number(publicReadMaxBytes) || 64 * 1024));
-    this.publicReadGrantStore = this.approvePublicRead
-      ? new AuthorizationGrantStore({ now: publicReadGrantNow, trustedIssuer: "activetab-run-local-public-read" })
-      : null;
-    this.publicReadGrantBindings = new Map();
+    this.publicReadGrantAuthority = new RunLocalPublicReadGrants({
+      enabled: Boolean(this.approvePublicRead),
+      now: publicReadGrantNow,
+      expiresInMs: this.publicReadGrantTtlMs
+    });
+    // Preserve the existing inspection surface while ownership moves to the grant authority.
+    this.publicReadGrantStore = this.publicReadGrantAuthority.store;
+    this.publicReadGrantBindings = this.publicReadGrantAuthority.bindings;
     this.authorizePagination = authorizePagination;
     this.runApiQualification = runApiQualification;
     this.maxCandidates = Math.max(1, Math.min(1000, Number(maxCandidates) || 100));
@@ -276,70 +266,9 @@ export class CapabilityService {
     return { entry, input, environmentId, fields };
   }
 
-  #verifyRunLocalPublicReadGrant(grantId, field, context = {}, kind = "read") {
-    const binding = this.publicReadGrantBindings.get(grantId);
-    if (!binding || !this.publicReadGrantStore) return false;
-    if (binding.expiresAt <= this.publicReadGrantNow()
-      || context.targetId !== binding.input.targetId
-      || context.origin !== binding.input.origin
-      || context.sourceFingerprint !== binding.input.sourceFingerprint
-      || context.principalId !== binding.principalId
-      || context.environmentId !== binding.environmentId
-      || context.applicationId !== binding.applicationId
-      || !Number.isInteger(context.maxRecords) || context.maxRecords < 1 || context.maxRecords > binding.input.maxRecords
-      || context.maxOutputBytes !== binding.input.maxBytes
-      || !binding.input.fields.some(approved => publicReadFieldIdentity(approved) === publicReadFieldIdentity(field))) return false;
-    const verification = this.publicReadGrantStore.verify(grantId, {
-      principal: binding.principalId,
-      environmentId: binding.environmentId,
-      resource: binding.input.targetId,
-      operation: "read_public_observed_fields",
-      input: binding.input,
-      effect: grantEffect(kind, field)
-    });
-    if (!verification.ok && verification.reason?.includes("expired")) {
-      this.publicReadGrantBindings.delete(grantId);
-      this.publicReadGrantStore.grants.delete(grantId);
-    }
-    return verification.ok;
-  }
-
   #authorizePublicField(field, context = {}, kind = "read") {
     const policy = kind === "read" ? this.authorizePublicRead : this.authorizePublicRelease;
-    if (typeof policy === "function" && policy(field, context) === true) return true;
-    return this.#verifyRunLocalPublicReadGrant(context.runLocalGrantId, field, context, kind);
-  }
-
-  #issueRunLocalPublicReadGrant(proposal, scope, { principalId, environment, candidate, session, selectedFields }) {
-    if (!this.publicReadGrantStore || !scope) return null;
-    const allowedEffects = selectedFields.flatMap(field => [grantEffect("read", field), grantEffect("release", field)]);
-    allowedEffects.push("return_result");
-    const grant = this.publicReadGrantStore.issue({
-      principal: principalId,
-      environmentId: scope.environmentId,
-      resource: session.target.id,
-      operation: "read_public_observed_fields",
-      input: scope.input,
-      allowedEffects,
-      expiresInMs: this.publicReadGrantTtlMs,
-      singleUse: true
-    });
-    const binding = {
-      grantId: grant.grantId,
-      principalId,
-      environmentId: scope.environmentId,
-      applicationId: candidate.applicationId ?? null,
-      candidateId: candidate.candidateId,
-      input: scope.input,
-      expiresAt: Date.parse(grant.expiresAt)
-    };
-    this.publicReadGrantBindings.set(grant.grantId, binding);
-    while (this.publicReadGrantBindings.size > 256) {
-      const oldest = this.publicReadGrantBindings.keys().next().value;
-      this.publicReadGrantBindings.delete(oldest);
-      this.publicReadGrantStore.grants.delete(oldest);
-    }
-    return binding;
+    return this.publicReadGrantAuthority.authorize(field, context, kind, policy);
   }
 
   async discover({ session, environment, principalId } = {}) {
@@ -442,8 +371,8 @@ export class CapabilityService {
     try { approved = await this.approvePublicRead(proposal, { signal }) === true; }
     catch { approved = false; }
     if (!approved) return null;
-    return this.#issueRunLocalPublicReadGrant(proposal, scope, {
-      principalId, environment, candidate, session, selectedFields
+    return this.publicReadGrantAuthority.issue(scope, {
+      principalId, candidate, session, selectedFields
     });
   }
 
@@ -601,7 +530,7 @@ export class CapabilityService {
           evidenceRefs: result?.evidenceRefs ?? []
         };
         if (runLocalGrant) {
-          const consumed = thisService.publicReadGrantStore.consume(runLocalGrant.grantId, {
+          const consumed = thisService.publicReadGrantAuthority.consume(runLocalGrant.grantId, {
             principal: principalId,
             environmentId: runLocalGrant.environmentId,
             resource: session.target.id,
@@ -609,8 +538,6 @@ export class CapabilityService {
             input: runLocalGrant.input,
             effect: "return_result"
           });
-          thisService.publicReadGrantBindings.delete(runLocalGrant.grantId);
-          thisService.publicReadGrantStore.grants.delete(runLocalGrant.grantId);
           if (!consumed.ok) return { status: "blocked", reasonCode: "public_read_grant_expired_or_consumed" };
         }
         return {
@@ -914,7 +841,7 @@ export class CapabilityService {
       return { status: "blocked", reasonCode: "public_read_output_byte_limit_exceeded", records: [], evidenceRefs: [observation.evidenceId] };
     }
     if (directRunLocalGrant) {
-      const consumed = this.publicReadGrantStore.consume(directRunLocalGrant.grantId, {
+      const consumed = this.publicReadGrantAuthority.consume(directRunLocalGrant.grantId, {
         principal: principalId,
         environmentId: directRunLocalGrant.environmentId,
         resource: session.target.id,
@@ -922,8 +849,6 @@ export class CapabilityService {
         input: directRunLocalGrant.input,
         effect: "return_result"
       });
-      this.publicReadGrantBindings.delete(directRunLocalGrant.grantId);
-      this.publicReadGrantStore.grants.delete(directRunLocalGrant.grantId);
       if (!consumed.ok) return { status: "blocked", reasonCode: "public_read_grant_expired_or_consumed", records: [], evidenceRefs: [observation.evidenceId] };
     }
     return {
