@@ -19,6 +19,7 @@ import { discoverVisibleNextPage } from "../extraction/recordResolver.js";
 import { bindVisualEvidence, isBoundVisualEvidence } from "./visualEvidence.js";
 import { groundVisualTarget, revalidateVisualGrounding } from "./visualGrounder.js";
 import { reobserveFromRetainedLookup } from "./retainedLookupFallback.js";
+import { createNavigationRunContext } from "./runContext.js";
 
 function pageChangeWaitBaseline(observation, scrollTarget) {
   return {
@@ -83,12 +84,6 @@ async function dispatchThroughAuthorizedExecutor(session, options) {
   error.dispatchStatus = result.authorized ? "uncertain" : "refused";
   error.authorizationCategory = result.category ?? null;
   throw error;
-}
-
-function unchangedAfterFailedClick(attempt) {
-  return attempt?.action === "click" && Boolean(attempt.error) &&
-    (attempt.sameTargetRemained === true || attempt.observationUnavailable === true ||
-      /^[a-f0-9]{64}$/.test(attempt.beforeStateFingerprint ?? "") && attempt.beforeStateFingerprint === attempt.afterStateFingerprint);
 }
 
 class UnresolvedTaskRoutePlanner {
@@ -391,30 +386,30 @@ export class NavigationEngine {
     state.initialPageLabelHashes ??= pageLabelHashes(latest);
     state.status = "running";
     if (this.journal) await updateTaskJournal(this.journal, state);
-    let recoveries = state.recoveryCount ?? 0;
-    let scrollActionsUsed = (state.attempts ?? []).filter(attempt => attempt.action === "scroll").length;
-    // Track per-identity scroll convergence: { identity, matchingCandidateCount, scrollActionsUsed }
-    const scrollConvergenceStates = new Map();
-    const failedClicks = (state.attempts ?? []).filter(attempt => attempt.action === "click" && attempt.error);
-    const failedTargets = (state.attempts ?? []).filter(attempt => attempt.error && attempt.action !== "scroll");
-    const excludedIdentities = new Set(failedTargets.map(attempt => attempt.targetIdentity).filter(value => typeof value === "string" && value));
-    const excludedTargetSignatures = failedClicks
-      .filter(attempt => attempt.uncertainOutcome === true || unchangedAfterFailedClick(attempt))
-      .map(attempt => attempt.targetSignature)
-      .filter(Boolean);
-    const excludedScrollIdentities = new Set((state.attempts ?? [])
-      .filter(attempt => attempt.action === "scroll" && attempt.error && attempt.scrollProgressObserved !== true)
-      .map(attempt => attempt.targetIdentity)
-      .filter(value => typeof value === "string" && value));
-    if (state.scrollRecoveryBlocked === true) {
-      for (const target of latest.scrollTargets ?? []) excludedScrollIdentities.add(target.identity);
-    }
-    const excludeFailedAttempt = attempt => {
-      if (!attempt?.error) return;
-      if (attempt.action !== "scroll" && typeof attempt.targetIdentity === "string" && attempt.targetIdentity) excludedIdentities.add(attempt.targetIdentity);
-      if (attempt.action === "scroll" && typeof attempt.targetIdentity === "string" && attempt.targetIdentity && attempt.scrollProgressObserved !== true) excludedScrollIdentities.add(attempt.targetIdentity);
-      if (attempt.action === "click" && (attempt.uncertainOutcome === true || unchangedAfterFailedClick(attempt)) && attempt.targetSignature) excludedTargetSignatures.push(attempt.targetSignature);
+    const runContext = createNavigationRunContext({
+      taskState: state,
+      observation: latest,
+      limits: { actions: this.maxActions, recoveries: this.maxRecoveries, scrolls: this.maxScrolls },
+      executionBinding: {
+        targetId: this.session.target.id,
+        endpoint: state.endpoint ?? this.session.target.journalEndpoint ?? this.session.target.endpoint ?? "local-cdp",
+        environmentFingerprint: currentEnvironmentFingerprint,
+        applicationId: observedApplicationId,
+        principalId: this.principalId
+      }
+    });
+    const scrollConvergenceStates = runContext.scrollConvergenceStates;
+    const { candidateIdentities: excludedIdentities, targetSignatures: excludedTargetSignatures, scrollIdentities: excludedScrollIdentities } = runContext.exclusions;
+    const { counters } = runContext;
+    let recoveries = counters.recoveries;
+    let scrollActionsUsed = counters.scrolls;
+    const setLatestObservation = observation => {
+      latest = runContext.setLatestObservation(observation);
+      return latest;
     };
+    const incrementRecoveries = () => { recoveries = ++counters.recoveries; return recoveries; };
+    const incrementScrolls = () => { scrollActionsUsed = ++counters.scrolls; return scrollActionsUsed; };
+    const excludeFailedAttempt = attempt => runContext.excludeFailedAttempt(attempt);
     const recordFailedTargetPresence = (attempt, observation) => {
       if (attempt?.action !== "click" || !attempt.error) return;
       attempt.sameTargetRemained = (observation.candidates ?? []).some(candidate => candidate.identity === attempt.targetIdentity);
@@ -803,12 +798,15 @@ export class NavigationEngine {
       return resultWithWorkflow({ status: "canceled", goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: latest.evidenceId });
     };
     const beginAction = async attempt => {
+      runContext.pendingAttempt = attempt;
       state.pendingAction = attempt;
       await updateJournal();
     };
     const finishAction = attempt => {
       delete state.pendingAction;
       state.attempts.push(attempt);
+      counters.actions = state.attempts.length;
+      runContext.pendingAttempt = null;
     };
     const resultWithWorkflow = result => {
       completeDecisionEpisode(result.status);
@@ -1277,7 +1275,7 @@ export class NavigationEngine {
         const moved = Boolean(currentTarget && currentTarget.scrollTop > Number(pending.scrollTopBefore ?? 0) + 2);
         interrupted.scrollTopAfter = currentTarget?.scrollTop ?? null;
         interrupted.scrollProgressObserved = moved;
-        scrollActionsUsed++;
+        incrementScrolls();
         if (!moved) {
           state.scrollRecoveryBlocked = true;
           for (const target of latest.scrollTargets ?? []) excludedScrollIdentities.add(target.identity);
@@ -1309,7 +1307,7 @@ export class NavigationEngine {
         await updateJournal();
         return resultWithWorkflow({ status: state.status, goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: latest.evidenceId });
       }
-      recoveries++;
+      incrementRecoveries();
       state.recoveryCount = recoveries;
       await updateJournal();
     }
@@ -1378,7 +1376,7 @@ export class NavigationEngine {
               }
               await recordTelemetryDispatch(attempt, "scroll", attempt.error ? (attempt.dispatchStatus ?? "failed") : "dispatched");
               try {
-                latest = await observeAfterChange(1_500, waitBaseline);
+                setLatestObservation(await observeAfterChange(1_500, waitBaseline));
               } catch (error) {
                 workflowReplay.actions++;
                 if (isAbortError(error)) return await canceledWithPendingAction(attempt);
@@ -1401,7 +1399,7 @@ export class NavigationEngine {
               await recordTelemetryObservation(attempt, moved, attempt.error ? "scroll_failed_state_observed" : moved ? "scroll_progress_observed" : "scroll_no_progress_observed");
               finishAction(attempt);
               workflowReplay.actions++;
-              scrollActionsUsed++;
+              incrementScrolls();
               excludeFailedAttempt(attempt);
               if (attempt.error || !moved) {
                 workflowTraceSafe = false;
@@ -1481,7 +1479,7 @@ export class NavigationEngine {
             await recordTelemetryDispatch(attempt, "click", attempt.error ? (attempt.dispatchStatus ?? "failed") : "dispatched");
             excludedIdentities.add(target.identity);
             try {
-              latest = await observeAfterChange(2_000, waitBaseline, attempt);
+              setLatestObservation(await observeAfterChange(2_000, waitBaseline, attempt));
             } catch (error) {
               workflowReplay.actions++;
               if (isAbortError(error)) return await canceledWithPendingAction(attempt);
@@ -1519,7 +1517,7 @@ export class NavigationEngine {
           if (stale) {
             await this.workflowStore.invalidate(goal, state.initialUrlFingerprint);
             if (workflowReplay.actions > 0) {
-              recoveries++;
+              incrementRecoveries();
               state.recoveryCount = recoveries;
               workflowReplay.status = "repairing";
               await updateJournal();
@@ -1571,7 +1569,7 @@ export class NavigationEngine {
           });
           if (expandedObservation?.evidenceId !== previousEvidenceId
             && expandedObservation?.targetId === this.session.target.id) {
-            latest = expandedObservation;
+            setLatestObservation(expandedObservation);
             planningObservation = filterPlanningObservation(latest);
           }
         } catch {
@@ -1579,12 +1577,12 @@ export class NavigationEngine {
         }
       }
       if ((this.plannerMode !== "auto" && planner?.requiresScreenshot === true) || this.decisionRuntime?.requiresScreenshot === true) {
-        latest = await this.session.observe({
+        setLatestObservation(await this.session.observe({
           profile: "visual",
           prepareForJev: true,
           selectionGoal: goal,
           candidateLimit: candidateExpansionAttempted ? 384 : 200
-        });
+        }));
         planningObservation = {
           ...latest,
           candidates: (latest.candidates ?? []).filter(candidate =>
@@ -1670,7 +1668,7 @@ export class NavigationEngine {
             }
             candidateExpansionAttempted = fallback.status !== "not_needed";
             if (fallback.status === "refreshed") {
-              latest = fallback.observation;
+              setLatestObservation(fallback.observation);
               planningObservation = filterPlanningObservation(latest);
               localPlan = await this.deterministicPlanner.plan(goal, planningObservation, planningOptions);
             }
@@ -1733,7 +1731,7 @@ export class NavigationEngine {
               ? await groundAmbiguousTarget(planningObservation, localPlan, targetRoleCode)
               : await classifyAmbiguousPage(planningObservation);
             if (routedVisualReview?.observation?.evidenceId) {
-              latest = routedVisualReview.observation;
+              setLatestObservation(routedVisualReview.observation);
               planningObservation = filterPlanningObservation(latest);
               if (routedVisualReview.imageEvidence) {
                 planningObservation.visualEvidence = routedVisualReview.imageEvidence;
@@ -1774,7 +1772,7 @@ export class NavigationEngine {
               });
               if (this.planner.requiresScreenshot === true && !isBoundVisualEvidence(planningObservation, planningObservation.visualEvidence)) {
                 const captured = await captureVisualObservation(planningObservation);
-                latest = captured.observation;
+                setLatestObservation(captured.observation);
                 planningObservation = filterPlanningObservation(latest);
                 if (captured.imageEvidence) {
                   planningObservation.visualEvidence = captured.imageEvidence;
@@ -1787,7 +1785,7 @@ export class NavigationEngine {
           } else {
             if (this.planner.requiresScreenshot === true) {
               const captured = await captureVisualObservation(planningObservation);
-              latest = captured.observation;
+              setLatestObservation(captured.observation);
               planningObservation = filterPlanningObservation(latest);
               if (captured.imageEvidence) {
                 planningObservation.visualEvidence = captured.imageEvidence;
@@ -2076,7 +2074,7 @@ export class NavigationEngine {
       }
       await recordTelemetryDispatch(attempt, actionType, dispatchOutcome);
       try {
-        latest = await observeAfterChange(actionType === "type" ? 500 : actionType === "scroll" ? 1_500 : 2_000, waitBaseline, attempt);
+        setLatestObservation(await observeAfterChange(actionType === "type" ? 500 : actionType === "scroll" ? 1_500 : 2_000, waitBaseline, attempt));
       } catch (error) {
         if (isAbortError(error)) return await canceledWithPendingAction(attempt);
         return await stopAfterObservationLoss(attempt, error);
@@ -2093,7 +2091,7 @@ export class NavigationEngine {
       recordFailedTargetPresence(attempt, latest);
       excludeFailedAttempt(attempt);
       if (actionType === "scroll") {
-        scrollActionsUsed++;
+        incrementScrolls();
         // Record convergence state for infinite-scroll detection.
         if (attempt.scrollProgressObserved === true) {
           const scrollIdentity = selectedTarget.identity;
@@ -2213,7 +2211,7 @@ export class NavigationEngine {
             action: "navigate",
             url: recoveryUrl
           });
-            latest = await observeAfterChange(2_500, waitBaseline);
+            setLatestObservation(await observeAfterChange(2_500, waitBaseline));
           } catch (error) {
             if (isAbortError(error)) return await canceledWithPendingAction(attempt);
             return await stopAfterObservationLoss(attempt, error);
@@ -2273,7 +2271,7 @@ export class NavigationEngine {
         await updateJournal();
         return resultWithWorkflow({ status: state.status, goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: latest.evidenceId });
       }
-      recoveries++;
+      incrementRecoveries();
       state.recoveryCount = recoveries;
       if (this.workflowStore && workflowReplay.status === "repairing") workflowReplay.status = "repairing";
       await updateJournal();
