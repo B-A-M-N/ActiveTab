@@ -19,6 +19,7 @@ Append-only, local decision lifecycle events for operational reconstruction, eva
 - Record the pinned model ID, provider/model version, rubric version and hash, complete typed output distribution, and usage when available.
 - Usage payloads use only bounded `inputTokens`, `outputTokens`, `totalTokens`, `cachedInputTokens`, and `cost` fields. Provider-specific response keys must be normalized before append; unsupported usage fields fail schema validation.
 - Persist model input fingerprints and minimized evidence references, never raw prompt/page content, form values, credentials, cookies, tokens, or model response bodies. Validate with versioned structural schemas and exact nested field sets; do not infer sensitivity by scanning text.
+- `decisionEventProjections.js` owns bounded workflow, Jev, and semantic input projections. `decisionEventValidation.js` owns shared event field, enum, answer, and exact-key validation. Keep both pure; `decisionEvents.js` composes their output into the versioned event envelope.
 - Record Jev's outcome-review inputs as a separate typed projection before its prediction, linked to the independent verification event and exact evidence references.
 - Semantic and Jev predictions are never ground-truth labels. Only independently verified and authenticated labels can become training-eligible.
 - Qualification lifecycle records are append-only and linked to the parent episode, source evidence, scenario, provider, strategy fingerprint, level, provider identity, scenario seed, source revision, oracle reference, and cleanup result. A resolver-level result cannot claim independent application qualification. A qualified result creates candidate knowledge only; it does not promote workflows or make telemetry training-eligible.
@@ -33,3 +34,13 @@ Append-only, local decision lifecycle events for operational reconstruction, eva
 ## Verification
 
 Run focused decision telemetry and model-client tests after changes to event schemas, privacy rules, labels, or episode reconstruction.
+
+## Child DOX Index
+
+| Path | Purpose |
+|------|---------|
+| `decisionEvents.js` | Event type schemas, payload composition, versioned envelope, and canonical JSON |
+| `decisionEventProjections.js` | Bounded workflow, Jev, visual evidence, and semantic input projections |
+| `decisionEventValidation.js` | Shared bounded text/code, enum, exact-key, confidence, and answer validation |
+| `eventStore.js` | Append-only event persistence, lineage queries, and authenticated training approval |
+| `episodeBuilder.js` | Event lineage reconstruction and training-safe example export |
