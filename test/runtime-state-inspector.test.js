@@ -27,8 +27,7 @@ test("runtime state inspection stays read-only and retains bounded sensitive val
   };
   const serializedByteLength = jsonByteLength(evidence);
   const stored = { evidence, byteLength: serializedByteLength, serializedByteLength, lookupIndexBytes: 0 };
-  observer.evidence.set(evidence.id, stored);
-  observer.evidenceBytes = serializedByteLength;
+  observer.evidenceStore.retain(evidence.id, stored);
 
   const result = await observer.inspectRuntimeState(evidence.id, {
     path: ["application", "publicLabel"],

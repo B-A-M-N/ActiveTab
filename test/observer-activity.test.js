@@ -461,7 +461,7 @@ test("response body acquisition enforces byte limits and reports timeout or canc
   const unknownSizeSession = fakeSession();
   const unknownSizeObserver = new BrowserObserver(unknownSizeSession);
   const unknownSizeEvidence = await unknownSizeObserver.capture({ includeScreenshot: false });
-  const unknownRequest = unknownSizeObserver.evidence.get(unknownSizeEvidence.evidenceId).evidence.activity.networkRequests
+  const unknownRequest = unknownSizeObserver.evidenceStore.get(unknownSizeEvidence.evidenceId).evidence.activity.networkRequests
     .find(item => item.requestId === "request-1");
   unknownRequest.encodedDataLength = null;
   unknownRequest.decodedDataLength = 0;
@@ -484,7 +484,7 @@ test("response body acquisition enforces byte limits and reports timeout or canc
   };
   const streamingObserver = new BrowserObserver(streamingSession);
   const streamingEvidence = await streamingObserver.capture({ includeScreenshot: false });
-  streamingObserver.evidence.get(streamingEvidence.evidenceId).evidence.activity.networkRequests
+  streamingObserver.evidenceStore.get(streamingEvidence.evidenceId).evidence.activity.networkRequests
     .find(item => item.requestId === "request-1").resourceType = "WebSocket";
   const streamingResult = await streamingObserver.inspectNetworkResponse(streamingEvidence.evidenceId, {
     requestId: "request-1", includeSensitive: true

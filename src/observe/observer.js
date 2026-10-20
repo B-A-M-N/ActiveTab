@@ -10,6 +10,7 @@ import { buildDocumentIndex } from "./documentIndex.js";
 import { jsonByteLength } from "./evidenceSizing.js";
 import { inspectRuntimeState } from "./runtimeStateInspector.js";
 import { captureOutOfProcessFrames, captureScrollableTargets, instrumentCaptureClient, viewportScrollTarget } from "./frameCollector.js";
+import { EvidenceStore } from "./evidenceStore.js";
 
 const STYLE_NAMES = ["display", "visibility", "opacity", "pointer-events", "position", "z-index"];
 const NETWORK_RESPONSE_PROJECTION_CACHE_TTL_MS = 5 * 60_000;
@@ -215,18 +216,30 @@ function sanitizeSnapshotForRetrieval(snapshot, { includeSensitiveFormValues = f
 export class BrowserObserver {
   constructor(session, { evidenceLimit = 12, maxEvidenceBytes = 64 * 1024 * 1024 } = {}) {
     this.session = session;
-    this.evidenceLimit = Math.max(1, Math.min(evidenceLimit, 100));
-    this.maxEvidenceBytes = Math.max(1024 * 1024, Math.min(maxEvidenceBytes, 256 * 1024 * 1024));
-    this.evidence = new Map();
-    this.evidenceBytes = 0;
-    this.peakRetainedEvidenceBytes = 0;
     this.networkSignalState = new Map();
     this.responseProjectionCache = new Map();
     this.responseProjectionCacheBytes = 0;
+    this.evidenceStore = new EvidenceStore({
+      limit: evidenceLimit,
+      maxBytes: maxEvidenceBytes,
+      onEvict: evidenceId => this.#deleteResponseProjectionsForEvidence(evidenceId)
+    });
+  }
+
+  get maxEvidenceBytes() {
+    return this.evidenceStore.maxBytes;
+  }
+
+  get evidenceBytes() {
+    return this.evidenceStore.bytes;
+  }
+
+  get peakRetainedEvidenceBytes() {
+    return this.evidenceStore.peakBytes;
   }
 
   async queryAccessibility(id, query) {
-    const stored = this.evidence.get(id);
+    const stored = this.evidenceStore.get(id);
     if (!stored) return { status: "expired", evidenceId: id, actionAuthorized: false };
     return queryRetainedControls({
       session: this.session,
@@ -241,7 +254,7 @@ export class BrowserObserver {
   }
 
   getHitTestContext(id) {
-    const stored = this.evidence.get(id);
+    const stored = this.evidenceStore.get(id);
     if (!stored) return { status: "expired", evidenceId: id };
     const evidence = stored.evidence;
     if (evidence.targetId !== this.session.target?.id
@@ -270,7 +283,7 @@ export class BrowserObserver {
   }
 
   resolveCandidateForHitNode(id, { backendNodeId, frameId, x, y } = {}) {
-    const stored = this.evidence.get(id);
+    const stored = this.evidenceStore.get(id);
     if (!stored) return { status: "expired", reasonCode: "evidence_expired" };
     const evidence = stored.evidence;
     const lookupIndex = stored.lookupIndex;
@@ -606,20 +619,7 @@ export class BrowserObserver {
     evidence.semanticPage = semanticPage;
     const serializedByteLength = jsonByteLength(evidence);
     const byteLength = serializedByteLength + lookupIndexBytes;
-    let retained = byteLength <= this.maxEvidenceBytes;
-    if (retained) {
-      this.evidence.set(id, { evidence, byteLength, serializedByteLength, lookupIndexBytes, lookupIndex });
-      this.evidenceBytes += byteLength;
-      while (this.evidence.size > this.evidenceLimit || this.evidenceBytes > this.maxEvidenceBytes) {
-        const oldestId = this.evidence.keys().next().value;
-        const oldest = this.evidence.get(oldestId);
-        this.evidence.delete(oldestId);
-        this.evidenceBytes -= oldest.byteLength;
-        this.#deleteResponseProjectionsForEvidence(oldestId);
-        if (oldestId === id) retained = false;
-      }
-      this.peakRetainedEvidenceBytes = Math.max(this.peakRetainedEvidenceBytes, this.evidenceBytes);
-    }
+    const retained = this.evidenceStore.retain(id, { evidence, byteLength, serializedByteLength, lookupIndexBytes, lookupIndex });
     const domNodeCount = (snapshot.documents ?? []).reduce((total, document) => total + (document.nodes?.nodeName?.length ?? 0), 0)
       + frameSnapshots.reduce((total, frame) => total + (frame.domSnapshot.documents ?? []).reduce((frameTotal, document) => frameTotal + (document.nodes?.nodeName?.length ?? 0), 0), 0);
     const accessibilityNodeCount = (ax.nodes ?? []).length + frameSnapshots.reduce((total, frame) => total + frame.accessibilityTree.length, 0);
@@ -756,7 +756,7 @@ export class BrowserObserver {
 
 
   getEvidence(id, { includeSensitiveFormValues = false, includeSensitivePageText = false, includeSensitiveUrlData = false, includeSensitiveRuntimeValues = false, includeScreenshot = false, facets, backendNodeId, frameTargetId = null } = {}) {
-    const stored = this.evidence.get(id)?.evidence;
+    const stored = this.evidenceStore.get(id)?.evidence;
     if (!stored) return { status: "expired", evidenceId: id };
     const selected = new Set(facets ?? ["page", "domSnapshot", "accessibilityTree", "frameTree"]);
     const availableFacets = new Set(["page", "domSnapshot", "accessibilityTree", "frameTree", "outOfProcessFrames", "scrollTargets", "selectedElement", "networkActivity", "lifecycleEvents", "domMutations", "runtimeState"]);

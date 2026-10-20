@@ -75,7 +75,7 @@ export async function inspectNetworkResponse(observer, id, {
     sectionId,
     blockId
   } = {}, responseCache) {
-    const stored = observer.evidence.get(id)?.evidence;
+    const stored = observer.evidenceStore.get(id)?.evidence;
     if (!stored) return { status: "expired", evidenceId: id };
     if (stored.targetId && stored.targetId !== observer.session.target.id) return {
       status: "stale",

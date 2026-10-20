@@ -1,14 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { jsonByteLength } from "./evidenceSizing.js";
 
 const MAX_RUNTIME_PATH_SEGMENTS = 8;
 const MAX_RUNTIME_PATH_SEGMENT_LENGTH = 128;
 const DEFAULT_RUNTIME_VALUE_CHUNK_LENGTH = 4_096;
 const MAX_RUNTIME_VALUE_CHUNK_LENGTH = 16_384;
 const MAX_RUNTIME_VALUE_LENGTH = MAX_RUNTIME_VALUE_CHUNK_LENGTH;
-const MAX_RUNTIME_RECORD_BYTES = 512 * 1024;
-const MAX_RUNTIME_RECORDS_PER_EVIDENCE = 8;
-const MAX_RUNTIME_EVIDENCE_BYTES_PER_PAGE = 1024 * 1024;
 
 const RUNTIME_PATH_INSPECTOR = `function(path, failureMarker, includeSensitiveValues, valueOffset, valueChunkLength) {
   let current = this;
@@ -57,7 +53,7 @@ export async function inspectRuntimeState(observer, id, {
   path = [], frameTargetId = null, includeSensitiveValues = false,
   offset = 0, maxChars = DEFAULT_RUNTIME_VALUE_CHUNK_LENGTH
 } = {}) {
-  const stored = observer.evidence.get(id);
+  const stored = observer.evidenceStore.get(id);
   if (!stored) return { status: "expired", evidenceId: id };
   if (!Array.isArray(path) || path.length > MAX_RUNTIME_PATH_SEGMENTS || path.some(segment => typeof segment !== "string" || segment.length > MAX_RUNTIME_PATH_SEGMENT_LENGTH)) {
     throw new Error(`path must contain at most ${MAX_RUNTIME_PATH_SEGMENTS} strings of at most ${MAX_RUNTIME_PATH_SEGMENT_LENGTH} characters.`);
@@ -188,41 +184,6 @@ export async function inspectRuntimeState(observer, id, {
     status: result.status,
     result
   };
-  const recordBytes = jsonByteLength(record);
-  const currentRuntimeBytes = stored.evidence.runtimeStateBytes ?? 0;
-  let retained = recordBytes <= MAX_RUNTIME_RECORD_BYTES
-    && stored.byteLength - currentRuntimeBytes + recordBytes <= observer.maxEvidenceBytes
-    && observer.evidenceBytes - currentRuntimeBytes + recordBytes <= observer.maxEvidenceBytes;
-  if (retained) {
-    const records = stored.evidence.runtimeStateRecords;
-    const originalRecords = records.slice();
-    const originalRuntimeBytes = currentRuntimeBytes;
-    const originalEntryBytes = stored.byteLength;
-    const originalSerializedBytes = stored.serializedByteLength;
-    const originalTotalBytes = observer.evidenceBytes;
-    while (records.length && (records.length >= MAX_RUNTIME_RECORDS_PER_EVIDENCE || (stored.evidence.runtimeStateBytes ?? 0) + recordBytes > MAX_RUNTIME_EVIDENCE_BYTES_PER_PAGE)) {
-      const removed = records.shift();
-      const removedBytes = jsonByteLength(removed);
-      stored.evidence.runtimeStateBytes = Math.max(0, (stored.evidence.runtimeStateBytes ?? 0) - removedBytes);
-      stored.byteLength -= removedBytes;
-      observer.evidenceBytes -= removedBytes;
-    }
-    if ((stored.evidence.runtimeStateBytes ?? 0) + recordBytes > MAX_RUNTIME_EVIDENCE_BYTES_PER_PAGE) retained = false;
-    else {
-      records.push(record);
-      stored.evidence.runtimeStateBytes = (stored.evidence.runtimeStateBytes ?? 0) + recordBytes;
-      stored.serializedByteLength = jsonByteLength(stored.evidence);
-      stored.byteLength = stored.serializedByteLength + (stored.lookupIndexBytes ?? 0);
-      observer.evidenceBytes = originalTotalBytes + stored.byteLength - originalEntryBytes;
-      if (stored.byteLength > observer.maxEvidenceBytes || observer.evidenceBytes > observer.maxEvidenceBytes) {
-        records.splice(0, records.length, ...originalRecords);
-        stored.evidence.runtimeStateBytes = originalRuntimeBytes;
-        stored.byteLength = originalEntryBytes;
-        stored.serializedByteLength = originalSerializedBytes;
-        observer.evidenceBytes = originalTotalBytes;
-        retained = false;
-      }
-    }
-  }
+  const retained = observer.evidenceStore.appendRuntimeRecord(id, record);
   return { ...structuredClone(record), retained };
 }
