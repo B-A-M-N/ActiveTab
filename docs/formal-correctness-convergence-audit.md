@@ -41,7 +41,7 @@ Recent behavior-preserving slices are separate commits:
 - `4eb1117` — extract API-authenticated test-run route dispatch while retaining lifecycle handlers in the server composition.
 - `1b81b6a` — extract workflow route selection and planner construction after trusted task resolution, with explicit abstention preserved.
 - `b2a37ea` — extract permission-gated visual assessment and candidate grounding while retaining fresh evidence checks and engine-owned policy admission.
-- Compatibility API run listing, status, detail, and cancellation now use an injected route module; outer API authentication and server-owned task store/lifecycle dependencies remain in the composition layer.
+- `bfd839e` — extract compatibility API run listing, status, detail, and cancellation into an injected route module; preserve outer API authentication and server-owned task store/lifecycle dependencies.
 - `b3f8f7f` — route `/v1/interventions/run-state` before the generic intervention-ID matcher so the run-state handler is reachable.
 - `b3c66a8` — give the 600-control retained-lookup fixture the existing maximum query timeout; production defaults are unchanged.
 
