@@ -139,9 +139,19 @@ test("local API test-run lifecycle: start → status → cancel → report", asy
     }
     assert.equal(terminal, true, "run should reach a reportable state");
 
-    // report
-    const reportRes = await fetch(`${url}/v1/test/runs/${runId}/report`, { headers: { "Authorization": "Bearer test-token" } });
-    assert.equal(reportRes.status, 200);
+    // Durable terminal state can become visible just before the local worker
+    // settles. The report endpoint is authoritative for report readiness.
+    let reportRes;
+    let reportReady = false;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      reportRes = await fetch(`${url}/v1/test/runs/${runId}/report`, { headers: { "Authorization": "Bearer test-token" } });
+      if (reportRes.status === 200) { reportReady = true; break; }
+      const pendingReport = await reportRes.json();
+      assert.equal(reportRes.status, 409, `Unexpected report response: ${JSON.stringify(pendingReport)}`);
+      assert.match(pendingReport.msg ?? "", /has not settled/u, "only the expected worker-settlement race is retryable");
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(reportReady, true, "report should become available after the worker settles");
     const reportBody = await reportRes.json();
     assert.equal(reportBody.runId, runId);
     assert.ok(Array.isArray(reportBody.findings));
