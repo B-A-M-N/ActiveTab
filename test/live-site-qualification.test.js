@@ -130,6 +130,34 @@ test("search result outcome is independently checked against the fetched public 
   assert.equal(oversized.reasonCode, "independent_result_too_large");
 });
 
+test("independent verifier refuses out-of-scope URLs and exhausted request budgets before fetching", async () => {
+  const scenario = await loadPublicSearchScenario("public-search-wikipedia-001");
+  const topic = chooseNeutralTopic(scenario.queryPoolId, () => 2);
+  let fetchCount = 0;
+  const fetchImpl = async () => {
+    fetchCount++;
+    return new Response("<h1>Basalt</h1>", { status: 200, headers: { "content-type": "text/html" } });
+  };
+  const outOfScope = await verifyPublicSearchResult(scenario, topic, {
+    page: { url: "https://en.wikipedia.org/outside" },
+    headings: [{ level: 1, text: "Basalt" }]
+  }, { fetchImpl });
+  assert.equal(outOfScope.status, "agent_error");
+  assert.equal(outOfScope.reasonCode, "result_destination_outside_scope");
+  assert.equal(fetchCount, 0);
+
+  const exhaustedBudget = await verifyPublicSearchResult(scenario, topic, {
+    page: { url: "https://en.wikipedia.org/wiki/Basalt" },
+    headings: [{ level: 1, text: "Basalt" }]
+  }, {
+    fetchImpl,
+    consumeRequest: () => ({ allowed: false, reasonCode: "live_site_request_rate_limited" })
+  });
+  assert.equal(exhaustedBudget.status, "site_access_error");
+  assert.equal(exhaustedBudget.reasonCode, "live_site_request_rate_limited");
+  assert.equal(fetchCount, 0);
+});
+
 test("honeybee search verification accepts its declared waggle-dance article title", async () => {
   const scenario = await loadPublicSearchScenario("public-search-wikipedia-001");
   const topic = chooseNeutralTopic(scenario.queryPoolId, () => 3);
