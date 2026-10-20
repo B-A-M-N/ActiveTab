@@ -19,6 +19,15 @@ const chromePath = process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
 const projectRoot = new URL("../", import.meta.url).pathname;
 const installer = join(projectRoot, "scripts", "install-native-host.js");
 
+function activateFixtureWindow(windowId) {
+  const activated = spawnSync("xdotool", ["windowactivate", "--sync", String(windowId)], { encoding: "utf8" });
+  if (activated.status === 0 || !/windowmanager claims not to support _NET_ACTIVE_WINDOW/u.test(activated.stderr ?? "")) return activated;
+  const focused = spawnSync("xdotool", ["windowfocus", "--sync", String(windowId)], { encoding: "utf8" });
+  return focused.status === 0
+    ? { ...focused, directFocusFallback: true }
+    : { ...focused, stderr: `${activated.stderr ?? ""}${focused.stderr ?? ""}` };
+}
+
 function countingPlanner() {
   const local = new DeterministicPlanner();
   return {
@@ -182,8 +191,11 @@ async function settleWithin(promise, timeoutMs) {
   return completed;
 }
 
-async function attachThroughPopup(client, broker, extensionId, tabTargetId, popupAlreadyOpened = false) {
-  if (!popupAlreadyOpened) await client.send("Extensions.triggerAction", { id: extensionId, targetId: tabTargetId });
+async function attachThroughPopup(client, broker, extensionId, tabTargetId, popupAlreadyOpened = false, headless = false) {
+  if (!popupAlreadyOpened) {
+    await client.send("Target.activateTarget", { targetId: tabTargetId });
+    await client.send("Extensions.triggerAction", { id: extensionId, targetId: tabTargetId });
+  }
   const popupDeadline = Date.now() + 10_000;
   let popupTarget;
   while (Date.now() < popupDeadline) {
@@ -193,6 +205,7 @@ async function attachThroughPopup(client, broker, extensionId, tabTargetId, popu
     await new Promise(resolve => setTimeout(resolve, 50));
   }
   assert.ok(popupTarget, "Chrome opens the extension action popup for the selected tab");
+  await client.send("Target.activateTarget", { targetId: popupTarget.targetId });
   const { sessionId } = await client.send("Target.attachToTarget", { targetId: popupTarget.targetId, flatten: true });
   await client.send("Page.enable", {}, sessionId);
   await client.send("Runtime.enable", {}, sessionId);
@@ -212,17 +225,48 @@ async function attachThroughPopup(client, broker, extensionId, tabTargetId, popu
     broker.once("attached", target => { clearTimeout(timer); resolve(target); });
   });
   await client.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: bounds.x, y: bounds.y }, sessionId);
-  await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: bounds.x, y: bounds.y, button: "left", clickCount: 1 }, sessionId);
-  await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: bounds.x, y: bounds.y, button: "left", clickCount: 1 }, sessionId);
-  const target = await attached;
+  await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: bounds.x, y: bounds.y, button: "left", buttons: 1, clickCount: 1 }, sessionId);
+  await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: bounds.x, y: bounds.y, button: "left", buttons: 0, clickCount: 1 }, sessionId);
+  if (headless) {
+    const inputDelivered = await Promise.race([
+      attached.then(() => true, () => false),
+      new Promise(resolve => setTimeout(() => resolve(false), 300))
+    ]);
+    if (!inputDelivered) {
+      await client.send("Runtime.evaluate", {
+        expression: "document.querySelector('#attach').click()",
+        userGesture: true,
+        returnByValue: true
+      }, sessionId);
+    }
+  }
+  let target;
+  try {
+    target = await attached;
+  } catch (error) {
+    const popupState = await client.send("Runtime.evaluate", {
+      expression: "(async()=>{const [current,all]=await Promise.all([chrome.tabs.query({active:true,currentWindow:true}),chrome.tabs.query({})]);return JSON.stringify({page:document.querySelector('#page')?.innerText,status:document.querySelector('#status')?.innerText,attachHidden:document.querySelector('#attach')?.hidden,attachDisabled:document.querySelector('#attach')?.disabled,current:current.map(({id,active,windowId,url})=>({id,active,windowId,url})),all:all.map(({id,active,windowId,url})=>({id,active,windowId,url}))})})()",
+      returnByValue: true,
+      awaitPromise: true
+    }, sessionId).then(result => result.result?.value).catch(stateError => ({ error: stateError.message }));
+    throw new Error(`${error.message} popup=${JSON.stringify(popupState)}`);
+  }
   await client.send("Target.closeTarget", { targetId: popupTarget.targetId }).catch(() => {});
+  await client.send("Target.activateTarget", { targetId: tabTargetId }).catch(() => {});
   return target;
 }
 
-test("visible extension attaches, observes, navigates, and recovers its disposable Chrome tab", { timeout: 120_000 }, async t => {
-  if (process.env.ACTIVETAB_VISIBLE_CHROME !== "1") { t.skip("set ACTIVETAB_VISIBLE_CHROME=1 to launch the real Chrome window for extension integration"); return; }
-  if (process.env.ACTIVETAB_HEADLESS === "1") { t.skip("the visible extension fixture requires headed Chrome; unset ACTIVETAB_HEADLESS=1 to run it"); return; }
-  if (!process.env.DISPLAY) { t.skip("extension integration requires a visible desktop display"); return; }
+test("Chrome extension attaches, observes, navigates, and recovers its disposable tab", { timeout: 120_000 }, async t => {
+  const headless = process.env.ACTIVETAB_HEADLESS === "1";
+  if (headless && process.env.ACTIVETAB_EXTENSION_INTEGRATION !== "1") {
+    t.skip("set ACTIVETAB_EXTENSION_INTEGRATION=1 to run the extension lifecycle fixture in headless Chrome");
+    return;
+  }
+  if (!headless && process.env.ACTIVETAB_VISIBLE_CHROME !== "1") {
+    t.skip("set ACTIVETAB_VISIBLE_CHROME=1 to launch the real Chrome window for extension integration");
+    return;
+  }
+  if (!headless && !process.env.DISPLAY) { t.skip("headed extension integration requires a reachable display"); return; }
   let chrome;
   let connection;
   let session;
@@ -234,6 +278,15 @@ test("visible extension attaches, observes, navigates, and recovers its disposab
   let benchmarkSites;
   let root;
   let stderr = "";
+  let reportedDirectFocusFallback = false;
+  const activateWindow = windowId => {
+    const result = activateFixtureWindow(windowId);
+    if (result.directFocusFallback && !reportedDirectFocusFallback) {
+      reportedDirectFocusFallback = true;
+      t.diagnostic("Xvfb has no EWMH window manager; direct X focus was used for the disposable Chrome fixture.");
+    }
+    return result;
+  };
   const benchmarkRuns = [];
   const processFamilySampler = startProcessGroupSampler();
   const recordBenchmark = (name, startedAt, result, oracle) => {
@@ -306,8 +359,9 @@ test("visible extension attaches, observes, navigates, and recovers its disposab
 
     broker = await new ExtensionBroker({ socketPath: join(stateDir, "extension-broker.sock"), requestTimeoutMs: 20_000 }).start();
     const displayEnv = { ...process.env, ACTIVETAB_STATE_DIR: stateDir };
+    if (headless) delete displayEnv.DISPLAY;
     chrome = spawn(chromePath, [
-      ...chromeWindowPositionArgs({ env: displayEnv }),
+      ...(headless ? ["--headless=new"] : chromeWindowPositionArgs({ env: displayEnv })),
       "--no-sandbox", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check", "--disable-background-networking", "--disable-default-apps",
       "--remote-debugging-pipe", "--enable-unsafe-extension-debugging", "--site-per-process", `--user-data-dir=${profileDir}`,
       siteUrl
@@ -338,17 +392,19 @@ test("visible extension attaches, observes, navigates, and recovers its disposab
       await new Promise(resolve => setTimeout(resolve, 50));
     }
     assert.ok(page, `Chrome loaded the local fixture page. ${stderr.slice(-1_000)}`);
-    const visibleWindowDeadline = Date.now() + 5_000;
-    let visibleWindowId;
-    while (Date.now() < visibleWindowDeadline) {
-      const windows = spawnSync("xdotool", ["search", "--onlyvisible", "--name", "^Extension start"], { encoding: "utf8" });
-      visibleWindowId = windows.status === 0 ? windows.stdout.trim().split(/\s+/)[0] : undefined;
-      if (visibleWindowId) break;
-      await new Promise(resolve => setTimeout(resolve, 100));
+    if (!headless) {
+      const visibleWindowDeadline = Date.now() + 5_000;
+      let visibleWindowId;
+      while (Date.now() < visibleWindowDeadline) {
+        const windows = spawnSync("xdotool", ["search", "--onlyvisible", "--name", "^Extension start"], { encoding: "utf8" });
+        visibleWindowId = windows.status === 0 ? windows.stdout.trim().split(/\s+/)[0] : undefined;
+        if (visibleWindowId) break;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      assert.ok(visibleWindowId, `The disposable Chrome fixture is shown in a real desktop window. ${stderr.slice(-1_000)}`);
+      const activatedWindow = activateWindow(visibleWindowId);
+      assert.equal(activatedWindow.status, 0, activatedWindow.stderr);
     }
-    assert.ok(visibleWindowId, `The disposable Chrome fixture is shown in a real desktop window. ${stderr.slice(-1_000)}`);
-    const activateWindow = spawnSync("xdotool", ["windowactivate", "--sync", visibleWindowId], { encoding: "utf8" });
-    assert.equal(activateWindow.status, 0, activateWindow.stderr);
     const tabTargets = await connection.client.send("Target.getTargets", { filter: [{ type: "tab", exclude: false }] });
     const tab = tabTargets.targetInfos?.find(target => target.type === "tab" && target.url.startsWith(`http://127.0.0.1:${site.address().port}/`));
     assert.ok(tab, `Chrome exposed a tab target for the fixture page: ${JSON.stringify(tabTargets.targetInfos)}`);
@@ -363,6 +419,7 @@ test("visible extension attaches, observes, navigates, and recovers its disposab
       await new Promise(resolve => setTimeout(resolve, 50));
     }
     assert.ok(popupTarget, "Chrome opened the extension action popup for the selected fixture tab");
+    await connection.client.send("Target.activateTarget", { targetId: popupTarget.targetId });
     const { sessionId: popupSessionId } = await connection.client.send("Target.attachToTarget", { targetId: popupTarget.targetId, flatten: true });
     await connection.client.send("Page.enable", {}, popupSessionId);
     await connection.client.send("Runtime.enable", {}, popupSessionId);
@@ -400,8 +457,8 @@ test("visible extension attaches, observes, navigates, and recovers its disposab
     }, popupSessionId);
     const { x: attachX, y: attachY } = attachBounds.result.value;
     await connection.client.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: attachX, y: attachY }, popupSessionId);
-    await connection.client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: attachX, y: attachY, button: "left", clickCount: 1 }, popupSessionId);
-    await connection.client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: attachX, y: attachY, button: "left", clickCount: 1 }, popupSessionId);
+    await connection.client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: attachX, y: attachY, button: "left", buttons: 1, clickCount: 1 }, popupSessionId);
+    await connection.client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: attachX, y: attachY, button: "left", buttons: 0, clickCount: 1 }, popupSessionId);
     const attachDeadline = Date.now() + 8_000;
     let popupState;
     while (Date.now() < attachDeadline && !attachedTarget) {
@@ -430,13 +487,22 @@ test("visible extension attaches, observes, navigates, and recovers its disposab
       await new Promise(resolve => setTimeout(resolve, 50));
     }
     assert.ok(secondTab, "Chrome exposes the second page as a tab target for the extension action click");
-    const secondAuthorization = await attachThroughPopup(connection.client, broker, installedId, secondTab.targetId);
+    const secondAuthorization = await attachThroughPopup(connection.client, broker, installedId, secondTab.targetId, false, headless);
     assert.equal(secondAuthorization.id, secondPage.targetId, "the second tab receives a separate explicit popup grant");
     assert.deepEqual((await broker.listTabs()).map(target => target.id).sort(), [page.targetId, secondPage.targetId].sort(), "the broker retains both user-authorized page targets");
     try {
       secondSession = await new BrowserSession(await broker.resolveTarget(secondPage.targetId)).attach();
       const secondObservation = await secondSession.observe({ includeScreenshot: false });
       assert.equal(secondObservation.page.title, "Signed-in session ready", "the selected tab retains the fixture's preexisting authenticated page state");
+      if (headless) {
+        await secondSession.client.send("Page.navigate", { url: `http://127.0.0.1:${site.address().port}/private-profile` });
+        await secondSession.waitForChange();
+        const authenticatedPage = await secondSession.observe({ includeScreenshot: false });
+        assert.equal(authenticatedPage.page.title, "Private profile");
+        assert.ok(authenticatedProfileRequests >= 1, "the independent server oracle received the existing HTTP-only session cookie through the authorized target");
+        t.diagnostic("Headless extension coverage passed for explicit popup consent on two exact tabs, native messaging grants, native CDP observation, and protected-route cookie preservation. Planner navigation and desktop UI checks remain covered or limited separately.");
+        return;
+      }
       const authenticatedPlanner = countingPlanner();
       const authenticatedProfileRun = await runMeasured("authenticated existing-tab navigation", async () => {
         const result = await new NavigationEngine(secondSession, { maxActions: 2, maxRecoveries: 1, planner: authenticatedPlanner }).run("Open the private profile page");
@@ -774,7 +840,7 @@ test("visible extension attaches, observes, navigates, and recovers its disposab
       await new Promise(resolve => setTimeout(resolve, 100));
     }
     assert.ok(freshWindowId, "the replacement fixture page is visibly shown in Chrome");
-    const activatedFreshWindow = spawnSync("xdotool", ["windowactivate", "--sync", freshWindowId], { encoding: "utf8" });
+    const activatedFreshWindow = activateWindow(freshWindowId);
     assert.equal(activatedFreshWindow.status, 0, activatedFreshWindow.stderr);
     await connection.client.send("Extensions.triggerAction", { id: installedId, targetId: freshTab.targetId });
     const freshPopupDeadline = Date.now() + 10_000;
@@ -807,8 +873,8 @@ test("visible extension attaches, observes, navigates, and recovers its disposab
     const freshAttachX = freshAttachBounds.x;
     const freshAttachY = freshAttachBounds.y;
     await connection.client.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: freshAttachX, y: freshAttachY }, freshPopupSessionId);
-    await connection.client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: freshAttachX, y: freshAttachY, button: "left", clickCount: 1 }, freshPopupSessionId);
-    await connection.client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: freshAttachX, y: freshAttachY, button: "left", clickCount: 1 }, freshPopupSessionId);
+    await connection.client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: freshAttachX, y: freshAttachY, button: "left", buttons: 1, clickCount: 1 }, freshPopupSessionId);
+    await connection.client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: freshAttachX, y: freshAttachY, button: "left", buttons: 0, clickCount: 1 }, freshPopupSessionId);
     const newlyAuthorizedTarget = await freshAttachedTarget;
     assert.equal(newlyAuthorizedTarget.id, freshPage.targetId, "the replacement tab receives a new grant only after the user clicks Attach");
     assert.equal((await broker.listTabs())[0].id, freshPage.targetId, "the broker now controls only the newly authorized target");
@@ -875,7 +941,7 @@ test("visible extension attaches, observes, navigates, and recovers its disposab
       await new Promise(resolve => setTimeout(resolve, 100));
     }
     assert.ok(restartedWindowId, "the restarted fixture is visible in a real Chrome window");
-    const activatedRestartedWindow = spawnSync("xdotool", ["windowactivate", "--sync", restartedWindowId], { encoding: "utf8" });
+    const activatedRestartedWindow = activateWindow(restartedWindowId);
     assert.equal(activatedRestartedWindow.status, 0, activatedRestartedWindow.stderr);
     await restartedClient.send("Extensions.triggerAction", { id: installedId, targetId: restartedTab.targetId });
     assert.deepEqual(await broker.listTabs(), [], "opening the restored extension popup does not grant browser control");
@@ -891,7 +957,7 @@ test("visible extension attaches, observes, navigates, and recovers its disposab
     let devtoolsDetachedTarget;
     const onDevtoolsDetach = target => { devtoolsDetachedTarget = target; };
     broker.once("detached", onDevtoolsDetach);
-    const focusedBeforeDevtools = spawnSync("xdotool", ["windowactivate", "--sync", restartedWindowId], { encoding: "utf8" });
+    const focusedBeforeDevtools = activateWindow(restartedWindowId);
     assert.equal(focusedBeforeDevtools.status, 0, focusedBeforeDevtools.stderr);
     const focusedWindowName = spawnSync("xdotool", ["getwindowfocus", "getwindowname"], { encoding: "utf8" });
     assert.match(focusedWindowName.stdout, /Extension start/, `the fixture Chrome window has focus: ${focusedWindowName.stdout}`);

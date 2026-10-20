@@ -31,7 +31,7 @@ test("a real Chrome target reattaches after a dispatched same-tab navigation wit
   let injectedDetach = false;
 
   try {
-    owned = await launchOwnedChrome({ initialUrl: `${origin}/`, headed: true });
+    owned = await launchOwnedChrome({ initialUrl: `${origin}/`, headed: process.env.ACTIVETAB_HEADLESS !== "1" });
     const originalSession = owned.session;
     const waitForChange = originalSession.waitForChange.bind(originalSession);
     originalSession.waitForChange = async (...args) => {

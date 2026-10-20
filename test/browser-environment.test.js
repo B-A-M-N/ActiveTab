@@ -10,7 +10,9 @@ import { chromeWindowPositionArgs, resolveChromeWindowPosition } from "../src/br
 const requestedWindowPosition = resolveChromeWindowPosition();
 
 test("owned headed Chrome window stays on the configured test display", {
-  skip: !requestedWindowPosition
+  skip: process.env.ACTIVETAB_HEADLESS === "1"
+    ? "headless mode cannot verify desktop window coordinates; run this fixture on a display"
+    : !requestedWindowPosition
 }, async () => {
   const server = createServer((_request, response) => response.end("display placement fixture"));
   server.listen(0, "127.0.0.1");

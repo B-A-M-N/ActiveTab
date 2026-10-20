@@ -133,7 +133,7 @@ test("retained control lookup finds omitted controls without CDP traversal and p
   let owned = null;
 
   try {
-    owned = await launchOwnedChrome({ initialUrl, headed: true, userDataDir: profileDir, preserveProfile: false });
+    owned = await launchOwnedChrome({ initialUrl, headed: process.env.ACTIVETAB_HEADLESS !== "1", userDataDir: profileDir, preserveProfile: false });
     const session = owned.session;
     const observation = await session.observe({ profile: "interaction", candidateLimit: 200 });
     assert.equal(observation.candidateCoverage.pageCoverage, "partial", "the fixture exceeds the normal candidate projection limit");

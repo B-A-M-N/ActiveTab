@@ -54,9 +54,11 @@ test("keeping Chrome open requires an explicit persistent profile", async () => 
 const chromeExecutable = process.env.CHROME_PATH ?? process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
 
 test("the selected secondary display is reapplied when reusing an owned Chrome profile", {
-  skip: !existsSync(chromeExecutable)
-    || (process.env.ACTIVETAB_CHROME_DISPLAY ?? "secondary") !== "secondary"
-    || Boolean(process.env.ACTIVETAB_CHROME_WINDOW_POSITION),
+  skip: process.env.ACTIVETAB_HEADLESS === "1"
+    ? "headless mode cannot verify desktop window placement; run this fixture on a display"
+    : !existsSync(chromeExecutable)
+      || (process.env.ACTIVETAB_CHROME_DISPLAY ?? "secondary") !== "secondary"
+      || Boolean(process.env.ACTIVETAB_CHROME_WINDOW_POSITION),
   timeout: 60_000
 }, async () => {
   const server = createServer((_request, response) => {

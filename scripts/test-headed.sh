@@ -24,7 +24,7 @@ done
 
 if [[ "${ACTIVETAB_HEADLESS:-}" == "1" ]]; then
   echo "ACTIVETAB_HEADLESS=1: explicit operator opt-in for headless execution."
-  export DISPLAY="${DISPLAY:-}"  # no display needed
+  unset DISPLAY
   node --test "${NODE_ARGS[@]}"
   exit $?
 fi
