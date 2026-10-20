@@ -54,17 +54,18 @@ The repository also already has separate run-context, replay, recovery, action-a
 
 ## Headless verification and limits
 
-The latest complete run used `ACTIVETAB_HEADLESS=1 npm run test:isolated -- --test-concurrency=1` through an owner-private disposable state directory. It used the standard `node --test` discovery and serial file execution, with compatible Chrome fixtures launched as `--headless=new`.
+The latest complete headless run used `ACTIVETAB_HEADLESS=1 npm run test:isolated -- --test-concurrency=1` through an owner-private disposable state directory. It used the standard `node --test` discovery and serial file execution, with compatible Chrome fixtures launched as `--headless=new`. I also ran the same suite without the headless opt-in; the repository harness used its private Xvfb display rather than the physical desktop.
 
 - Full suite after NavigationEngine run-intent extraction: **869 passed, 0 failed, 5 skipped** (874 tests; 120.84 seconds).
+- Paired private-Xvfb headed suite: **870 passed, 0 failed, 4 skipped** (the same 874 tests; 114.28 seconds).
 - Focused output/API regression: **43 passed, 0 failed**; API-server rerun after the authentication assertion: **35 passed, 0 failed**.
-- Focused run-intent/navigation selection: **5 files passed, 0 failed**.
-- Opt-in headless extension subset: **1 passed, 0 failed, 0 skipped**. It covers explicit popup consent through a `userGesture` handler call, exact-tab grants, Native Messaging, CDP observation, and protected-route cookie preservation.
+- Focused run-intent/navigation selection: **5 suite files passed, 0 failed**.
+- Opt-in headless extension subset: **1 passed, 0 failed, 0 skipped**. It covers explicit popup consent through a `userGesture` handler call on two exact tabs, Native Messaging grants, native CDP observation, and protected-route cookie preservation.
 - Headless OOPIF fixture: direct and nested frame recovery plus root-page scroll passed.
 
-Headless does not verify desktop window coordinates or physical toolbar interaction. The extension subset's `Runtime.evaluate(userGesture:true)` path is not evidence of a physical popup click; the full extension UI, DevTools keyboard interaction, and desktop placement remain headed-only checks. The five standard-suite skips include those display checks, the opt-in extension scenario, an unavailable second-provider configuration, and the staging session check. The display, staging, provider, and extension limits are also described in `testing-display.md`.
+Both full runs discovered the same 874 tests. The headless run skips the two desktop placement checks; the Xvfb run passes the general window-bounds check and skips secondary-display reuse because its isolated display is configured as one main screen. The three other skips are shared: the opt-in extension scenario, missing second-provider configuration, and unavailable authorized staging session. This paired result accounts for the non-display regression suite in both modes. The Xvfb placement pass verifies bounds inside its virtual display only; it does not verify the physical HDMI-1 monitor origin.
 
-No headed equivalence is claimed for skipped desktop behavior. Live/staging qualification remains pending an authorized headed display and staging session; fixture and headless success do not substitute for it.
+The extension subset's `Runtime.evaluate(userGesture:true)` path is not evidence of a physical toolbar click. Full extension UI behavior, physical toolbar interaction, DevTools keyboard interaction, and physical desktop placement remain unverified. Live/staging qualification remains pending an authorized headed display and staging session; fixture and headless success do not substitute for it. The display, staging, provider, and extension limits are also described in `testing-display.md`.
 
 ## Next bounded slices
 
