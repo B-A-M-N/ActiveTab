@@ -126,6 +126,11 @@ test("compact and default evidence redact URL secrets while detailed URL access 
   assert.equal(JSON.stringify(compact).includes(compact.pageChangeFingerprint), false);
   assert.equal(compact.page.url, "https://example.test/page");
   assert.equal(compact.frames[0].url, "https://example.test/page");
+  assert.deepEqual(compact.candidates.map(candidate => candidate.identity).sort(), [
+    "target-1:root:frame-main:2:7",
+    "target-1:root:frame-main:3:7",
+    "target-1:root:frame-main:5:7"
+  ], "candidate derivation preserves target, frame, backend-node, and document-generation identity");
   assert.equal(compact.candidates[0].href, "https://destination.test/account");
   assert.equal(compact.candidates[0].opensNewTarget, true);
   assert.equal(compact.candidates[0].target, undefined, "raw page target names are not projected into model-facing candidates");
