@@ -42,6 +42,7 @@ Recent behavior-preserving slices are separate commits:
 - `1b81b6a` — extract workflow route selection and planner construction after trusted task resolution, with explicit abstention preserved.
 - `b2a37ea` — extract permission-gated visual assessment and candidate grounding while retaining fresh evidence checks and engine-owned policy admission.
 - `bfd839e` — extract compatibility API run listing, status, detail, and cancellation into an injected route module; preserve outer API authentication and server-owned task store/lifecycle dependencies.
+- Registered pagination target resolution, authorized dispatch, and progress verification now live in `registeredPagination.js`; the engine retains a compatibility export and exact lease checks. Focused workflow/pagination coverage passed 48/48.
 - `b3f8f7f` — route `/v1/interventions/run-state` before the generic intervention-ID matcher so the run-state handler is reachable.
 - `b3c66a8` — give the 600-control retained-lookup fixture the existing maximum query timeout; production defaults are unchanged.
 
@@ -51,7 +52,7 @@ The repository also already has separate run-context, replay, recovery, action-a
 
 The latest complete run used `ACTIVETAB_HEADLESS=1 npm run test:isolated -- --test-concurrency=1` through an owner-private disposable state directory. It used the same `node --test` discovery and serial file execution as the isolated suite, with compatible Chrome fixtures launched as `--headless=new`.
 
-- Full suite after the legacy run-record route extraction: **852 passed, 0 failed, 5 skipped** (857 tests; 97.13 seconds).
+- Full suite after registered pagination extraction: **854 passed, 0 failed, 5 skipped** (859 tests; 76.79 seconds).
 - Opt-in headless extension subset: **1 passed, 0 failed, 0 skipped**. It covers explicit popup consent through a `userGesture` handler call, exact-tab grants, Native Messaging, CDP observation, and protected-route cookie preservation.
 - Headless OOPIF fixture: direct and nested frame recovery plus root-page scroll passed.
 
@@ -61,7 +62,7 @@ No headed equivalence is claimed for skipped desktop behavior. Live/staging qual
 
 ## Next bounded slices
 
-1. Continue `NavigationEngine` extraction from provider planning and attempt coordination while retaining one public run loop and the current executor. Task-scope expansion lives in `planningEvidence.js`; workflow planner selection lives in `workflowRoutePlanner.js`; visual assessment and grounding live in `visualDecisionCoordinator.js` and remain advisory.
+1. Continue `NavigationEngine` extraction from provider planning and attempt coordination while retaining one public run loop and the current executor. Task-scope expansion lives in `planningEvidence.js`; workflow planner selection lives in `workflowRoutePlanner.js`; visual assessment and grounding live in `visualDecisionCoordinator.js` and remain advisory; registered pagination is isolated in `registeredPagination.js`.
 2. Continue decomposition from the largest remaining coordinators. HTTP endpoint dispatch for discovery, capabilities, interventions, approvals, evidence releases, test runs, and legacy run records now uses injected route modules; test-run lifecycle implementations, run creation/peer execution, template metadata, and output serving remain composed in `local-server.js` (909 lines).
 3. Measure response acquisition/process memory as best-effort diagnostics; keep `hardMemoryBound:false` until the transport can enforce a pre-materialization limit.
 4. Run the remaining held-out application and multi-process lifecycle qualifications when their required authorized environments are available.

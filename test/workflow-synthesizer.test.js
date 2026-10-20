@@ -7,7 +7,8 @@ import { JEV_MODEL_ID } from "../src/decisions/jevClient.js";
 import { DecisionEventStore } from "../src/telemetry/eventStore.js";
 import { rebindWorkflowTarget, WorkflowSynthesizer } from "../src/navigation/workflowSynthesizer.js";
 import { OutputAccumulator } from "../src/extraction/outputAccumulator.js";
-import { advanceRegisteredPagination, NavigationEngine } from "../src/navigation/engine.js";
+import { advanceRegisteredPagination as legacyAdvanceRegisteredPagination, NavigationEngine } from "../src/navigation/engine.js";
+import { advanceRegisteredPagination, createRegisteredPaginationButtonAuthorizer } from "../src/navigation/registeredPagination.js";
 import { WorkflowGraphPlanner } from "../src/navigation/workflowPlanner.js";
 import { createGenericWorkflowCapabilities } from "../src/navigation/workflowCapabilities.js";
 import { createDecisionRuntime } from "../src/decisions/runtime.js";
@@ -140,6 +141,53 @@ function makeObservedPartialExtractionOutput() {
     }
   };
 }
+
+test("NavigationEngine retains a compatibility export for registered pagination", () => {
+  assert.equal(legacyAdvanceRegisteredPagination, advanceRegisteredPagination);
+});
+
+test("registered next-button authorization binds the trusted capability and exact fresh target", () => {
+  const resolutionCalls = [];
+  const environment = {
+    environmentId: "staging",
+    entryOrigin: "https://shop.example",
+    authorizedOrigins: ["https://shop.example"],
+    applications: [{ applicationId: "shop", authenticationRealm: "shop-session", candidateEntry: "/products" }],
+    authenticationRealms: [{ realmId: "shop-session" }]
+  };
+  const details = {
+    fromPageUrl: "https://shop.example/products?page=1",
+    capabilityId: "shop.products",
+    capabilityVersion: 1,
+    nextPage: { target: { backendNodeId: 11, frameId: "frame-1", tag: "button" } }
+  };
+  const authorizer = createRegisteredPaginationButtonAuthorizer({
+    registry: { resolve: (id, scope) => {
+      resolutionCalls.push([id, scope]);
+      return { extractionContract: { pagination: { kind: "explicit_next_same_path" } } };
+    } },
+    environment,
+    principalId: "operator-1",
+    session: { target: { id: "target-1" } },
+    details
+  });
+  const candidate = {
+    targetId: "target-1", backendNodeId: 11, frameId: "frame-1", tag: "button",
+    visible: true, disabled: false
+  };
+  const observation = { targetId: "target-1", page: { url: details.fromPageUrl } };
+
+  assert.deepEqual(authorizer.authorize({ action: "click", candidate, observation }), {
+    allowed: true, category: "registered_pagination_button"
+  });
+  assert.deepEqual(resolutionCalls, [["shop.products", {
+    capabilityVersion: 1, origin: "https://shop.example", environmentId: "staging",
+    applicationId: "shop", principalId: "operator-1"
+  }]]);
+  assert.equal(authorizer.authorize({ action: "click", candidate: { ...candidate, backendNodeId: 12 }, observation }).allowed, false);
+  assert.equal(authorizer.authorize({ action: "click", candidate, observation: { ...observation, page: { url: "https://shop.example/products?page=2" } } }).allowed, false);
+  assert.equal(authorizer.authorize({ action: "navigate", candidate, observation }).allowed, false);
+});
 
 test("workflow synthesis binds a plan to trusted capabilities and current observed candidates once", async () => {
   const store = new DecisionEventStore({ databasePath: ":memory:" });
