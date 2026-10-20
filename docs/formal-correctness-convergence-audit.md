@@ -43,7 +43,7 @@ Recent behavior-preserving slices are separate commits:
 - `b2a37ea` — extract permission-gated visual assessment and candidate grounding while retaining fresh evidence checks and engine-owned policy admission.
 - `bfd839e` — extract compatibility API run listing, status, detail, and cancellation into an injected route module; preserve outer API authentication and server-owned task store/lifecycle dependencies.
 - `540514b` — extract registered pagination target resolution, authorized dispatch, and progress verification; retain the engine compatibility export and exact lease checks.
-- Authenticated compatibility bot, template, and region catalog reads now live in `routes/catalog.js`; capability routes retain priority, and the existing `/v3` authentication gate remains outside the module.
+- `b85aa06` — extract authenticated compatibility bot, template, and region catalog reads while retaining capability-route priority and the existing `/v3` authentication gate.
 - `b3f8f7f` — route `/v1/interventions/run-state` before the generic intervention-ID matcher so the run-state handler is reachable.
 - `b3c66a8` — give the 600-control retained-lookup fixture the existing maximum query timeout; production defaults are unchanged.
 
