@@ -7,6 +7,7 @@ import { runVisualCandidateProbe } from "./visualCandidateProbe.js";
 import { DialogState } from "./dialogState.js";
 import { TextInputController } from "./textInput.js";
 import { CandidateValidator } from "./candidateValidator.js";
+import { FrameSessionManager } from "./frameSessionManager.js";
 import { sanitizeUrl } from "./urlPrivacy.js";
 import { isOperatorProhibitedControl, operatorProhibitedControlReason } from "../runtime/controlRestrictions.js";
 import { isFileUploadDispatchToken } from "../runtime/fileUploadGrants.js";
@@ -29,16 +30,13 @@ function assertControlAllowed(candidate, actionType) {
   if (isOperatorProhibitedControl(candidate, actionType)) throw new Error(operatorProhibitedControlReason());
 }
 
-const IFRAME_TARGET_FILTER = [{ type: "iframe", exclude: false }];
-const MAX_OUT_OF_PROCESS_SESSIONS = 16;
 const ROOT_NETWORK_TOTAL_BUFFER_BYTES = 8 * 1024 * 1024;
 const ROOT_NETWORK_RESOURCE_BUFFER_BYTES = 512 * 1024;
-const FRAME_NETWORK_TOTAL_BUFFER_BYTES = 512 * 1024;
-const FRAME_NETWORK_RESOURCE_BUFFER_BYTES = 128 * 1024;
 
 export class BrowserSession {
   #textInput;
   #candidateValidator;
+  #frameSessionManager;
 
   constructor(target, { evidenceLimit = 12 } = {}) {
     this.target = target;
@@ -55,6 +53,12 @@ export class BrowserSession {
     this.#candidateValidator = new CandidateValidator(this, {
       assertTargetAttached: () => this.#assertTargetAttached()
     });
+    this.#frameSessionManager = new FrameSessionManager(this, {
+      onTargetDetached: reason => this.#markTargetDetached(reason),
+      onGenerationChange: () => { this.documentGeneration++; },
+      subscribeDomTree: client => this.#subscribeDomTree(client),
+      scheduleDomSubscription: (client, owner) => this.#scheduleDomSubscription(client, owner)
+    });
     this.documentGeneration = 0;
     this.observationGeneration = 0;
     this.visualProbeSequence = 0;
@@ -62,10 +66,6 @@ export class BrowserSession {
     this.attached = false;
     this.targetLifecycle = "created";
     this.targetDetachReason = null;
-    this.frameSessions = new Map();
-    this.frameAttachmentAvailable = false;
-    this.frameAttachmentError = null;
-    this.frameAttachmentOmitted = 0;
     this.activity = new BrowserActivityRecorder();
     this.networkObservationAvailable = false;
     this.domObservationAvailable = false;
@@ -76,6 +76,11 @@ export class BrowserSession {
     this.pendingDialog = null;
     this.disposers = [];
   }
+
+  get frameSessions() { return this.#frameSessionManager.frameSessions; }
+  get frameAttachmentAvailable() { return this.#frameSessionManager.attachmentAvailable; }
+  get frameAttachmentError() { return this.#frameSessionManager.attachmentError; }
+  get frameAttachmentOmitted() { return this.#frameSessionManager.attachmentOmitted; }
 
   async attach() {
     if (this.ownsTransport) await this.transport.connect();
@@ -89,8 +94,7 @@ export class BrowserSession {
           this.sessionId = attached.sessionId;
         }
       }
-      this.disposers.push(this.transport.on("Target.attachedToTarget", (params, parentSessionId) => this.#onTargetAttached(params, parentSessionId)));
-      this.disposers.push(this.transport.on("Target.detachedFromTarget", (params, parentSessionId) => this.#onTargetDetached(params, parentSessionId)));
+      this.disposers.push(...this.#frameSessionManager.subscribe());
       this.disposers.push(this.transport.on("CDP.connectionClosed", event => this.#markTargetDetached(event?.reason ?? "CDP connection closed.")));
       this.disposers.push(this.client.on("Inspector.detached", event => this.#markTargetDetached(event?.reason ?? "Inspector session detached.")));
       this.disposers.push(this.client.on("Page.lifecycleEvent", event => this.activity.recordLifecycleEvent("Page.lifecycleEvent", event)));
@@ -134,25 +138,14 @@ export class BrowserSession {
         await this.client.send("Network.enable", { maxTotalBufferSize: ROOT_NETWORK_TOTAL_BUFFER_BYTES, maxResourceBufferSize: ROOT_NETWORK_RESOURCE_BUFFER_BYTES });
         this.networkObservationAvailable = true;
       } catch { this.networkObservationAvailable = false; }
-      try {
-        await this.client.send("Target.setAutoAttach", {
-          autoAttach: true,
-          waitForDebuggerOnStart: false,
-          flatten: true,
-          filter: IFRAME_TARGET_FILTER
-        });
-        this.frameAttachmentAvailable = true;
-        await this.#awaitExistingFrameTargets();
-      } catch (error) {
-        this.frameAttachmentAvailable = false;
-        this.frameAttachmentError = error.message;
-      }
+      try { await this.#frameSessionManager.enable(); }
+      catch (error) { this.#frameSessionManager.markAttachmentFailure(error); }
       if (this.targetLifecycle === "detached") throw new Error("The authorized browser target detached during session setup.");
       this.targetLifecycle = "attached";
       return this;
     } catch (error) {
       for (const dispose of this.disposers.splice(0)) dispose();
-      await this.#detachFrameSessions();
+      await this.#frameSessionManager.detachAll();
       this.attached = false;
       this.targetLifecycle = "detached";
       this.targetDetachReason ??= String(error?.message ?? error).slice(0, 200);
@@ -162,65 +155,6 @@ export class BrowserSession {
       if (this.ownsTransport || this.ownsBrowserClient) await this.transport.close().catch(() => {});
       throw error;
     }
-  }
-
-  #isManagedParentSession(parentSessionId) {
-    const parent = parentSessionId ?? null;
-    if (parent === (this.sessionId ?? null)) return true;
-    return [...this.frameSessions.values()].some(frame => frame.sessionId === parent && frame.status !== "detached");
-  }
-
-  #onTargetAttached(params, parentSessionId) {
-    const targetInfo = params?.targetInfo;
-    const childSessionId = params?.sessionId;
-    if (!this.attached || targetInfo?.type !== "iframe" || typeof targetInfo.targetId !== "string" || typeof childSessionId !== "string" || !this.#isManagedParentSession(parentSessionId)) return;
-    if (this.frameSessions.has(targetInfo.targetId)) return;
-    if (this.frameSessions.size >= MAX_OUT_OF_PROCESS_SESSIONS) {
-      this.frameAttachmentOmitted++;
-      this.transport.send("Target.detachFromTarget", { sessionId: childSessionId }, parentSessionId ?? null).catch(() => {});
-      return;
-    }
-    const frame = {
-      targetId: targetInfo.targetId,
-      frameId: targetInfo.targetId,
-      parentFrameId: typeof targetInfo.parentFrameId === "string" ? targetInfo.parentFrameId : null,
-      targetInfo: structuredClone(targetInfo),
-      parentSessionId: parentSessionId ?? null,
-      sessionId: childSessionId,
-      client: null,
-      status: "attaching",
-      error: null,
-      ready: null,
-      domEnabled: false,
-      domObservationAvailable: false,
-      networkObservationAvailable: false,
-      domSubscriptionScheduled: false,
-      disposers: []
-    };
-    frame.client = createSessionClient(this.transport, () => frame.sessionId);
-    this.frameSessions.set(frame.targetId, frame);
-    this.documentGeneration++;
-    this.#bindFrameEvents(frame);
-    frame.ready = this.#initializeFrameTarget(frame).then(() => {
-      frame.status = "ready";
-    }).catch(error => {
-      frame.status = "failed";
-      frame.error = String(error?.message ?? error).slice(0, 300);
-      this.frameAttachmentError ??= frame.error;
-    });
-  }
-
-  #onTargetDetached(params, parentSessionId) {
-    if (this.sessionId && params?.sessionId === this.sessionId && (parentSessionId ?? null) === null) {
-      this.#markTargetDetached("Target.detachedFromTarget");
-      return;
-    }
-    const frame = [...this.frameSessions.values()].find(item => item.sessionId === params?.sessionId);
-    if (!frame || (parentSessionId ?? null) !== frame.parentSessionId) return;
-    frame.status = "detached";
-    for (const dispose of frame.disposers.splice(0)) dispose();
-    this.frameSessions.delete(frame.targetId);
-    this.documentGeneration++;
   }
 
   #markTargetDetached(reason) {
@@ -233,11 +167,7 @@ export class BrowserSession {
     this.domObservationAvailable = false;
     this.networkObservationAvailable = false;
     this.documentGeneration++;
-    for (const frame of this.frameSessions.values()) {
-      frame.status = "detached";
-      for (const dispose of frame.disposers.splice(0)) dispose();
-    }
-    this.frameSessions.clear();
+    this.#frameSessionManager.markParentDetached();
     this.activity.recordLifecycleEvent("Target.detachedFromTarget", { targetId: this.target.id, reason: this.targetDetachReason });
   }
 
@@ -252,112 +182,13 @@ export class BrowserSession {
     this.activeVisualProbe.controller.abort();
   }
 
-  #bindFrameEvents(frame) {
-    const client = frame.client;
-    const recordLifecycle = (method, event) => this.activity.recordLifecycleEvent(method, { ...event, frameTargetId: frame.targetId });
-    frame.disposers.push(client.on("Page.lifecycleEvent", event => recordLifecycle("Page.lifecycleEvent", event)));
-    frame.disposers.push(client.on("Page.frameNavigated", event => {
-      frame.frameId = event.frame?.id ?? frame.frameId;
-      recordLifecycle("Page.frameNavigated", event);
-      this.documentGeneration++;
-    }));
-    frame.disposers.push(client.on("Page.navigatedWithinDocument", event => {
-      recordLifecycle("Page.navigatedWithinDocument", event);
-      this.documentGeneration++;
-    }));
-    for (const method of ["Page.frameStartedLoading", "Page.frameStoppedLoading", "Page.domContentEventFired", "Page.loadEventFired"]) {
-      frame.disposers.push(client.on(method, event => recordLifecycle(method, event)));
-    }
-    frame.disposers.push(client.on("DOM.documentUpdated", event => {
-      this.documentGeneration++;
-      frame.domObservationAvailable = false;
-      recordLifecycle("DOM.documentUpdated", event);
-      this.#scheduleDomSubscription(client, frame);
-    }));
-    for (const method of ["DOM.childNodeInserted", "DOM.childNodeRemoved", "DOM.attributeModified", "DOM.attributeRemoved", "DOM.characterDataModified", "DOM.childNodeCountUpdated", "DOM.shadowRootPushed", "DOM.shadowRootPopped", "DOM.pseudoElementAdded", "DOM.pseudoElementRemoved", "DOM.inlineStyleInvalidated", "DOM.distributedNodesUpdated"]) {
-      frame.disposers.push(client.on(method, event => this.activity.recordDomMutation(method, { ...event, frameTargetId: frame.targetId })));
-    }
-    for (const method of ["Network.requestWillBeSent", "Network.responseReceived", "Network.dataReceived", "Network.loadingFinished", "Network.loadingFailed"]) {
-      frame.disposers.push(client.on(method, event => this.activity.recordNetworkEvent(method, event, { frameTargetId: frame.targetId })));
-    }
-  }
-
-  async #initializeFrameTarget(frame) {
-    const client = frame.client;
-    await client.send("Page.enable");
-    await client.send("DOM.enable");
-    frame.domEnabled = true;
-    await client.send("Runtime.enable");
-    frame.domObservationAvailable = await this.#subscribeDomTree(client);
-    try { await client.send("Page.setLifecycleEventsEnabled", { enabled: true }); }
-    catch { /* Some CDP-compatible targets omit optional lifecycle events. */ }
-    try {
-      await client.send("Network.enable", { maxTotalBufferSize: FRAME_NETWORK_TOTAL_BUFFER_BYTES, maxResourceBufferSize: FRAME_NETWORK_RESOURCE_BUFFER_BYTES });
-      frame.networkObservationAvailable = true;
-    } catch { frame.networkObservationAvailable = false; }
-    await client.send("Target.setAutoAttach", {
-      autoAttach: true,
-      waitForDebuggerOnStart: false,
-      flatten: true,
-      filter: IFRAME_TARGET_FILTER
-    });
-  }
-
-  async #awaitExistingFrameTargets(timeoutMs = 500) {
-    if (this.ownsTransport) return;
-    const { targetInfos = [] } = await this.transport.send("Target.getTargets");
-    const expected = targetInfos.filter(item => item?.type === "iframe" && item.parentId === this.target.id).map(item => item.targetId);
-    if (!expected.length) return;
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (expected.every(targetId => this.frameSessions.has(targetId))) return;
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
-  }
-
   async getOutOfProcessFrames({ onCdpRoundTrip } = {}) {
     this.#assertTargetAttached();
-    let expected = new Set(this.frameSessions.keys());
-    if (!this.ownsTransport && this.frameAttachmentAvailable) {
-      try {
-        const startedAt = Date.now();
-        let targetInfos = [];
-        try { ({ targetInfos = [] } = await this.transport.send("Target.getTargets")); }
-        finally { onCdpRoundTrip?.(Date.now() - startedAt); }
-        const iframeTargets = targetInfos.filter(item => item?.type === "iframe" && typeof item.targetId === "string");
-        const parents = new Set([this.target.id]);
-        let expanded = true;
-        while (expanded) {
-          expanded = false;
-          for (const info of iframeTargets) {
-            if (!parents.has(info.parentId) || parents.has(info.targetId)) continue;
-            parents.add(info.targetId);
-            expanded = true;
-          }
-        }
-        expected = new Set(iframeTargets.filter(info => parents.has(info.targetId)).map(info => info.targetId));
-      } catch { /* The browser target list is unavailable on some CDP endpoints. */ }
-    }
-    const deadline = Date.now() + 500;
-    while (Date.now() < deadline && [...expected].some(targetId => this.frameSessions.get(targetId)?.status !== "ready")) {
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
-    return [...expected].map(targetId => this.frameSessions.get(targetId)).filter(frame => frame?.status === "ready");
-  }
-
-  async #detachFrameSessions() {
-    for (const frame of [...this.frameSessions.values()].reverse()) {
-      try { await this.transport.send("Target.detachFromTarget", { sessionId: frame.sessionId }, frame.parentSessionId); }
-      catch { /* Detaching the selected parent target below also tears down owned descendants. */ }
-      for (const dispose of frame.disposers.splice(0)) dispose();
-    }
-    this.frameSessions.clear();
+    return this.#frameSessionManager.getOutOfProcessFrames({ onCdpRoundTrip });
   }
 
   networkClientForTarget(frameTargetId = null) {
-    if (!frameTargetId) return this.networkObservationAvailable ? this.client : null;
-    const frame = this.frameSessions.get(frameTargetId);
-    return frame?.status === "ready" && frame.networkObservationAvailable ? frame.client : null;
+    return this.#frameSessionManager.networkClientForTarget(frameTargetId);
   }
 
   async observe(options) {
@@ -1035,7 +866,7 @@ export class BrowserSession {
 
   async close() {
     this.#invalidateVisualProbe("target_closed");
-    await this.#detachFrameSessions();
+    await this.#frameSessionManager.detachAll();
     for (const dispose of this.disposers.splice(0)) dispose();
     this.attached = false;
     this.targetLifecycle = "closed";
