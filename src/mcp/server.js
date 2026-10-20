@@ -9,8 +9,6 @@ import { selectBrowserSession } from "./session-selection.js";
 import { createDiagnosticContract, AUTHORITY, OPERATION, SENSITIVITY } from "../diagnostics/contracts.js";
 import { cloudAgentAdapterFromEnv } from "../diagnostics/adapters/cloudAgentApi.js";
 import { DiagnosticCorrelator } from "../diagnostics/correlator.js";
-import { DiagnosticReport, FINDING_LEVEL, deriveRunInvestigationStatus } from "../diagnostics/report.js";
-import { buildDurableRunReport } from "../testing/durableRunReport.js";
 import { RunStateStore } from "../testing/runState.js";
 import { InterventionStore, InterventionWatcher } from "../runtime/interventions.js";
 import { createInterventionTools } from "../api/intervention-tools.js";
@@ -489,55 +487,6 @@ async function callTool(name, args) {
       ...(review ? { jevReview: review } : {}),
       results
     };
-  }
-  if (name === "get_test_report") {
-    const run = testRuns.get(args.runId);
-    if (!run) {
-      const durableState = await runStateStore.getFresh(args.runId);
-      if (!durableState) throw new Error(`No test run found for runId '${args.runId}'.`);
-      return buildDurableRunReport(durableState);
-    }
-    const receipt = await run.runPromise;
-    const durableState = await runStateStore.getFresh(args.runId).catch(() => null);
-    const report = new DiagnosticReport({ runId: args.runId, title: `Test run: ${receipt.workflowName}` });
-    report.setCorrelationSummary(run.correlator.summary());
-    for (const step of receipt.steps) {
-      const level = step.status === "PASS" ? FINDING_LEVEL.CONFIRMED
-        : step.status === "FAIL" ? FINDING_LEVEL.LIKELY
-        : step.status === "BLOCKED" ? FINDING_LEVEL.BLOCKED
-        : FINDING_LEVEL.INSUFFICIENT;
-      report.addFinding({ level, subject: `Step ${step.stepId} (${step.type})`, description: step.reason, evidenceIds: step.evidenceIds });
-    }
-    const cloudDiagnosticSources = new Set((run.cloudAgentEvidenceResults ?? []).map(result => result.sourceId));
-    for (const entry of run.collector.getSnapshots()) {
-      if (cloudDiagnosticSources.has(entry.sourceId)) continue;
-      report.logSourceAccess({ sourceId: entry.sourceId, operation: entry.operation, status: "ok" });
-    }
-    for (const result of run.cloudAgentEvidenceResults ?? []) {
-      report.logSourceAccess({
-        sourceId: result.sourceId,
-        operation: OPERATION.READ_SCOPED,
-        status: result.status,
-        ...(result.status === "error" ? { error: result.error } : {})
-      });
-    }
-    const assessment = deriveRunInvestigationStatus({
-      receipt: receipt.toObject(),
-      durableStateAvailable: durableState !== null,
-      durableRunStatus: durableState?.status ?? null,
-      unresolvedOperations: (durableState?.pendingOperations ?? []).filter(operation => ["RESERVED", "DISPATCHED", "UNCERTAIN"].includes(operation.status)),
-      testOwnedResources: durableState?.testOwnedResources ?? [],
-      integration: run.integration?.verificationRequired ? {
-        ...run.integration,
-        outcomeStatus: run.cloudAgentOutcome?.status,
-        cloudAgentRunId: run.cloudAgentRunId,
-        correlationStrength: run.cloudAgentCorrelation?.strength
-      } : null,
-      diagnosticResults: run.cloudAgentEvidenceResults ?? []
-    });
-    report.setInvestigationStatus(assessment.status);
-    for (const limitation of assessment.limitations) report.addLimitation(limitation);
-    return report.redacted();
   }
   const session = selectBrowserSession(sessions, args.targetId);
   if (name === "request_evidence_release") return await evidenceReleaseTools.requestEvidenceRelease(session, args);

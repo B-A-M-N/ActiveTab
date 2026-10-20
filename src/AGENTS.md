@@ -77,7 +77,7 @@ node --test test/mcp-evidence-release.test.js test/mcp.test.js
 | `src/api/routes/` | Incrementally extracted endpoint-family handlers; no alternate policy or run composition |
 | `src/mcp/` | MCP tool composition, exact session selection, and separately granted sensitive evidence release |
 | `src/mcp/browserTools.js` | Injected tab lifecycle and browser observation handlers; click dispatch remains behind the shared lease and authorized action path |
-| `src/mcp/tools/diagnosticTools.js` | Read-only run diagnostics and failure investigation over server-owned runs and sessions |
+| `src/mcp/tools/diagnosticTools.js` | Read-only run diagnostics, failure investigation, and reports over server-owned runs and sessions |
 | `src/mcp/tools/navigationTools.js` | MCP navigation, discovery, and visible-record reads through shared run and lease services |
 | `src/mcp/tools/workflowTools.js` | MCP test-run start, resume, status, and cancellation over `ApplicationRunService` and durable run state |
 | `src/mcp/evidenceReleaseTools.js` | Profile-bound evidence-release requests, grant verification, data retrieval, and byte charging |
