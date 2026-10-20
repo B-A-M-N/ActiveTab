@@ -8,7 +8,7 @@ import { normalizeOrigin, resolveObservedApplication } from "../environments/mod
 import { isOperatorProhibitedNavigation } from "../runtime/controlRestrictions.js";
 import { executeAuthorizedAction } from "../runtime/authorizedExecutor.js";
 import { adjudicatePreActionReview } from "../decisions/adjudication.js";
-import { hasReviewIntent, selectAutomaticNavigationRoute, selectPreActionDecisionRoute } from "../decisions/callPolicy.js";
+import { hasReviewIntent, selectPreActionDecisionRoute } from "../decisions/callPolicy.js";
 import { matchesScrollTargetSignature, observationSemanticFingerprint, observationStateFingerprint, routeFingerprint, scrollPositionFraction, scrollPositionMatches, scrollTargetSignature, targetSignature, visibleCandidatesFingerprint } from "../state/workflows.js";
 import { createConfiguredWorkflowSynthesizer } from "./workflowSynthesizer.js";
 import { createExtractionWorkflowCapabilities, createGenericWorkflowCapabilities, createObservedSearchWorkflowCapabilities, createProfileFormWorkflowCapabilities } from "./workflowCapabilities.js";
@@ -16,17 +16,17 @@ import { WorkflowGraphPlanner } from "./workflowPlanner.js";
 import { requiresCompositeReadWorkflow, resolveTaskIntent } from "./taskIntentResolver.js";
 import { hasVerifiedOutcome, pageLabelHashes } from "./outcomeVerifier.js";
 import { bindVisualEvidence, isBoundVisualEvidence } from "./visualEvidence.js";
-import { reobserveFromRetainedLookup } from "./retainedLookupFallback.js";
 import { createNavigationRunContext } from "./runContext.js";
 import { RecoveryCoordinator } from "./recoveryCoordinator.js";
 import { ReplayCoordinator } from "./replayCoordinator.js";
 import { ActionAttemptCoordinator } from "./actionAttemptCoordinator.js";
-import { createPlanningOptions, filterPlanningObservation } from "./planningCycle.js";
+import { filterPlanningObservation } from "./planningCycle.js";
 import { expandTaskScopeObservation, shouldExpandTaskScope } from "./planningEvidence.js";
 import { createWorkflowRoutePlanner } from "./workflowRoutePlanner.js";
 import { createVisualDecisionCoordinator } from "./visualDecisionCoordinator.js";
 import { advanceRegisteredPagination, createRegisteredPaginationButtonAuthorizer } from "./registeredPagination.js";
 import { createNavigationRunIntent } from "./runIntent.js";
+import { coordinateProviderPlan } from "./providerPlanCoordinator.js";
 
 export { advanceRegisteredPagination };
 
@@ -1139,209 +1139,58 @@ export class NavigationEngine {
       let modelPlannerDecisionId = null;
       let routedVisualReview = null;
       let visualHandoffSuggested = false;
+      const providerPlanState = {
+        planningObservation,
+        candidateExpansionAttempted,
+        plan,
+        modelPlannerDecisionId,
+        routedVisualReview,
+        visualHandoffSuggested
+      };
+      const syncProviderPlanState = () => {
+        planningObservation = providerPlanState.planningObservation;
+        candidateExpansionAttempted = providerPlanState.candidateExpansionAttempted;
+        plan = providerPlanState.plan;
+        modelPlannerDecisionId = providerPlanState.modelPlannerDecisionId;
+        routedVisualReview = providerPlanState.routedVisualReview;
+        visualHandoffSuggested = providerPlanState.visualHandoffSuggested;
+      };
       try {
-        const planningOptions = createPlanningOptions({
+        await coordinateProviderPlan({
+          goal,
+          planner,
+          configuredPlanner: this.planner,
+          plannerMode: this.plannerMode,
+          workflowModeActive,
+          explicitReadWorkflowRequest,
+          resumeState,
+          effectiveWorkflowIntent,
+          deterministicPlanner: this.deterministicPlanner,
+          secondaryPlannerAvailable: this.secondaryPlannerAvailable,
+          decisionRuntime: this.decisionRuntime,
+          decisionEpisodeId,
+          decisionRunId,
+          decisionStepId,
+          session: this.session,
+          state: providerPlanState,
           excludedIdentities,
           excludedScrollIdentities,
-          maxScrolls: this.maxScrolls,
           scrollActionsUsed,
           scrollConvergenceStates,
+          maxScrolls: this.maxScrolls,
           signal: abortSignal,
-          inputBindings
+          inputBindings,
+          searchPhrase,
+          getLatestObservation: () => latest,
+          setLatestObservation,
+          filterPlanning,
+          captureVisualObservation,
+          classifyAmbiguousPage,
+          groundAmbiguousTarget
         });
-        if (workflowModeActive || this.plannerMode !== "auto") {
-          if (this.plannerMode === "model" && planner?.plannerRole) {
-            const visualEvidenceUsed = planner.requiresScreenshot === true
-              && isBoundVisualEvidence(planningObservation, planningObservation.visualEvidence);
-            modelPlannerDecisionId = randomUUID();
-            this.decisionRuntime?.recordInferenceRoute?.({
-              episodeId: decisionEpisodeId,
-              runId: decisionRunId,
-              stepId: decisionStepId(),
-              decisionId: modelPlannerDecisionId,
-              observationId: planningObservation.evidenceId,
-              route: "semantic_only",
-              reasonCode: "explicit_model_planner",
-              providers: ["secondary"],
-              visualEvidenceUsed
-            });
-          }
-          plan = await planner.plan(goal, planningObservation, planningOptions);
-        } else if (explicitReadWorkflowRequest && resumeState) {
-          const decisionId = randomUUID();
-          this.decisionRuntime?.recordInferenceRoute?.({
-            episodeId: decisionEpisodeId, runId: decisionRunId, stepId: decisionStepId(),
-            decisionId, observationId: planningObservation.evidenceId,
-            route: "abstain", reasonCode: "read_output_not_retained_for_resume",
-            providers: ["deterministic"], visualEvidenceUsed: false
-          });
-          plan = {
-            status: "ambiguous",
-            candidates: [],
-            reason: "Read-only extraction output is not retained in task continuation state; start a new task to rebuild it from fresh evidence. No browser action was selected."
-          };
-        } else {
-          let localPlan = await this.deterministicPlanner.plan(goal, planningObservation, planningOptions);
-          if (localPlan.status === "ambiguous" && !candidateExpansionAttempted
-            && latest.candidateCoverage?.pageCoverage === "partial") {
-            const expectedTargets = goalExpectation(goal).targetTokens;
-            const fallback = await reobserveFromRetainedLookup({
-              session: this.session,
-              goal,
-              observation: latest,
-              targetTokens: expectedTargets
-            });
-            if (fallback.lookupTelemetry && this.decisionRuntime?.recordTargetLookup && decisionEpisodeId) {
-              try {
-                this.decisionRuntime.recordTargetLookup({
-                  episodeId: decisionEpisodeId,
-                  runId: decisionRunId,
-                  stepId: decisionStepId(),
-                  decisionId: randomUUID(),
-                  observationId: latest.evidenceId,
-                  ...fallback.lookupTelemetry
-                });
-              } catch { /* lookup telemetry never changes target admission */ }
-            }
-            candidateExpansionAttempted = fallback.status !== "not_needed";
-            if (fallback.status === "refreshed") {
-              setLatestObservation(fallback.observation);
-              planningObservation = filterPlanning(latest);
-              localPlan = await this.deterministicPlanner.plan(goal, planningObservation, planningOptions);
-            }
-          }
-          if (searchPhrase) {
-            const routeDecisionId = randomUUID();
-            this.decisionRuntime?.recordInferenceRoute?.({
-              episodeId: decisionEpisodeId,
-              runId: decisionRunId,
-              stepId: decisionStepId(),
-              decisionId: routeDecisionId,
-              observationId: planningObservation.evidenceId,
-              route: "deterministic",
-              reasonCode: "caller_bound_search_primitive",
-              providers: ["deterministic"],
-              visualEvidenceUsed: false
-            });
-            plan = localPlan;
-          } else {
-          const rawTargetRoleCode = goalExpectation(goal).targetTokens.slice(0, 10).join("_");
-          const targetRoleCode = /^[a-z0-9][a-z0-9_]{0,95}$/u.test(rawTargetRoleCode) ? rawTargetRoleCode : "";
-          const visualAssessmentAvailable = this.decisionRuntime?.jevClient?.allowImages === true
-            && typeof this.decisionRuntime?.visualDecisionService?.classifyPage === "function";
-          const visualGroundingAvailable = this.decisionRuntime?.jevClient?.allowImages === true
-            && typeof this.decisionRuntime?.visualDecisionService?.groundTarget === "function"
-            && targetRoleCode.length > 0;
-          const route = selectAutomaticNavigationRoute({
-            goal,
-            deterministicPlan: localPlan,
-            intentShape: effectiveWorkflowIntent?.cardinality ?? "unknown",
-            semanticAvailable: this.secondaryPlannerAvailable,
-            visualAssessmentAvailable,
-            visualGroundingAvailable
-          });
-          const routeDecisionId = randomUUID();
-          if (route.route === "deterministic" || route.route === "abstain") {
-            this.decisionRuntime?.recordInferenceRoute?.({
-              episodeId: decisionEpisodeId,
-              runId: decisionRunId,
-              stepId: decisionStepId(),
-              decisionId: routeDecisionId,
-              observationId: planningObservation.evidenceId,
-              route: route.route,
-              reasonCode: route.reasonCode,
-              providers: route.providers,
-              visualEvidenceUsed: route.visualEvidenceUsed
-            });
-          }
-          if (route.route === "deterministic") {
-            plan = localPlan;
-          } else if (route.route === "abstain") {
-            plan = {
-              status: "ambiguous",
-              candidates: localPlan.candidates ?? [],
-              expected: localPlan.expected,
-              reason: "The task has no trusted atomicity contract and no configured secondary planner is available; no browser action was selected."
-            };
-          } else if (route.route === "jev_only") {
-            routedVisualReview = route.reasonCode === "ambiguous_visual_target_grounding"
-              ? await groundAmbiguousTarget(planningObservation, localPlan, targetRoleCode)
-              : await classifyAmbiguousPage(planningObservation);
-            if (routedVisualReview?.observation?.evidenceId) {
-              setLatestObservation(routedVisualReview.observation);
-              planningObservation = filterPlanning(latest);
-              if (routedVisualReview.imageEvidence) {
-                planningObservation.visualEvidence = routedVisualReview.imageEvidence;
-                planningObservation.screenshotBase64 = routedVisualReview.imageEvidence.screenshotBase64;
-              }
-              localPlan = await this.deterministicPlanner.plan(goal, planningObservation, planningOptions);
-            }
-            if (routedVisualReview?.candidate && routedVisualReview.grounding?.status === "grounded") {
-              plan = {
-                status: "planned",
-                action: { type: "click", target: routedVisualReview.candidate },
-                expected: localPlan.expected,
-                confidence: Math.min(0.95, routedVisualReview.grounding.scores.boxConfidence, routedVisualReview.grounding.scores.presenceProbability),
-                reasoning: "Jev visually grounded one candidate already selected by deterministic matching; the exact identity was freshly re-resolved before policy admission."
-              };
-            }
-            const pageAnswer = routedVisualReview?.assessment?.answers?.page_state;
-            visualHandoffSuggested = ["login", "challenge"].includes(pageAnswer?.choice)
-              && (pageAnswer.probabilities?.[pageAnswer.choice] ?? 0) >= 0.8;
-            if (plan?.status === "planned") {
-              // The advisory grounding selected only among current observed
-              // candidates. The common action policy and executor still gate it.
-            } else if (visualHandoffSuggested || !this.secondaryPlannerAvailable) {
-              plan = {
-                ...localPlan,
-                status: "ambiguous",
-                reason: visualHandoffSuggested
-                  ? "Visual assessment recommends a manual handoff for the apparent authentication or challenge state; no action was dispatched."
-                  : localPlan.reason
-              };
-            } else {
-              const escalationId = randomUUID();
-              this.decisionRuntime?.recordInferenceRoute?.({
-                episodeId: decisionEpisodeId, runId: decisionRunId, stepId: decisionStepId(),
-                decisionId: escalationId, observationId: planningObservation.evidenceId,
-                route: "semantic_only", reasonCode: "visual_state_did_not_resolve_navigation",
-                providers: ["secondary"], visualEvidenceUsed: this.planner.requiresScreenshot === true && isBoundVisualEvidence(planningObservation, planningObservation.visualEvidence)
-              });
-              if (this.planner.requiresScreenshot === true && !isBoundVisualEvidence(planningObservation, planningObservation.visualEvidence)) {
-                const captured = await captureVisualObservation(planningObservation);
-                setLatestObservation(captured.observation);
-                planningObservation = filterPlanning(latest);
-                if (captured.imageEvidence) {
-                  planningObservation.visualEvidence = captured.imageEvidence;
-                  planningObservation.screenshotBase64 = captured.imageEvidence.screenshotBase64;
-                }
-              }
-              modelPlannerDecisionId = escalationId;
-              plan = await this.planner.plan(goal, planningObservation, planningOptions);
-            }
-          } else {
-            if (this.planner.requiresScreenshot === true) {
-              const captured = await captureVisualObservation(planningObservation);
-              setLatestObservation(captured.observation);
-              planningObservation = filterPlanning(latest);
-              if (captured.imageEvidence) {
-                planningObservation.visualEvidence = captured.imageEvidence;
-                planningObservation.screenshotBase64 = captured.imageEvidence.screenshotBase64;
-              }
-            }
-            this.decisionRuntime?.recordInferenceRoute?.({
-              episodeId: decisionEpisodeId, runId: decisionRunId, stepId: decisionStepId(),
-              decisionId: routeDecisionId, observationId: planningObservation.evidenceId,
-              route: route.route, reasonCode: route.reasonCode, providers: route.providers,
-              visualEvidenceUsed: this.planner.requiresScreenshot === true
-                && isBoundVisualEvidence(planningObservation, planningObservation.visualEvidence)
-            });
-            modelPlannerDecisionId = routeDecisionId;
-            plan = await this.planner.plan(goal, planningObservation, planningOptions);
-          }
-          }
-        }
+        syncProviderPlanState();
       } catch (error) {
+        syncProviderPlanState();
         if (isAbortError(error)) return await canceledBeforeDispatch();
         if (modelPlannerDecisionId && this.decisionRuntime?.recordPlannerFailure) {
           const failureCode = ["configuration", "privacy", "size", "timeout", "transport", "http", "schema", "response_too_large", "refusal", "budget_exhausted"].includes(error?.kind)

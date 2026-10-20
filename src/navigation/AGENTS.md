@@ -77,6 +77,7 @@ node --test test/navigation-coordinators.test.js test/navigation-context.test.js
 |------|---------|
 | `actionAttemptCoordinator.js` | Durable pending and completed attempt bookkeeping; no browser dispatch |
 | `planningCycle.js` | Candidate and scroll exclusion projection plus bounded planner option construction; no browser dispatch |
+| `providerPlanCoordinator.js` | One provider-plan decision cycle across deterministic, semantic, visual, and workflow routes; returns bounded plan state and retains failure lineage without dispatch |
 | `planningEvidence.js` | One bounded task-scope observation expansion with same-target freshness acceptance; no action or authorization authority |
 | `workflowRoutePlanner.js` | Selects workflow planner construction or explicit abstention after trusted task resolution; no observation or dispatch authority |
 | `runIntent.js` | Classifies run-local search/read and workflow-mode hints; it creates no capability and dispatches no action |
