@@ -6,16 +6,14 @@ import { brokerSocketPath, stateDirectory } from "../extension/paths.js";
 import { WorkflowStore } from "../state/workflows.js";
 import { McpTaskJournalStore } from "../state/mcpTaskJournals.js";
 import { selectBrowserSession } from "./session-selection.js";
-import { runMcpGoal } from "./runGoal.js";
 import { createDiagnosticContract, AUTHORITY, OPERATION, SENSITIVITY } from "../diagnostics/contracts.js";
 import { cloudAgentAdapterFromEnv } from "../diagnostics/adapters/cloudAgentApi.js";
 import { DiagnosticCorrelator } from "../diagnostics/correlator.js";
 import { DiagnosticReport, FINDING_LEVEL, deriveRunInvestigationStatus } from "../diagnostics/report.js";
 import { receiptFromRunState } from "../testing/receipts.js";
 import { buildDurableRunReport } from "../testing/durableRunReport.js";
-import { RunStateStore, requestRunCancellation, withTargetExecutionLease } from "../testing/runState.js";
+import { RunStateStore, requestRunCancellation } from "../testing/runState.js";
 import { ApplicationRunService } from "../navigation/applicationRunService.js";
-import { ApplicationDiscoveryEngine } from "../discovery/engine.js";
 import { InterventionStore, InterventionWatcher } from "../runtime/interventions.js";
 import { createInterventionTools } from "../api/intervention-tools.js";
 import { AuthorizationGrantStore } from "../runtime/approvals.js";
@@ -39,6 +37,7 @@ import { FileUploadGrantStore } from "../runtime/fileUploadGrants.js";
 import { createEvidenceReleaseTools } from "./evidenceReleaseTools.js";
 import { createBrowserToolHandlers } from "./browserTools.js";
 import { createDiagnosticToolHandlers } from "./tools/diagnosticTools.js";
+import { createNavigationToolHandlers } from "./tools/navigationTools.js";
 
 const modelPreflight = await preflightModelCapabilities();
 writeModelPreflightSummary(modelPreflight);
@@ -102,6 +101,19 @@ const browserToolRuntime = createBrowserToolHandlers({
 });
 const browserToolHandlers = browserToolRuntime.handlers;
 const diagnosticToolHandlers = createDiagnosticToolHandlers({ testRuns, sessions, runStateStore });
+const navigationToolHandlers = createNavigationToolHandlers({
+  sessions,
+  principalId: mcpPrincipalId,
+  loadEnvironmentProfile,
+  taskJournalStore,
+  workflowStore,
+  decisionRuntime,
+  capabilityRegistry,
+  capabilityService,
+  authorizeExtractionField,
+  authorizeExtractionRelease,
+  runStateStore
+});
 const grantStore = new AuthorizationGrantStore({ trustedIssuer: process.env.ACTIVETAB_TRUSTED_ISSUER ?? "activetab-mcp" });
 const interventionCtx = {
   grantStore,
@@ -293,6 +305,7 @@ async function callTool(name, args) {
   if (Object.hasOwn(interventionTools, name)) return await interventionTools[name](args);
   if (Object.hasOwn(browserToolHandlers, name)) return await browserToolHandlers[name](args);
   if (Object.hasOwn(diagnosticToolHandlers, name)) return await diagnosticToolHandlers[name](args);
+  if (Object.hasOwn(navigationToolHandlers, name)) return await navigationToolHandlers[name](args);
   if (name === "get_runtime_capabilities") {
     const routeFor = roles => roles.map(role => modelPreflight.routes.find(route => route.role === role)).find(Boolean) ?? null;
     const secondary = routeFor(["planner", "semantic", "workflow"]);
@@ -606,19 +619,6 @@ async function callTool(name, args) {
       results
     };
   }
-  if (name === "discover_application") {
-    const session = selectBrowserSession(sessions, args.targetId);
-    return await withTargetExecutionLease(runStateStore, session, `mcp-discovery-${randomUUID()}`, async lease => {
-      const engine = new ApplicationDiscoveryEngine({
-        session,
-        maxSteps: args.maxSteps ?? 8,
-        maxLinksPerStep: args.maxLinksPerStep ?? 4,
-        decisionRuntime,
-        assertExecutionLease: lease.assertCurrent
-      });
-      return await engine.discover();
-    });
-  }
   if (name === "get_test_report") {
     const run = testRuns.get(args.runId);
     if (!run) {
@@ -669,34 +669,8 @@ async function callTool(name, args) {
     return report.redacted();
   }
   const session = selectBrowserSession(sessions, args.targetId);
-  if (name === "read_page_records") {
-    const loaded = await loadEnvironmentProfile(args.profileId);
-    return await capabilityService.readObservedRecords({
-      session,
-      environment: loaded?.environment ?? null,
-      principalId: mcpPrincipalId,
-      ...(args.candidateId ? { candidateId: args.candidateId } : {}),
-      requestedFields: args.fields,
-      maxRecords: args.maxRecords ?? 100,
-      uniqueBy: args.uniqueBy ?? []
-    });
-  }
   if (name === "request_evidence_release") return await evidenceReleaseTools.requestEvidenceRelease(session, args);
   if (name === "release_evidence") return await evidenceReleaseTools.releaseEvidence(session, args);
-  if (name === "run_goal") {
-    const selectedProfile = await loadEnvironmentProfile(args.profileId);
-    return await runMcpGoal(session, args, {
-      journalStore: taskJournalStore,
-      workflowStore,
-      decisionRuntime,
-      environment: selectedProfile?.environment ?? null,
-      capabilityRegistry,
-      capabilityService,
-      authorizeExtractionField,
-      authorizeExtractionRelease,
-      runStateStore
-    });
-  }
   throw new Error(`Unknown tool: ${name}`);
 }
 
