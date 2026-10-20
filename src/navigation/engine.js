@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { configuredPlanner, DeterministicPlanner, goalExpectation } from "./planner.js";
-import { createSearchSubmitAuthorizer, isSearchFieldCandidate, searchPhraseFromGoal, searchReadRequestFromGoal, SEARCH_SUBMIT_OPERATION_ID } from "./search.js";
+import { isSearchFieldCandidate, SEARCH_SUBMIT_OPERATION_ID } from "./search.js";
 import { authorizePlannedAction } from "./actionPolicy.js";
 import { classifyHumanHandoff } from "./handoff.js";
 import { newTaskState, taskGoalFingerprint, updateTaskJournal } from "../state/journal.js";
@@ -13,7 +13,7 @@ import { matchesScrollTargetSignature, observationSemanticFingerprint, observati
 import { createConfiguredWorkflowSynthesizer } from "./workflowSynthesizer.js";
 import { createExtractionWorkflowCapabilities, createGenericWorkflowCapabilities, createObservedSearchWorkflowCapabilities, createProfileFormWorkflowCapabilities } from "./workflowCapabilities.js";
 import { WorkflowGraphPlanner } from "./workflowPlanner.js";
-import { classifyTaskRequest, requiresCompositeReadWorkflow, resolveTaskIntent } from "./taskIntentResolver.js";
+import { requiresCompositeReadWorkflow, resolveTaskIntent } from "./taskIntentResolver.js";
 import { hasVerifiedOutcome, pageLabelHashes } from "./outcomeVerifier.js";
 import { bindVisualEvidence, isBoundVisualEvidence } from "./visualEvidence.js";
 import { reobserveFromRetainedLookup } from "./retainedLookupFallback.js";
@@ -26,6 +26,7 @@ import { expandTaskScopeObservation, shouldExpandTaskScope } from "./planningEvi
 import { createWorkflowRoutePlanner } from "./workflowRoutePlanner.js";
 import { createVisualDecisionCoordinator } from "./visualDecisionCoordinator.js";
 import { advanceRegisteredPagination, createRegisteredPaginationButtonAuthorizer } from "./registeredPagination.js";
+import { createNavigationRunIntent } from "./runIntent.js";
 
 export { advanceRegisteredPagination };
 
@@ -155,14 +156,20 @@ export class NavigationEngine {
       }
     };
     throwIfAborted();
-    const searchReadRequest = searchReadRequestFromGoal(goal);
-    const searchPhrase = searchReadRequest?.query ?? searchPhraseFromGoal(goal);
-    const taskRequest = classifyTaskRequest(goal, { suppliedIntent: workflowIntent });
-    const explicitReadWorkflowRequest = taskRequest.explicitReadRequest;
-    const workflowModeActive = (!resumeState || Boolean(this.resumeWorkflowCheckpoint))
-      && ((this.plannerMode === "workflow" && (!searchPhrase || Boolean(searchReadRequest)))
-        || (this.plannerMode === "auto" && (explicitReadWorkflowRequest || taskRequest.compoundRequest || taskRequest.typedWorkflowIntent)));
-    const searchSubmitAuthorizer = searchPhrase ? createSearchSubmitAuthorizer(searchPhrase) : null;
+    const {
+      searchReadRequest,
+      searchPhrase,
+      taskRequest,
+      explicitReadWorkflowRequest,
+      workflowModeActive,
+      searchSubmitAuthorizer
+    } = createNavigationRunIntent({
+      goal,
+      suppliedIntent: workflowIntent,
+      plannerMode: this.plannerMode,
+      resumeState,
+      canResumeWorkflowCheckpoint: Boolean(this.resumeWorkflowCheckpoint)
+    });
     const state = resumeState ?? newTaskState(
       goal,
       this.session.target,
