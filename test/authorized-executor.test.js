@@ -93,6 +93,9 @@ test("same-origin GET query fields require the exact caller search contract for 
   });
   assert.equal(refused.dispatched, false);
   assert.equal(refused.category, "operation_contract_refused");
+  assert.equal(refused.dispatchDisposition, "refused_pre_dispatch");
+  assert.equal(refused.browserEffectPossible, false);
+  assert.equal(refused.retryWithoutReconciliation, true);
   assert.deepEqual(foreignSession.dispatched, []);
 
   for (const [suffix, overrides] of [
@@ -131,6 +134,9 @@ test("sensitive actions are refused before dispatch through the authorized execu
   });
   assert.equal(result.dispatched, false, "Policy must block sensitive actions before dispatch.");
   assert.equal(result.authorized, false);
+  assert.equal(result.dispatchDisposition, "refused_pre_dispatch");
+  assert.equal(result.browserEffectPossible, false);
+  assert.equal(result.retryWithoutReconciliation, true);
   assert.equal(session.dispatched.length, 0, "No effectful CDP dispatch may occur.");
   assert.equal(session.client.sent, undefined, "No CDP command may be sent.");
 });
@@ -148,6 +154,8 @@ test("pre-dispatch review refusal is enforced before the browser effect", async 
   });
   assert.equal(result.dispatched, false);
   assert.equal(result.category, "independent_review_required");
+  assert.equal(result.dispatchDisposition, "refused_pre_dispatch");
+  assert.equal(result.browserEffectPossible, false);
   assert.equal(session.dispatched.length, 0);
   assert.equal(session.client.sent, undefined);
 });
@@ -349,6 +357,9 @@ test("a CDP error after dispatch begins returns an uncertain outcome", async () 
   assert.equal(result.authorized, true);
   assert.equal(result.dispatched, false);
   assert.equal(result.effectStatus, "uncertain");
+  assert.equal(result.dispatchDisposition, "uncertain");
+  assert.equal(result.browserEffectPossible, true);
+  assert.equal(result.retryWithoutReconciliation, false);
 });
 
 test("attached targets refuse dispatch when no durable target lease is supplied", async () => {
@@ -360,6 +371,8 @@ test("attached targets refuse dispatch when no durable target lease is supplied"
   const result = await executeAuthorizedAction({ session, action: "click", candidate });
   assert.equal(result.dispatched, false);
   assert.equal(result.category, "target_lease_unavailable");
+  assert.equal(result.dispatchDisposition, "refused_pre_dispatch");
+  assert.equal(result.browserEffectPossible, false);
   assert.deepEqual(session.dispatched, []);
 });
 
@@ -466,6 +479,10 @@ test("a composite select refuses an unexpected second control after opening the 
     assertExecutionLease: fixtureLease
   });
   assert.equal(result.status, "partial");
+  assert.equal(result.dispatchDisposition, "partially_dispatched_uncertain");
+  assert.equal(result.dispatchStatus, "uncertain");
+  assert.equal(result.browserEffectPossible, true);
+  assert.equal(result.retryWithoutReconciliation, false);
   assert.equal(result.dispatchResult.selectionStatus, "refused_after_open");
   assert.deepEqual(session.dispatched, [["open", combobox.identity]], "the second control is refused before its click dispatch");
   assert.deepEqual(operationAuthorizer.dispatchStatuses, ["uncertain"], "a partial composite effect cannot advance the typed operation sequence as complete");

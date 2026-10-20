@@ -12,6 +12,7 @@ ActiveTab's browser control plane. Every effectful browser action ultimately dis
 
 - No CDP target control without independently verified authorization.
 - Stale document generations and revoked or detached leases fail closed.
+- The native click path may report `refused_pre_dispatch` for an exact occlusion check only before sending mouse input. Once any input dispatch starts, transport errors remain uncertain; error wording never proves that no input was sent.
 - Closing a BrowserSession or restarting the MCP broker disposes only the local CDP session; the extension's explicitly authorized tab lease persists for same-browser-session reconnect. Only `detach_tab` or the extension's explicit Detach action revokes that lease.
 - Candidates must match the current observation's target, document generation, and freshness state.
 - Candidate link projections may expose `opensNewTarget` as a boolean. Following a link that declares another target is refused by default because its browser behavior can create an unleased target. A trusted run may explicitly select same-target navigation for an observed root-frame anchor; the session revalidates the exact current destination, document generation, and lease before `Page.navigate`.

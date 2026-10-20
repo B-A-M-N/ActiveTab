@@ -11,6 +11,7 @@ import { FrameSessionManager } from "./frameSessionManager.js";
 import { NativeControlsController } from "./nativeControls.js";
 import { sanitizeUrl } from "./urlPrivacy.js";
 import { isOperatorProhibitedControl, operatorProhibitedControlReason } from "../runtime/controlRestrictions.js";
+import { DISPATCH_DISPOSITION } from "../runtime/dispatchDisposition.js";
 import { isFileUploadDispatchToken } from "../runtime/fileUploadGrants.js";
 
 function createSessionClient(transport, sessionId) {
@@ -29,6 +30,13 @@ function createSessionClient(transport, sessionId) {
 
 function assertControlAllowed(candidate, actionType) {
   if (isOperatorProhibitedControl(candidate, actionType)) throw new Error(operatorProhibitedControlReason());
+}
+
+function preDispatchRefusal(reasonCode, message) {
+  return Object.assign(new Error(message), {
+    dispatchDisposition: DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH,
+    reasonCode
+  });
 }
 
 const ROOT_NETWORK_TOTAL_BUFFER_BYTES = 8 * 1024 * 1024;
@@ -312,7 +320,7 @@ export class BrowserSession {
     if (!current?.connected) throw new Error("The selected page element became stale before action.");
     if (!current.visible) throw new Error("The selected page element is no longer visible or interactable.");
     if (!current.labelMatches) throw new Error("The selected element's accessible label changed; observe and plan again.");
-    if (current.occluded) throw new Error("The selected page element is occluded; observe and choose another target.");
+    if (current.occluded) throw preDispatchRefusal("target_occluded", "The selected page element is occluded; observe and choose another target.");
     const { model } = await client.send("DOM.getBoxModel", { backendNodeId: candidate.backendNodeId });
     const quad = model?.content;
     if (!quad || quad.length < 8) throw new Error("The selected page element has no usable layout box.");

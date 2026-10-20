@@ -24,7 +24,9 @@ test("ActionAttemptCoordinator journals pending metadata before dispatch and set
     runContext,
     async updateJournal() {
       journalSnapshots.push({ pendingAction: taskState.pendingAction, attempts: [...taskState.attempts] });
-    }
+    },
+    async reserveOperation() {},
+    async onDispatch() {}
   });
   const attempt = { action: "click", targetIdentity: "observed-link" };
 
@@ -38,6 +40,196 @@ test("ActionAttemptCoordinator journals pending metadata before dispatch and set
   assert.equal(Object.hasOwn(taskState, "pendingAction"), false);
   assert.deepEqual(taskState.attempts, [attempt]);
   assert.equal(runContext.counters.actions, 1);
+});
+
+test("ActionAttemptCoordinator owns write-ahead reservation and dispatch disposition ordering", async () => {
+  const taskState = { attempts: [] };
+  const runContext = { pendingAttempt: null, counters: { actions: 0 } };
+  const order = [];
+  const attempt = { action: "click", operationId: "operation-1" };
+  const coordinator = new ActionAttemptCoordinator({
+    taskState,
+    runContext,
+    async updateJournal() {
+      order.push("journal");
+      assert.equal(taskState.pendingAction, attempt);
+      assert.deepEqual(taskState.attempts, []);
+    },
+    async reserveOperation(receivedAttempt, actionType) {
+      order.push("reserve");
+      assert.equal(receivedAttempt, attempt);
+      assert.equal(actionType, "click");
+      assert.equal(taskState.pendingAction, attempt);
+    },
+    async onDispatch(receivedAttempt, actionType, dispatchStatus) {
+      order.push("record");
+      assert.equal(receivedAttempt, attempt);
+      assert.equal(actionType, "click");
+      assert.equal(dispatchStatus, "refused");
+      assert.equal(attempt.dispatchStatus, "refused");
+      assert.equal(taskState.pendingAction, attempt);
+    }
+  });
+
+  const result = await coordinator.coordinateDispatch(attempt, "click", async () => {
+    order.push("dispatch");
+    assert.equal(taskState.pendingAction, attempt);
+    assert.deepEqual(taskState.attempts, []);
+    return {
+      dispatchDisposition: "refused_pre_dispatch",
+      reasonCode: "target_lease_lost",
+      error: new Error("lease expired")
+    };
+  });
+
+  assert.equal(result.dispatchStatus, "refused");
+  assert.equal(result.dispatchDisposition, "refused_pre_dispatch");
+  assert.deepEqual(order, ["journal", "reserve", "dispatch", "record", "journal"]);
+  assert.deepEqual(attempt.error, { name: "Error", message: "lease expired" });
+  assert.equal(taskState.pendingAction, attempt);
+  coordinator.finish(attempt);
+  assert.equal(runContext.pendingAttempt, null);
+  assert.deepEqual(taskState.attempts, [attempt]);
+  assert.equal(runContext.counters.actions, 1);
+});
+
+test("ActionAttemptCoordinator leaves the write-ahead attempt pending when dispatch callback reports cancellation", async () => {
+  const taskState = { attempts: [] };
+  const runContext = { pendingAttempt: null, counters: { actions: 0 } };
+  let dispatchRecords = 0;
+  const attempt = { action: "click" };
+  const coordinator = new ActionAttemptCoordinator({
+    taskState,
+    runContext,
+    async updateJournal() {},
+    async reserveOperation() {},
+    async onDispatch(_attempt, _actionType, dispatchStatus) {
+      dispatchRecords++;
+      assert.equal(dispatchStatus, "refused");
+    }
+  });
+  const abort = Object.assign(new Error("canceled during dispatch"), { name: "AbortError" });
+
+  const result = await coordinator.coordinateDispatch(attempt, "click", async () => ({
+    cancelled: true,
+    dispatchDisposition: "refused_pre_dispatch",
+    error: abort
+  }));
+  assert.equal(result.cancelled, true);
+  assert.equal(result.error, abort);
+  assert.equal(result.dispatchStatus, "refused");
+  assert.equal(taskState.pendingAction, attempt);
+  assert.equal(runContext.pendingAttempt, attempt);
+  assert.deepEqual(taskState.attempts, []);
+  assert.equal(dispatchRecords, 1, "the coordinator records cancellation as a definite pre-dispatch refusal");
+});
+
+test("ActionAttemptCoordinator records callback failures as uncertain dispatch outcomes", async () => {
+  const taskState = { attempts: [] };
+  const runContext = { pendingAttempt: null, counters: { actions: 0 } };
+  const attempt = { action: "click" };
+  const failure = new Error("observation transport failed during stale recovery");
+  let dispatchRecords = 0;
+  const coordinator = new ActionAttemptCoordinator({
+    taskState,
+    runContext,
+    async updateJournal() {},
+    async reserveOperation() {},
+    async onDispatch() { dispatchRecords++; }
+  });
+
+  const result = await coordinator.coordinateDispatch(attempt, "click", async () => { throw failure; });
+  assert.equal(result.dispatchDisposition, "uncertain");
+  assert.equal(result.dispatchStatus, "uncertain");
+  assert.equal(result.error, failure);
+  assert.equal(taskState.pendingAction, attempt);
+  assert.equal(runContext.pendingAttempt, attempt);
+  assert.equal(dispatchRecords, 1);
+  assert.equal(attempt.uncertainOutcome, true);
+  assert.equal(attempt.browserEffectPossible, true);
+  assert.equal(attempt.retryWithoutReconciliation, false);
+});
+
+test("ActionAttemptCoordinator preserves a definite refusal when dispatch telemetry fails", async () => {
+  const taskState = { attempts: [] };
+  const runContext = { pendingAttempt: null, counters: { actions: 0 } };
+  const attempt = { action: "click" };
+  const coordinator = new ActionAttemptCoordinator({
+    taskState,
+    runContext,
+    async updateJournal() {},
+    async reserveOperation() {},
+    async onDispatch() { throw new Error("telemetry storage unavailable"); }
+  });
+
+  const result = await coordinator.coordinateDispatch(attempt, "click", async () => ({
+    dispatchDisposition: "refused_pre_dispatch",
+    reasonCode: "target_lease_lost"
+  }));
+  assert.equal(result.dispatchDisposition, "refused_pre_dispatch");
+  assert.equal(attempt.dispatchStatus, "refused");
+  assert.equal(attempt.telemetryIncomplete, true);
+  assert.equal(attempt.browserEffectPossible, false);
+  assert.equal(taskState.pendingAction, attempt, "the attempt stays pending until the engine records its observed refusal");
+});
+
+test("ActionAttemptCoordinator leaves a write-ahead record when post-dispatch journaling fails", async () => {
+  const taskState = { attempts: [] };
+  const runContext = { pendingAttempt: null, counters: { actions: 0 } };
+  const attempt = { action: "click" };
+  const journalError = new Error("journal storage failed after dispatch");
+  let writes = 0;
+  let durableSnapshot;
+  let dispatches = 0;
+  const coordinator = new ActionAttemptCoordinator({
+    taskState,
+    runContext,
+    async updateJournal() {
+      writes++;
+      if (writes === 1) {
+        durableSnapshot = structuredClone({ pendingAction: taskState.pendingAction });
+        return;
+      }
+      throw journalError;
+    },
+    async reserveOperation() {},
+    async onDispatch() {}
+  });
+
+  await assert.rejects(coordinator.coordinateDispatch(attempt, "click", async () => {
+    dispatches++;
+    return { dispatchDisposition: "dispatched_unverified", reasonCode: "dispatch_sent" };
+  }), error => error === journalError);
+  assert.equal(dispatches, 1);
+  assert.equal(attempt.dispatchDisposition, "dispatched_unverified");
+  assert.equal(attempt.dispatchStatus, "dispatched");
+  assert.equal(durableSnapshot.pendingAction.action, "click", "the pre-dispatch write-ahead record remains available for restart reconciliation");
+  assert.equal(durableSnapshot.pendingAction.dispatchDisposition, undefined, "a failed post-dispatch write cannot claim a durable outcome");
+  assert.equal(taskState.pendingAction, attempt, "the in-memory action remains pending and cannot be treated as settled");
+});
+
+test("ActionAttemptCoordinator does not dispatch when write-ahead operation reservation fails", async () => {
+  const taskState = { attempts: [] };
+  const runContext = { pendingAttempt: null, counters: { actions: 0 } };
+  const attempt = { action: "click" };
+  const reservationError = new Error("reservation unavailable");
+  let dispatches = 0;
+  const coordinator = new ActionAttemptCoordinator({
+    taskState,
+    runContext,
+    async updateJournal() {},
+    async reserveOperation() { throw reservationError; },
+    async onDispatch() {}
+  });
+
+  const result = await coordinator.coordinateDispatch(attempt, "click", async () => { dispatches++; });
+  assert.equal(result.dispatchDisposition, "refused_pre_dispatch");
+  assert.equal(result.dispatchStatus, "refused");
+  assert.equal(result.error, reservationError);
+  assert.equal(taskState.pendingAction, attempt);
+  assert.equal(runContext.pendingAttempt, attempt);
+  assert.equal(dispatches, 0);
+  assert.deepEqual(taskState.attempts, []);
 });
 
 test("NavigationEngine enters one inference budget without recursively invoking run", async () => {

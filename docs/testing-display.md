@@ -40,6 +40,15 @@ xvfb-run -a env ACTIVETAB_CHROME_DISPLAY=main node scripts/benchmark-response-in
 env -u DISPLAY ACTIVETAB_HEADLESS=1 ACTIVETAB_CHROME_DISPLAY=main node scripts/benchmark-response-inspection.mjs
 ```
 
-That benchmark explicitly sets the page viewport to 1280×720 at device scale 1 and emulates screen dimensions of 1280×1024 in both modes. It reports Chrome startup time, page visibility, response-inspection timings, Node CPU, and sampled Node/Chrome memory. Repeat each run and compare per-case medians; one sample is too noisy to establish a performance difference. Headless has no desktop window manager, physical monitor, toolbar surface, or physical window bounds, and cannot prove those paths. The ordinary regression and fixture navigation paths use the same Node code and Chrome build in both modes, with only Chrome's explicit `--headless=new` mode switch; browser scheduling and rendering can still produce timing differences. Use the visible headed commands when the behavior depends on a real desktop surface.
+That benchmark explicitly sets the page viewport to 1280×720 at device scale 1 and emulates screen dimensions of 1280×1024 in both modes. It reports Chrome startup time, page visibility, response-inspection timings, Node CPU, and sampled Node/Chrome memory. Repeat paired runs and compare per-case medians; one sample is too noisy to establish a performance difference. ActiveTab uses Chrome's unified `--headless=new` mode, which shares Chrome's browser implementation with headful mode ([Chrome Headless documentation](https://developer.chrome.com/docs/automation-and-testing/headless)). The browser still has no desktop window manager, physical monitor, toolbar surface, or physical window bounds, so headless cannot exercise or verify those paths. The ordinary regression and fixture navigation paths use the same Node code and Chrome build in both modes, with only Chrome's explicit headless mode switch; browser scheduling and rendering can still produce timing differences. Use the visible headed commands when the behavior depends on a real desktop surface.
+
+For an end-to-end local navigation comparison, run the API-to-CDP fixture in both modes with the same Chrome binary and `ACTIVETAB_CHROME_DISPLAY=main`:
+
+```bash
+ACTIVETAB_HEADLESS=1 npm run test:isolated -- test/api-cdp-integration.test.js
+npm run test:isolated -- test/api-cdp-integration.test.js
+```
+
+The shared wrapper selects the same main-display window-position setting for both modes; the only browser-mode argument difference is `--headless=new`. Repeat in interleaved order and compare the test's `duration_ms`, result status, action count, and final page. This covers one local navigation path; it is a diagnostic workload, not a cross-site latency guarantee.
 
 `launchOwnedChrome()` applies the selected position through `Browser.setWindowBounds` and verifies the resulting bounds before the app URL loads. Reuse and exact-target reattachment also apply and verify the configured position on their explicitly owned profiles. For independent verification, compare `window.screenX * window.devicePixelRatio` with the physical monitor origin; on this desktop the secondary begins at x=2880. Recheck `xrandr --query` if monitors are reconnected, rotated, or change resolution.

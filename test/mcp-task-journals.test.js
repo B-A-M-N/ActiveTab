@@ -564,14 +564,28 @@ test("task journals enforce a byte cap and reject unapproved pending-action fiel
       beforeStateFingerprint: "a".repeat(64),
       beforeRouteFingerprint: "b".repeat(64),
       beforeEvidenceId: "evidence",
-      startedAt: new Date().toISOString()
+      startedAt: new Date().toISOString(),
+      dispatchDisposition: "uncertain",
+      dispatchStatus: "uncertain",
+      browserEffectPossible: true,
+      retryWithoutReconciliation: false,
+      dispatchReasonCode: "dispatch_exception",
+      uncertainOutcome: true,
+      error: { name: "Error", message: "raw browser error text must stay out of pending metadata" }
     }
   };
   await journal.write(state);
-  assert.equal((await journal.read()).pendingAction.action, "type");
+  const persisted = await journal.read();
+  assert.equal(persisted.pendingAction.action, "type");
+  assert.equal(persisted.pendingAction.dispatchDisposition, "uncertain");
+  assert.equal(persisted.pendingAction.dispatchStatus, "uncertain");
+  assert.equal(persisted.pendingAction.error, undefined, "free-form exception text is excluded from pending-action metadata");
   await assert.rejects(journal.write({ ...state, unbounded: "x".repeat(65 * 1024) }), /64 KiB local storage limit/);
 
   await journal.write({ ...state, pendingAction: { ...state.pendingAction, value: "private search phrase" } });
+  await assert.rejects(journal.read(), /Task journal is invalid or unsupported/);
+
+  await journal.write({ ...state, pendingAction: { ...state.pendingAction, dispatchReasonCode: "an error with page text" } });
   await assert.rejects(journal.read(), /Task journal is invalid or unsupported/);
 }));
 

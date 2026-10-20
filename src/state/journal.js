@@ -5,6 +5,12 @@ import { createHash, randomUUID } from "node:crypto";
 const REDACTED_GOAL = "[redacted task goal]";
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const MAX_TASK_JOURNAL_BYTES = 64 * 1024;
+const DISPATCH_STATUS_BY_DISPOSITION = Object.freeze({
+  refused_pre_dispatch: "refused",
+  dispatched_unverified: "dispatched",
+  partially_dispatched_uncertain: "uncertain",
+  uncertain: "uncertain"
+});
 
 function validTargetSignature(value) {
   return value && typeof value === "object" && !Array.isArray(value) &&
@@ -20,15 +26,32 @@ function validPendingAction(value) {
   const stableId = candidate => candidate === undefined || typeof candidate === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$/.test(candidate);
   if (value === undefined) return true;
   if (!value || typeof value !== "object" || Array.isArray(value) ||
-      Object.keys(value).some(key => !["action", "targetIdentity", "targetSignature", "scrollTopBefore", "beforeStateFingerprint", "beforeRouteFingerprint", "beforeEvidenceId", "startedAt", "decisionId", "decisionStepId", "operationId"].includes(key)) ||
+      Object.keys(value).some(key => !["action", "targetIdentity", "targetSignature", "scrollTopBefore", "beforeStateFingerprint", "beforeRouteFingerprint", "beforeEvidenceId", "startedAt", "decisionId", "decisionStepId", "operationId", "dispatchDisposition", "dispatchStatus", "browserEffectPossible", "retryWithoutReconciliation", "dispatchReasonCode", "dispatchObservationId", "dispatched", "uncertainOutcome", "telemetryIncomplete"].includes(key)) ||
       !["click", "type", "fill", "select", "toggle", "upload", "scroll"].includes(value.action) ||
       typeof value.targetIdentity !== "string" || value.targetIdentity.length < 1 || value.targetIdentity.length > 256 ||
+      (value.dispatchObservationId !== undefined && (typeof value.dispatchObservationId !== "string" || value.dispatchObservationId.length > 256)) ||
       !HASH_PATTERN.test(value.beforeStateFingerprint ?? "") ||
       typeof value.beforeRouteFingerprint !== "string" || value.beforeRouteFingerprint.length > 64 ||
       typeof value.beforeEvidenceId !== "string" || value.beforeEvidenceId.length > 256 ||
       typeof value.startedAt !== "string" || !Number.isFinite(Date.parse(value.startedAt)) ||
       !stableId(value.decisionId) || !stableId(value.decisionStepId) || !stableId(value.operationId)) return false;
   if (value.targetSignature !== undefined && value.targetSignature !== null && !validTargetSignature(value.targetSignature)) return false;
+  if (value.dispatchDisposition !== undefined && !Object.hasOwn(DISPATCH_STATUS_BY_DISPOSITION, value.dispatchDisposition)) return false;
+  if (value.dispatchStatus !== undefined && !["refused", "dispatched", "uncertain"].includes(value.dispatchStatus)) return false;
+  if (value.dispatchDisposition !== undefined && value.dispatchStatus !== undefined
+      && DISPATCH_STATUS_BY_DISPOSITION[value.dispatchDisposition] !== value.dispatchStatus) return false;
+  for (const key of ["browserEffectPossible", "retryWithoutReconciliation", "dispatched", "uncertainOutcome", "telemetryIncomplete"]) {
+    if (value[key] !== undefined && typeof value[key] !== "boolean") return false;
+  }
+  if (value.dispatchReasonCode !== undefined && value.dispatchReasonCode !== null
+      && (typeof value.dispatchReasonCode !== "string" || value.dispatchReasonCode.length > 96
+        || !/^[A-Za-z0-9_.:-]+$/.test(value.dispatchReasonCode))) return false;
+  if (value.dispatchDisposition === "refused_pre_dispatch"
+      && (value.browserEffectPossible === true || value.retryWithoutReconciliation === false)) return false;
+  if (value.dispatchDisposition === "dispatched_unverified"
+      && (value.browserEffectPossible === false || value.retryWithoutReconciliation === true)) return false;
+  if (["uncertain", "partially_dispatched_uncertain"].includes(value.dispatchDisposition)
+      && (value.browserEffectPossible === false || value.retryWithoutReconciliation === true)) return false;
   return value.action !== "scroll" || Number.isFinite(value.scrollTopBefore);
 }
 
@@ -44,7 +67,11 @@ export class TaskJournal {
   constructor(path) { this.path = path; }
 
   async write(value) {
-    const serialized = `${JSON.stringify(value, null, 2)}\n`;
+    const persisted = value?.pendingAction && typeof value.pendingAction === "object"
+      ? { ...value, pendingAction: { ...value.pendingAction } }
+      : value;
+    if (persisted?.pendingAction && typeof persisted.pendingAction === "object") delete persisted.pendingAction.error;
+    const serialized = `${JSON.stringify(persisted, null, 2)}\n`;
     if (Buffer.byteLength(serialized, "utf8") > MAX_TASK_JOURNAL_BYTES) throw new Error("Task journal exceeds the 64 KiB local storage limit.");
     await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     const temp = `${this.path}.${randomUUID()}.tmp`;

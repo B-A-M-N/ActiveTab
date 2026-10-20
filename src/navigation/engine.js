@@ -7,6 +7,12 @@ import { newTaskState, taskGoalFingerprint, updateTaskJournal } from "../state/j
 import { normalizeOrigin, resolveObservedApplication } from "../environments/model.js";
 import { isOperatorProhibitedNavigation } from "../runtime/controlRestrictions.js";
 import { executeAuthorizedAction } from "../runtime/authorizedExecutor.js";
+import {
+  DISPATCH_DISPOSITION,
+  dispatchStatusForDisposition,
+  isDispatchDisposition,
+  normalizeDispatchOutcome
+} from "../runtime/dispatchDisposition.js";
 import { adjudicatePreActionReview } from "../decisions/adjudication.js";
 import { hasReviewIntent, selectPreActionDecisionRoute } from "../decisions/callPolicy.js";
 import { matchesScrollTargetSignature, observationSemanticFingerprint, observationStateFingerprint, routeFingerprint, scrollPositionFraction, scrollPositionMatches, scrollTargetSignature, targetSignature, visibleCandidatesFingerprint } from "../state/workflows.js";
@@ -87,11 +93,16 @@ function handoffResult(goal, reason, authorizationRequired, attempts, recoveries
 
 async function dispatchThroughAuthorizedExecutor(session, options) {
   const result = await executeAuthorizedAction({ session, ...options });
-  if (result.dispatched) return result;
-  const error = new Error(result.reason ?? "The authorized executor refused the browser operation.");
-  error.kind = result.authorized ? "dispatch_uncertain" : "authorization_refused";
-  error.dispatchStatus = result.authorized ? "uncertain" : "refused";
+  const outcome = normalizeDispatchOutcome(result);
+  if (outcome.dispatchDisposition === DISPATCH_DISPOSITION.DISPATCHED_UNVERIFIED) return outcome;
+  const error = outcome.error ?? new Error(result.reason ?? "The authorized executor did not confirm a complete dispatch.");
+  error.kind = outcome.browserEffectPossible ? "dispatch_uncertain" : "authorization_refused";
+  error.dispatchStatus = dispatchStatusForDisposition(outcome.dispatchDisposition);
+  error.dispatchDisposition = outcome.dispatchDisposition;
+  error.browserEffectPossible = outcome.browserEffectPossible;
+  error.reasonCode = outcome.reasonCode;
   error.authorizationCategory = result.category ?? null;
+  error.observation = result.observation ?? null;
   throw error;
 }
 
@@ -265,6 +276,9 @@ export class NavigationEngine {
     const setLatestObservation = observation => {
       latest = runContext.setLatestObservation(observation);
       return latest;
+    };
+    const observeAfterPreDispatchRefusal = async outcome => {
+      return setLatestObservation(await this.session.observe({ selectionGoal: goal }));
     };
     const incrementRecoveries = () => { recoveries = ++counters.recoveries; return recoveries; };
     const incrementScrolls = () => { scrollActionsUsed = ++counters.scrolls; return scrollActionsUsed; };
@@ -569,8 +583,7 @@ export class NavigationEngine {
         operationId: attempt.operationId
       });
     };
-    const recordTelemetryDispatch = async (attempt, actionType, dispatchStatus) => {
-      attempt.dispatchStatus = dispatchStatus;
+    const recordTelemetryDispatchEvent = async (attempt, actionType, dispatchStatus) => {
       if (!this.decisionRuntime || !decisionEpisodeId || !attempt.decisionId) return;
       await this.decisionRuntime.recordDispatch({
         episodeId: decisionEpisodeId,
@@ -641,7 +654,12 @@ export class NavigationEngine {
       await updateJournal();
       return resultWithWorkflow({ status: "canceled", goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, uncertain: true, evidenceId: latest.evidenceId });
     };
-    const canceledBeforeDispatch = async () => {
+    const canceledBeforeDispatch = async attempt => {
+      if (attempt && state.pendingAction === attempt) {
+        attempt.canceled = true;
+        attempt.completedAt = new Date().toISOString();
+        finishAction(attempt);
+      }
       state.status = "canceled";
       state.terminationReason = "The run was canceled before the pending action was dispatched; no browser input was sent.";
       await updateJournal();
@@ -650,10 +668,54 @@ export class NavigationEngine {
     const actionAttemptCoordinator = new ActionAttemptCoordinator({
       taskState: state,
       runContext,
-      updateJournal
+      updateJournal,
+      reserveOperation: reserveTelemetryOperation,
+      onDispatch: recordTelemetryDispatchEvent
     });
-    const beginAction = attempt => actionAttemptCoordinator.begin(attempt);
+    const recordTelemetryDispatch = (attempt, actionType, dispatchStatus) =>
+      actionAttemptCoordinator.recordDispatch(attempt, actionType, dispatchStatus);
     const finishAction = attempt => actionAttemptCoordinator.finish(attempt);
+    const executeActionDispatch = async (execute, preflight = null) => {
+      try {
+        throwIfAborted();
+      } catch (error) {
+        return normalizeDispatchOutcome({
+          cancelled: isAbortError(error),
+          dispatchDisposition: DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH,
+          reasonCode: isAbortError(error) ? "canceled_before_dispatch" : "pre_dispatch_check_failed",
+          observation: latest
+        }, { error });
+      }
+      try {
+        const refusal = preflight?.();
+        if (refusal) {
+          return normalizeDispatchOutcome({
+            dispatchDisposition: DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH,
+            reasonCode: refusal.reasonCode ?? "action_preflight_refused",
+            observation: latest
+          }, { error: new Error(refusal.reason ?? "The action was refused before browser dispatch.") });
+        }
+      } catch (error) {
+        return normalizeDispatchOutcome({
+          dispatchDisposition: DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH,
+          reasonCode: "action_preflight_failed",
+          observation: latest
+        }, { error });
+      }
+      try {
+        return normalizeDispatchOutcome(await execute());
+      } catch (error) {
+        const dispatchDisposition = isDispatchDisposition(error?.dispatchDisposition)
+          ? error.dispatchDisposition
+          : DISPATCH_DISPOSITION.UNCERTAIN;
+        return normalizeDispatchOutcome({
+          cancelled: isAbortError(error),
+          dispatchDisposition,
+          reasonCode: error?.reasonCode ?? "dispatch_callback_exception",
+          observation: error?.observation ?? null
+        }, { error });
+      }
+    };
     const resultWithWorkflow = result => {
       completeDecisionEpisode(result.status);
       const workflowPlanStatus = planner?.getStatus?.();
@@ -669,6 +731,7 @@ export class NavigationEngine {
       };
     };
     const stopAfterObservationLoss = async (attempt, error) => {
+      const effectPossible = attempt.dispatchDisposition !== DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH;
       const observationError = { name: error?.name ?? "Error", message: String(error?.message ?? error).slice(0, 400) };
       const observationAttempts = Number.isInteger(error?.observationAttempts) && error.observationAttempts >= 1 && error.observationAttempts <= 2
         ? error.observationAttempts : 1;
@@ -687,19 +750,24 @@ export class NavigationEngine {
       attempt.observationUnavailable = true;
       attempt.observationError = observationError;
       attempt.observationAttemptCount = observationAttempts;
-      attempt.uncertainOutcome = true;
+      if (effectPossible) attempt.uncertainOutcome = true;
       attempt.completedAt = new Date().toISOString();
       finishAction(attempt);
-      state.reconciliation = Object.freeze({
-        reasonCode: "post_action_observation_unavailable",
-        errorClass: observationErrorClass,
-        observationAttempts,
-        reattachFailureCode: REATTACH_FAILURE_CODES.has(error?.reattachFailureCode)
-          ? error.reattachFailureCode : "not_attempted"
-      });
       state.status = "unresolved";
-      state.terminationReason = "The browser target or observation connection could not be re-established after one bounded read retry; no browser action was repeated. Reattach and resume from fresh evidence.";
-      if (this.decisionRuntime?.recordReconciliationRequired && decisionEpisodeId && attempt.decisionId && attempt.operationId) {
+      state.terminationReason = effectPossible
+        ? "The browser target or observation connection could not be re-established after one bounded read retry; the effect remains uncertain and no browser action was repeated. Reattach and reconcile from fresh evidence."
+        : "A pre-dispatch refusal was recorded, but fresh browser evidence could not be obtained for replanning. Reattach and resume from fresh evidence.";
+      if (effectPossible) {
+        state.reconciliation = Object.freeze({
+          reasonCode: "post_action_observation_unavailable",
+          dispatchDisposition: attempt.dispatchDisposition ?? DISPATCH_DISPOSITION.UNCERTAIN,
+          errorClass: observationErrorClass,
+          observationAttempts,
+          reattachFailureCode: REATTACH_FAILURE_CODES.has(error?.reattachFailureCode)
+            ? error.reattachFailureCode : "not_attempted"
+        });
+      }
+      if (effectPossible && this.decisionRuntime?.recordReconciliationRequired && decisionEpisodeId && attempt.decisionId && attempt.operationId) {
         this.decisionRuntime.recordReconciliationRequired({
           episodeId: decisionEpisodeId,
           runId: decisionRunId,
@@ -718,6 +786,48 @@ export class NavigationEngine {
       }
       await updateJournal();
       return resultWithWorkflow({ status: state.status, goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: attempt.beforeEvidenceId });
+    };
+    const stopAfterUncertainDispatch = async attempt => {
+      attempt.uncertainOutcome = true;
+      attempt.afterStateFingerprint = observationStateFingerprint(latest);
+      attempt.afterRouteFingerprint = routeFingerprint(latest.page.url);
+      attempt.afterEvidenceId = latest.evidenceId;
+      attempt.completedAt = new Date().toISOString();
+      workflowTraceSafe = false;
+      recordFailedTargetPresence(attempt, latest);
+      excludeFailedAttempt(attempt);
+      await recordTelemetryObservation(attempt, attempt.afterStateFingerprint !== attempt.beforeStateFingerprint,
+        "uncertain_dispatch_state_observed");
+      finishAction(attempt);
+      state.reconciliation = Object.freeze({
+        reasonCode: "browser_dispatch_uncertain",
+        dispatchDisposition: attempt.dispatchDisposition ?? DISPATCH_DISPOSITION.UNCERTAIN,
+        dispatchReasonCode: attempt.dispatchReasonCode ?? "dispatch_outcome_unknown",
+        evidenceId: latest.evidenceId ?? null
+      });
+      state.status = "unresolved";
+      state.terminationReason = "The browser operation may have taken effect, so no further action was dispatched. Reconcile the observed state before resuming.";
+      if (this.decisionRuntime?.recordReconciliationRequired && decisionEpisodeId && attempt.decisionId && attempt.operationId) {
+        try {
+          await this.decisionRuntime.recordReconciliationRequired({
+            episodeId: decisionEpisodeId,
+            runId: decisionRunId,
+            stepId: attempt.decisionStepId,
+            decisionId: attempt.decisionId,
+            observationId: latest.evidenceId ?? attempt.beforeEvidenceId,
+            operation: attempt.action,
+            targetRole: "browser_target",
+            operationId: attempt.operationId,
+            dispatchStatus: attempt.dispatchStatus ?? "uncertain",
+            reasonCode: attempt.dispatchReasonCode ?? "dispatch_outcome_unknown",
+            evidenceRefs: [attempt.beforeEvidenceId, latest.evidenceId].filter(Boolean)
+          });
+        } catch {
+          attempt.telemetryIncomplete = true;
+        }
+      }
+      await updateJournal();
+      return resultWithWorkflow({ status: state.status, goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: latest.evidenceId });
     };
     const recoveryCoordinator = new RecoveryCoordinator({
       getSession: () => this.session,
@@ -824,6 +934,11 @@ export class NavigationEngine {
       const interrupted = {
         ...pending,
         error: { name: "InterruptedAction", message: "The process ended while the browser action outcome was unknown." },
+        dispatchDisposition: DISPATCH_DISPOSITION.UNCERTAIN,
+        dispatchStatus: "uncertain",
+        browserEffectPossible: true,
+        retryWithoutReconciliation: false,
+        dispatchReasonCode: "process_interrupted_during_action",
         uncertainOutcome: true,
         afterStateFingerprint: observationStateFingerprint(latest),
         afterRouteFingerprint: routeFingerprint(latest.page.url),
@@ -917,11 +1032,8 @@ export class NavigationEngine {
             };
             const review = await prepareTelemetryDecision(attempt, "scroll", target, true);
             if (!review.allowed) return await suspendForDecisionReview(attempt, review);
-            await beginAction(attempt);
-            await reserveTelemetryOperation(attempt, "scroll");
-            try {
-              throwIfAborted();
-              await dispatchThroughAuthorizedExecutor(this.session, {
+            const dispatchResult = await actionAttemptCoordinator.coordinateDispatch(attempt, "scroll", () => executeActionDispatch(async () =>
+              dispatchThroughAuthorizedExecutor(this.session, {
                 environment: this.environment,
                 localFixture: this.localFixture,
                 assertExecutionLease: this.assertExecutionLease,
@@ -929,14 +1041,47 @@ export class NavigationEngine {
                 goal,
                 action: "scroll",
                 candidate: target
-              });
+              })
+            ));
+            if (dispatchResult.cancelled) {
+              return dispatchResult.dispatchDisposition === DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH
+                ? await canceledBeforeDispatch(attempt)
+                : await canceledWithPendingAction(attempt);
             }
-            catch (error) {
-              if (isAbortError(error)) return await canceledWithPendingAction(attempt);
-              attempt.error = { name: error.name, message: String(error.message).slice(0, 400) };
-              attempt.dispatchStatus = error.dispatchStatus ?? "failed";
+            if (dispatchResult.dispatchDisposition === DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH) {
+              try {
+                await observeAfterPreDispatchRefusal(dispatchResult);
+              } catch (error) {
+                if (isAbortError(error)) return await canceledBeforeDispatch(attempt);
+                workflowReplay.status = "interrupted";
+                return await stopAfterObservationLoss(attempt, error);
+              }
+              attempt.afterStateFingerprint = observationStateFingerprint(latest);
+              attempt.afterRouteFingerprint = routeFingerprint(latest.page.url);
+              attempt.afterEvidenceId = latest.evidenceId;
+              attempt.completedAt = new Date().toISOString();
+              recordFailedTargetPresence(attempt, latest);
+              excludeFailedAttempt(attempt);
+              finishAction(attempt);
+              workflowReplay.status = "stale";
+              stale = true;
+              await updateJournal();
+              break;
             }
-            await recordTelemetryDispatch(attempt, "scroll", attempt.error ? (attempt.dispatchStatus ?? "failed") : "dispatched");
+            if (dispatchResult.dispatchDisposition === DISPATCH_DISPOSITION.PARTIALLY_DISPATCHED_UNCERTAIN
+              || dispatchResult.dispatchDisposition === DISPATCH_DISPOSITION.UNCERTAIN) {
+              try {
+                setLatestObservation(await observeAfterChange(1_500, waitBaseline, attempt));
+              } catch (error) {
+                workflowReplay.actions++;
+                if (isAbortError(error)) return await canceledWithPendingAction(attempt);
+                workflowReplay.status = "interrupted";
+                return await stopAfterObservationLoss(attempt, error);
+              }
+              workflowReplay.actions++;
+              workflowReplay.status = "interrupted";
+              return await stopAfterUncertainDispatch(attempt);
+            }
             try {
               setLatestObservation(await observeAfterChange(1_500, waitBaseline));
             } catch (error) {
@@ -1012,11 +1157,8 @@ export class NavigationEngine {
           };
           const review = await prepareTelemetryDecision(attempt, "click", target, true);
           if (!review.allowed) return await suspendForDecisionReview(attempt, review);
-          await beginAction(attempt);
-          await reserveTelemetryOperation(attempt, "click");
-          try {
-            throwIfAborted();
-            await dispatchThroughAuthorizedExecutor(this.session, {
+          const dispatchResult = await actionAttemptCoordinator.coordinateDispatch(attempt, "click", () => executeActionDispatch(async () =>
+            dispatchThroughAuthorizedExecutor(this.session, {
               environment: this.environment,
               localFixture: this.localFixture,
               assertExecutionLease: this.assertExecutionLease,
@@ -1024,13 +1166,47 @@ export class NavigationEngine {
               goal,
               action: "click",
               candidate: target
-            });
-          } catch (error) {
-            if (isAbortError(error)) return await canceledWithPendingAction(attempt);
-            attempt.error = { name: error.name, message: String(error.message).slice(0, 400) };
-            attempt.dispatchStatus = error.dispatchStatus ?? "failed";
+            })
+          ));
+          if (dispatchResult.cancelled) {
+            return dispatchResult.dispatchDisposition === DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH
+              ? await canceledBeforeDispatch(attempt)
+              : await canceledWithPendingAction(attempt);
           }
-          await recordTelemetryDispatch(attempt, "click", attempt.error ? (attempt.dispatchStatus ?? "failed") : "dispatched");
+          if (dispatchResult.dispatchDisposition === DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH) {
+            try {
+              await observeAfterPreDispatchRefusal(dispatchResult);
+            } catch (error) {
+              if (isAbortError(error)) return await canceledBeforeDispatch(attempt);
+              workflowReplay.status = "interrupted";
+              return await stopAfterObservationLoss(attempt, error);
+            }
+            attempt.afterStateFingerprint = observationStateFingerprint(latest);
+            attempt.afterRouteFingerprint = routeFingerprint(latest.page.url);
+            attempt.afterEvidenceId = latest.evidenceId;
+            attempt.completedAt = new Date().toISOString();
+            recordFailedTargetPresence(attempt, latest);
+            excludeFailedAttempt(attempt);
+            finishAction(attempt);
+            workflowReplay.status = "stale";
+            stale = true;
+            await updateJournal();
+            break;
+          }
+          if (dispatchResult.dispatchDisposition === DISPATCH_DISPOSITION.PARTIALLY_DISPATCHED_UNCERTAIN
+            || dispatchResult.dispatchDisposition === DISPATCH_DISPOSITION.UNCERTAIN) {
+            try {
+              setLatestObservation(await observeAfterChange(2_000, waitBaseline, attempt));
+            } catch (error) {
+              workflowReplay.actions++;
+              if (isAbortError(error)) return await canceledWithPendingAction(attempt);
+              workflowReplay.status = "interrupted";
+              return await stopAfterObservationLoss(attempt, error);
+            }
+            workflowReplay.actions++;
+            workflowReplay.status = "interrupted";
+            return await stopAfterUncertainDispatch(attempt);
+          }
           excludedIdentities.add(target.identity);
           try {
             setLatestObservation(await observeAfterChange(2_000, waitBaseline, attempt));
@@ -1384,13 +1560,8 @@ export class NavigationEngine {
       };
       const review = await prepareTelemetryDecision(attempt, actionType, selectedTarget, authorization.authorized, operationId, workflowCapability, plan.workflowReview);
       if (authorization.authorized && !review.allowed) return await suspendForDecisionReview(attempt, review);
-      await beginAction(attempt);
-      await reserveTelemetryOperation(attempt, actionType);
-      let dispatchOutcome = "dispatched";
-      try {
-        throwIfAborted(); // canceled before dispatch: no browser input was sent
-        if (actionType === "scroll" && plan.action.direction !== "down") throw new Error("Only downward scroll actions are supported.");
-        await dispatchThroughAuthorizedExecutor(this.session, {
+      const dispatchResult = await actionAttemptCoordinator.coordinateDispatch(attempt, actionType, () => executeActionDispatch(
+        () => dispatchThroughAuthorizedExecutor(this.session, {
           environment: this.environment,
           localFixture: this.localFixture,
           assertExecutionLease: this.assertExecutionLease,
@@ -1403,71 +1574,39 @@ export class NavigationEngine {
           operationId,
           operationAuthorizer,
           validateActionTarget: workflowCapability?.validateTarget ?? null
-        });
-        if (actionType !== "scroll") excludedIdentities.add(selectedTarget.identity);
-      } catch (error) {
-        if (isAbortError(error)) return await canceledWithPendingAction(attempt);
-        dispatchOutcome = error.dispatchStatus ?? "failed";
-        // Stale element recovery: if the failure is specifically a staleness
-        // error and recovery budget allows, reobserve and retry once with a
-        // freshly resolved target. Do not count this against maxRecoveries.
-        const isStaleError = /stale|no longer exists|no longer visible|changed since observation/.test(String(error?.message ?? ""));
-        if (isStaleError && !attempt.retriedAfterStale && recoveries <= this.maxRecoveries) {
-          attempt.retriedAfterStale = true;
-          const freshObservation = await this.session.observe({ selectionGoal: goal });
-          const freshMatches = (freshObservation.candidates ?? []).filter(candidate =>
-            candidate.visible === true && candidate.disabled !== true &&
-            (candidate.name === selectedTarget.name || candidate.identity === selectedTarget.identity)
-          );
-          if (freshMatches.length === 1) {
-            selectedTarget = freshMatches[0];
-            excludedIdentities.delete(selectedTarget.identity);
-            try {
-              throwIfAborted();
-              if (actionType === "scroll" && plan.action.direction !== "down") throw new Error("Only downward scroll actions are supported.");
-              await dispatchThroughAuthorizedExecutor(this.session, {
-                environment: this.environment,
-                localFixture: this.localFixture,
-                assertExecutionLease: this.assertExecutionLease,
-                sameTargetNavigation: this.sameTargetNavigation,
-                goal,
-                action: actionType,
-                candidate: selectedTarget,
-                value: plan.action.value ?? null,
-                filePaths: plan.action.filePaths ?? null,
-                operationId,
-                operationAuthorizer,
-                validateActionTarget: workflowCapability?.validateTarget ?? null
-              });
-              dispatchOutcome = "dispatched";
-              delete attempt.error;
-              attempt.recoveredFromStale = true;
-            } catch (retryError) {
-              if (isAbortError(retryError)) return await canceledWithPendingAction(attempt);
-              dispatchOutcome = retryError.dispatchStatus ?? "failed";
-              attempt.error = { name: retryError.name, message: String(retryError.message).slice(0, 400) };
-              attempt.dispatchStatus = retryError.dispatchStatus ?? "failed";
-            }
-          } else {
-            dispatchOutcome = "failed";
-            attempt.error = { name: error.name, message: String(error.message).slice(0, 400) };
-          }
-        } else {
-          dispatchOutcome = "failed";
-          attempt.error = { name: error.name, message: String(error.message).slice(0, 400) };
-        }
-        excludedIdentities.add(selectedTarget.identity);
+        }),
+        () => actionType === "scroll" && plan.action.direction !== "down"
+          ? { reasonCode: "unsupported_scroll_direction", reason: "Only downward scroll actions are supported." }
+          : null
+      ));
+      if (dispatchResult.cancelled) {
+        return dispatchResult.dispatchDisposition === DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH
+          ? await canceledBeforeDispatch(attempt)
+          : await canceledWithPendingAction(attempt);
       }
-      await recordTelemetryDispatch(attempt, actionType, dispatchOutcome);
+      const dispatchOutcome = dispatchResult.dispatchStatus;
+      if (actionType !== "scroll" || attempt.error) excludedIdentities.add(selectedTarget.identity);
       try {
-        setLatestObservation(await observeAfterChange(actionType === "type" ? 500 : actionType === "scroll" ? 1_500 : 2_000, waitBaseline, attempt));
+        if (dispatchResult.dispatchDisposition === DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH) {
+          await observeAfterPreDispatchRefusal(dispatchResult);
+        } else {
+          setLatestObservation(await observeAfterChange(actionType === "type" ? 500 : actionType === "scroll" ? 1_500 : 2_000, waitBaseline, attempt));
+        }
       } catch (error) {
-        if (isAbortError(error)) return await canceledWithPendingAction(attempt);
+        if (isAbortError(error)) {
+          return attempt.dispatchDisposition === DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH
+            ? await canceledBeforeDispatch(attempt)
+            : await canceledWithPendingAction(attempt);
+        }
         return await stopAfterObservationLoss(attempt, error);
       }
       try { throwIfAborted(); }
       catch (error) {
-        if (isAbortError(error)) return await canceledWithPendingAction(attempt);
+        if (isAbortError(error)) {
+          return attempt.dispatchDisposition === DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH
+            ? await canceledBeforeDispatch(attempt)
+            : await canceledWithPendingAction(attempt);
+        }
         throw error;
       }
       const afterStateFingerprint = observationStateFingerprint(latest);
@@ -1476,6 +1615,10 @@ export class NavigationEngine {
       if (dispatchOutcome === "dispatched") attempt.dispatched = true;
       recordFailedTargetPresence(attempt, latest);
       excludeFailedAttempt(attempt);
+      if (dispatchResult.dispatchDisposition === DISPATCH_DISPOSITION.PARTIALLY_DISPATCHED_UNCERTAIN
+        || dispatchResult.dispatchDisposition === DISPATCH_DISPOSITION.UNCERTAIN) {
+        return await stopAfterUncertainDispatch(attempt);
+      }
       if (actionType === "scroll") {
         incrementScrolls();
         // Record convergence state for infinite-scroll detection.
@@ -1630,6 +1773,14 @@ export class NavigationEngine {
       await updateJournal();
       const actionHandoff = await handoffIfNeeded(latest);
       if (actionHandoff) return actionHandoff;
+      if (attempt.dispatchReasonCode === "target_occluded") {
+        const interventionRequired = { category: "target_occluded", targetIdentity: attempt.targetIdentity, evidenceId: latest.evidenceId };
+        state.status = "needs_human";
+        state.interventionRequired = interventionRequired;
+        state.terminationReason = "The selected browser control is covered. Clear the obstruction or select a different observed target before continuing.";
+        await updateJournal();
+        return resultWithWorkflow({ status: "needs_human", goal, reason: state.terminationReason, interventionRequired, attempts: state.attempts.length, recoveries, evidenceId: latest.evidenceId });
+      }
       if (planner instanceof WorkflowGraphPlanner && planner.isComplete()) return await succeed();
       if (await outcomeVerified() && workflowPlanCanFinish()) return await succeed();
       if (actionType === "type") {

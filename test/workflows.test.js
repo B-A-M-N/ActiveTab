@@ -260,7 +260,7 @@ test("stale target signatures invalidate the workflow and repair through the cur
   assert.deepEqual(changedSession.clicks, ["current-node"]);
 }));
 
-test("intermediate workflow replay failure replans from fresh evidence and records the repaired trace", async () => withStore(async store => {
+test("uncertain intermediate workflow replay failure stays unresolved without repair or redispatch", async () => withStore(async store => {
   const goal = "Open the account security page";
   const learned = new FixtureSession([
     pageState("/", "Shop", "Shop", [candidate("old-account", "Open account")]),
@@ -305,29 +305,16 @@ test("intermediate workflow replay failure replans from fresh evidence and recor
   };
 
   const repaired = await new NavigationEngine(replaySession, { planner: repairPlanner, workflowStore: store, maxActions: 4, maxRecoveries: 1 }).run(goal);
-  assert.equal(repaired.status, "succeeded");
-  assert.equal(repaired.recoveries, 1);
-  assert.equal(repaired.workflowReplay.status, "repaired-and-recorded");
-  assert.equal(repairPlanner.calls, 1);
-  assert.deepEqual(replaySession.clicks, ["new-account-node", "stale-security-node", "repaired-security-node"]);
-
-  const start = pageState("/", "Shop", "Shop", [candidate("second-account-node", "Open account")]);
-  const stored = await store.find(goal, { page: start.page });
-  assert.equal(stored.steps.length, 2, "the failed click is omitted from the newly verified trace");
-  const replayAgainSession = new FixtureSession([
-    start,
-    pageState("/account", "Account", "Account", [candidate("second-security-node", "Security settings")]),
-    pageState("/account/security", "Security", "Security settings")
-  ]);
-  const noCallPlanner = { calls: 0, async plan() { this.calls++; throw new Error("A repaired trace should replay without planning."); } };
-  const replayedAgain = await new NavigationEngine(replayAgainSession, { planner: noCallPlanner, workflowStore: store, maxActions: 3 }).run(goal);
-  assert.equal(replayedAgain.status, "succeeded");
-  assert.equal(replayedAgain.workflowReplay.status, "replayed");
-  assert.equal(replayedAgain.workflowReplay.actions, 2);
-  assert.equal(noCallPlanner.calls, 0);
+  assert.equal(repaired.status, "unresolved");
+  assert.equal(repaired.attempts, 2);
+  assert.equal(repaired.recoveries, 0);
+  assert.equal(repaired.workflowReplay.status, "interrupted");
+  assert.equal(repairPlanner.calls, 0, "the engine does not repair until the uncertain dispatch is reconciled");
+  assert.deepEqual(replaySession.clicks, ["new-account-node", "stale-security-node"]);
+  assert.equal(repaired.reconciliation.reasonCode, "browser_dispatch_uncertain");
 }));
 
-test("a failed replay that changes observed state is never omitted to manufacture a reusable trace", async () => withStore(async store => {
+test("a replay exception after a visible state change remains unresolved until reconciliation", async () => withStore(async store => {
   const goal = "Open the account security page";
   const learned = new FixtureSession([
     pageState("/", "Shop", "Shop", [candidate("old-account", "Open account")]),
@@ -369,10 +356,12 @@ test("a failed replay that changes observed state is never omitted to manufactur
   };
 
   const result = await new NavigationEngine(replaySession, { planner, workflowStore: store, maxActions: 4, maxRecoveries: 1 }).run(goal);
-  assert.equal(result.status, "succeeded");
-  assert.equal(result.workflowReplay.status, "repaired-not-recorded");
-  assert.match(result.workflowReplay.reason, /failed action changed observable state/);
-  assert.equal(await store.find(goal, { page: { url: "https://shop.example.test/" } }), undefined);
+  assert.equal(result.status, "unresolved");
+  assert.equal(result.attempts, 2);
+  assert.deepEqual(replaySession.clicks, ["new-account-node", "stale-security-node"]);
+  assert.equal(result.reconciliation.reasonCode, "browser_dispatch_uncertain");
+  assert.equal((await store.find(goal, { page: { url: "https://shop.example.test/" } }))?.steps?.length, 2,
+    "the pre-existing verified trace remains intact; no uncertain repair is recorded");
 }));
 
 test("workflow persistence contains only bounded hashes and creates owner-only files", async () => withStore(async store => {

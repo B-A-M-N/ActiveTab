@@ -36,6 +36,7 @@ function isolatedModelEnvironment(overrides, guardDirectory) {
 }
 
 const chromePath = process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
+const chromeStartupTimeoutMs = 45_000;
 const fixture = await readFile(new URL("./fixtures/navigation.html", import.meta.url));
 const sameFrameFixture = await readFile(new URL("./fixtures/same-frame.html", import.meta.url));
 const crossFrameFixture = await readFile(new URL("./fixtures/cross-frame.html", import.meta.url));
@@ -46,7 +47,7 @@ function frameUrls(node, output = []) {
   return output;
 }
 
-test("native CDP attaches to disposable Chrome, preserves evidence, recovers, verifies, and journals", { timeout: 90_000 }, async t => {
+test("native CDP attaches to disposable Chrome, preserves evidence, recovers, verifies, and journals", { timeout: 180_000 }, async t => {
   let chrome;
   let session;
   let chromeConnection;
@@ -101,7 +102,7 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     chrome.stderr.setEncoding("utf8");
     chrome.stderr.on("data", chunk => { stderr += chunk.slice(-5000); });
     const endpoint = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`Chrome CDP startup timed out. ${stderr.slice(-1000)}`)), 15_000);
+      const timer = setTimeout(() => reject(new Error(`Chrome CDP startup timed out. ${stderr.slice(-1000)}`)), chromeStartupTimeoutMs);
       const check = () => {
         const match = stderr.match(/DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)\//);
         if (match) { clearTimeout(timer); resolve(`http://127.0.0.1:${match[1]}`); return true; }

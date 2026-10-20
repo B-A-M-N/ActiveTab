@@ -26,6 +26,10 @@ import { chromeWindowPositionArgs } from "../src/browser/chromeWindowPlacement.j
 const chromePath = process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
 const fixture = await readFile(new URL("./fixtures/navigation.html", import.meta.url));
 const sameFrameFixture = await readFile(new URL("./fixtures/same-frame.html", import.meta.url));
+const fixtureViewport = Object.freeze({ width: 1280, height: 720, deviceScaleFactor: 1 });
+const fixtureScreen = Object.freeze({ width: 1280, height: 1024 });
+const browserSurfaceExpression = "({url:location.href,title:document.title,visibilityState:document.visibilityState,hidden:document.hidden,innerWidth,innerHeight,screenWidth:screen.width,screenHeight:screen.height,deviceScaleFactor:devicePixelRatio})";
+const chromeStartupTimeoutMs = 45_000;
 
 function createRealRunner({ journalDir, outputDir }) {
   return {
@@ -59,7 +63,7 @@ function createRealRunner({ journalDir, outputDir }) {
       try {
         // Wait for CDP endpoint
         const endpoint = await new Promise((resolve, reject) => {
-          const timer = setTimeout(() => reject(new Error(`Chrome CDP startup timed out: ${stderr.slice(-500)}`)), 15000);
+          const timer = setTimeout(() => reject(new Error(`Chrome CDP startup timed out: ${stderr.slice(-500)}`)), chromeStartupTimeoutMs);
           const check = () => {
             const match = stderr.match(/DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)\//);
             if (match) { clearTimeout(timer); resolve(`http://127.0.0.1:${match[1]}`); return true; }
@@ -86,6 +90,7 @@ function createRealRunner({ journalDir, outputDir }) {
         if (targets.length === 0) throw new Error("No CDP targets found");
 
         let session;
+        let bootstrap;
         try {
           // Chrome starts at about:blank, which is not an authorized HTTP(S)
           // control target. Navigate the existing page target to the input URL
@@ -96,22 +101,55 @@ function createRealRunner({ journalDir, outputDir }) {
             const rawTargets = await rawList.json();
             const raw = rawTargets.find(item => item.id === rawTarget?.id);
             if (!raw?.webSocketDebuggerUrl) throw new Error("The page target has no direct CDP WebSocket.");
-            const bootstrap = new CdpClient(raw.webSocketDebuggerUrl);
+            bootstrap = new CdpClient(raw.webSocketDebuggerUrl);
             await bootstrap.connect();
-            try {
-              await bootstrap.send("Page.enable");
-              await bootstrap.send("Page.navigate", { url: input.url });
-            } finally {
-              await bootstrap.close().catch(() => {});
+            await bootstrap.send("Page.enable");
+            await bootstrap.send("Emulation.setDeviceMetricsOverride", {
+              width: fixtureViewport.width,
+              height: fixtureViewport.height,
+              deviceScaleFactor: fixtureViewport.deviceScaleFactor,
+              mobile: false,
+              screenWidth: fixtureScreen.width,
+              screenHeight: fixtureScreen.height
+            });
+            await bootstrap.send("Page.navigate", { url: input.url });
+            let initialSurface;
+            const initialLoadDeadline = Date.now() + 5000;
+            while (Date.now() < initialLoadDeadline) {
+              initialSurface = await bootstrap.send("Runtime.evaluate", {
+                expression: browserSurfaceExpression,
+                returnByValue: true
+              });
+              if (initialSurface?.result?.value?.url === input.url && initialSurface?.result?.value?.title === "Demo shop") break;
+              await new Promise(r => setTimeout(r, 100));
             }
-            await new Promise(r => setTimeout(r, 1000));
+            assert.deepEqual(initialSurface?.result?.value, {
+              url: input.url,
+              title: "Demo shop",
+              visibilityState: "visible",
+              hidden: false,
+              innerWidth: fixtureViewport.width,
+              innerHeight: fixtureViewport.height,
+              screenWidth: fixtureScreen.width,
+              screenHeight: fixtureScreen.height,
+              deviceScaleFactor: fixtureViewport.deviceScaleFactor
+            }, "the fixture's first site load uses the shared viewport and emulated screen");
+            await bootstrap.close().catch(() => {});
+            bootstrap = null;
           }
 
           // Re-list so authorization sees the post-navigation HTTP(S) URL.
           const readyTargets = await listTargets(endpoint);
           const target = await resolveAuthorizedTarget(endpoint, readyTargets[0].id, readyTargets[0].id);
           session = await new BrowserSession(target).attach();
-
+          await session.client.send("Emulation.setDeviceMetricsOverride", {
+            width: fixtureViewport.width,
+            height: fixtureViewport.height,
+            deviceScaleFactor: fixtureViewport.deviceScaleFactor,
+            mobile: false,
+            screenWidth: fixtureScreen.width,
+            screenHeight: fixtureScreen.height
+          });
           let observation;
           const loadDeadline = Date.now() + 5000;
           while (Date.now() < loadDeadline) {
@@ -119,6 +157,22 @@ function createRealRunner({ journalDir, outputDir }) {
             if (observation.page.title === "Demo shop") break;
             await new Promise(r => setTimeout(r, 100));
           }
+          const surface = await session.client.send("Runtime.evaluate", {
+            expression: browserSurfaceExpression,
+            returnByValue: true
+          });
+          console.log(`[CDP Test] Browser surface: ${JSON.stringify(surface?.result?.value)}`);
+          assert.deepEqual(surface?.result?.value, {
+            url: input.url,
+            title: "Demo shop",
+            visibilityState: "visible",
+            hidden: false,
+            innerWidth: fixtureViewport.width,
+            innerHeight: fixtureViewport.height,
+            screenWidth: fixtureScreen.width,
+            screenHeight: fixtureScreen.height,
+            deviceScaleFactor: fixtureViewport.deviceScaleFactor
+          }, "the local workflow fixture uses the same visible viewport and emulated screen in headed and headless modes");
 
           console.log(`[CDP Test] Goal: ${goal}`);
           console.log(`[CDP Test] Page title: ${observation?.page?.title}`);
@@ -195,7 +249,8 @@ function createRealRunner({ journalDir, outputDir }) {
             live_url_info: null
           };
         } finally {
-          await session.close().catch(() => {});
+          await session?.close().catch(() => {});
+          await bootstrap?.close().catch(() => {});
         }
       } finally {
         try { chrome.kill("SIGKILL"); } catch { /* already dead */ }

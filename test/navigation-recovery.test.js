@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { BrowserSession } from "../src/browser/session.js";
 import { NavigationEngine } from "../src/navigation/engine.js";
 import { FileUploadGrantStore } from "../src/runtime/fileUploadGrants.js";
+import { DISPATCH_DISPOSITION, normalizeDispatchOutcome } from "../src/runtime/dispatchDisposition.js";
 
 test("BrowserSession tracks and handles JavaScript dialogs", async t => {
   const dialogEvent = { type: "confirm", message: "Are you sure?", url: "http://fixture.local/" };
@@ -76,12 +77,25 @@ test("BrowserSession tracks and handles JavaScript dialogs", async t => {
   await assert.rejects(() => session.handleDialog(), /No JavaScript dialog is currently open/);
 });
 
-test("stale-error regex correctly classifies staleness messages", () => {
-  const STALE_PATTERN = /stale|no longer exists|no longer visible|changed since observation/;
-  assert.ok(STALE_PATTERN.test("The selected page element no longer exists."), "Matches no-longer-exists");
-  assert.ok(STALE_PATTERN.test("The selected page element is no longer visible or interactable."), "Matches no-longer-visible");
-  assert.ok(STALE_PATTERN.test("Candidate belongs to a stale document generation; observe again before acting."), "Matches stale generation");
-  assert.ok(!STALE_PATTERN.test("Input dispatch failed."), "Does not match generic dispatch failure");
+test("stale-looking exception text stays uncertain unless the executor returns a typed pre-dispatch refusal", () => {
+  const errorOutcome = normalizeDispatchOutcome({ error: new Error("The target became stale before dispatch.") });
+  assert.equal(errorOutcome.dispatchDisposition, DISPATCH_DISPOSITION.UNCERTAIN);
+  assert.equal(errorOutcome.browserEffectPossible, true);
+  assert.equal(errorOutcome.retryWithoutReconciliation, false);
+
+  const refusal = normalizeDispatchOutcome({
+    dispatchDisposition: DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH,
+    reasonCode: "target_occluded"
+  });
+  assert.equal(refusal.dispatchStatus, "refused");
+  assert.equal(refusal.browserEffectPossible, false);
+  assert.equal(refusal.retryWithoutReconciliation, true);
+
+  const unboundedCode = normalizeDispatchOutcome({
+    dispatchDisposition: DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH,
+    reasonCode: "unexpected free-form page text"
+  });
+  assert.equal(unboundedCode.reasonCode, null, "only bounded reason codes enter durable pending metadata");
 });
 
 test("scroll convergence stops after repeated scrolling without new content", async t => {

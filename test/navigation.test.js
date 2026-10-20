@@ -101,6 +101,42 @@ test("an unrelated URL change is not treated as task success", async () => {
   assert.equal(result.page, undefined);
 });
 
+test("an uncertain stale-target dispatch is observed without retry", async () => {
+  const target = { identity: "retry-account-link", backendNodeId: 17, documentGeneration: 1, name: "Open account", role: "link", tag: "a", visible: true };
+  const journal = { value: undefined, async write(value) { this.value = structuredClone(value); } };
+  const session = {
+    target: { id: "stale-retry-target", endpoint: "fixture", url: "https://shop.example.test/" },
+    clicks: 0,
+    current: {
+      page: { url: "https://shop.example.test/", title: "Shop" },
+      headings: [{ level: 1, text: "Shop" }],
+      candidates: [target]
+    },
+    async observe() {
+      return { evidenceId: `stale-retry-${this.clicks}`, targetId: this.target.id, documentGeneration: 1, ...structuredClone(this.current) };
+    },
+    async click() {
+      this.clicks++;
+      if (this.clicks === 1) throw new Error("The selected target became stale before dispatch.");
+      this.current = {
+        page: { url: "https://shop.example.test/account", title: "Account" },
+        headings: [{ level: 1, text: "Account" }],
+        candidates: []
+      };
+    },
+    async waitForChange() {}
+  };
+
+  const result = await new NavigationEngine(session, { journal, maxActions: 1, maxRecoveries: 0 }).run("Open the account page");
+
+  assert.equal(result.status, "unresolved");
+  assert.equal(session.clicks, 1, "an uncertain first dispatch must never trigger a second physical click");
+  assert.equal(journal.value.attempts[0].dispatchDisposition, "uncertain");
+  assert.equal(journal.value.attempts[0].dispatchStatus, "uncertain");
+  assert.equal(journal.value.attempts[0].uncertainOutcome, true);
+  assert.equal(journal.value.reconciliation.reasonCode, "browser_dispatch_uncertain");
+});
+
 test("ephemeral current-origin binding permits a same-origin visible link and blocks a cross-origin link", async t => {
   class ScopedOriginSession {
     target = { id: "scoped-origin-target", endpoint: "local-cdp", url: "https://shop.example.test/" };
@@ -512,7 +548,8 @@ test("explicit task resume records when a human handoff condition has cleared", 
   assert.equal(journal.value.interventionRequired, undefined);
 });
 
-test("a failed action identity is not retried from unchanged evidence", async () => {
+test("an untyped click exception with unchanged evidence remains unresolved and is not retried", async () => {
+  const journal = { value: undefined, async write(value) { this.value = structuredClone(value); } };
   const session = {
     target: { id: "stable-target", endpoint: "local-cdp" },
     clicks: 0,
@@ -531,13 +568,14 @@ test("a failed action identity is not retried from unchanged evidence", async ()
     async waitForChange() {}
   };
 
-  const result = await new NavigationEngine(session, { maxActions: 3, maxRecoveries: 2 }).run("Open the account page");
-  assert.equal(result.status, "needs_human");
+  const result = await new NavigationEngine(session, { journal, maxActions: 3, maxRecoveries: 2 }).run("Open the account page");
+  assert.equal(result.status, "unresolved");
   assert.equal(result.attempts, 1);
   assert.equal(session.clicks, 1);
+  assert.equal(journal.value.attempts[0].dispatchDisposition, "uncertain");
 });
 
-test("a failed action that partially changes the route is journaled and replanned from fresh evidence", async () => {
+test("a click exception after a partial route change is observed and left unresolved", async () => {
   const firstTarget = { identity: "first-account-link", backendNodeId: 1, documentGeneration: 1, name: "Open account", role: "link", tag: "a", visible: true };
   const continuationTarget = { identity: "continue-account-link", backendNodeId: 2, documentGeneration: 2, name: "Continue to account", role: "link", tag: "a", visible: true };
   const session = {
@@ -585,15 +623,15 @@ test("a failed action that partially changes the route is journaled and replanne
 
   const result = await new NavigationEngine(session, { planner, journal, workflowStore, maxActions: 3, maxRecoveries: 1 }).run("Open the account page");
 
-  assert.equal(result.status, "succeeded");
-  assert.equal(result.attempts, 2);
-  assert.equal(result.recoveries, 1);
-  assert.deepEqual(session.clicks, [firstTarget.identity, continuationTarget.identity]);
-  assert.equal(plannerCalls[1].evidenceId, "Contact options-evidence");
-  assert.ok(plannerCalls[1].excludedIdentities.includes(firstTarget.identity));
+  assert.equal(result.status, "unresolved");
+  assert.equal(result.attempts, 1);
+  assert.equal(result.recoveries, 0);
+  assert.deepEqual(session.clicks, [firstTarget.identity], "a partial state change cannot authorize another click in the same run");
+  assert.equal(plannerCalls.length, 1, "the engine does not replan until the uncertain dispatch has been reconciled");
   assert.equal(journal.value.attempts[0].error.message, "Dispatch failed: The route changed before the original node detached.");
   assert.notEqual(journal.value.attempts[0].beforeRouteFingerprint, journal.value.attempts[0].afterRouteFingerprint);
-  assert.deepEqual(recordedWorkflows, [], "a trace containing a failed action that changed page state must not be persisted");
+  assert.equal(journal.value.attempts[0].dispatchDisposition, "uncertain");
+  assert.deepEqual(recordedWorkflows, [], "an uncertain action trace must not be persisted");
 });
 
 test("a lost tab observation journals the action and resume excludes its matching target", async () => {
@@ -885,6 +923,7 @@ test("same-target reattachment rejects another target and keeps the dispatched a
   assert.equal(replacementClosed, true);
   assert.deepEqual(result.reconciliation, {
     reasonCode: "post_action_observation_unavailable",
+    dispatchDisposition: "dispatched_unverified",
     errorClass: "target_detached",
     observationAttempts: 2,
     reattachFailureCode: "reattach_identity_mismatch"
@@ -968,7 +1007,8 @@ test("resume excludes the same target after failure despite an unrelated DOM sta
   assert.deepEqual(plannerViews[1], [alternativeTarget.identity], "all planner providers receive the current candidate list with the unchanged failed target removed");
 });
 
-test("engine refuses a cached planner target that is absent from the fresh candidate set", async () => {
+test("an untyped click exception on an unchanged planner target remains unresolved without retry", async () => {
+  const journal = { value: undefined, async write(value) { this.value = structuredClone(value); } };
   const staleTarget = { identity: "stale-control", backendNodeId: 1, documentGeneration: 1, name: "Open account", role: "button", tag: "button", visible: true };
   const session = {
     target: { id: "cached-planner-target", endpoint: "local-cdp" },
@@ -986,11 +1026,12 @@ test("engine refuses a cached planner target that is absent from the fresh candi
   };
   const planner = { async plan() { return { status: "planned", action: { type: "click", target: staleTarget } }; } };
 
-  const result = await new NavigationEngine(session, { planner, maxActions: 3, maxRecoveries: 2 }).run("Open the account page");
+  const result = await new NavigationEngine(session, { planner, journal, maxActions: 3, maxRecoveries: 2 }).run("Open the account page");
 
-  assert.equal(result.status, "needs_human");
-  assert.equal(session.clicks, 1, "the planner cannot redispatch a cached target filtered from current evidence");
-  assert.match(result.reason, /not present and interactable in the fresh observation/);
+  assert.equal(result.status, "unresolved");
+  assert.equal(session.clicks, 1, "the same physical click is not repeated after its dispatch result becomes uncertain");
+  assert.equal(journal.value.attempts[0].dispatchDisposition, "uncertain");
+  assert.equal(result.reconciliation.reasonCode, "browser_dispatch_uncertain");
 });
 
 test("a model-selected sensitive action outside the user goal is handed off without clicking", async () => {

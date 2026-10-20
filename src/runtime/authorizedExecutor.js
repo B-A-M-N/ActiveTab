@@ -15,11 +15,24 @@
 import { authorizePlannedAction } from "../navigation/actionPolicy.js";
 import { normalizeOrigin, resolveObservedApplication, verifyObservedUrl, isLoopbackUrl } from "../environments/model.js";
 import { isOperatorProhibitedNavigation } from "./controlRestrictions.js";
+import { DISPATCH_DISPOSITION, dispatchStatusForDisposition } from "./dispatchDisposition.js";
 
 const SUPPORTED_ACTIONS = new Set(["navigate", "click", "fill", "select", "toggle", "upload", "scroll", "type"]);
 
 function refused(reason, observation = null, category = "authorization_refused") {
-  return { status: "refused", dispatched: false, authorized: false, category, reason, observation };
+  return {
+    status: "refused",
+    dispatchDisposition: DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH,
+    dispatchStatus: "refused",
+    browserEffectPossible: false,
+    retryWithoutReconciliation: true,
+    reasonCode: category,
+    dispatched: false,
+    authorized: false,
+    category,
+    reason,
+    observation
+  };
 }
 
 function navigationTarget(url, { environment, localFixture, authorizedOrigins }) {
@@ -584,14 +597,31 @@ export async function executeAuthorizedAction({
       }
     }
   } catch (error) {
+    const definitelyRefused = error?.dispatchDisposition === DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH;
+    const dispatchStatus = definitelyRefused ? "refused" : "uncertain";
     let telemetryError = false;
-    try { await onDispatch?.({ action, candidate, url, observation, dispatchResult, dispatchStatus: "uncertain" }); }
+    try { await onDispatch?.({ action, candidate, url, observation, dispatchResult, dispatchStatus }); }
     catch { telemetryError = true; }
     let operationError = false;
-    try { await operationAuthorizer?.recordDispatch?.({ operationId, action, candidate, value, observation, dispatchResult, dispatchStatus: "uncertain" }); }
+    try { await operationAuthorizer?.recordDispatch?.({ operationId, action, candidate, value, observation, dispatchResult, dispatchStatus }); }
     catch { operationError = true; }
+    if (definitelyRefused) {
+      return {
+        ...refused(String(error.message ?? error).slice(0, 300), observation, error.reasonCode ?? "pre_dispatch_refused"),
+        authorized: true,
+        ...(telemetryError ? { telemetryError: true } : {}),
+        ...(operationError ? { operationError: true } : {})
+      };
+    }
     return {
-      status: "uncertain", dispatched: false, authorized: true,
+      status: "uncertain",
+      dispatchDisposition: DISPATCH_DISPOSITION.UNCERTAIN,
+      dispatchStatus: "uncertain",
+      browserEffectPossible: true,
+      retryWithoutReconciliation: false,
+      reasonCode: "dispatch_exception",
+      dispatched: false,
+      authorized: true,
       reason: `Dispatch failed: ${String(error.message ?? error).slice(0, 300)}`,
       effectStatus: "uncertain",
       verificationStatus: "not_verified",
@@ -612,11 +642,30 @@ export async function executeAuthorizedAction({
   }
   const partialCompositeSelect = isCompositeSelect && dispatchResult?.selectionStatus !== "selected";
   const finalDispatchStatus = partialCompositeSelect ? "uncertain" : "dispatched";
+  const dispatchDisposition = partialCompositeSelect
+    ? DISPATCH_DISPOSITION.PARTIALLY_DISPATCHED_UNCERTAIN
+    : DISPATCH_DISPOSITION.DISPATCHED_UNVERIFIED;
   let telemetryError = false;
   try { await onDispatch?.({ action, candidate, url, observation, dispatchResult, dispatchStatus: finalDispatchStatus }); }
   catch { telemetryError = true; }
   let operationError = false;
   try { await operationAuthorizer?.recordDispatch?.({ operationId, action, candidate, value, observation, dispatchResult, dispatchStatus: finalDispatchStatus }); }
   catch { operationError = true; }
-  return { status: partialCompositeSelect ? "partial" : "dispatched", dispatched: true, authorized: true, effectStatus: partialCompositeSelect ? "partial" : "unknown", verificationStatus: "not_verified", dispatchResult, observation, ...(telemetryError ? { telemetryError: true } : {}), ...(operationError ? { operationError: true } : {}) };
+  return {
+    status: partialCompositeSelect ? "partial" : "dispatched",
+    dispatchDisposition,
+    dispatchStatus: dispatchStatusForDisposition(dispatchDisposition),
+    browserEffectPossible: true,
+    retryWithoutReconciliation: false,
+    reasonCode: partialCompositeSelect ? "partial_composite_select" : "dispatch_sent",
+    ...(partialCompositeSelect && dispatchResult?.reason ? { reason: dispatchResult.reason } : {}),
+    dispatched: true,
+    authorized: true,
+    effectStatus: partialCompositeSelect ? "partial" : "unknown",
+    verificationStatus: "not_verified",
+    dispatchResult,
+    observation,
+    ...(telemetryError ? { telemetryError: true } : {}),
+    ...(operationError ? { operationError: true } : {})
+  };
 }
