@@ -6,6 +6,8 @@ import { launchOwnedChrome } from "../src/browser/ownedChrome.js";
 
 const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const headless = process.env.ACTIVETAB_HEADLESS === "1";
+const benchmarkViewport = Object.freeze({ width: 1280, height: 720, deviceScaleFactor: 1 });
+const benchmarkScreen = Object.freeze({ width: 1280, height: 1024 });
 const memorySnapshot = () => {
   const memory = process.memoryUsage();
   return { nodeRssBytes: memory.rss, nodeHeapUsedBytes: memory.heapUsed };
@@ -46,6 +48,8 @@ let chromeMonitorTimer;
 let baseline;
 let peak;
 let activeCaseMemory = null;
+let browserStartupWallMs = null;
+let browserSurface = null;
 
 function chromeTreeRss(rootPid) {
   try {
@@ -67,10 +71,26 @@ function chromeTreeRss(rootPid) {
 
 try {
   process.stderr.write("Starting owned Chrome on the local response fixture.\n");
+  const browserStartupStartedAt = process.hrtime.bigint();
   owned = await launchOwnedChrome({
     initialUrl: `http://127.0.0.1:${port}/`, headed: !headless, displayMode: "current-display",
-    preserveProfile: false, reuseExisting: false
+    preserveProfile: false, reuseExisting: false,
+    environmentProfile: { viewport: benchmarkViewport }
   });
+  browserStartupWallMs = Number(process.hrtime.bigint() - browserStartupStartedAt) / 1e6;
+  await owned.session.client.send("Emulation.setDeviceMetricsOverride", {
+    width: benchmarkViewport.width,
+    height: benchmarkViewport.height,
+    deviceScaleFactor: benchmarkViewport.deviceScaleFactor,
+    mobile: false,
+    screenWidth: benchmarkScreen.width,
+    screenHeight: benchmarkScreen.height
+  });
+  const surface = await owned.session.client.send("Runtime.evaluate", {
+    expression: "({visibilityState:document.visibilityState,hidden:document.hidden,innerWidth,innerHeight,screenWidth:screen.width,screenHeight:screen.height,deviceScaleFactor:devicePixelRatio})",
+    returnByValue: true
+  });
+  browserSurface = surface?.result?.value ?? null;
   process.stderr.write(`Owned Chrome ready (${owned.browserVersion}).\n`);
   baseline = {
     ...memorySnapshot(),
@@ -184,6 +204,15 @@ try {
     schemaVersion: 1,
     mode: headless ? "owned_headless_chrome_loopback_fixture" : "owned_headed_chrome_loopback_fixture",
     browserVersion: owned.browserVersion,
+    browserViewport: browserSurface ? {
+      width: browserSurface.innerWidth,
+      height: browserSurface.innerHeight,
+      screenWidth: browserSurface.screenWidth,
+      screenHeight: browserSurface.screenHeight,
+      deviceScaleFactor: browserSurface.deviceScaleFactor
+    } : null,
+    browserSurface,
+    browserStartupWallMs,
     chromePid: owned.chromeProcess.pid,
     measurement: "Node RSS and heapUsed sampled every 25 ms; Chrome RSS is the owned process tree sum sampled every 500 ms. Synchronous Node work can finish between samples; before/after snapshots are also reported.",
     baseline,

@@ -25,6 +25,11 @@ done
 if [[ "${ACTIVETAB_HEADLESS:-}" == "1" ]]; then
   echo "ACTIVETAB_HEADLESS=1: explicit operator opt-in for headless execution."
   unset DISPLAY
+  # Match the disposable headed Xvfb test defaults. Headless Chrome has no
+  # visible window, but using the same display selection keeps any shared
+  # launch arguments and environment decisions deterministic across modes.
+  export ACTIVETAB_CHROME_DISPLAY=main
+  export ACTIVETAB_CHROME_MAIN_POSITION=0,0
   node --test "${NODE_ARGS[@]}"
   exit $?
 fi
