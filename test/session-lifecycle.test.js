@@ -163,6 +163,62 @@ test("visual hit testing allows only one outstanding probe per target", async ()
   }
 });
 
+test("visual probe shares one deadline across viewport recheck and DOM hit test", async () => {
+  const harness = await createHitTestSession();
+  try {
+    const commandTimeouts = [];
+    const originalSend = harness.session.client.send.bind(harness.session.client);
+    harness.session.client.send = async (method, params, options = {}) => {
+      if (["Runtime.evaluate", "DOM.getNodeForLocation"].includes(method)) {
+        commandTimeouts.push({ method, timeoutMs: options.timeoutMs });
+      }
+      if (method === "Runtime.evaluate") await new Promise(resolve => setTimeout(resolve, 20));
+      return originalSend(method, params, options);
+    };
+
+    const pending = harness.session.probeVisualCandidateAtPoint(harness.evidenceId, { x: 20, y: 30, timeoutMs: 1_000 });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    await waitForPendingQuery(harness.pendingQueries);
+    assert.equal(commandTimeouts.length, 2);
+    assert.equal(commandTimeouts[0].method, "Runtime.evaluate");
+    assert.ok(commandTimeouts[0].timeoutMs > 0 && commandTimeouts[0].timeoutMs <= 1_000);
+    assert.equal(commandTimeouts[1].method, "DOM.getNodeForLocation");
+    assert.ok(commandTimeouts[1].timeoutMs > 0 && commandTimeouts[1].timeoutMs < commandTimeouts[0].timeoutMs,
+      "the hit test receives only the remaining caller budget");
+
+    harness.pendingQueries[0].complete();
+    assert.equal((await pending).status, "candidate");
+  } finally {
+    await harness.session.close();
+  }
+});
+
+test("visual probe deadline applies to viewport recheck and prevents a later hit-test dispatch", async () => {
+  const harness = await createHitTestSession();
+  try {
+    let viewportTimeoutMs = null;
+    let hitTestDispatched = false;
+    harness.session.client.send = (method, _params, options = {}) => {
+      if (method === "Runtime.evaluate") {
+        viewportTimeoutMs = options.timeoutMs;
+        return Promise.reject(Object.assign(new Error("caller deadline exceeded"), {
+          callerDeadlineExceeded: true,
+          commandMayStillComplete: true
+        }));
+      }
+      if (method === "DOM.getNodeForLocation") hitTestDispatched = true;
+      return Promise.resolve({});
+    };
+
+    const result = await harness.session.probeVisualCandidateAtPoint(harness.evidenceId, { x: 20, y: 30, timeoutMs: 50 });
+    assert.ok(viewportTimeoutMs > 0 && viewportTimeoutMs <= 50);
+    assert.equal(result.reasonCode, "hit_test_deadline");
+    assert.equal(hitTestDispatched, false);
+  } finally {
+    await harness.session.close();
+  }
+});
+
 test("visual hit-test deadline expires the consumer and ignores a later completion", async () => {
   const harness = await createHitTestSession();
   try {

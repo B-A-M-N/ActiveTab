@@ -1,5 +1,7 @@
 export async function runVisualCandidateProbe(session, evidenceId, { x, y, timeoutMs, active }) {
   const startedAt = performance.now();
+  const deadline = startedAt + timeoutMs;
+  const remainingTimeoutMs = () => Math.floor(deadline - performance.now());
   const staleResult = reasonCode => ({ status: "stale", reasonCode, evidenceId, actionAuthorized: false });
   const isSuperseded = () => active.invalidatedBy !== null
     || active.observationGeneration !== session.observationGeneration;
@@ -15,15 +17,24 @@ export async function runVisualCandidateProbe(session, evidenceId, { x, y, timeo
 
   let viewport;
   try {
+    const commandTimeoutMs = remainingTimeoutMs();
+    if (commandTimeoutMs < 1) {
+      return { status: "unavailable", reasonCode: "hit_test_deadline", evidenceId, actionAuthorized: false };
+    }
     const result = await session.client.send("Runtime.evaluate", {
       expression: "({width:innerWidth,height:innerHeight,deviceScaleFactor:window.devicePixelRatio||1,scrollX,scrollY})",
       returnByValue: true,
       awaitPromise: false
-    }, { signal: active.controller.signal });
+    }, { timeoutMs: commandTimeoutMs, signal: active.controller.signal });
     viewport = result.result?.value;
-  } catch {
+  } catch (error) {
     if (isSuperseded()) return staleResult(active.invalidatedBy ?? "superseded_by_new_observation");
-    return { status: "unavailable", reasonCode: "viewport_recheck_failed", evidenceId, actionAuthorized: false };
+    return {
+      status: "unavailable",
+      reasonCode: error?.callerDeadlineExceeded === true ? "hit_test_deadline" : "viewport_recheck_failed",
+      evidenceId,
+      actionAuthorized: false
+    };
   }
   if (isSuperseded()) return staleResult(active.invalidatedBy ?? "superseded_by_new_observation");
   if (context.targetId !== session.target.id || context.documentGeneration !== session.documentGeneration
@@ -39,13 +50,17 @@ export async function runVisualCandidateProbe(session, evidenceId, { x, y, timeo
   }
 
   let hit;
+  const hitTestTimeoutMs = remainingTimeoutMs();
+  if (hitTestTimeoutMs < 1) {
+    return { status: "unavailable", reasonCode: "hit_test_deadline", evidenceId, actionAuthorized: false };
+  }
   try {
     hit = await session.client.send("DOM.getNodeForLocation", {
       x: Math.round(x + context.viewportScroll.x),
       y: Math.round(y + context.viewportScroll.y),
       includeUserAgentShadowDOM: false,
       ignorePointerEventsNone: false
-    }, { timeoutMs, signal: active.controller.signal });
+    }, { timeoutMs: hitTestTimeoutMs, signal: active.controller.signal });
   } catch (error) {
     if (isSuperseded()) return staleResult(active.invalidatedBy ?? "superseded_by_new_observation");
     if (session.targetLifecycle !== "attached") return staleResult("target_detached");
