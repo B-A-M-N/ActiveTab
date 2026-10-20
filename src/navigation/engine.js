@@ -20,6 +20,8 @@ import { bindVisualEvidence, isBoundVisualEvidence } from "./visualEvidence.js";
 import { groundVisualTarget, revalidateVisualGrounding } from "./visualGrounder.js";
 import { reobserveFromRetainedLookup } from "./retainedLookupFallback.js";
 import { createNavigationRunContext } from "./runContext.js";
+import { RecoveryCoordinator } from "./recoveryCoordinator.js";
+import { ReplayCoordinator } from "./replayCoordinator.js";
 
 function pageChangeWaitBaseline(observation, scrollTarget) {
   return {
@@ -420,6 +422,9 @@ export class NavigationEngine {
         : "disabled",
       actions: 0
     };
+    const replayCoordinator = this.workflowStore
+      ? new ReplayCoordinator({ workflowStore: this.workflowStore, goal, initialRouteFingerprint: state.initialUrlFingerprint })
+      : null;
     const workflowTraceAttempts = [];
     let workflowTraceSafe = true;
     let planner = searchPhrase ? new DeterministicPlanner() : this.planner;
@@ -873,92 +878,21 @@ export class NavigationEngine {
       await updateJournal();
       return resultWithWorkflow({ status: state.status, goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: attempt.beforeEvidenceId });
     };
-    const observeAfterChange = async (timeoutMs, baseline, attempt = null) => {
-      const reattachToSameTarget = async error => {
-        const errorText = String(error?.message ?? error).toLocaleLowerCase();
-        const detached = this.session.attached === false || ["detached", "closed"].includes(this.session.targetLifecycle)
-          || /target.{0,24}(detached|closed)|(?:detached|closed).{0,24}target/u.test(errorText);
-        if (!detached || typeof this.reattachSameTarget !== "function"
-          || attempt?.action !== "click" || attempt?.dispatchStatus !== "dispatched") {
-          if (error && typeof error === "object") error.observationAttempts = 1;
-          throw error;
-        }
-
-        let replacement;
-        try {
-          const originalTarget = this.session.target;
-          replacement = await this.reattachSameTarget({
-            targetId: originalTarget?.id,
-            endpoint: originalTarget?.reattachEndpoint ?? originalTarget?.endpoint ?? "local-cdp",
-            environment: this.environment,
-            selectionGoal: goal
-          });
-          const nextSession = replacement?.session;
-          const observation = replacement?.observation;
-          const targetId = originalTarget?.id;
-          const endpointValue = originalTarget?.reattachEndpoint ?? originalTarget?.endpoint ?? "local-cdp";
-          const replacementEndpointValue = nextSession?.target?.reattachEndpoint ?? nextSession?.target?.endpoint ?? "local-cdp";
-          const endpoint = (() => { try { return new URL(endpointValue).origin; } catch { return endpointValue; } })();
-          const replacementEndpoint = (() => { try { return new URL(replacementEndpointValue).origin; } catch { return replacementEndpointValue; } })();
-          if (!nextSession || nextSession.attached !== true || nextSession.target?.id !== targetId
-            || replacementEndpoint !== endpoint || observation?.targetId !== targetId) {
-            throw Object.assign(new Error("Same-target reattachment did not return a fresh observation from the exact leased target."), {
-              reattachFailureCode: "reattach_identity_mismatch"
-            });
-          }
-          let observedUrl;
-          try { observedUrl = new URL(observation.page?.url ?? ""); }
-          catch { throw Object.assign(new Error("Same-target reattachment returned an invalid observed page URL."), { reattachFailureCode: "target_scope_rejected" }); }
-          const allowedOriginValues = Array.isArray(this.environment?.authorizedOrigins)
-            ? this.environment.authorizedOrigins
-            : [originalTarget?.url ?? latest?.page?.url];
-          const allowedOrigins = allowedOriginValues.map(normalizeOrigin).filter(Boolean);
-          if (!allowedOrigins.includes(normalizeOrigin(observedUrl.origin)) || observedUrl.username || observedUrl.password) {
-            throw Object.assign(new Error("Same-target reattachment observed a page outside the authorized environment."), { reattachFailureCode: "target_scope_rejected" });
-          }
-          if (typeof replacement.commit === "function") await replacement.commit();
-          this.session = nextSession;
-          try { await this.assertExecutionLease?.(); }
-          catch (leaseError) {
-            if (leaseError && typeof leaseError === "object") leaseError.reattachFailureCode ??= "lease_rebind_failed";
-            throw leaseError;
-          }
-          attempt.reconnectedObservation = true;
-          return observation;
-        } catch (reattachError) {
-          await replacement?.session?.close?.().catch(() => {});
-          if (reattachError && typeof reattachError === "object") {
-            reattachError.observationAttempts = 2;
-            reattachError.reattachFailureCode ??= "unknown";
-          }
-          throw reattachError;
-        }
-      };
-
-      try {
-        await this.session.waitForChange(timeoutMs, baseline);
-        return await this.session.observe({ selectionGoal: goal });
-      } catch (firstError) {
-        if (isAbortError(firstError)) throw firstError;
-        const stillAttached = this.session.attached !== false
-          && !["detached", "closed"].includes(this.session.targetLifecycle);
-        if (!stillAttached) return await reattachToSameTarget(firstError);
-        await new Promise(resolve => setTimeout(resolve, 100));
-        throwIfAborted();
-        try {
-          const observation = await this.session.observe({ selectionGoal: goal });
-          return observation;
-        } catch (secondError) {
-          const secondErrorText = String(secondError?.message ?? secondError).toLocaleLowerCase();
-          const detachedAfterRetry = this.session.attached === false
-            || ["detached", "closed"].includes(this.session.targetLifecycle)
-            || /target.{0,24}(detached|closed)|(?:detached|closed).{0,24}target/u.test(secondErrorText);
-          if (detachedAfterRetry) return await reattachToSameTarget(secondError);
-          if (secondError && typeof secondError === "object") secondError.observationAttempts = 2;
-          throw secondError;
-        }
-      }
-    };
+    const recoveryCoordinator = new RecoveryCoordinator({
+      getSession: () => this.session,
+      setSession: session => { this.session = session; },
+      getLatestObservation: () => latest,
+      reattachSameTarget: this.reattachSameTarget
+        ? (...args) => this.reattachSameTarget(...args)
+        : null,
+      environment: this.environment,
+      assertExecutionLease: (...args) => this.assertExecutionLease?.(...args),
+      selectionGoal: goal,
+      isAbortError,
+      throwIfAborted
+    });
+    const observeAfterChange = (timeoutMs, baseline, attempt = null) =>
+      recoveryCoordinator.observeAfterChange(timeoutMs, baseline, attempt);
     const outcomeVerified = async () => {
       if (!hasVerifiedOutcome(latest, goal, state.initialPageLabelHashes, this.environment)) return false;
       return !searchPhrase || await this.session.verifySearchOutcome(searchPhrase);
@@ -1322,144 +1256,36 @@ export class NavigationEngine {
     // Replay only verified traces. Each step resolves a fresh, visible candidate from the current observation.
     // Candidate identities, raw labels, form values, and URL query data are never stored in the workflow file.
     if (this.workflowStore && !resumeState && !searchPhrase && !explicitReadWorkflowRequest && !(planner?.getTaskIntent?.() ?? effectiveWorkflowIntent)?.requiredCapabilityIds?.length) {
-      const workflow = await this.workflowStore.find(goal, latest);
-      if (workflow) {
-        const scrollSteps = workflow.steps.filter(step => step.action === "scroll").length;
-        if (workflow.steps.length <= this.maxActions - state.attempts.length && scrollSteps <= this.maxScrolls - scrollActionsUsed) {
-          workflowReplay.status = "replaying";
-          let stale = false;
-          for (const step of workflow.steps) {
-            if (routeFingerprint(latest.page.url) !== step.routeFingerprint) { stale = true; break; }
-            if (step.action === "scroll") {
-              const beforePositionFraction = latest.scrollTargets
-                ?.filter(target => matchesScrollTargetSignature(target, step.scrollTarget) && target.canScrollDown === true)
-                .map(scrollPositionFraction)
-                .find(Number.isFinite);
-              if (!scrollPositionMatches(beforePositionFraction, step.beforePositionFraction) ||
-                  visibleCandidatesFingerprint(latest) !== step.beforeCandidatesFingerprint) { stale = true; break; }
-              const scrollMatches = (latest.scrollTargets ?? []).filter(target =>
-                matchesScrollTargetSignature(target, step.scrollTarget) && target.canScrollDown === true
-              );
-              if (scrollMatches.length !== 1) { stale = true; break; }
-              const target = scrollMatches[0];
-              const beforeStateFingerprint = observationStateFingerprint(latest);
-              const waitBaseline = pageChangeWaitBaseline(latest, target);
-              const attempt = {
-                action: "scroll",
-                targetIdentity: target.identity,
-                scrollTopBefore: target.scrollTop,
-                beforeStateFingerprint,
-                beforeRouteFingerprint: routeFingerprint(latest.page.url),
-                beforeEvidenceId: latest.evidenceId,
-                startedAt: new Date().toISOString()
-              };
-              const review = await prepareTelemetryDecision(attempt, "scroll", target, true);
-              if (!review.allowed) return await suspendForDecisionReview(attempt, review);
-              await beginAction(attempt);
-              await reserveTelemetryOperation(attempt, "scroll");
-              try {
-                throwIfAborted();
-                await dispatchThroughAuthorizedExecutor(this.session, {
-                  environment: this.environment,
-                  localFixture: this.localFixture,
-                  assertExecutionLease: this.assertExecutionLease,
-                  sameTargetNavigation: this.sameTargetNavigation,
-                  goal,
-                  action: "scroll",
-                  candidate: target
-                });
-              }
-              catch (error) {
-                if (isAbortError(error)) return await canceledWithPendingAction(attempt);
-                attempt.error = { name: error.name, message: String(error.message).slice(0, 400) };
-                attempt.dispatchStatus = error.dispatchStatus ?? "failed";
-              }
-              await recordTelemetryDispatch(attempt, "scroll", attempt.error ? (attempt.dispatchStatus ?? "failed") : "dispatched");
-              try {
-                setLatestObservation(await observeAfterChange(1_500, waitBaseline));
-              } catch (error) {
-                workflowReplay.actions++;
-                if (isAbortError(error)) return await canceledWithPendingAction(attempt);
-                workflowReplay.status = "interrupted";
-                return await stopAfterObservationLoss(attempt, error);
-              }
-              throwIfAborted();
-              const afterStateFingerprint = observationStateFingerprint(latest);
-              const afterScrollMatches = (latest.scrollTargets ?? []).filter(item => matchesScrollTargetSignature(item, step.scrollTarget));
-              const afterTarget = afterScrollMatches.length === 1 ? afterScrollMatches[0] : undefined;
-              const afterPositionFraction = scrollPositionFraction(afterTarget);
-              const afterCandidatesFingerprint = visibleCandidatesFingerprint(latest);
-              const moved = Boolean(afterTarget && afterTarget.scrollTop > Number(target.scrollTop ?? 0) + 2);
-              attempt.afterStateFingerprint = afterStateFingerprint;
-              attempt.scrollTopAfter = afterTarget?.scrollTop ?? null;
-              attempt.scrollProgressObserved = moved;
-              attempt.afterRouteFingerprint = routeFingerprint(latest.page.url);
-              attempt.afterEvidenceId = latest.evidenceId;
-              attempt.completedAt = new Date().toISOString();
-              await recordTelemetryObservation(attempt, moved, attempt.error ? "scroll_failed_state_observed" : moved ? "scroll_progress_observed" : "scroll_no_progress_observed");
-              finishAction(attempt);
-              workflowReplay.actions++;
-              incrementScrolls();
-              excludeFailedAttempt(attempt);
-              if (attempt.error || !moved) {
-                workflowTraceSafe = false;
-                if (!moved) {
-                  state.scrollRecoveryBlocked = true;
-                  for (const item of latest.scrollTargets ?? []) excludedScrollIdentities.add(item.identity);
-                }
-              }
-              await updateJournal();
-              const replayHandoff = await handoffIfNeeded(latest);
-              if (replayHandoff) return replayHandoff;
-              if (await outcomeVerified()) {
-                workflowReplay.status = "replayed";
-                return await succeed();
-              }
-              const afterMatchesTrace = !attempt.error && moved &&
-                afterCandidatesFingerprint === step.afterCandidatesFingerprint &&
-                scrollPositionMatches(afterPositionFraction, step.afterPositionFraction);
-              if (!afterMatchesTrace) {
-                workflowTraceSafe = false;
-                stale = true;
-                break;
-              }
-              workflowTraceAttempts.push({
-                ...attempt,
-                scrollTargetSignature: step.scrollTarget,
-                beforePositionFraction: step.beforePositionFraction,
-                afterPositionFraction,
-                beforeCandidatesFingerprint: step.beforeCandidatesFingerprint,
-                afterCandidatesFingerprint
-              });
-              continue;
-            }
-            const matches = latest.candidates.filter(candidate => matchesTargetSignature(candidate, step.target));
-            if (matches.length !== 1) { stale = true; break; }
-            const target = matches[0];
-            const authorization = authorizePlannedAction(goal, target);
-            if (!authorization.authorized) {
-              state.status = "needs_human";
-              state.terminationReason = authorization.reason;
-              state.authorizationRequired = { category: authorization.category, targetIdentity: target.identity, evidenceId: latest.evidenceId };
-              await updateJournal();
-              return resultWithWorkflow(handoffResult(goal, state.terminationReason, state.authorizationRequired, state.attempts.length, recoveries, latest.evidenceId));
-            }
+      const replay = await replayCoordinator.load({
+        observation: latest,
+        remainingActions: this.maxActions - state.attempts.length,
+        remainingScrolls: this.maxScrolls - scrollActionsUsed
+      });
+      if (replay.status === "budget-skipped") workflowReplay.status = "budget-skipped";
+      if (replay.workflow) {
+        const workflow = replay.workflow;
+        workflowReplay.status = "replaying";
+        let stale = false;
+        for (const step of workflow.steps) {
+          const resolvedStep = replayCoordinator.resolveStep(step, latest);
+          if (resolvedStep.status !== "ready") { stale = true; break; }
+          if (step.action === "scroll") {
+            const { target } = resolvedStep;
             const beforeStateFingerprint = observationStateFingerprint(latest);
-            const beforeSemanticFingerprint = observationSemanticFingerprint(latest);
-            const waitBaseline = pageChangeWaitBaseline(latest);
+            const waitBaseline = pageChangeWaitBaseline(latest, target);
             const attempt = {
-              action: "click",
+              action: "scroll",
               targetIdentity: target.identity,
-              targetSignature: targetSignature(target),
+              scrollTopBefore: target.scrollTop,
               beforeStateFingerprint,
               beforeRouteFingerprint: routeFingerprint(latest.page.url),
               beforeEvidenceId: latest.evidenceId,
               startedAt: new Date().toISOString()
             };
-            const review = await prepareTelemetryDecision(attempt, "click", target, true);
+            const review = await prepareTelemetryDecision(attempt, "scroll", target, true);
             if (!review.allowed) return await suspendForDecisionReview(attempt, review);
             await beginAction(attempt);
-            await reserveTelemetryOperation(attempt, "click");
+            await reserveTelemetryOperation(attempt, "scroll");
             try {
               throwIfAborted();
               await dispatchThroughAuthorizedExecutor(this.session, {
@@ -1468,18 +1294,18 @@ export class NavigationEngine {
                 assertExecutionLease: this.assertExecutionLease,
                 sameTargetNavigation: this.sameTargetNavigation,
                 goal,
-                action: "click",
+                action: "scroll",
                 candidate: target
               });
-            } catch (error) {
+            }
+            catch (error) {
               if (isAbortError(error)) return await canceledWithPendingAction(attempt);
               attempt.error = { name: error.name, message: String(error.message).slice(0, 400) };
               attempt.dispatchStatus = error.dispatchStatus ?? "failed";
             }
-            await recordTelemetryDispatch(attempt, "click", attempt.error ? (attempt.dispatchStatus ?? "failed") : "dispatched");
-            excludedIdentities.add(target.identity);
+            await recordTelemetryDispatch(attempt, "scroll", attempt.error ? (attempt.dispatchStatus ?? "failed") : "dispatched");
             try {
-              setLatestObservation(await observeAfterChange(2_000, waitBaseline, attempt));
+              setLatestObservation(await observeAfterChange(1_500, waitBaseline));
             } catch (error) {
               workflowReplay.actions++;
               if (isAbortError(error)) return await canceledWithPendingAction(attempt);
@@ -1488,22 +1314,26 @@ export class NavigationEngine {
             }
             throwIfAborted();
             const afterStateFingerprint = observationStateFingerprint(latest);
-            const afterSemanticFingerprint = observationSemanticFingerprint(latest);
+            const scrollEvaluation = replayCoordinator.evaluateScrollStep(step, target, attempt, latest);
+            const { afterTarget, afterPositionFraction, afterCandidatesFingerprint, moved } = scrollEvaluation;
             attempt.afterStateFingerprint = afterStateFingerprint;
-            recordFailedTargetPresence(attempt, latest);
-            excludeFailedAttempt(attempt);
-            if (attempt.error) {
-              if (afterSemanticFingerprint !== beforeSemanticFingerprint) workflowTraceSafe = false;
-            } else if (afterStateFingerprint !== beforeStateFingerprint) {
-              workflowTraceAttempts.push(attempt);
-            }
+            attempt.scrollTopAfter = afterTarget?.scrollTop ?? null;
+            attempt.scrollProgressObserved = moved;
             attempt.afterRouteFingerprint = routeFingerprint(latest.page.url);
             attempt.afterEvidenceId = latest.evidenceId;
             attempt.completedAt = new Date().toISOString();
-            await recordTelemetryObservation(attempt, afterStateFingerprint !== beforeStateFingerprint,
-              attempt.error ? "click_failed_state_observed" : "click_state_observed");
+            await recordTelemetryObservation(attempt, moved, attempt.error ? "scroll_failed_state_observed" : moved ? "scroll_progress_observed" : "scroll_no_progress_observed");
             finishAction(attempt);
             workflowReplay.actions++;
+            incrementScrolls();
+            excludeFailedAttempt(attempt);
+            if (attempt.error || !moved) {
+              workflowTraceSafe = false;
+              if (!moved) {
+                state.scrollRecoveryBlocked = true;
+                for (const item of latest.scrollTargets ?? []) excludedScrollIdentities.add(item.identity);
+              }
+            }
             await updateJournal();
             const replayHandoff = await handoffIfNeeded(latest);
             if (replayHandoff) return replayHandoff;
@@ -1511,22 +1341,112 @@ export class NavigationEngine {
               workflowReplay.status = "replayed";
               return await succeed();
             }
-            if (attempt.error || afterStateFingerprint === beforeStateFingerprint) { stale = true; break; }
+            if (!scrollEvaluation.matchesTrace) {
+              workflowTraceSafe = false;
+              stale = true;
+              break;
+            }
+            workflowTraceAttempts.push({
+              ...attempt,
+              scrollTargetSignature: step.scrollTarget,
+              beforePositionFraction: step.beforePositionFraction,
+              afterPositionFraction,
+              beforeCandidatesFingerprint: step.beforeCandidatesFingerprint,
+              afterCandidatesFingerprint
+            });
+            continue;
           }
-          if (workflowReplay.actions === workflow.steps.length && !await outcomeVerified()) stale = true;
-          if (stale) {
-            await this.workflowStore.invalidate(goal, state.initialUrlFingerprint);
-            if (workflowReplay.actions > 0) {
-              incrementRecoveries();
-              state.recoveryCount = recoveries;
-              workflowReplay.status = "repairing";
-              await updateJournal();
-            } else workflowReplay.status = "stale";
-          } else if (workflowReplay.actions === workflow.steps.length) {
+          const target = resolvedStep.target;
+          const authorization = authorizePlannedAction(goal, target);
+          if (!authorization.authorized) {
+            state.status = "needs_human";
+            state.terminationReason = authorization.reason;
+            state.authorizationRequired = { category: authorization.category, targetIdentity: target.identity, evidenceId: latest.evidenceId };
+            await updateJournal();
+            return resultWithWorkflow(handoffResult(goal, state.terminationReason, state.authorizationRequired, state.attempts.length, recoveries, latest.evidenceId));
+          }
+          const beforeStateFingerprint = observationStateFingerprint(latest);
+          const beforeSemanticFingerprint = observationSemanticFingerprint(latest);
+          const waitBaseline = pageChangeWaitBaseline(latest);
+          const attempt = {
+            action: "click",
+            targetIdentity: target.identity,
+            targetSignature: targetSignature(target),
+            beforeStateFingerprint,
+            beforeRouteFingerprint: routeFingerprint(latest.page.url),
+            beforeEvidenceId: latest.evidenceId,
+            startedAt: new Date().toISOString()
+          };
+          const review = await prepareTelemetryDecision(attempt, "click", target, true);
+          if (!review.allowed) return await suspendForDecisionReview(attempt, review);
+          await beginAction(attempt);
+          await reserveTelemetryOperation(attempt, "click");
+          try {
+            throwIfAborted();
+            await dispatchThroughAuthorizedExecutor(this.session, {
+              environment: this.environment,
+              localFixture: this.localFixture,
+              assertExecutionLease: this.assertExecutionLease,
+              sameTargetNavigation: this.sameTargetNavigation,
+              goal,
+              action: "click",
+              candidate: target
+            });
+          } catch (error) {
+            if (isAbortError(error)) return await canceledWithPendingAction(attempt);
+            attempt.error = { name: error.name, message: String(error.message).slice(0, 400) };
+            attempt.dispatchStatus = error.dispatchStatus ?? "failed";
+          }
+          await recordTelemetryDispatch(attempt, "click", attempt.error ? (attempt.dispatchStatus ?? "failed") : "dispatched");
+          excludedIdentities.add(target.identity);
+          try {
+            setLatestObservation(await observeAfterChange(2_000, waitBaseline, attempt));
+          } catch (error) {
+            workflowReplay.actions++;
+            if (isAbortError(error)) return await canceledWithPendingAction(attempt);
+            workflowReplay.status = "interrupted";
+            return await stopAfterObservationLoss(attempt, error);
+          }
+          throwIfAborted();
+          const afterStateFingerprint = observationStateFingerprint(latest);
+          const afterSemanticFingerprint = observationSemanticFingerprint(latest);
+          attempt.afterStateFingerprint = afterStateFingerprint;
+          recordFailedTargetPresence(attempt, latest);
+          excludeFailedAttempt(attempt);
+          if (attempt.error) {
+            if (afterSemanticFingerprint !== beforeSemanticFingerprint) workflowTraceSafe = false;
+          } else if (afterStateFingerprint !== beforeStateFingerprint) {
+            workflowTraceAttempts.push(attempt);
+          }
+          attempt.afterRouteFingerprint = routeFingerprint(latest.page.url);
+          attempt.afterEvidenceId = latest.evidenceId;
+          attempt.completedAt = new Date().toISOString();
+          await recordTelemetryObservation(attempt, afterStateFingerprint !== beforeStateFingerprint,
+            attempt.error ? "click_failed_state_observed" : "click_state_observed");
+          finishAction(attempt);
+          workflowReplay.actions++;
+          await updateJournal();
+          const replayHandoff = await handoffIfNeeded(latest);
+          if (replayHandoff) return replayHandoff;
+          if (await outcomeVerified()) {
             workflowReplay.status = "replayed";
             return await succeed();
           }
-        } else workflowReplay.status = "budget-skipped";
+          if (attempt.error || !replayCoordinator.clickChanged(beforeStateFingerprint, latest)) { stale = true; break; }
+        }
+        if (workflowReplay.actions === workflow.steps.length && !await outcomeVerified()) stale = true;
+        if (stale) {
+          await replayCoordinator.invalidate();
+          if (workflowReplay.actions > 0) {
+            incrementRecoveries();
+            state.recoveryCount = recoveries;
+            workflowReplay.status = "repairing";
+            await updateJournal();
+          } else workflowReplay.status = "stale";
+        } else if (workflowReplay.actions === workflow.steps.length) {
+          workflowReplay.status = "replayed";
+          return await succeed();
+        }
       }
     }
 
