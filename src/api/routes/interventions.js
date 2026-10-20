@@ -38,6 +38,10 @@ export function createInterventionRoutes({
         sendJson(res, 200, await interventionTools.list_pending_interventions());
         return true;
       }
+      if (method === "GET" && path === "/v1/interventions/run-state") {
+        sendJson(res, 200, await interventionTools.get_run_state({ runId: query.runId ?? "" }));
+        return true;
+      }
       const interventionMatch = path.match(/^\/v1\/interventions\/([^/]+)(?:\/(acknowledge|approve|reject|resume|cancel))?$/);
       if (interventionMatch) {
         const interventionId = interventionMatch[1];
@@ -48,10 +52,6 @@ export function createInterventionRoutes({
         if (method === "POST" && action === "reject") { const body = await readBody(req); sendJson(res, 200, await interventionTools.reject_operation({ interventionId, ...(body ?? {}) })); return true; }
         if (method === "POST" && action === "resume") { sendJson(res, 200, await interventionTools.resume_run({ interventionId })); return true; }
         if (method === "POST" && action === "cancel") { sendJson(res, 200, await interventionTools.cancel_run({ interventionId })); return true; }
-      }
-      if (method === "GET" && path === "/v1/interventions/run-state") {
-        sendJson(res, 200, await interventionTools.get_run_state({ runId: query.runId ?? "" }));
-        return true;
       }
       sendError(res, 404, 99404, "No such intervention resource.");
     } catch (error) {

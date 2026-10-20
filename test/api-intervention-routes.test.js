@@ -61,6 +61,20 @@ test("unmatched intervention actions preserve the family 404 response", async ()
   assert.deepEqual(harness.responses, [{ status: 404, code: 99404, message: "No such intervention resource." }]);
 });
 
+test("run-state endpoint is matched before the generic intervention identifier route", async () => {
+  const harness = createHarness({
+    tools: { async get_run_state(input) { return { runId: input.runId }; } }
+  });
+  const handled = await harness.route({}, {}, {
+    method: "GET",
+    path: "/v1/interventions/run-state",
+    query: { runId: "run-7" }
+  });
+
+  assert.equal(handled, true);
+  assert.deepEqual(harness.responses, [{ status: 200, value: { runId: "run-7" } }]);
+});
+
 test("non-intervention routes are left to the API composition layer", async () => {
   const harness = createHarness();
   const handled = await harness.route({}, {}, { method: "GET", path: "/v1/evidence/releases/audit" });
