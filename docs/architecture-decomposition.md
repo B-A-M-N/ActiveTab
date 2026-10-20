@@ -52,7 +52,7 @@ Keep `TestRunner` as the top-level declarative workflow owner. `NavigationEngine
 
 ## Stage 4 — Shared application services for transports
 
-The shared run service is in place for MCP and HTTP. `src/mcp/server.js` is now a 270-line protocol startup/composition module. `src/api/local-server.js` is 1,088 lines after extracting discovery and capability endpoint families into injected route modules. Test-run lifecycle, evidence release, public-read approvals, intervention handling, and general request dispatch remain composed there. Continue extracting endpoint families with injected server-owned dependencies while MCP and HTTP retain request validation, authentication, protocol serialization, and response mapping. Do not move leases, principals, grants, stores, or execution authority into request-controlled route data. Both transports must preserve identical policy and lifecycle semantics.
+The shared run service is in place for MCP and HTTP. `src/mcp/server.js` is a 270-line protocol startup/composition module. `src/api/local-server.js` is now 1,049 lines after extracting discovery, capability, and intervention endpoint families into injected route modules. Test-run lifecycle, evidence release, public-read approvals, and general request dispatch remain composed there. Continue extracting endpoint families with injected server-owned dependencies while MCP and HTTP retain request validation, authentication, protocol serialization, and response mapping. Do not move leases, principals, grants, stores, or execution authority into request-controlled route data. Both transports must preserve identical policy and lifecycle semantics.
 
 ## Stage 5 — Qualification and fixture composition
 

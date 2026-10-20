@@ -47,6 +47,7 @@ import { RunLocalPublicReadApprovalBroker } from "../capabilities/publicReadAppr
 import { FileUploadGrantStore } from "../runtime/fileUploadGrants.js";
 import { createDiscoveryRoutes } from "./routes/discovery.js";
 import { createCapabilityRoutes } from "./routes/capabilities.js";
+import { createInterventionRoutes } from "./routes/interventions.js";
 
 const DEFAULT_PORT = 9377;
 const API_PREFIX = "/v3/bots";
@@ -501,6 +502,14 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
     sendJson,
     sendError
   });
+  const handleInterventionRoute = createInterventionRoutes({
+    authorizeMutation,
+    authenticateOperator,
+    interventionTools,
+    readBody,
+    sendJson,
+    sendError
+  });
 
   // Executor readiness: fail closed when no real navigation runner was provided.
   const executorReady = lifecycle.executorReady;
@@ -602,56 +611,8 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
         return;
       }
 
-      // ── Intervention lifecycle (P0-6): status/ack/approval/resume/cancel ──
-      if (path === "/v1/interventions" || path.startsWith("/v1/interventions/")) {
-        const resolveMatch = path.match(/^\/v1\/interventions\/([^/]+)\/resolve$/);
-        if (method === "POST" && resolveMatch) {
-          const authenticatedOperator = await authenticateOperator(req);
-          if (!authenticatedOperator) { sendError(res, 403, 99403, "Independent operator authentication required."); return; }
-          const body = await readBody(req) ?? {};
-          if (typeof body !== "object" || Array.isArray(body)) { sendError(res, 400, 99001, "Approval resolution must be a JSON object."); return; }
-          if (Object.hasOwn(body, "authenticatedOperator")) { sendError(res, 400, 99001, "Operator identity is derived from the authenticated operator session."); return; }
-          if (body.decision !== undefined && !["approve", "reject"].includes(body.decision)) { sendError(res, 400, 99001, "decision must be approve or reject."); return; }
-          if (!Number.isInteger(body.expectedRevision)) { sendError(res, 400, 99001, "expectedRevision is required."); return; }
-          try {
-            sendJson(res, 200, await interventionTools.resolve_operation_approval({
-              interventionId: decodeURIComponent(resolveMatch[1]),
-              authenticatedOperator,
-              decision: body.decision ?? "approve",
-              expectedRevision: body.expectedRevision
-            }));
-          } catch (error) {
-            sendError(res, 409, 99409, String(error?.message ?? error).slice(0, 300));
-          }
-          return;
-        }
-        if (!authorizeMutation(req)) { sendError(res, 401, 99401, "Authentication required."); return; }
-        try {
-          if (method === "GET" && path === "/v1/interventions") {
-            sendJson(res, 200, await interventionTools.list_pending_interventions());
-            return;
-          }
-          const interventionMatch = path.match(/^\/v1\/interventions\/([^/]+)(?:\/(acknowledge|approve|reject|resume|cancel))?$/);
-          if (interventionMatch) {
-            const interventionId = interventionMatch[1];
-            const action = interventionMatch[2] ?? "get";
-            if (method === "GET" && action === "get") { sendJson(res, 200, await interventionTools.get_pending_intervention({ interventionId })); return; }
-            if (method === "POST" && action === "acknowledge") { const body = await readBody(req); sendJson(res, 200, await interventionTools.acknowledge_human_action({ interventionId, ...(body ?? {}) })); return; }
-            if (method === "POST" && action === "approve") { const body = await readBody(req); sendJson(res, 200, await interventionTools.request_operation_approval({ interventionId, ...(body ?? {}) })); return; }
-            if (method === "POST" && action === "reject") { const body = await readBody(req); sendJson(res, 200, await interventionTools.reject_operation({ interventionId, ...(body ?? {}) })); return; }
-            if (method === "POST" && action === "resume") { sendJson(res, 200, await interventionTools.resume_run({ interventionId })); return; }
-            if (method === "POST" && action === "cancel") { sendJson(res, 200, await interventionTools.cancel_run({ interventionId })); return; }
-          }
-          if (method === "GET" && path === "/v1/interventions/run-state") {
-            sendJson(res, 200, await interventionTools.get_run_state({ runId: query.runId ?? "" }));
-            return;
-          }
-          sendError(res, 404, 99404, "No such intervention resource.");
-        } catch (error) {
-          sendError(res, 400, 99400, String(error?.message ?? error).slice(0, 300));
-        }
-        return;
-      }
+      // Operator and API authentication remain enforced inside the injected route.
+      if (await handleInterventionRoute(req, res, { method, path, query })) return;
 
       // Evidence releases are reviewed on the independent operator channel.
       // The model-facing MCP process can create requests but cannot approve them.
