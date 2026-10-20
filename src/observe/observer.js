@@ -11,12 +11,9 @@ import { jsonByteLength } from "./evidenceSizing.js";
 import { inspectRuntimeState } from "./runtimeStateInspector.js";
 import { captureOutOfProcessFrames, captureScrollableTargets, instrumentCaptureClient, viewportScrollTarget } from "./frameCollector.js";
 import { EvidenceStore } from "./evidenceStore.js";
+import { ResponseProjectionCache } from "./responseProjectionCache.js";
 
 const STYLE_NAMES = ["display", "visibility", "opacity", "pointer-events", "position", "z-index"];
-const NETWORK_RESPONSE_PROJECTION_CACHE_TTL_MS = 5 * 60_000;
-const NETWORK_RESPONSE_PROJECTION_CACHE_MAX_ENTRIES = 2;
-const NETWORK_RESPONSE_PROJECTION_CACHE_MAX_BYTES = 18 * 1024 * 1024;
-const NETWORK_RESPONSE_PROJECTION_CACHE_MAX_ENTRY_BYTES = 17 * 1024 * 1024;
 const FORBIDDEN_VALUE_ATTRIBUTES = new Set(["value", "placeholder"]);
 const VALUE_ROLES = new Set(["textbox", "searchbox", "combobox", "spinbutton", "slider", "progressbar"]);
 const MAX_RETAINED_LOOKUP_CANDIDATES = 10_000;
@@ -217,12 +214,11 @@ export class BrowserObserver {
   constructor(session, { evidenceLimit = 12, maxEvidenceBytes = 64 * 1024 * 1024 } = {}) {
     this.session = session;
     this.networkSignalState = new Map();
-    this.responseProjectionCache = new Map();
-    this.responseProjectionCacheBytes = 0;
+    this.responseProjectionCache = new ResponseProjectionCache();
     this.evidenceStore = new EvidenceStore({
       limit: evidenceLimit,
       maxBytes: maxEvidenceBytes,
-      onEvict: evidenceId => this.#deleteResponseProjectionsForEvidence(evidenceId)
+      onEvict: evidenceId => this.responseProjectionCache.deleteForEvidence(evidenceId)
     });
   }
 
@@ -699,59 +695,10 @@ export class BrowserObserver {
 
   async inspectNetworkResponse(id, options = {}) {
     return inspectNetworkResponse(this, id, options, {
-      getProjection: key => this.#getResponseProjection(key),
-      storeProjection: (key, projection) => this.#storeResponseProjection(key, projection),
+      getProjection: key => this.responseProjectionCache.get(key),
+      storeProjection: (key, projection) => this.responseProjectionCache.store(key, projection),
       pageProjection: pageResponseProjection
     });
-  }
-
-  #getResponseProjection(key) {
-    const entry = this.responseProjectionCache.get(key);
-    if (!entry) return null;
-    if (entry.expiresAt <= Date.now()) {
-      this.responseProjectionCache.delete(key);
-      this.responseProjectionCacheBytes -= entry.weightBytes;
-      return null;
-    }
-    this.responseProjectionCache.delete(key);
-    this.responseProjectionCache.set(key, entry);
-    return entry;
-  }
-
-  #deleteResponseProjectionsForEvidence(evidenceId) {
-    for (const [key, entry] of this.responseProjectionCache) {
-      if (entry.projection.evidenceId !== evidenceId) continue;
-      this.responseProjectionCache.delete(key);
-      this.responseProjectionCacheBytes -= entry.weightBytes;
-    }
-  }
-
-  #storeResponseProjection(key, projection) {
-    const metadataBytes = Buffer.byteLength(JSON.stringify({
-      analysis: projection.analysis,
-      credentialDetails: projection.credentialDetails,
-      sections: projection.markdownIndex?.sections,
-      blocks: projection.markdownIndex?.blocks
-    })) + (projection.byteOffsets.checkpoints.length * 32);
-    const weightBytes = metadataBytes + (projection.selectedView.length * 2);
-    if (weightBytes > NETWORK_RESPONSE_PROJECTION_CACHE_MAX_ENTRY_BYTES) return false;
-    const prior = this.responseProjectionCache.get(key);
-    if (prior) {
-      this.responseProjectionCache.delete(key);
-      this.responseProjectionCacheBytes -= prior.weightBytes;
-    }
-    const now = Date.now();
-    const entry = { projection, weightBytes, expiresAt: now + NETWORK_RESPONSE_PROJECTION_CACHE_TTL_MS };
-    this.responseProjectionCache.set(key, entry);
-    this.responseProjectionCacheBytes += weightBytes;
-    while (this.responseProjectionCache.size > NETWORK_RESPONSE_PROJECTION_CACHE_MAX_ENTRIES
-      || this.responseProjectionCacheBytes > NETWORK_RESPONSE_PROJECTION_CACHE_MAX_BYTES) {
-      const oldestKey = this.responseProjectionCache.keys().next().value;
-      const oldest = this.responseProjectionCache.get(oldestKey);
-      this.responseProjectionCache.delete(oldestKey);
-      this.responseProjectionCacheBytes -= oldest.weightBytes;
-    }
-    return this.responseProjectionCache.has(key);
   }
 
 
