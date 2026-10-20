@@ -76,10 +76,13 @@ node --test test/mcp-evidence-release.test.js test/mcp.test.js
 | `src/api/` | Local HTTP composition, routing, and server-owned persistence configuration |
 | `src/api/routes/` | Incrementally extracted endpoint-family handlers; no alternate policy or run composition |
 | `src/mcp/` | MCP tool composition, exact session selection, and separately granted sensitive evidence release |
+| `src/mcp/tools/toolCatalog.js` | MCP tool descriptions and schemas in stable advertised order |
 | `src/mcp/browserTools.js` | Injected tab lifecycle and browser observation handlers; click dispatch remains behind the shared lease and authorized action path |
 | `src/mcp/tools/diagnosticTools.js` | Read-only run diagnostics, failure investigation, and reports over server-owned runs and sessions |
 | `src/mcp/tools/navigationTools.js` | MCP navigation, discovery, and visible-record reads through shared run and lease services |
 | `src/mcp/tools/workflowTools.js` | MCP test-run start, resume, status, and cancellation over `ApplicationRunService` and durable run state |
+| `src/mcp/tools/qualificationTools.js` | Staging Cloud Agent entry/task qualification and exact browser/backend evidence reconciliation through server-owned workflow and durable run services |
+| `src/mcp/tools/runtimeTools.js` | Read-only capability projections from attached targets and authenticated model-catalog metadata |
 | `src/mcp/evidenceReleaseTools.js` | Profile-bound evidence-release requests, grant verification, data retrieval, and byte charging |
 | `src/discovery/` | Evidence-driven application discovery and bounded persistent knowledge |
 | `src/capabilities/` | Capability discovery, compilation, qualification, registry, and invocation contracts |
