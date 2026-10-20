@@ -44,6 +44,8 @@ Recent behavior-preserving slices are separate commits:
 - `bfd839e` — extract compatibility API run listing, status, detail, and cancellation into an injected route module; preserve outer API authentication and server-owned task store/lifecycle dependencies.
 - `540514b` — extract registered pagination target resolution, authorized dispatch, and progress verification; retain the engine compatibility export and exact lease checks.
 - `b85aa06` — extract authenticated compatibility bot, template, and region catalog reads while retaining capability-route priority and the existing `/v3` authentication gate.
+- `86e3a6d` — extract compatibility run creation and peer execution handlers with the outer API gate, peer-token check, server-owned executor, and extraction release policy preserved.
+- `935ba8a` — extract bounded output-file serving; retain the API authentication gate and verify path, extension, size, MIME, and response behavior.
 - `b3f8f7f` — route `/v1/interventions/run-state` before the generic intervention-ID matcher so the run-state handler is reachable.
 - `b3c66a8` — give the 600-control retained-lookup fixture the existing maximum query timeout; production defaults are unchanged.
 
@@ -51,9 +53,10 @@ The repository also already has separate run-context, replay, recovery, action-a
 
 ## Headless verification and limits
 
-The latest complete run used `ACTIVETAB_HEADLESS=1 npm run test:isolated -- --test-concurrency=1` through an owner-private disposable state directory. It used the same `node --test` discovery and serial file execution as the isolated suite, with compatible Chrome fixtures launched as `--headless=new`.
+The latest complete run used `ACTIVETAB_HEADLESS=1 npm test -- --test-concurrency=1` through an owner-private disposable state directory. It used the standard `node --test` discovery and serial file execution, with compatible Chrome fixtures launched as `--headless=new`.
 
-- Full suite after run creation/peer handler extraction: **861 passed, 0 failed, 5 skipped** (866 tests; 81.01 seconds).
+- Full suite after bounded output-file handler extraction: **864 passed, 0 failed, 5 skipped** (869 tests; 105.70 seconds).
+- Focused output/API regression: **43 passed, 0 failed**; API-server rerun after the authentication assertion: **35 passed, 0 failed**.
 - Opt-in headless extension subset: **1 passed, 0 failed, 0 skipped**. It covers explicit popup consent through a `userGesture` handler call, exact-tab grants, Native Messaging, CDP observation, and protected-route cookie preservation.
 - Headless OOPIF fixture: direct and nested frame recovery plus root-page scroll passed.
 
@@ -64,6 +67,6 @@ No headed equivalence is claimed for skipped desktop behavior. Live/staging qual
 ## Next bounded slices
 
 1. Continue `NavigationEngine` extraction from provider planning and attempt coordination while retaining one public run loop and the current executor. Task-scope expansion lives in `planningEvidence.js`; workflow planner selection lives in `workflowRoutePlanner.js`; visual assessment and grounding live in `visualDecisionCoordinator.js` and remain advisory; registered pagination is isolated in `registeredPagination.js`.
-2. Continue decomposition from the largest remaining coordinators. HTTP endpoint dispatch for discovery, capabilities, interventions, approvals, evidence releases, test runs, legacy run records, and catalog reads now uses injected route modules; test-run lifecycle implementations, run creation/peer execution, output serving, and general request dispatch remain composed in `local-server.js` (874 lines).
+2. Continue decomposition from the largest remaining coordinators. HTTP route modules now cover discovery, capabilities, interventions, approvals, evidence releases, test runs, legacy run records, catalog reads, run creation/peer execution, and bounded output-file serving; test-run lifecycle implementations and general request dispatch remain composed in `local-server.js` (712 lines).
 3. Measure response acquisition/process memory as best-effort diagnostics; keep `hardMemoryBound:false` until the transport can enforce a pre-materialization limit.
 4. Run the remaining held-out application and multi-process lifecycle qualifications when their required authorized environments are available.
