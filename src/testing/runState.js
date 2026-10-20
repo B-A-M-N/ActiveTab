@@ -6,12 +6,12 @@
  */
 
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
-import { mkdir, writeFile, readFile, readdir, rename, open, lstat, chmod, unlink } from "node:fs/promises";
-import { join, dirname, resolve } from "node:path";
+import { readFile, open, lstat, chmod, unlink } from "node:fs/promises";
+import { join } from "node:path";
 import { hostname } from "node:os";
 import { BrowserTargetLeaseStore } from "./targetLeaseStore.js";
+import { RunDocumentStore } from "./lifecycle/runDocumentStore.js";
 
-const MAX_RUN_STATE_BYTES = 64 * 1024;
 const LOCK_WAIT_MS = 2500;
 const IMMUTABLE_FIELDS = Object.freeze([
   "runId", "schemaVersion", "createdAt", "workflowId", "workflowVersion", "workflowHash",
@@ -158,7 +158,8 @@ export async function withTargetExecutionLease(store, session, runId, execute) {
 export class RunStateStore {
   constructor(baseDir, { lockWaitMs = LOCK_WAIT_MS } = {}) {
     if (typeof baseDir !== "string" || !baseDir) throw new Error("RunStateStore requires a baseDir.");
-    this.baseDir = resolve(baseDir);
+    this.documentStore = new RunDocumentStore(baseDir);
+    this.baseDir = this.documentStore.baseDir;
     this.lockWaitMs = Math.max(100, Math.min(30_000, Number(lockWaitMs) || LOCK_WAIT_MS));
     this.runs = new Map();
     this.targetLeaseStore = new BrowserTargetLeaseStore(this.baseDir);
@@ -167,11 +168,8 @@ export class RunStateStore {
   get targetLeaseDb() { return this.targetLeaseStore.db; }
 
   async init() {
-    await mkdir(this.baseDir, { recursive: true, mode: 0o700 });
-    const stat = await lstat(this.baseDir);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Run state directory must be a real directory, not a symlink.");
-    await chmod(this.baseDir, 0o700);
-    await this.#reload();
+    this.runs.clear();
+    for (const run of await this.documentStore.init()) this.runs.set(run.runId, run);
     await this.targetLeaseStore.init();
   }
 
@@ -212,53 +210,20 @@ export class RunStateStore {
   }
 
   async #reload() {
-    let entries;
-    try { entries = await readdir(this.baseDir, { withFileTypes: true }); }
-    catch { return; }
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-      try {
-        const run = JSON.parse(await readFile(join(this.baseDir, entry.name), "utf8"));
-        if (run?.runId && entry.name === `${run.runId}.json`) {
-          safeIdentifier(run.runId, "runId");
-          this.runs.set(run.runId, run);
-        }
-      } catch { /* Unreadable records are left for explicit local inspection. */ }
+    for (const run of await this.documentStore.readAll()) {
+      safeIdentifier(run.runId, "runId");
+      this.runs.set(run.runId, run);
     }
   }
 
-  #runPath(runId) { return join(this.baseDir, `${safeIdentifier(runId, "runId")}.json`); }
+  #runPath(runId) { return this.documentStore.runPath(safeIdentifier(runId, "runId")); }
 
   async #readRun(runId) {
-    try {
-      const path = this.#runPath(runId);
-      const stat = await lstat(path);
-      if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Run state must be a regular file, not a symlink.");
-      const run = JSON.parse(await readFile(path, "utf8"));
-      return run?.runId === runId ? run : null;
-    } catch (error) {
-      if (error.code === "ENOENT") return null;
-      throw error;
-    }
+    return await this.documentStore.read(runId);
   }
 
   async #writeAtomic(run) {
-    const path = this.#runPath(run.runId);
-    const temp = `${path}.${randomUUID()}.tmp`;
-    const file = await open(temp, "wx", 0o600);
-    try {
-      const serialized = JSON.stringify(run, null, 2);
-      if (Buffer.byteLength(serialized, "utf8") > MAX_RUN_STATE_BYTES) throw new Error("Run state exceeds the 64 KiB local storage limit.");
-      await file.writeFile(serialized, "utf8");
-      await file.sync();
-    } catch (error) {
-      await file.close();
-      await unlink(temp).catch(() => {});
-      throw error;
-    }
-    await file.close();
-    await rename(temp, path);
-    await chmod(path, 0o600);
+    await this.documentStore.writeAtomic(run);
   }
 
   async #acquireLock(runId) {

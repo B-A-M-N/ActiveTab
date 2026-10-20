@@ -7,7 +7,7 @@ Owns declarative workflow schemas, test execution, receipts, assertions, and pos
 ## Ownership
 
 ActiveTab's testing layer. It dispatches through the authorized executor and browser session; it does not own policy decisions.
-`RunStateStore` owns the public run-state API and delegates SQLite browser-target lease persistence to `BrowserTargetLeaseStore`.
+`RunStateStore` owns the public run-state API and operation state transitions. It delegates owner-private JSON document storage to lifecycle `RunDocumentStore` and SQLite browser-target lease persistence to `BrowserTargetLeaseStore`.
 
 ## Local Contracts
 
