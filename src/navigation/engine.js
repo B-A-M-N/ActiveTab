@@ -22,6 +22,7 @@ import { reobserveFromRetainedLookup } from "./retainedLookupFallback.js";
 import { createNavigationRunContext } from "./runContext.js";
 import { RecoveryCoordinator } from "./recoveryCoordinator.js";
 import { ReplayCoordinator } from "./replayCoordinator.js";
+import { ActionAttemptCoordinator } from "./actionAttemptCoordinator.js";
 
 function pageChangeWaitBaseline(observation, scrollTarget) {
   return {
@@ -355,14 +356,51 @@ export class NavigationEngine {
       this.session.target,
       this.session.target.journalEndpoint ?? this.session.target.endpoint ?? "local-cdp"
     );
-    let effectiveWorkflowIntent = workflowIntent;
+    const runPrepared = () => this.#runPrepared(goal, {
+      resumeState,
+      workflowInputs,
+      workflowIntent,
+      inputBindings,
+      abortSignal,
+      searchReadRequest,
+      searchPhrase,
+      taskRequest,
+      explicitReadWorkflowRequest,
+      workflowModeActive,
+      searchSubmitAuthorizer,
+      state
+    });
     if (!_inferenceBudgeted && typeof this.decisionRuntime?.withInferenceBudget === "function") {
       const runId = this.decisionContext?.runId ?? state.taskId;
-      return this.decisionRuntime.withInferenceBudget({ runId }, () => this.run(goal, {
-        resumeState, signal, workflowInputs, workflowIntent, inputBindings,
-        _executionState: state, _inferenceBudgeted: true
-      }));
+      return this.decisionRuntime.withInferenceBudget({ runId }, runPrepared);
     }
+    return runPrepared();
+  }
+
+  async #runPrepared(goal, {
+    resumeState,
+    workflowInputs,
+    workflowIntent,
+    inputBindings,
+    abortSignal,
+    searchReadRequest,
+    searchPhrase,
+    taskRequest,
+    explicitReadWorkflowRequest,
+    workflowModeActive,
+    searchSubmitAuthorizer,
+    state
+  }) {
+    const throwIfAborted = () => {
+      if (abortSignal?.aborted) {
+        const error = new Error("The navigation run was canceled.");
+        error.name = "AbortError";
+        error.code = 20;
+        throw error;
+      }
+    };
+    throwIfAborted();
+    let effectiveWorkflowIntent = workflowIntent;
     const currentEnvironmentFingerprint = environmentBindingFingerprint(this.environment);
     if (resumeState && (resumeState.environmentFingerprint ?? null) !== currentEnvironmentFingerprint) {
       throw new Error("Resume state environment binding does not match the current authorized profile.");
@@ -802,17 +840,13 @@ export class NavigationEngine {
       await updateJournal();
       return resultWithWorkflow({ status: "canceled", goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: latest.evidenceId });
     };
-    const beginAction = async attempt => {
-      runContext.pendingAttempt = attempt;
-      state.pendingAction = attempt;
-      await updateJournal();
-    };
-    const finishAction = attempt => {
-      delete state.pendingAction;
-      state.attempts.push(attempt);
-      counters.actions = state.attempts.length;
-      runContext.pendingAttempt = null;
-    };
+    const actionAttemptCoordinator = new ActionAttemptCoordinator({
+      taskState: state,
+      runContext,
+      updateJournal
+    });
+    const beginAction = attempt => actionAttemptCoordinator.begin(attempt);
+    const finishAction = attempt => actionAttemptCoordinator.finish(attempt);
     const resultWithWorkflow = result => {
       completeDecisionEpisode(result.status);
       const workflowPlanStatus = planner?.getStatus?.();

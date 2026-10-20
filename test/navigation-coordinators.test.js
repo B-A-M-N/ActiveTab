@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { RecoveryCoordinator } from "../src/navigation/recoveryCoordinator.js";
 import { ReplayCoordinator } from "../src/navigation/replayCoordinator.js";
+import { ActionAttemptCoordinator } from "../src/navigation/actionAttemptCoordinator.js";
+import { NavigationEngine } from "../src/navigation/engine.js";
 import {
   routeFingerprint,
   observationStateFingerprint,
@@ -12,6 +14,72 @@ import {
 
 const neverAborted = () => {};
 const isAbortError = error => error?.name === "AbortError" || error?.code === 20;
+
+test("ActionAttemptCoordinator journals pending metadata before dispatch and settles canonical state", async () => {
+  const taskState = { attempts: [] };
+  const runContext = { pendingAttempt: null, counters: { actions: 0 } };
+  const journalSnapshots = [];
+  const coordinator = new ActionAttemptCoordinator({
+    taskState,
+    runContext,
+    async updateJournal() {
+      journalSnapshots.push({ pendingAction: taskState.pendingAction, attempts: [...taskState.attempts] });
+    }
+  });
+  const attempt = { action: "click", targetIdentity: "observed-link" };
+
+  await coordinator.begin(attempt);
+  assert.equal(runContext.pendingAttempt, attempt);
+  assert.equal(taskState.pendingAction, attempt);
+  assert.deepEqual(journalSnapshots, [{ pendingAction: attempt, attempts: [] }]);
+
+  coordinator.finish(attempt);
+  assert.equal(runContext.pendingAttempt, null);
+  assert.equal(Object.hasOwn(taskState, "pendingAction"), false);
+  assert.deepEqual(taskState.attempts, [attempt]);
+  assert.equal(runContext.counters.actions, 1);
+});
+
+test("NavigationEngine enters one inference budget without recursively invoking run", async () => {
+  const targetId = "budget-target";
+  const session = {
+    target: { id: targetId, endpoint: "local-cdp" },
+    async observe() {
+      return {
+        targetId,
+        evidenceId: "budget-observation",
+        page: { url: "https://app.example.test/" },
+        candidates: [],
+        scrollTargets: [],
+        observationProfile: "interaction"
+      };
+    }
+  };
+  let budgetEntries = 0;
+  const engine = new NavigationEngine(session, {
+    planner: { async plan() { return { status: "ambiguous", candidates: [], reason: "No visible target." }; } },
+    decisionContext: { runId: "budget-run", sharedEpisode: true },
+    decisionRuntime: {
+      async withInferenceBudget(_binding, callback) {
+        budgetEntries++;
+        return callback();
+      },
+      startEpisode() { return { episodeId: "budget-episode" }; },
+      inferenceBudgetSnapshot() { return { attempts: 0, maxAttempts: 3 }; }
+    }
+  });
+  const run = engine.run.bind(engine);
+  let publicRunCalls = 0;
+  engine.run = (...args) => {
+    publicRunCalls++;
+    return run(...args);
+  };
+
+  const result = await engine.run("Open account history");
+  assert.equal(budgetEntries, 1);
+  assert.equal(publicRunCalls, 1);
+  assert.equal(result.status, "unresolved");
+});
 
 test("ReplayCoordinator enforces action budgets and resolves only one fresh signed target", async () => {
   const candidate = {
