@@ -145,6 +145,53 @@ test("a lost CDP or Native Messaging transport invalidates the current target se
   await session.close();
 });
 
+test("out-of-order observations remain historical and cannot replace the current evidence pointer", async () => {
+  const transport = new MockTransport();
+  const session = await new BrowserSession({
+    id: "ordered-observation-target",
+    endpoint: "local-cdp",
+    browserClient: transport
+  }).attach();
+  const pending = [];
+  session.observer.capture = () => new Promise(resolve => pending.push(resolve));
+
+  const olderPromise = session.observe();
+  const olderSequence = session.observationGeneration;
+  const newerPromise = session.observe();
+  const newerSequence = session.observationGeneration;
+  assert.ok(newerSequence > olderSequence);
+
+  pending[1]({ evidenceId: "newer-evidence", targetId: session.target.id, documentGeneration: session.documentGeneration });
+  const newer = await newerPromise;
+  assert.equal(newer.historical, false);
+  assert.equal(newer.observationSequence, newerSequence);
+  assert.equal(session.latestEvidenceId, "newer-evidence");
+
+  pending[0]({ evidenceId: "older-evidence", targetId: session.target.id, documentGeneration: session.documentGeneration });
+  const older = await olderPromise;
+  assert.equal(older.historical, true);
+  assert.equal(older.observationSequence, olderSequence);
+  assert.equal(session.latestEvidenceId, "newer-evidence");
+
+  const oldGeneration = session.documentGeneration;
+  const oldGenerationPromise = session.observe();
+  session.documentGeneration++;
+  pending[pending.length - 1]({ evidenceId: "old-generation-evidence", targetId: session.target.id, documentGeneration: oldGeneration });
+  const oldGenerationObservation = await oldGenerationPromise;
+  assert.equal(oldGenerationObservation.historical, true);
+  assert.equal(session.latestEvidenceId, "newer-evidence");
+
+  const detachedPromise = session.observe();
+  const detachedEvidence = pending.length;
+  session.attached = false;
+  session.targetLifecycle = "detached";
+  pending[detachedEvidence - 1]({ evidenceId: "detached-evidence", targetId: session.target.id, documentGeneration: session.documentGeneration });
+  const detached = await detachedPromise;
+  assert.equal(detached.historical, true);
+  assert.equal(session.latestEvidenceId, "newer-evidence");
+  await session.close();
+});
+
 test("visual hit testing allows only one outstanding probe per target", async () => {
   const harness = await createHitTestSession();
   try {

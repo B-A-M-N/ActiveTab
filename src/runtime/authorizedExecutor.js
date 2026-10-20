@@ -98,11 +98,26 @@ function authorizeInteraction({ goal, action, candidate, value, url, observation
 }
 
 function sameObservationBinding(before, after, session) {
+  if (!isCurrentObservation(session, after)) return false;
   if (!after?.page?.url || !before?.page?.url || after.page.url !== before.page.url) return false;
   if (before.targetId && after.targetId !== before.targetId) return false;
   if (session.target?.id && after.targetId !== session.target.id) return false;
   if (before.documentGeneration !== undefined && after.documentGeneration !== before.documentGeneration) return false;
   return true;
+}
+
+function isCurrentObservation(session, observation) {
+  if (observation?.historical === true) return false;
+  return !Number.isInteger(observation?.observationSequence)
+    || observation.observationSequence === session?.observationGeneration;
+}
+
+function assertCurrentObservation(session, observation) {
+  if (isCurrentObservation(session, observation)) return;
+  throw Object.assign(new Error("The observation was superseded before dispatch; observe again before acting."), {
+    dispatchDisposition: DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH,
+    reasonCode: "observation_superseded"
+  });
 }
 
 function retainedObservationUrl(session, observation) {
@@ -224,6 +239,7 @@ export async function executeAuthorizedAction({
     }
     observation = await session.observe().catch(() => null);
     if (!observation?.page?.url) return refused("A fresh browser observation is required before navigation.", observation, "observation_unavailable");
+    if (!isCurrentObservation(session, observation)) return refused("A superseded observation cannot authorize navigation.", observation, "observation_superseded");
     if (observation.targetId && session.target?.id && observation.targetId !== session.target.id) return refused("The observation belongs to a different browser target.", observation, "target_mismatch");
     origins = boundOrigins(session, environment, localFixture, observation);
     if (!origins?.length && !localFixture) return refused("Navigation requires an authorized environment or a target with a bound origin.", observation, "environment_unbound");
@@ -240,6 +256,7 @@ export async function executeAuthorizedAction({
   } else {
     observation = await session.observe().catch(() => null);
     if (!observation?.page?.url) return refused("A fresh browser observation is required before interaction.", observation, "observation_unavailable");
+    if (!isCurrentObservation(session, observation)) return refused("A superseded observation cannot authorize an interaction.", observation, "observation_superseded");
     if (observation.targetId && session.target?.id && observation.targetId !== session.target.id) return refused("The observation belongs to a different browser target.", observation, "target_mismatch");
     origins = boundOrigins(session, environment, localFixture, observation);
     if (environment) {
@@ -317,7 +334,7 @@ export async function executeAuthorizedAction({
     }
   } else {
     const refreshed = await revalidateInteractionTarget(session, candidate, admittedObservation, action);
-    if (!refreshed?.observation) return refused("The selected target became stale during pre-dispatch review.", admittedObservation, refreshed?.errorCode ?? "candidate_stale");
+    if (!refreshed?.observation || !isCurrentObservation(session, refreshed.observation)) return refused("The selected target became stale during pre-dispatch review.", admittedObservation, refreshed?.errorCode ?? "candidate_stale");
     observation = refreshed.observation;
     candidate = refreshed.candidate;
   }
@@ -409,25 +426,32 @@ export async function executeAuthorizedAction({
     return refused("The browser target execution lease was lost after reservation and before dispatch.", observation, "target_lease_lost");
   }
 
+  if (!isCurrentObservation(session, observation)) {
+    try { await onDispatch?.({ action, candidate, url, observation, dispatchResult: null, dispatchStatus: "refused" }); }
+    catch { /* The newer observation still prevents this operation from dispatching. */ }
+    try { await operationAuthorizer?.recordDispatch?.({ operationId, action, candidate, value, observation, dispatchResult: null, dispatchStatus: "refused" }); }
+    catch { /* Preserve the typed refusal if operation telemetry storage fails. */ }
+    return refused("The observation was superseded after reservation; no browser input was sent.", observation, "observation_superseded");
+  }
+
   let dispatchResult = null;
   try {
     switch (action) {
       case "navigate": {
+        assertCurrentObservation(session, observation);
         await session.client.send("Page.navigate", { url });
         break;
       }
       case "click": case "toggle": {
         dispatchResult = action === "toggle" && typeof session.setCheckboxState === "function"
           && ["checked", "unchecked"].includes(value)
-          ? await session.setCheckboxState(candidate, value === "checked", { beforeDispatch: async () => assertExecutionLease?.() })
+          ? await session.setCheckboxState(candidate, value === "checked", { beforeDispatch: async () => { await assertExecutionLease?.(); assertCurrentObservation(session, observation); } })
           : action === "click" && sameTargetNavigation === true && isObservedAnchor(candidate)
           ? await session.navigateObservedLinkInSameTarget(candidate, {
             beforeDispatch: async ({ href }) => {
               await assertExecutionLease?.();
               const refreshed = await revalidateInteractionTarget(session, candidate, observation, "click");
-              if (!refreshed?.observation) {
-                throw new Error("The authorized page or target changed before same-target navigation.");
-              }
+              if (!refreshed?.observation || !isCurrentObservation(session, refreshed.observation)) assertCurrentObservation(session, refreshed?.observation ?? { historical: true });
               const currentObservation = refreshed.observation;
               const freshCandidate = refreshed.candidate;
               if (!freshCandidate || !isObservedAnchor(freshCandidate)) {
@@ -447,20 +471,23 @@ export async function executeAuthorizedAction({
                 operationAuthorizer
               });
               if (!decision.allowed) throw new Error(decision.reason ?? "Typed application operation is outside its registered contract.");
+              observation = currentObservation;
+              candidate = freshCandidate;
+              assertCurrentObservation(session, observation);
             }
           })
-          : await session.click(candidate, { beforeDispatch: async () => assertExecutionLease?.() });
+          : await session.click(candidate, { beforeDispatch: async () => { await assertExecutionLease?.(); assertCurrentObservation(session, observation); } });
         break;
       }
       case "fill": {
-        dispatchResult = await session.fillField(candidate, value ?? "", { beforeDispatch: async () => assertExecutionLease?.() });
+        dispatchResult = await session.fillField(candidate, value ?? "", { beforeDispatch: async () => { await assertExecutionLease?.(); assertCurrentObservation(session, observation); } });
         break;
       }
       case "select": {
         const exactValue = value ?? "";
         const customCombobox = String(candidate?.tag ?? "").toLowerCase() !== "select";
         if (!customCombobox) {
-          dispatchResult = await session.selectOption(candidate, exactValue, { beforeDispatch: async () => assertExecutionLease?.() });
+          dispatchResult = await session.selectOption(candidate, exactValue, { beforeDispatch: async () => { await assertExecutionLease?.(); assertCurrentObservation(session, observation); } });
           break;
         }
 
@@ -497,6 +524,7 @@ export async function executeAuthorizedAction({
             if (!sameObservationBinding(admittedObservation, current, session)) {
               return { allowed: false, reason: "The authorized page or target changed between composite selection suboperations.", category: "pre_dispatch_state_changed" };
             }
+            observation = current;
             const bindingError = interactionBindingError({ session, environment, localFixture, origins, observation: current });
             if (bindingError) return { allowed: false, reason: bindingError, category: "environment_mismatch" };
 
@@ -546,6 +574,8 @@ export async function executeAuthorizedAction({
             }
             try { await assertExecutionLease?.(); }
             catch { return { allowed: false, reason: "The browser target execution lease was lost immediately before a composite suboperation.", category: "target_lease_lost" }; }
+            try { assertCurrentObservation(session, observation); }
+            catch { return { allowed: false, reason: "The observation was superseded before a composite suboperation.", category: "observation_superseded" }; }
             return { allowed: true };
           }
           if (stage === "completed") {
@@ -577,6 +607,7 @@ export async function executeAuthorizedAction({
             grantToken: grant.dispatchToken,
             beforeDispatch: async () => {
               await assertExecutionLease?.();
+              assertCurrentObservation(session, observation);
               const stillCurrent = await uploadGrantStore.assertDispatchToken(grant.dispatchToken, {
                 targetId: session.target?.id,
                 candidateIdentity: candidate.identity
@@ -588,11 +619,11 @@ export async function executeAuthorizedAction({
         break;
       }
       case "scroll": {
-        dispatchResult = await session.scroll(candidate, { beforeDispatch: async () => assertExecutionLease?.() });
+        dispatchResult = await session.scroll(candidate, { beforeDispatch: async () => { await assertExecutionLease?.(); assertCurrentObservation(session, observation); } });
         break;
       }
       case "type": {
-        dispatchResult = await session.typeSearchPhrase(candidate, value ?? "", observation, { beforeDispatch: async () => assertExecutionLease?.() });
+        dispatchResult = await session.typeSearchPhrase(candidate, value ?? "", observation, { beforeDispatch: async () => { await assertExecutionLease?.(); assertCurrentObservation(session, observation); } });
         break;
       }
     }

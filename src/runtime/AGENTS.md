@@ -20,6 +20,7 @@ ActiveTab's authorization architecture. Changes here affect every execution entr
 - Grant verification rejects omissions of required scope fields; unknown effects fail closed.
 - Single-use grants are consumed atomically; reusable grants are not consumed on first use.
 - Browser dispatch outcomes use a typed disposition: `refused_pre_dispatch`, `dispatched_unverified`, `partially_dispatched_uncertain`, or `uncertain`. Only a definite pre-dispatch refusal proves that retry needs no reconciliation; callback exceptions and partial composites retain an uncertain effect disposition.
+- The authorized executor refuses historical or superseded observations before browser effects and rechecks the current observation sequence immediately before dispatch.
 - Uncertain outcomes must be reconciled before retry.
 - A Jev `needs_agent_review` disposition blocks dispatch before side effects. A positive Jev result never grants authority; reviewer unavailability may use deterministic local policy fallback.
 - Production and staging authority are never interchangeable.

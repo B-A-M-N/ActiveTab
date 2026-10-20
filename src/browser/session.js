@@ -207,16 +207,29 @@ export class BrowserSession {
 
   async observe(options) {
     this.#assertTargetAttached();
-    this.observationGeneration++;
+    const observationSequence = ++this.observationGeneration;
+    const targetId = this.target.id;
+    const documentGeneration = this.documentGeneration;
     this.#invalidateVisualProbe("superseded_by_new_observation");
     const observation = await this.observer.capture(options);
+    const isCurrent = observationSequence === this.observationGeneration
+      && this.attached
+      && this.targetLifecycle === "attached"
+      && this.target.id === targetId
+      && this.documentGeneration === documentGeneration
+      && observation?.targetId === targetId
+      && observation?.documentGeneration === documentGeneration;
+    const publishedObservation = observation && typeof observation === "object"
+      ? { ...observation, observationSequence, historical: !isCurrent }
+      : observation;
     // Observations are retained evidence. Record the session-owned evidence id
-    // so diagnostic collectors can request the exact observation, rather than
-    // relying on an empty or mutable external global.
-    if (typeof observation?.evidenceId === "string" && observation.evidenceId) {
-      this.latestEvidenceId = observation.evidenceId;
+    // so diagnostic collectors can request the exact observation. An older,
+    // detached, or cross-generation capture remains available as historical
+    // evidence but cannot replace the session's current evidence pointer.
+    if (isCurrent && typeof publishedObservation?.evidenceId === "string" && publishedObservation.evidenceId) {
+      this.latestEvidenceId = publishedObservation.evidenceId;
     }
-    return observation;
+    return publishedObservation;
   }
 
   async queryAccessibility(evidenceId, query) {

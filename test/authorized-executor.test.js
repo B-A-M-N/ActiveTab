@@ -160,6 +160,36 @@ test("pre-dispatch review refusal is enforced before the browser effect", async 
   assert.equal(session.client.sent, undefined);
 });
 
+test("a historical observation cannot authorize an effect after a newer capture starts", async () => {
+  const candidate = { name: "Open account", role: "button", tag: "button", visible: true, backendNodeId: 21, targetId: "tab-1", documentGeneration: 1 };
+  const observation = {
+    page: { url: "https://app.example.test/", title: "Home" },
+    candidates: [candidate],
+    evidenceId: "historical-evidence",
+    targetId: "tab-1",
+    documentGeneration: 1,
+    observationSequence: 4,
+    historical: true
+  };
+  const session = mockSession({ observation });
+  session.target = { id: "tab-1", url: observation.page.url };
+  session.attached = true;
+  session.observationGeneration = 5;
+
+  const result = await executeAuthorizedAction({
+    session,
+    goal: "Open account",
+    action: "click",
+    candidate,
+    assertExecutionLease: fixtureLease
+  });
+
+  assert.equal(result.dispatchDisposition, "refused_pre_dispatch");
+  assert.equal(result.category, "observation_superseded");
+  assert.equal(result.browserEffectPossible, false);
+  assert.deepEqual(session.dispatched, []);
+});
+
 test("authorized navigation dispatches through the session", async () => {
   const observation = { page: { url: "https://app.example.test/", title: "Home" }, candidates: [], evidenceId: "e-2" };
   const session = mockSession({ observation });
