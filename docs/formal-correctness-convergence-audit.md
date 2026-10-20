@@ -53,6 +53,7 @@ Recent behavior-preserving slices are separate commits:
 - `b885ead` — extract run-local search/read classification and workflow-mode selection while leaving trusted capability resolution and action dispatch in their existing owners.
 - `77bc3d1` — validate compatibility/peer JSON roots before task admission, enforce capacity in `TaskStore.create`, persist preparation/scheduler failures, and extract bounded shutdown settlement coordination after fault-injection coverage.
 - `19e6b0b` — extract provider-plan routing from `NavigationEngine` while retaining planner-failure lineage and engine-owned action admission.
+- `6db07c5` — move API test-run worker tracking, resume/cancel coordination, durable status projection, and reporting into `testRunLifecycle.js`; retain outer route authentication and matching.
 - `3dfb7de` — align headless test display defaults and add a same-surface response-performance comparison.
 - `b3f8f7f` — route `/v1/interventions/run-state` before the generic intervention-ID matcher so the run-state handler is reachable.
 - `b3c66a8` — give the 600-control retained-lookup fixture the existing maximum query timeout; production defaults are unchanged.
@@ -63,15 +64,16 @@ The repository also already has separate run-context, replay, recovery, action-a
 
 The latest full runs used `npm run test:isolated -- --test-concurrency=1` with identical `node --test` discovery and serial execution. Headless explicitly unset `DISPLAY`; headed used the repository's private Xvfb display, not the physical desktop. Compatible Chrome fixtures used `--headless=new` only in the headless run.
 
-- Headless: **876 passed, 0 failed, 5 skipped** (881 tests; 126.81 seconds TAP, 127.18 seconds wall).
-- Private-Xvfb headed: **877 passed, 0 failed, 4 skipped** (the same 881 test names; 133.19 seconds TAP, 133.73 seconds wall).
+- Headless: **876 passed, 0 failed, 5 skipped** (881 tests; 220.80 seconds TAP, 221.97 seconds wall).
+- Private-Xvfb headed: **877 passed, 0 failed, 4 skipped** (the same 881 test names; 240.14 seconds TAP, 243.18 seconds wall).
 - Test-name sets matched exactly. Headless skipped the two desktop-placement checks; private Xvfb skipped secondary-display reuse because it exposes one screen. Three skips were shared: opt-in extension integration, missing second-provider configuration, and unavailable authorized staging session.
 - Focused API run/shutdown/peer-executor regressions: **20 passed, 0 failed**. Focused API run-route and task-store regressions: **22 passed, 0 failed**.
+- API test-run lifecycle extraction regressions: **55 passed, 0 failed**, including authentication order, start/status/cancel/report, resume reconciliation, and shutdown fault injection.
 - Focused navigation/planner/telemetry regressions after provider-plan extraction: **102 passed, 0 failed**.
 - Opt-in headless extension subset: **1 passed, 0 failed, 0 skipped**. It covers explicit popup consent through a `userGesture` handler call on two exact tabs, Native Messaging grants, native CDP observation, and protected-route cookie preservation.
 - Headless OOPIF fixture: direct and nested frame recovery plus root-page scroll passed.
 
-In this paired full-suite sample, headless completed **6.55 seconds (4.9%) faster**. The two skipped desktop checks were not counted as equivalent passes: the headed Xvfb run covers generic bounds on its private screen and also skips the physical secondary-display check. The Xvfb placement pass verifies bounds inside that virtual display only; it does not verify the physical HDMI-1 monitor origin.
+In this paired full-suite sample, headless completed **21.21 seconds (8.7%) faster**. Host timing varied substantially from the preceding pair, so this supports that the headless suite does not carry a consistent runtime penalty here; it does not establish fixed per-test latency. The two skipped desktop checks were not counted as equivalent passes: the headed Xvfb run covers generic bounds on its private screen and also skips the physical secondary-display check. The Xvfb placement pass verifies bounds inside that virtual display only; it does not verify the physical HDMI-1 monitor origin.
 
 The response benchmark was also run once per mode on Chrome 150.0.7871.114 with an emulated 1280×720 viewport, 1× device scale, and 1280×1024 screen dimensions. Both pages reported visible state and all seven response classifications matched. Headless startup took 0.62 seconds versus 1.55 seconds headed; peak Chrome process-tree RSS was 1,243.9 MiB versus 1,299.6 MiB. Per-case response timings were mixed, so one pair does not establish stable per-case latency parity; repeated medians remain necessary for that claim.
 
@@ -80,6 +82,6 @@ The extension subset's `Runtime.evaluate(userGesture:true)` path is not evidence
 ## Next bounded slices
 
 1. Continue `NavigationEngine` extraction from attempt coordination while retaining one public run loop and the current executor. Run-local classification now lives in `runIntent.js`; task-scope expansion lives in `planningEvidence.js`; provider planning lives in `providerPlanCoordinator.js`; workflow planner selection lives in `workflowRoutePlanner.js`; visual assessment and grounding live in `visualDecisionCoordinator.js` and remain advisory; registered pagination is isolated in `registeredPagination.js`.
-2. Continue decomposition from the largest remaining coordinators. HTTP route modules now cover discovery, capabilities, interventions, approvals, evidence releases, test-run dispatch, legacy run records, catalog reads, run creation/peer execution, bounded output-file serving, and shutdown coordination; test-run lifecycle handlers, general request dispatch, and lifecycle composition remain in `local-server.js`.
+2. Continue decomposition from the largest remaining coordinators. HTTP modules now cover discovery, capabilities, interventions, approvals, evidence releases, test-run dispatch and lifecycle, legacy run records, catalog reads, run creation/peer execution, bounded output-file serving, and shutdown coordination; general request dispatch and server lifecycle composition remain in `local-server.js`.
 3. Measure response acquisition/process memory as best-effort diagnostics; keep `hardMemoryBound:false` until the transport can enforce a pre-materialization limit.
 4. Run the remaining held-out application and multi-process lifecycle qualifications when their required authorized environments are available.
