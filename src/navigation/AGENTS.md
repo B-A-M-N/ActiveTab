@@ -79,6 +79,7 @@ node --test test/navigation-coordinators.test.js test/navigation-context.test.js
 | `planningCycle.js` | Candidate and scroll exclusion projection plus bounded planner option construction; no browser dispatch |
 | `planningEvidence.js` | One bounded task-scope observation expansion with same-target freshness acceptance; no action or authorization authority |
 | `workflowRoutePlanner.js` | Selects workflow planner construction or explicit abstention after trusted task resolution; no observation or dispatch authority |
+| `visualDecisionCoordinator.js` | Performs permission-gated page assessment and advisory candidate grounding with fresh evidence; it cannot authorize or dispatch actions |
 | `runContext.js` | Initial navigation run bindings, bounded counters, observation reference, and resume-derived candidate exclusions |
 | `replayCoordinator.js` | Stored workflow signature and precondition checks against fresh observations; no browser dispatch |
 | `recoveryCoordinator.js` | Bounded post-action observation retry and exact-target reattachment without action replay |
