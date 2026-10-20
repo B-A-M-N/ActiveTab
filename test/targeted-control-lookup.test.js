@@ -135,6 +135,26 @@ test("retained control lookup finds omitted controls without CDP traversal and p
   try {
     owned = await launchOwnedChrome({ initialUrl, headed: process.env.ACTIVETAB_HEADLESS !== "1", userDataDir: profileDir, preserveProfile: false });
     const session = owned.session;
+    const frameDeadline = Date.now() + 10_000;
+    while (Date.now() < frameDeadline && ![...session.frameSessions.values()].some(frame => frame.status === "ready")) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    const frameTargetId = [...session.frameSessions.values()].find(frame => frame.status === "ready")?.targetId;
+    assert.ok(frameTargetId, "the fixture's cross-origin frame is an attached OOPIF target");
+
+    let stableMutationCount = session.activity.totalDomMutations;
+    let mutationQuietSince = Date.now();
+    const quietDeadline = Date.now() + 10_000;
+    while (Date.now() < quietDeadline && Date.now() - mutationQuietSince < 150) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+      const currentMutationCount = session.activity.totalDomMutations;
+      if (currentMutationCount !== stableMutationCount) {
+        stableMutationCount = currentMutationCount;
+        mutationQuietSince = Date.now();
+      }
+    }
+    assert.ok(Date.now() - mutationQuietSince >= 150, "the fixture frame mutation stream settles before its evidence snapshot");
+
     const observation = await session.observe({ profile: "interaction", candidateLimit: 200 });
     assert.equal(observation.candidateCoverage.pageCoverage, "partial", "the fixture exceeds the normal candidate projection limit");
 
@@ -176,13 +196,7 @@ test("retained control lookup finds omitted controls without CDP traversal and p
     assert.equal(scoped.matches.length, 1);
     assert.equal(scoped.matches[0].name, "Scoped Submit");
 
-    const frameDeadline = Date.now() + 10_000;
-    while (Date.now() < frameDeadline && ![...session.frameSessions.values()].some(frame => frame.status === "ready")) {
-      await new Promise(resolve => setTimeout(resolve, 25));
-    }
-    const framedObservation = await session.observe({ profile: "interaction", candidateLimit: 200 });
-    const frameTargetId = [...session.frameSessions.values()].find(frame => frame.status === "ready")?.targetId;
-    assert.ok(frameTargetId, "the fixture's cross-origin frame is an attached OOPIF target");
+    const framedObservation = observation;
     const frameMatch = await session.queryAccessibility(framedObservation.evidenceId, {
       role: "button", accessibleName: "Frame Save", exact: true, frameTargetId
     });

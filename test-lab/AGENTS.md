@@ -18,6 +18,7 @@ This package is part of ActiveTab's capability surface. It owns benchmark orches
 - A fixture result may qualify a candidate strategy but cannot authorize a live target or substitute for live-site verification.
 - Qualified strategies remain versioned candidates. Promotion, replay, and training export require their own explicit review and authorization.
 - Scenario and fault variation is deterministic from a recorded seed. Unsupported variations fail validation.
+- Fault-injection lifecycle tests use disposable owner-private state directories and real Node child processes against the production local SQLite/filesystem stores. They exercise durable state only; they do not dispatch browser effects or establish application outcomes.
 - Every scenario declares a qualification level, provider identity, source revision, and oracle reference. Scenario and benchmark receipts persist those fields with the seed and cleanup result. `resolver` does not claim an independent application outcome; `integration` names owned-app browser/CDP coverage; `outcome` requires an independent application-state oracle. `live` requires separately scoped authorization and is not runnable through Fixture Lab.
 - The built-in extraction qualifier is a deterministic in-process resolver baseline. It does not claim to exercise an independently maintained application; external benchmark targets remain in scope and must be selected through their registered Fixture Lab adapters and independent oracles.
 - API response-shape qualification is limited to completed same-origin GET JSON requests already observed from the page. The selected response is interpreted locally; the provider-side `api-shape-twin` oracle scores only schema, record completeness, and credential-value isolation across seeded variants. This does not register an API, replay a request, or authorize an effect.
@@ -29,11 +30,13 @@ This package is part of ActiveTab's capability surface. It owns benchmark orches
 - Use exact, reviewed modifications for external bind-address changes; never expose an external fixture server beyond loopback.
 - WebArena-Infinity setup uses a disposable pinned checkout. Its UI seed adapter may provide only bounded synthetic scenario rows to the page; preserve pre-existing modified checkouts and never surface the oracle credential to browser content.
 - Keep fixture setup, driver execution, oracle scoring, and cleanup independently reportable.
+- Always terminate child processes and remove disposable state in `finally` blocks, including when an assertion fails.
 
 ## Verification
 
 ```bash
 node --test test/fi-agent-twin-auth.test.js test/fixture-lab.test.js test/qualification.test.js
+node --test test/run-lifecycle-multiprocess.test.js
 ```
 
 Run an external benchmark only against its pinned local synthetic application. It must not access staging or production.
@@ -52,3 +55,4 @@ Run an external benchmark only against its pinned local synthetic application. I
 | `fixtures/fi-agent-twin/agentJobs.js` | Synthetic run submission, status/diagnostic reads, state transitions, and timer cleanup |
 | `runtime/` | Provider, scenario, driver, variant, and fault contracts |
 | `scoring/` | Independent fixture outcome scoring |
+| `fault-injection/` | Disposable cross-process run-lifecycle crash and fencing harnesses |
