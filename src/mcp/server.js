@@ -31,6 +31,7 @@ import { createWorkflowToolHandlers } from "./tools/workflowTools.js";
 import { createQualificationToolHandlers } from "./tools/qualificationTools.js";
 import { createRuntimeToolHandlers } from "./tools/runtimeTools.js";
 import { tools } from "./tools/toolCatalog.js";
+import { createMcpToolDispatcher } from "./toolRegistry.js";
 
 const modelPreflight = await preflightModelCapabilities();
 writeModelPreflightSummary(modelPreflight);
@@ -201,21 +202,30 @@ const qualificationToolHandlers = createQualificationToolHandlers({
   decisionRuntime, runStateStore, verifyObservedUrl
 });
 const runtimeToolHandlers = createRuntimeToolHandlers({ sessions, modelPreflight, workflowStore });
+const mcpInterventionToolHandlers = Object.fromEntries(
+  tools.map(({ name }) => [name, interventionTools[name]])
+    .filter(([, handler]) => typeof handler === "function")
+);
+const evidenceReleaseToolHandlers = Object.freeze({
+  request_evidence_release: args => evidenceReleaseTools.requestEvidenceRelease(selectBrowserSession(sessions, args.targetId), args),
+  release_evidence: args => evidenceReleaseTools.releaseEvidence(selectBrowserSession(sessions, args.targetId), args)
+});
+const toolDispatcher = createMcpToolDispatcher({
+  tools,
+  handlerGroups: [
+    mcpInterventionToolHandlers,
+    browserToolHandlers,
+    diagnosticToolHandlers,
+    navigationToolHandlers,
+    workflowToolHandlers,
+    qualificationToolHandlers,
+    runtimeToolHandlers,
+    evidenceReleaseToolHandlers
+  ]
+});
 
 async function callTool(name, args) {
-  // Intervention tools (P0-6): long-running and suspended runs never block
-  // these status/acknowledgement/approval/cancellation/resume tools.
-  if (Object.hasOwn(interventionTools, name)) return await interventionTools[name](args);
-  if (Object.hasOwn(browserToolHandlers, name)) return await browserToolHandlers[name](args);
-  if (Object.hasOwn(diagnosticToolHandlers, name)) return await diagnosticToolHandlers[name](args);
-  if (Object.hasOwn(navigationToolHandlers, name)) return await navigationToolHandlers[name](args);
-  if (Object.hasOwn(workflowToolHandlers, name)) return await workflowToolHandlers[name](args);
-  if (Object.hasOwn(qualificationToolHandlers, name)) return await qualificationToolHandlers[name](args);
-  if (Object.hasOwn(runtimeToolHandlers, name)) return await runtimeToolHandlers[name](args);
-  const session = selectBrowserSession(sessions, args.targetId);
-  if (name === "request_evidence_release") return await evidenceReleaseTools.requestEvidenceRelease(session, args);
-  if (name === "release_evidence") return await evidenceReleaseTools.releaseEvidence(session, args);
-  throw new Error(`Unknown tool: ${name}`);
+  return await toolDispatcher.dispatch(name, args);
 }
 
 function write(message) { process.stdout.write(`${JSON.stringify(message)}\n`); }

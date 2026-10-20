@@ -109,6 +109,29 @@ test("MCP stdio server initializes and advertises bounded browser tools", async 
   }
 });
 
+test("MCP rejects the local API-only operation approval resolver", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "activetab-hidden-intervention-mcp-"));
+  const { responses, tempDir } = await runMcpShell(serverPath, [
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "resolve_operation_approval",
+        arguments: { interventionId: "unknown", authenticatedOperator: "caller-supplied" }
+      }
+    }
+  ], { stateDir });
+  try {
+    const response = responses.find(item => item.id === 2);
+    assert.match(response?.error?.message ?? "", /Unknown tool: resolve_operation_approval/);
+  } finally {
+    await rm(stateDir, { recursive: true, force: true }).catch(() => {});
+    await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
 test("extension MCP exposes no tabs and refuses attach until the popup authorizes one", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "activetab-extension-mcp-"));
   const { responses, tempDir } = await runMcpShell(extensionServerPath, [
