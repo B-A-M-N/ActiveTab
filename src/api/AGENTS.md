@@ -21,3 +21,4 @@ Owns local HTTP composition and endpoint-family adapters.
 | Path | Purpose |
 |------|---------|
 | `routes/` | Endpoint-family handlers with injected server-owned dependencies |
+| `routes/capabilities.js` | Capability discovery, read, compile, qualification, listing, and revocation endpoints after shared API authentication |
