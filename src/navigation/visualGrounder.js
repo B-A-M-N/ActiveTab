@@ -1,4 +1,5 @@
 import { describeJevImageTransform, jpegDimensions } from "../decisions/imagePreparation.js";
+import { mapFrameRectToParent } from "../observe/frameCoordinates.js";
 import { isBoundVisualEvidence } from "./visualEvidence.js";
 
 const MIN_PRESENCE_PROBABILITY = 0.8;
@@ -147,44 +148,34 @@ export function mapCandidateBoundsToRoot(candidate, observation) {
   if (!frame) return null;
   let bounds = { ...candidate.bounds };
   for (let depth = 0; depth < 8; depth++) {
+    bounds = clipToViewport(bounds, frame.viewport);
+    if (!bounds) return null;
     bounds = mapThroughFrameOwner(bounds, frame);
     if (!bounds) return null;
-    if (frame.parentTargetId === null) return bounds;
-    frame = frames.get(frame.parentTargetId);
-    if (!frame) return null;
+    if (frame.parentTargetId === null) return clipToViewport(bounds, observation?.viewport);
+    const parentFrame = frames.get(frame.parentTargetId);
+    if (!parentFrame) return null;
+    bounds = clipToViewport(bounds, parentFrame.viewport);
+    if (!bounds) return null;
+    frame = parentFrame;
   }
   return null;
 }
 
+function clipToViewport(rect, viewport) {
+  if (!validRect(rect) || !Number.isFinite(viewport?.width) || viewport.width <= 0
+    || !Number.isFinite(viewport?.height) || viewport.height <= 0) return null;
+  const x = Math.max(0, rect.x);
+  const y = Math.max(0, rect.y);
+  const right = Math.min(viewport.width, rect.x + rect.width);
+  const bottom = Math.min(viewport.height, rect.y + rect.height);
+  if (right <= x || bottom <= y) return null;
+  return { x, y, width: right - x, height: bottom - y };
+}
+
 function mapThroughFrameOwner(bounds, frame) {
-  const viewport = frame.viewport;
-  const quad = frame.ownerContentQuad;
-  if (!validRect(bounds) || !Number.isFinite(viewport?.width) || viewport.width <= 0
-    || !Number.isFinite(viewport?.height) || viewport.height <= 0
-    || !Array.isArray(quad) || quad.length !== 8 || !quad.every(Number.isFinite)) return null;
-  const p1 = { x: quad[0], y: quad[1] };
-  const p2 = { x: quad[2], y: quad[3] };
-  const p3 = { x: quad[4], y: quad[5] };
-  const p4 = { x: quad[6], y: quad[7] };
-  const expectedP3 = { x: p2.x + p4.x - p1.x, y: p2.y + p4.y - p1.y };
-  if (Math.hypot(p3.x - expectedP3.x, p3.y - expectedP3.y) > 2) return null;
-  const mapPoint = (x, y) => ({
-    x: p1.x + (p2.x - p1.x) * x / viewport.width + (p4.x - p1.x) * y / viewport.height,
-    y: p1.y + (p2.y - p1.y) * x / viewport.width + (p4.y - p1.y) * y / viewport.height
-  });
-  const points = [
-    mapPoint(bounds.x, bounds.y),
-    mapPoint(bounds.x + bounds.width, bounds.y),
-    mapPoint(bounds.x + bounds.width, bounds.y + bounds.height),
-    mapPoint(bounds.x, bounds.y + bounds.height)
-  ];
-  const xs = points.map(point => point.x);
-  const ys = points.map(point => point.y);
-  const left = Math.min(...xs);
-  const right = Math.max(...xs);
-  const top = Math.min(...ys);
-  const bottom = Math.max(...ys);
-  const mapped = { x: left, y: top, width: right - left, height: bottom - top };
+  if (!validRect(bounds)) return null;
+  const mapped = mapFrameRectToParent(bounds, frame);
   return validRect(mapped) ? mapped : null;
 }
 

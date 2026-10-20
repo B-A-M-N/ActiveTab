@@ -25,9 +25,9 @@ export const ENUMS = {
   inputModality: new Set(["text_only", "text_plus_visual", "unknown"]),
   capabilityStatus: new Set(["available", "unknown", "unavailable"]),
   capabilitySource: new Set(["authenticated_catalog", "configured_fallback"]),
-  lookupMode: new Set(["retained_snapshot", "cdp_dom_location"]),
+  lookupMode: new Set(["retained_snapshot", "cdp_dom_location", "cdp_dom_hit_test_chain"]),
   lookupStatus: new Set(["unique", "not_found", "ambiguous", "incomplete", "candidate", "unavailable", "stale", "invalid", "expired", "no_hint", "refreshed"]),
-  frameScope: new Set(["root", "page", "unknown"]),
+  frameScope: new Set(["root", "page", "out_of_process", "unknown"]),
   nextActionDisposition: new Set(["deferred", "permitted", "refused"])
 };
 

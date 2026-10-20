@@ -10,6 +10,7 @@ import { connectChromeAuto, listChromeTargets, resolveChromeTarget } from "../sr
 import { BrowserSession } from "../src/browser/session.js";
 import { FixtureNavigationEngine as NavigationEngine } from "../test-support/fixtureNavigationEngine.js";
 import { chromeWindowPositionArgs } from "../src/browser/chromeWindowPlacement.js";
+import { mapCandidateBoundsToRoot } from "../src/navigation/visualGrounder.js";
 
 const chromePath = process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
 
@@ -40,7 +41,7 @@ test("native CDP recursively attaches, observes, and controls nested out-of-proc
         response.end("<!doctype html><title>Nested OOPIF child</title><h1>Nested</h1><button onclick=\"document.querySelector('h1').textContent='Nested preferences';parent.parent.postMessage({kind:'nested-open'}, '*')\">Open nested preferences</button>");
         return;
       }
-      response.end(`<!doctype html><title>OOPIF parent</title><h1>Parent</h1><button onclick="document.querySelector('h1').textContent='Account';document.title='Account'">Open account</button><iframe src="http://localhost:${childPort}/?token=oopif-url-secret"></iframe><script>addEventListener('message',event=>{if(event.origin==='http://localhost:${childPort}'&&event.data?.kind==='oopif-open'){document.querySelector('h1').textContent='OOPIF preferences';document.title='OOPIF preferences'}else if(event.origin==='http://127.0.0.1:${parentPort}'&&event.data?.kind==='nested-open'){document.querySelector('h1').textContent='Nested preferences';document.title='Nested preferences'}})</script>`);
+      response.end(`<!doctype html><title>OOPIF parent</title><h1>Parent</h1><button onclick="document.querySelector('h1').textContent='Account';document.title='Account'">Open account</button><div style="height:600px"></div><iframe src="http://localhost:${childPort}/?token=oopif-url-secret"></iframe><div style="height:800px"></div><script>addEventListener('message',event=>{if(event.origin==='http://localhost:${childPort}'&&event.data?.kind==='oopif-open'){document.querySelector('h1').textContent='OOPIF preferences';document.title='OOPIF preferences'}else if(event.origin==='http://127.0.0.1:${parentPort}'&&event.data?.kind==='nested-open'){document.querySelector('h1').textContent='Nested preferences';document.title='Nested preferences'}})</script>`);
     });
     parentServer.listen(0, "127.0.0.1");
     await once(parentServer, "listening");
@@ -77,7 +78,7 @@ test("native CDP recursively attaches, observes, and controls nested out-of-proc
     assert.ok(iframeTarget, "Chrome exposes the cross-site frame as an iframe target");
     const childFrameSession = attached.find(frame => frame.targetId === iframeTarget.targetId);
     assert.ok(childFrameSession, "the direct OOPIF belongs to the authorized page target");
-    await childFrameSession.client.send("Runtime.evaluate", { expression: `const nested=document.createElement('iframe');nested.src='http://127.0.0.1:${parentPort}/nested';document.body.append(nested)` });
+    await childFrameSession.client.send("Runtime.evaluate", { expression: `const nested=document.createElement('iframe');nested.src='http://127.0.0.1:${parentPort}/nested';nested.style.cssText='position:fixed;left:180px;top:0;width:120px;height:150px;border:0';document.body.append(nested)` });
     const nestedDeadline = Date.now() + 5_000;
     while (Date.now() < nestedDeadline && attached.length < 2) {
       attached = await session.getOutOfProcessFrames();
@@ -125,6 +126,24 @@ test("native CDP recursively attaches, observes, and controls nested out-of-proc
     assert.equal(observation.outOfProcessFrameGeometry.length, 2);
     assert.ok(observation.outOfProcessFrameGeometry.every(frame => frame.status === "available" && frame.ownerContentQuad.length === 8),
       `each attached OOPIF includes observed owner geometry for root-coordinate visual mapping: ${JSON.stringify(observation.outOfProcessFrameGeometry)}`);
+    const rootScroll = await session.client.send("Runtime.evaluate", { expression: "window.scrollTo(0,650);scrollY", returnByValue: true });
+    assert.equal(rootScroll.result?.value, 650, "the parent fixture is scrolled so hit testing must translate root viewport coordinates");
+    const visualObservation = await session.observe({ profile: "visual" });
+    for (const [name, depth] of [["Open OOPIF preferences", 1], ["Open nested preferences", 2]]) {
+      const visualCandidate = visualObservation.candidates.find(item => item.name === name);
+      const rootBounds = mapCandidateBoundsToRoot(visualCandidate, visualObservation);
+      assert.ok(rootBounds, `${name} has geometry within every ancestor viewport: ${JSON.stringify({ candidate: visualCandidate?.bounds, frames: visualObservation.outOfProcessFrameGeometry })}`);
+      const hit = await session.probeVisualCandidateAtPoint(visualObservation.evidenceId, {
+        x: Math.round(rootBounds.x + rootBounds.width / 2),
+        y: Math.round(rootBounds.y + rootBounds.height / 2)
+      });
+      assert.equal(hit.status, "candidate", `${name} resolves through exact attached frame sessions: ${JSON.stringify(hit)}`);
+      assert.equal(hit.candidateHint.identity, visualCandidate.identity, `${name}: ${JSON.stringify({ hint: hit.candidateHint, expected: visualCandidate })}`);
+      assert.equal(hit.candidateHint.frameTargetId, visualCandidate.frameTargetId);
+      assert.equal(hit.frameDepth, depth);
+      assert.equal(hit.actionAuthorized, false);
+    }
+    await session.client.send("Runtime.evaluate", { expression: "window.scrollTo(0,0)" });
     const frameEvidence = session.observer.getEvidence(observation.evidenceId, { facets: ["outOfProcessFrames"] }).outOfProcessFrames;
     assert.equal(frameEvidence.length, 2, "full DOMSnapshot and accessibility evidence for each OOPIF remains selectively retrievable");
     assert.ok(frameEvidence.some(frame => frame.targetId === iframeTarget.targetId && frame.page.url.startsWith("http://localhost:")));

@@ -51,11 +51,12 @@ async function captureFrameGeometry(session, frame, childFrameId, frameViewport,
     return {
       status: "available",
       frameTargetId: frame.targetId,
-      frameId: frame.frameId,
+      frameId: childFrameId,
       parentTargetId: parentFrame?.targetId ?? null,
       parentFrameId,
       viewport: { width: frameViewport.width, height: frameViewport.height },
-      ownerContentQuad: quad
+      ownerContentQuad: quad,
+      ownerBackendNodeId: owner.backendNodeId
     };
   } catch {
     return { status: "unavailable", reason: "frame_geometry_capture_failed" };

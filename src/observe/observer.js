@@ -51,6 +51,7 @@ function retainDocumentTraversalIndex(index) {
 function estimateLookupIndexBytes(index) {
   if (!index?.available) return 0;
   let bytes = jsonByteLength(index.candidates);
+  bytes += jsonByteLength(index.frameOwners ?? []);
   for (const frame of index.frames) {
     for (const document of frame.documents ?? []) {
       if (!document) continue;
@@ -278,7 +279,7 @@ export class BrowserObserver {
     };
   }
 
-  resolveCandidateForHitNode(id, { backendNodeId, frameId, x, y } = {}) {
+  resolveCandidateForHitNode(id, { backendNodeId, frameId, frameTargetId = null, x, y } = {}) {
     const stored = this.evidenceStore.get(id);
     if (!stored) return { status: "expired", reasonCode: "evidence_expired" };
     const evidence = stored.evidence;
@@ -295,13 +296,25 @@ export class BrowserObserver {
       || !Number.isFinite(x) || !Number.isFinite(y)) {
       return { status: "invalid", reasonCode: "hit_test_binding_invalid" };
     }
+    const currentFrameTargetId = frameTargetId || null;
     const rootFrameId = evidence.frameTree?.frame?.id;
-    if (!rootFrameId || frameId !== rootFrameId) return { status: "unavailable", reasonCode: "frame_unavailable" };
-    const rootIndex = lookupIndex?.frames?.find(frame => frame.frameTargetId === null);
-    const documents = rootIndex?.documents?.filter(document => document?.frameId === frameId) ?? [];
+    if (!rootFrameId || (!currentFrameTargetId && frameId !== rootFrameId)) {
+      return { status: "unavailable", reasonCode: "frame_unavailable" };
+    }
+    const frameIndex = lookupIndex?.frames?.find(frame => frame.frameTargetId === currentFrameTargetId);
+    if (!frameIndex) return { status: "unavailable", reasonCode: "frame_unavailable" };
+    let expectedSnapshot = evidence.domSnapshot;
+    if (currentFrameTargetId) {
+      const liveFrame = this.session.frameSessions?.get(currentFrameTargetId);
+      const retainedFrame = evidence.outOfProcessFrames?.find(frame => frame.targetId === currentFrameTargetId && frame.status === "available");
+      if (!liveFrame || liveFrame.status !== "ready" || liveFrame.frameId !== frameId || liveFrame.domObservationAvailable !== true
+        || retainedFrame?.frameId !== frameId) return { status: "unavailable", reasonCode: "frame_unavailable" };
+      expectedSnapshot = retainedFrame.domSnapshot;
+    }
+    const documents = frameIndex.documents?.filter(document => document?.frameId === frameId) ?? [];
     if (documents.length !== 1) return { status: "unavailable", reasonCode: "snapshot_unavailable" };
     const document = documents[0];
-    if (document.snapshot !== rootIndex.snapshot || document.snapshot !== evidence.domSnapshot) {
+    if (document.snapshot !== frameIndex.snapshot || document.snapshot !== expectedSnapshot) {
       return { status: "stale", reasonCode: "snapshot_binding_mismatch" };
     }
     const startNodeIndex = document.backendNodeIndexes?.get(backendNodeId);
@@ -315,10 +328,10 @@ export class BrowserObserver {
     for (let depth = 0; depth < 16 && Number.isInteger(nodeIndex) && nodeIndex >= 0; depth++) {
       if (visited.has(nodeIndex)) return { status: "unavailable", reasonCode: "snapshot_cycle" };
       visited.add(nodeIndex);
-      const candidate = candidateByNode.get(keyForNode(null, document.documentIndex, nodeIndex));
+      const candidate = candidateByNode.get(keyForNode(currentFrameTargetId, document.documentIndex, nodeIndex));
       if (candidate) {
         if (candidate.targetId !== evidence.targetId || candidate.documentGeneration !== evidence.documentGeneration
-          || candidate.frameTargetId !== null || candidate.frameId !== frameId) {
+          || (candidate.frameTargetId ?? null) !== currentFrameTargetId || candidate.frameId !== frameId) {
           return { status: "stale", reasonCode: "candidate_binding_mismatch" };
         }
         if (candidate.visible !== true || candidate.disabled === true) {
@@ -335,7 +348,7 @@ export class BrowserObserver {
             identity: candidate.identity,
             targetId: candidate.targetId,
             documentGeneration: candidate.documentGeneration,
-            frameTargetId: candidate.frameTargetId,
+            frameTargetId: currentFrameTargetId,
             frameId: candidate.frameId,
             backendNodeId: candidate.backendNodeId
           },
@@ -345,6 +358,27 @@ export class BrowserObserver {
       }
       nodeIndex = parentIndexes[nodeIndex];
     }
+    const childFrames = (lookupIndex.frameOwners ?? []).filter(owner =>
+      owner.parentTargetId === currentFrameTargetId
+      && owner.parentFrameId === frameId
+      && owner.ownerBackendNodeId === backendNodeId
+      && owner.geometry?.status === "available"
+    );
+    if (childFrames.length === 1) {
+      return {
+        status: "frame_owner",
+        frameOwnerHint: {
+          targetId: childFrames[0].targetId,
+          frameId: childFrames[0].frameId,
+          parentTargetId: childFrames[0].parentTargetId,
+          parentFrameId: childFrames[0].parentFrameId,
+          geometry: childFrames[0].geometry
+        },
+        visitedNodeCount: visited.size,
+        reasonCode: "hit_location_enters_observed_frame"
+      };
+    }
+    if (childFrames.length > 1) return { status: "unavailable", visitedNodeCount: visited.size, reasonCode: "frame_owner_ambiguous" };
     return { status: "unavailable", visitedNodeCount: visited.size, reasonCode: "no_actionable_candidate_at_hit_location" };
   }
 
@@ -519,7 +553,15 @@ export class BrowserObserver {
       frames: rootDocumentIndex ? [
         retainDocumentTraversalIndex(rootDocumentIndex),
         ...frameDocumentIndexes.map(retainDocumentTraversalIndex)
-      ] : []
+      ] : [],
+      frameOwners: frameSnapshots.map(frame => ({
+        targetId: frame.targetId,
+        frameId: frame.frameId,
+        parentTargetId: frame.frameGeometry?.parentTargetId ?? null,
+        parentFrameId: frame.frameGeometry?.parentFrameId ?? null,
+        ownerBackendNodeId: frame.frameGeometry?.ownerBackendNodeId ?? null,
+        geometry: frame.frameGeometry
+      })).filter(owner => Number.isInteger(owner.ownerBackendNodeId))
     };
     const lookupIndexBytes = estimateLookupIndexBytes(lookupIndex);
     const returnedScopeCandidateCount = mainDerived.scopeCandidateIdentities
@@ -630,7 +672,11 @@ export class BrowserObserver {
       observationProfile: profile,
       page: { ...pageState, url: sanitizeUrl(pageState.url ?? "") },
       frames: derived.frames,
-      outOfProcessFrameGeometry: frameSnapshots.map(frame => frame.frameGeometry).filter(Boolean),
+      outOfProcessFrameGeometry: frameSnapshots.map(frame => {
+        if (!frame.frameGeometry) return null;
+        const { ownerBackendNodeId: _ownerBackendNodeId, ...geometry } = frame.frameGeometry;
+        return geometry;
+      }).filter(Boolean),
       headings: derived.headings,
       candidates: derived.candidates.map(({ evidence: _e, attributes: _attributes, documentUrl: _documentUrl, formBackendNodeId: _formBackendNodeId, recordContext: _recordContext, ...candidate }) => candidate),
       scrollTargets,

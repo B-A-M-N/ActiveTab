@@ -419,6 +419,29 @@ test("target lookup telemetry records bounded binding and disposition without pa
     assert.equal(stored.payload.visitedNodeCount, 3);
     assert.equal(stored.payload.nextActionDisposition, "deferred");
     assert.equal(store.verifyEpisodeChain(episode.episodeId).ok, true);
+    const frameEvent = runtime.recordTargetLookup({
+      episodeId: episode.episodeId,
+      runId: episode.runId,
+      stepId: "step_lookup",
+      decisionId: "decision_lookup_oopif",
+      observationId: "observation_mapping",
+      lookupMode: "cdp_dom_hit_test_chain",
+      lookupStatus: "candidate",
+      targetId: "authorized_target_1",
+      documentGeneration: 8,
+      frameScope: "out_of_process",
+      frameTargetId: "authorized_frame_1",
+      frameId: "frame_1",
+      returnedCount: 1,
+      visitedNodeCount: 3,
+      stopReason: "candidate_found_at_hit_location",
+      elapsedMs: 16,
+      nextActionDisposition: "deferred"
+    });
+    assert.equal(frameEvent.payload.frameScope, "out_of_process");
+    assert.equal(frameEvent.payload.lookupMode, "cdp_dom_hit_test_chain");
+    assert.equal(frameEvent.payload.frameTargetId, "authorized_frame_1");
+    assert.equal(store.verifyEpisodeChain(episode.episodeId).ok, true);
     assert.throws(() => store.append({
       episodeId: episode.episodeId,
       runId: episode.runId,

@@ -161,9 +161,24 @@ test("visual grounding maps OOPIF candidates through captured owner geometry and
       ownerContentQuad: [20, 20, 80, 20, 80, 80, 20, 80] }
   ];
   const nestedBounds = mapCandidateBoundsToRoot({ frameTargetId: "nested_frame", bounds: { x: 20, y: 20, width: 20, height: 20 } }, {
+    viewport,
     outOfProcessFrameGeometry: nested
   });
   assert.ok(nestedBounds && nestedBounds.x > viewport.width * 0.2 && nestedBounds.x < viewport.width * 0.4);
+
+  const clippedNested = mapCandidateBoundsToRoot({
+    frameTargetId: "nested_frame",
+    bounds: { x: 20, y: 80, width: 20, height: 10 }
+  }, {
+    viewport: { width: 100, height: 100 },
+    outOfProcessFrameGeometry: [
+      { status: "available", frameTargetId: "parent_frame", parentTargetId: null,
+        viewport: { width: 100, height: 50 }, ownerContentQuad: [0, 0, 100, 0, 100, 50, 0, 50] },
+      { status: "available", frameTargetId: "nested_frame", parentTargetId: "parent_frame",
+        viewport: { width: 100, height: 100 }, ownerContentQuad: [0, 0, 100, 0, 100, 100, 0, 100] }
+    ]
+  });
+  assert.equal(clippedNested, null, "nested frame candidates outside a parent viewport cannot be grounded against unrelated root pixels");
 });
 
 test("visual grounding rejects missing, stale, disabled, and disallowed candidates", () => {
