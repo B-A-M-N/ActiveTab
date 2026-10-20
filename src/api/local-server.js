@@ -19,7 +19,6 @@
  */
 import http from "node:http";
 import { join, resolve } from "node:path";
-import { open } from "node:fs/promises";
 import { TaskStore } from "./task-store.js";
 import { RunLifecycle } from "./run-lifecycle.js";
 import { checkHost, checkOrigin, createMutationAuthorizer, createOperatorAuthenticator } from "./security.js";
@@ -55,12 +54,11 @@ import { createTestRunRoutes } from "./routes/testRuns.js";
 import { createLegacyRunRoutes } from "./routes/legacyRuns.js";
 import { createCatalogRoutes } from "./routes/catalog.js";
 import { createRunExecutionHandlers } from "./routes/runExecution.js";
+import { createOutputFileHandler } from "./outputFileHandler.js";
 
 const DEFAULT_PORT = 9377;
 const API_PREFIX = "/v3/bots";
 const MAX_TASK_RECORDS = 1_000;
-const MAX_OUTPUT_FILE_BYTES = 5 * 1024 * 1024;
-const OUTPUT_EXTENSIONS = new Set(["json", "md", "csv", "xml"]);
 // Terminal states exclude human-handoff/waiting states: those are
 // resumable suspensions (P0-3), and status reads on them must not report
 // the run as finished.
@@ -579,6 +577,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
     sendError,
     logger
   });
+  const handleOutputFile = createOutputFileHandler({ sendError });
 
   const server = http.createServer(async (req, res) => {
     const requestStart = Date.now();
@@ -668,7 +667,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
       // Output file serving: allowlisted extensions, safe path resolution, bounded size.
       if (method === "GET" && path.match(/^\/output\/[^/]+\/[^/]+$/)) {
         if (!authorizeMutation(req)) { sendError(res, 401, 99401, "Authentication required."); return; }
-        await serveOutputFile(res, { store, path });
+        await handleOutputFile(res, { store, path });
         return;
       }
 
@@ -710,41 +709,4 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
       }));
     }
   };
-}
-
-// ── Output serving ─────────────────────────────────────────────────────
-
-async function serveOutputFile(res, { store, path }) {
-  const parts = path.split("/");
-  const taskId = parts[2];
-  const filename = parts[3];
-  const ext = filename.includes(".") ? filename.split(".").pop().toLowerCase() : "";
-  if (!/^[0-9a-f-]{36}$/.test(taskId) || !OUTPUT_EXTENSIONS.has(ext) || filename.includes("..")) {
-    sendError(res, 403, 99403, "Forbidden");
-    return;
-  }
-  let filePath;
-  try {
-    filePath = resolve(join(store.baseDir, "..", "output", taskId, filename));
-    if (!filePath.startsWith(resolve(join(store.baseDir, "..", "output")) + "/")) throw new Error("path escape");
-  } catch {
-    sendError(res, 403, 99403, "Forbidden");
-    return;
-  }
-  try {
-    const file = await open(filePath, "r");
-    try {
-      const stat = await file.stat();
-      if (!stat.isFile() || stat.size > MAX_OUTPUT_FILE_BYTES) {
-        sendError(res, 404, 99404, "Output file not found.");
-        return;
-      }
-      const content = await file.readFile("utf8");
-      const mimeTypes = { json: "application/json", md: "text/markdown", csv: "text/csv", xml: "application/xml" };
-      res.writeHead(200, { "Content-Type": mimeTypes[ext], "Content-Length": Buffer.byteLength(content) });
-      res.end(content);
-    } finally { await file.close(); }
-  } catch {
-    sendError(res, 404, 99404, `Output file not found: ${filename}`);
-  }
 }

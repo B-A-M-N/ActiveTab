@@ -14,7 +14,7 @@ Owns local HTTP composition and endpoint-family adapters.
 - Authentication and operator identity come from server-owned authenticators. Request bodies contain caller input only and cannot select trusted identity, knowledge storage, or grant configuration.
 - Durable run-state and target lease operations use the configured stores and existing coordinators.
 - Legacy run creation fails closed when the server-owned executor is unavailable. The peer endpoint keeps its separate peer-token authentication; it does not rely on the local API token.
-- Route extraction preserves method/path matching, status codes, response bodies, authentication order, redaction, and error behavior.
+- Route extraction preserves method/path matching, status codes, response bodies, authentication order, redaction, and error behavior. Output-file serving remains behind API authentication and retains its path, extension, and size checks.
 - The discovery routes use server-composed environment, principal, and canonical knowledge directory. Discovery holds the current target lease for its run.
 
 ## Child DOX Index
@@ -30,3 +30,4 @@ Owns local HTTP composition and endpoint-family adapters.
 | `routes/legacyRuns.js` | Compatibility API run listing, status, detail, and cancellation after shared API authentication; task store and lifecycle stay server-owned |
 | `routes/catalog.js` | Authenticated bot, template, and region catalog reads with compatibility response shapes |
 | `routes/runExecution.js` | Compatibility run creation and peer execution using server-owned lifecycle, stores, executor, and extraction release policy |
+| `outputFileHandler.js` | API-authenticated bounded reads of task output files with allowlisted extensions and MIME types |

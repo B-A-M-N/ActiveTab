@@ -473,6 +473,8 @@ test("legacy run and catalog reads, cancellation, and run creation require the b
   assert.equal(unauthCatalog.status, 401);
   const unauthRunList = await fetch(`${url}/v3/bots/runs`);
   assert.equal(unauthRunList.status, 401);
+  const unauthOutput = await fetch(`${url}/output/00000000-0000-4000-8000-000000000000/result.json`);
+  assert.equal(unauthOutput.status, 401);
   const unauthCancel = await fetch(`${url}/v3/bots/runs/missing-task/cancel`, { method: "POST" });
   assert.equal(unauthCancel.status, 401);
   const auth = await fetch(`${url}/v3/bots/templates/local-web-reviews-scraper/runs`, {
