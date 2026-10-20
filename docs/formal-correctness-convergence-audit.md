@@ -40,6 +40,7 @@ Recent behavior-preserving slices are separate commits:
 - `dd3a202` — extract evidence-release review, audit, and revocation routes; add adversarial route-boundary tests.
 - `4eb1117` — extract API-authenticated test-run route dispatch while retaining lifecycle handlers in the server composition.
 - `1b81b6a` — extract workflow route selection and planner construction after trusted task resolution, with explicit abstention preserved.
+- `b2a37ea` — extract permission-gated visual assessment and candidate grounding while retaining fresh evidence checks and engine-owned policy admission.
 - `b3f8f7f` — route `/v1/interventions/run-state` before the generic intervention-ID matcher so the run-state handler is reachable.
 - `b3c66a8` — give the 600-control retained-lookup fixture the existing maximum query timeout; production defaults are unchanged.
 
@@ -49,7 +50,7 @@ The repository also already has separate run-context, replay, recovery, action-a
 
 The latest complete run used `ACTIVETAB_HEADLESS=1 npm run test:isolated -- --test-concurrency=1` through an owner-private disposable state directory. It used the same `node --test` discovery and serial file execution as the isolated suite, with compatible Chrome fixtures launched as `--headless=new`.
 
-- Full suite after the latest four decomposition slices: **844 passed, 0 failed, 5 skipped** (849 tests; 96.18 seconds).
+- Full suite after the latest five decomposition slices: **846 passed, 0 failed, 5 skipped** (851 tests; 103.69 seconds).
 - Opt-in headless extension subset: **1 passed, 0 failed, 0 skipped**. It covers explicit popup consent through a `userGesture` handler call, exact-tab grants, Native Messaging, CDP observation, and protected-route cookie preservation.
 - Headless OOPIF fixture: direct and nested frame recovery plus root-page scroll passed.
 
@@ -59,7 +60,7 @@ No headed equivalence is claimed for skipped desktop behavior. Live/staging qual
 
 ## Next bounded slices
 
-1. Continue `NavigationEngine` extraction from provider and visual-review coordination while retaining one public run loop and the current executor. Task-scope expansion lives in `planningEvidence.js`; workflow planner selection now lives in `workflowRoutePlanner.js` after trusted task resolution.
+1. Continue `NavigationEngine` extraction from provider planning and attempt coordination while retaining one public run loop and the current executor. Task-scope expansion lives in `planningEvidence.js`; workflow planner selection lives in `workflowRoutePlanner.js`; visual assessment and grounding live in `visualDecisionCoordinator.js` and remain advisory.
 2. Continue decomposition from the largest remaining coordinators. HTTP endpoint dispatch for discovery, capabilities, interventions, approvals, evidence releases, and test runs now uses injected route modules; test-run lifecycle implementations and the broader `/v3` surface remain composed in `local-server.js` (957 lines).
 3. Measure response acquisition/process memory as best-effort diagnostics; keep `hardMemoryBound:false` until the transport can enforce a pre-materialization limit.
 4. Run the remaining held-out application and multi-process lifecycle qualifications when their required authorized environments are available.
