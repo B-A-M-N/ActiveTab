@@ -22,6 +22,7 @@ ActiveTab's browser control plane. Every effectful browser action ultimately dis
 - `visualCandidateProbe.js` owns the bounded hit-test sequence and freshness comparisons. `BrowserSession` owns probe admission, single-flight state, and invalidation; the helper can only issue `Runtime.evaluate` and `DOM.getNodeForLocation` reads and resolve the hit against retained evidence. Its result remains advisory.
 - `dialogState.js` owns the currently observed JavaScript dialog snapshot. `BrowserSession` remains the only component that dispatches `Page.handleJavaScriptDialog`; the state helper grants no operation authority.
 - `textInput.js` owns native search and field text mechanics, live candidate checks, focus revalidation, and exact text replacement. `BrowserSession.typeSearchPhrase()` and `fillField()` remain compatibility delegates; the controller receives current session state and the existing checks, and creates no authorization path.
+- `candidateValidator.js` owns read-only freshness checks for exact observed candidates. `BrowserSession` remains the canonical target/document-generation owner and delegates its compatibility method; validation cannot dispatch effects or grant authority.
 - Filter checkbox control accepts only an exact caller-selected checked/unchecked state for a fresh native checkbox. It returns no field value and remains behind trusted profile operation authorization.
 - ARIA combobox selection is a composite effect. It requires an executor-approved envelope limited to opening the exact observed combobox and selecting one exact visible option controlled by that still-open combobox; the executor rechecks target lease, page/application binding, and fresh candidate identity before each suboperation.
 - Search, fill, and select value limits come from `actionLimits.js` and must match planning and workflow validation; oversized exact values are refused without truncation.
@@ -68,6 +69,7 @@ Integration tests launch disposable Chrome headed by default. Test launch paths 
 | `visualCandidateProbe.js` | Bounded read-only hit-test sequence against exact retained visual evidence |
 | `dialogState.js` | Current JavaScript dialog observation state; no CDP dispatch |
 | `textInput.js` | Search/field text mechanics, focus revalidation, and exact-value input; no policy admission |
+| `candidateValidator.js` | Read-only exact candidate identity, state, and route revalidation; no effect dispatch |
 | `browserEnvironment.js` | Bounded environment configuration and pre-navigation initialization for newly owned Chromium targets |
 | `targets.js` | Loopback CDP discovery, exact target authorization, and owned startup-target resolution |
 | `targetReattachment.js` | Lease-bound recovery of one exact loopback CDP target with fresh post-navigation evidence |
