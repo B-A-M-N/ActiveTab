@@ -10,13 +10,17 @@ import { listTargets, resolveAuthorizedTarget } from "../src/browser/targets.js"
 import { connectChromeAuto, listChromeTargets, resolveChromeTarget } from "../src/browser/chrome-autoconnect.js";
 import { BrowserSession } from "../src/browser/session.js";
 import { executeAuthorizedAction } from "../src/runtime/authorizedExecutor.js";
+import { TestRunner } from "../src/testing/runner.js";
 import { FixtureNavigationEngine as NavigationEngine } from "../test-support/fixtureNavigationEngine.js";
 import { clickObservedElement } from "../src/navigation/observedAction.js";
 import { TaskJournal } from "../src/state/journal.js";
+import { RunStateStore } from "../src/testing/runState.js";
 import { CapabilityService } from "../src/capabilities/capabilityService.js";
 import { runApiShapeFixtureQualification } from "../test-lab/fixtures/api-shape-twin/oracle.js";
 import { jpegDimensions, isJevImageSizeSupported } from "../src/decisions/imagePreparation.js";
 import { chromeWindowPositionArgs, resolveChromeWindowPosition } from "../src/browser/chromeWindowPlacement.js";
+import { observeStable, waitForActivityQuiet } from "../test-support/stableObservation.js";
+import { spawnLifecycleWorker } from "../test-lab/fault-injection/runLifecycleHarness.js";
 
 const fixtureLease = async () => {};
 
@@ -198,11 +202,162 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     assert.equal(first.page.title, "Demo shop");
     assert.equal(first.targetId, session.target.id, "each real CDP observation is bound to its selected browser target");
     await session.client.send("Runtime.evaluate", {
+      expression: "window.__lostAckEffectCount = 0; const lostAckButton = document.createElement('button'); lostAckButton.id = 'lost-ack-button'; lostAckButton.type = 'button'; lostAckButton.textContent = 'Lost acknowledgement fixture'; lostAckButton.style.cssText = 'position:fixed;top:20px;left:20px;z-index:2147483647'; lostAckButton.addEventListener('click', () => { window.__lostAckEffectCount++; }); document.body.append(lostAckButton); true;",
+      returnByValue: true
+    });
+    const lostAckObservation = await observeStable(session, undefined, { label: "lost CDP acknowledgement control" });
+    const lostAckCandidate = lostAckObservation.candidates.find(candidate => candidate.role === "button" && candidate.name === "Lost acknowledgement fixture");
+    assert.ok(lostAckCandidate, "the lost-acknowledgement fixture button is freshly observed");
+    const sendBeforeLostAck = session.client.send;
+    let droppedMouseReleaseAcknowledgement = false;
+    let mouseReleaseDispatches = 0;
+    session.client.send = async function (method, params) {
+      const response = await sendBeforeLostAck.call(this, method, params);
+      if (method === "Input.dispatchMouseEvent" && params?.type === "mouseReleased") {
+        mouseReleaseDispatches++;
+        if (!droppedMouseReleaseAcknowledgement) {
+          droppedMouseReleaseAcknowledgement = true;
+          throw new Error("Injected loss after Chrome applied mouseReleased.");
+        }
+      }
+      return response;
+    };
+    let lostAckResult;
+    try {
+      lostAckResult = await executeAuthorizedAction({
+        session,
+        localFixture: true,
+        goal: "Activate the lost acknowledgement fixture",
+        action: "click",
+        candidate: lostAckCandidate,
+        operationId: "test.local_fixture_lost_ack_click",
+        operationAuthorizer: fixtureButtonAuthorizer,
+        assertExecutionLease: fixtureLease
+      });
+    } finally {
+      session.client.send = sendBeforeLostAck;
+    }
+    assert.equal(lostAckResult.status, "uncertain", "the executor preserves a command acknowledgement loss as unresolved");
+    assert.equal(lostAckResult.dispatchStatus, "uncertain");
+    assert.equal(lostAckResult.retryWithoutReconciliation, false, "the same action cannot be retried before reconciliation");
+    assert.equal(mouseReleaseDispatches, 1, "the uncertain action sent one mouse release");
+    const lostAckEffectCount = await session.client.send("Runtime.evaluate", {
+      expression: "window.__lostAckEffectCount",
+      returnByValue: true
+    });
+    assert.equal(lostAckEffectCount.result.value, 1, "the independent page oracle confirms Chrome applied the click despite the lost response");
+    await session.client.send("Runtime.evaluate", { expression: "document.querySelector('#lost-ack-button')?.remove(); window.scrollTo(0, 0); true;", returnByValue: true });
+    first = await observeStable(session, undefined, { label: "post-reconciliation base fixture" });
+    // Keep these original-page facets while the later crash and reconciliation
+    // scenarios generate additional bounded evidence entries.
+    const firstScrollTargetsEvidence = session.observer.getEvidence(first.evidenceId, { facets: ["scrollTargets"] });
+    const firstFrameTreeEvidence = session.observer.getEvidence(first.evidenceId, { facets: ["frameTree"] });
+    const firstDomSnapshotEvidence = session.observer.getEvidence(first.evidenceId, { facets: ["domSnapshot"] });
+    const postconditionCrashButtonName = "Postcondition crash fixture";
+    const postconditionCrashRunId = `cdp-postcondition-crash-${Date.now()}`;
+    const postconditionCrashEnvironment = {
+      environmentId: "cdp-postcondition-crash-fixture",
+      authorizedOrigins: [new URL(session.target.url).origin]
+    };
+    await session.client.send("Runtime.evaluate", {
+      expression: `window.__postconditionCrashEffectCount = 0; const button = document.createElement('button'); button.id = 'postcondition-crash-button'; button.type = 'button'; button.setAttribute('aria-label', '${postconditionCrashButtonName}'); button.textContent = '${postconditionCrashButtonName}'; button.style.cssText = 'position:fixed;top:84px;left:20px;z-index:2147483647'; button.addEventListener('click', () => { window.__postconditionCrashEffectCount++; }); document.body.append(button); true;`,
+      returnByValue: true
+    });
+    const postconditionCrashStateDir = await mkdtemp(join(tmpdir(), "activetab-cdp-postcondition-crash-"));
+    let postconditionCrashStore = new RunStateStore(postconditionCrashStateDir);
+    await postconditionCrashStore.init();
+    const postconditionCrashWorker = spawnLifecycleWorker("cdp-verification-pending", postconditionCrashStateDir, {
+      endpoint,
+      targetId: fixtureTarget.id,
+      runId: postconditionCrashRunId,
+      buttonName: postconditionCrashButtonName,
+      pageUrl: session.target.url,
+      pageTitle: first.page.title,
+      environment: postconditionCrashEnvironment
+    });
+    try {
+      const paused = await postconditionCrashWorker.nextMessage(45_000);
+      assert.equal(paused.event, "postcondition-verification-paused", "the child has dispatched the browser effect and entered the real workflow verifier");
+      const beforeCrash = await postconditionCrashStore.getFresh(postconditionCrashRunId);
+      const dispatchedOperation = beforeCrash.pendingOperations.find(operation => operation.stepId === "count-effect");
+      assert.equal(dispatchedOperation?.status, "DISPATCHED", "the operation is durably dispatched before verification completes");
+      const beforeCrashEffect = await session.client.send("Runtime.evaluate", {
+        expression: "window.__postconditionCrashEffectCount",
+        returnByValue: true
+      });
+      assert.equal(beforeCrashEffect.result.value, 1, "the separate Chrome owner observes one actual page effect before killing the verifier");
+      assert.equal((await postconditionCrashWorker.kill("SIGKILL")).signal, "SIGKILL");
+      postconditionCrashStore.close();
+      postconditionCrashStore = null;
+
+      const restartedStore = new RunStateStore(postconditionCrashStateDir);
+      await restartedStore.init();
+      try {
+        const recovered = await restartedStore.reconcileRestart(postconditionCrashRunId, {
+          attachmentCheck: async targetId => targetId === fixtureTarget.id,
+          environmentCheck: async environmentId => ({ ok: environmentId === postconditionCrashEnvironment.environmentId })
+        });
+        const uncertain = recovered.pendingOperations.find(operation => operation.operationId === dispatchedOperation.operationId);
+        assert.equal(uncertain?.status, "UNCERTAIN", "restart preserves a dispatch whose verifier died before checkpointing");
+        await assert.rejects(() => restartedStore.reserveOperation(postconditionCrashRunId, {
+          operationId: uncertain.operationId,
+          stepId: uncertain.stepId,
+          action: uncertain.action,
+          effectDigest: uncertain.effectDigest,
+          environmentId: uncertain.environmentId,
+          targetId: uncertain.targetId
+        }), /already reached UNCERTAIN/, "the effect cannot be replayed while its outcome is unresolved");
+
+        const independentEvidence = await observeStable(session, undefined, { label: "reconcile child verifier crash" });
+        const afterCrashEffect = await session.client.send("Runtime.evaluate", {
+          expression: "window.__postconditionCrashEffectCount",
+          returnByValue: true
+        });
+        assert.equal(afterCrashEffect.result.value, 1, "the external Chrome oracle still observes exactly one effect after restart");
+        await restartedStore.reconcileOperation(postconditionCrashRunId, {
+          operationId: uncertain.operationId,
+          status: "VERIFIED",
+          evidenceIds: [independentEvidence.evidenceId],
+          summary: "The exact fixture page counter independently showed one effect after verifier process death."
+        });
+
+        const resumed = await new TestRunner({
+          session,
+          environment: postconditionCrashEnvironment,
+          runStateStore: restartedStore,
+          operationAuthorizer: {
+            authorize({ action, candidate, observation }) {
+              const allowed = action === "click" && candidate?.name === postconditionCrashButtonName
+                && observation?.page?.url === session.target.url;
+              return { allowed, category: "test_cdp_postcondition_crash", reason: "The fixture contract permits one exact loopback control." };
+            }
+          }
+        }).run({
+          id: "cdp-postcondition-crash-workflow",
+          name: "Pause after dispatch during postcondition verification",
+          steps: [{ id: "count-effect", type: "interact", goal: "Count the durable verification fixture effect", action: {
+            type: "click", operationId: "test.cdp_postcondition_crash",
+            target: { name: postconditionCrashButtonName },
+            postcondition: { type: "page_title_contains", value: first.page.title }
+          } }]
+        }, { runId: postconditionCrashRunId });
+        assert.equal(resumed.status, "PASSED", "resume completes from the independently verified durable operation record");
+        assert.equal(afterCrashEffect.result.value, 1);
+        assert.equal((await session.client.send("Runtime.evaluate", { expression: "window.__postconditionCrashEffectCount", returnByValue: true })).result.value, 1,
+          "the resumed production runner does not dispatch the effect again");
+      } finally { restartedStore.close(); }
+    } finally {
+      await postconditionCrashWorker.kill();
+      postconditionCrashStore?.close();
+      await rm(postconditionCrashStateDir, { recursive: true, force: true });
+      await session.client.send("Runtime.evaluate", { expression: "document.querySelector('#postcondition-crash-button')?.remove(); true;", returnByValue: true }).catch(() => {});
+    }
+    await session.client.send("Runtime.evaluate", {
       expression: "globalThis.__activetabGetterRuns = 0; globalThis.__activetabRuntimeState__ = { publicLabel: 'runtime fixture', nested: { apiToken: 'runtime-fixture-secret' }, largeValue: 'x'.repeat(4095) + '😀' + 'y'.repeat(1000) }; Object.defineProperty(globalThis.__activetabRuntimeState__, 'lazyValue', { enumerable: true, get() { globalThis.__activetabGetterRuns++; return 'getter-must-not-run'; } }); void 0;",
       returnByValue: true
     });
     const sectionChoices = first.candidates.filter(candidate => candidate.name === "Continue" && ["Billing history", "Shipping history"].includes(candidate.contextName));
-    assert.deepEqual(sectionChoices.map(candidate => candidate.contextName).sort(), ["Billing history", "Shipping history"]);
+    assert.deepEqual(sectionChoices.map(candidate => candidate.contextName).sort(), ["Billing history", "Shipping history"], JSON.stringify(first.captureCoherence));
     const safeEvidence = session.observer.getEvidence(first.evidenceId);
     const serializedSafe = JSON.stringify(safeEvidence);
     assert.equal(serializedSafe.includes("fixture-secret"), false, "form values are redacted on evidence retrieval");
@@ -273,17 +428,17 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     });
     assert.equal(resolvedCallerAction.status, "action_dispatched");
     assert.equal(resolvedCallerAction.observation.page.title, "Primary route", "the selected handle is revalidated and the caller can verify the resulting route");
-    const observedScrollTargets = session.observer.getEvidence(first.evidenceId, { facets: ["scrollTargets"] }).scrollTargets;
+    const observedScrollTargets = firstScrollTargetsEvidence.scrollTargets;
     assert.ok(observedScrollTargets.some(target => target.kind === "container" && target.name === "Invoice list"), "native observation retains the virtualized inner list as a selectable scroll target");
-    const observedFrameTree = session.observer.getEvidence(first.evidenceId, { facets: ["frameTree"] }).frameTree;
+    const observedFrameTree = firstFrameTreeEvidence.frameTree;
     assert.ok(frameUrls(observedFrameTree).some(url => url.startsWith(`http://127.0.0.1:${crossOriginPort}/cross-frame.html`)), "the detailed frame tree preserves the cross-origin child relationship");
-    const capturedDom = session.observer.getEvidence(first.evidenceId, { facets: ["domSnapshot"] }).domSnapshot;
+    const capturedDom = firstDomSnapshotEvidence.domSnapshot;
     const crossFrameDocument = capturedDom.documents.find(document => capturedDom.strings[document.documentURL]?.startsWith(`http://127.0.0.1:${crossOriginPort}/cross-frame.html`));
     const crossFrameSummary = first.frames.find(frame => frame.url.startsWith(`http://127.0.0.1:${crossOriginPort}/cross-frame.html`));
     t.diagnostic(`cross-origin observation: frame-tree-present=true DOMSnapshot-document=${Boolean(crossFrameDocument)} compact-frame-summary=${Boolean(crossFrameSummary)}`);
     assert.ok(crossFrameDocument, "the native DOMSnapshot captures the cross-origin child document in this Chrome session");
     assert.equal(crossFrameSummary?.controlSupported, true, "a frame present in this target's DOMSnapshot is offered for native CDP revalidation");
-    const frameEvidence = session.observer.getEvidence(first.evidenceId, { facets: ["domSnapshot"] }).domSnapshot;
+    const frameEvidence = firstDomSnapshotEvidence.domSnapshot;
     const frameDocument = frameEvidence.documents.find(document => frameEvidence.strings[document.documentURL]?.endsWith("/same-frame.html"));
     assert.ok(frameDocument, "the native DOMSnapshot retains the same-origin iframe document");
     const frameButtonIndex = frameDocument.nodes.nodeName.findIndex(index => frameEvidence.strings[index] === "BUTTON");
@@ -628,10 +783,11 @@ test("native CDP attaches to disposable Chrome, preserves evidence, recovers, ve
     assert.equal(partialValueVerification.matches, false, "exact read-back detects text truncated by a native field constraint");
     await session.client.send("Page.reload", { ignoreCache: true });
     await session.waitForChange(5_000);
-    const resetObservation = await session.observe();
+    const resetObservation = await observeStable(session, undefined, { label: "reloaded navigation fixture" });
     assert.equal(resetObservation.page.title, "Demo shop", "the next navigation task starts from the fixture's initial page state");
+    await waitForActivityQuiet(session, { label: "pre-workflow navigation fixture" });
     const sectionRun = await new NavigationEngine(session, { maxActions: 1, maxRecoveries: 0 }).run("Open the billing history page");
-    assert.equal(sectionRun.status, "succeeded", `native observations and deterministic planning resolve repeated labels from their section context: ${JSON.stringify(sectionRun)}`);
+    assert.equal(sectionRun.status, "succeeded", `native observations and deterministic planning resolve repeated labels from their section context: ${JSON.stringify({ result: sectionRun, coherence: session.observer.getEvidence(sectionRun.evidenceId, { facets: ["scrollTargets"] }).captureCoherence, scrollTargets: session.observer.getEvidence(sectionRun.evidenceId, { facets: ["scrollTargets"] }).scrollTargets })}`);
     assert.equal(sectionRun.page.title, "Billing history");
     const virtualizedRun = await new NavigationEngine(session, { operationAuthorizer: fixtureButtonAuthorizer, maxActions: 10, maxScrolls: 8, maxRecoveries: 0 }).run("Open invoice 24 page");
     assert.equal(virtualizedRun.status, "succeeded", `native wheel input reveals and opens an item rendered only after scrolling: ${JSON.stringify(virtualizedRun)}`);

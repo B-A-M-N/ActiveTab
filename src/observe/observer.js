@@ -69,6 +69,47 @@ function percentile(values, fraction) {
   return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)];
 }
 
+function captureFrameState(session) {
+  return [...(session.frameSessions?.values?.() ?? [])]
+    .map(frame => ({
+      targetId: frame.targetId,
+      frameId: frame.frameId,
+      parentFrameId: frame.parentFrameId ?? null,
+      generation: Number.isInteger(frame.generation) ? frame.generation : 0,
+      status: frame.status
+    }))
+    .sort((left, right) => left.targetId.localeCompare(right.targetId));
+}
+
+function captureViewportState(runtimeState) {
+  if (!Number.isFinite(runtimeState?.viewportWidth) || !Number.isFinite(runtimeState?.viewportHeight)) return null;
+  return {
+    width: runtimeState.viewportWidth,
+    height: runtimeState.viewportHeight,
+    scrollX: Number.isFinite(runtimeState.scrollX) ? runtimeState.scrollX : Number(runtimeState.scrollLeft ?? 0),
+    scrollY: Number.isFinite(runtimeState.scrollY) ? runtimeState.scrollY : Number(runtimeState.scrollTop ?? 0),
+    deviceScaleFactor: Number.isFinite(runtimeState.deviceScaleFactor) ? runtimeState.deviceScaleFactor : 1
+  };
+}
+
+function captureEpochState(session, runtimeState, baseline = {}) {
+  const activity = baseline.activity ?? session.activity?.snapshot?.() ?? {};
+  return {
+    targetId: baseline.targetId ?? session.target?.id ?? null,
+    documentGeneration: baseline.documentGeneration ?? session.documentGeneration,
+    rootDomMutationCount: activity.rootDomMutationCount ?? 0,
+    totalDomMutationCount: activity.totalDomMutations ?? 0,
+    lifecycleEventCount: activity.totalLifecycleEvents ?? 0,
+    frames: baseline.frames ?? captureFrameState(session),
+    routeDigest: typeof runtimeState?.url === "string"
+      ? createHash("sha256").update(runtimeState.url).digest("hex") : null,
+    titleDigest: typeof runtimeState?.title === "string"
+      ? createHash("sha256").update(runtimeState.title).digest("hex") : null,
+    readyState: typeof runtimeState?.readyState === "string" ? runtimeState.readyState : null,
+    viewport: captureViewportState(runtimeState)
+  };
+}
+
 function stringAt(strings, index) {
   return Number.isInteger(index) && index >= 0 ? strings[index] ?? "" : "";
 }
@@ -386,7 +427,7 @@ export class BrowserObserver {
     return inspectRuntimeState(this, id, options);
   }
 
-  async capture({ profile = "interaction", includeScreenshot, includeRawInResponse = false, prepareForJev = false, selectionGoal = "", candidateLimit = 200, priorityCandidateIdentities = [] } = {}) {
+  async capture({ profile = "interaction", includeScreenshot, includeRawInResponse = false, prepareForJev = false, selectionGoal = "", candidateLimit = 200, priorityCandidateIdentities = [] } = {}, { retryCount = 0 } = {}) {
     if (!OBSERVATION_PROFILES.has(profile)) throw new Error(`profile must be one of: ${[...OBSERVATION_PROFILES].join(", ")}.`);
     if (includeScreenshot !== undefined && typeof includeScreenshot !== "boolean") throw new Error("includeScreenshot must be a boolean.");
     if (typeof prepareForJev !== "boolean") throw new Error("prepareForJev must be a boolean.");
@@ -397,11 +438,23 @@ export class BrowserObserver {
       throw new Error("priorityCandidateIdentities must contain at most four bounded exact candidate identities.");
     }
     priorityCandidateIdentities = [...new Set(priorityCandidateIdentities)];
-    const captureStartedAt = Date.now();
+    const captureStartedAt = performance.now();
     const memoryBefore = process.memoryUsage();
-    const metrics = { cdpRoundTrips: 0, totalCdpRoundTripMs: 0, domSnapshotCount: 0, cdpRoundTripDurations: [] };
+    const metrics = {
+      cdpRoundTrips: 0,
+      totalCdpRoundTripMs: 0,
+      cdpRoundTripsByMethod: Object.create(null),
+      domSnapshotCount: 0,
+      cdpRoundTripDurations: []
+    };
     const rawClient = this.session.client;
     const client = instrumentCaptureClient(rawClient, metrics);
+    const captureStart = {
+      targetId: this.session.target.id,
+      documentGeneration: this.session.documentGeneration,
+      activity: this.session.activity.snapshot(),
+      frames: captureFrameState(this.session)
+    };
     const captureStructure = profile !== "lightweight";
     const deriveInteraction = profile === "interaction" || profile === "visual";
     const deriveSemantic = profile !== "lightweight";
@@ -417,14 +470,16 @@ export class BrowserObserver {
       captureStructure ? client.send("Accessibility.getFullAXTree") : Promise.resolve({ nodes: [] }),
       client.send("Runtime.evaluate", { expression: runtimeExpression, returnByValue: true })
     ]);
-    const pageState = JSON.parse(runtime.result?.value ?? "{}" );
+    const initialRuntimeState = JSON.parse(runtime.result?.value ?? "{}" );
+    const captureEpochStart = captureEpochState(this.session, initialRuntimeState, captureStart);
+    const pageState = { ...initialRuntimeState };
     const deviceScaleFactor = Number.isFinite(pageState.deviceScaleFactor) && pageState.deviceScaleFactor > 0 && pageState.deviceScaleFactor <= 8
       ? pageState.deviceScaleFactor : 1;
     const viewportScroll = {
       x: Number.isFinite(pageState.scrollX) ? pageState.scrollX : Number(pageState.scrollLeft ?? 0),
       y: Number.isFinite(pageState.scrollY) ? pageState.scrollY : Number(pageState.scrollTop ?? 0)
     };
-    const activity = this.session.activity.snapshot();
+    let activity = this.session.activity.snapshot();
     const scrollState = {
       scrollTop: Number(pageState.scrollTop ?? 0),
       scrollLeft: Number(pageState.scrollLeft ?? 0),
@@ -443,18 +498,10 @@ export class BrowserObserver {
     delete pageState.viewportHeight;
     delete pageState.viewportWidth;
     delete pageState.deviceScaleFactor;
-    const pageChangeFingerprint = createHash("sha256").update(JSON.stringify([
-      pageState.url,
-      pageState.title,
-      pageState.readyState,
-      this.session.documentGeneration,
-      activity.totalDomMutations,
-      activity.totalLifecycleEvents
-    ])).digest("hex");
     const rootFrameId = frameTree?.frame?.id;
     const rootScrollTargets = deriveInteraction ? [
-      viewportScrollTarget(this.session.target.id, rootFrameId, this.session.documentGeneration, scrollState),
-      ...await captureScrollableTargets(client, { targetId: this.session.target.id, frameId: rootFrameId, generation: this.session.documentGeneration })
+      viewportScrollTarget(captureEpochStart.targetId, rootFrameId, captureEpochStart.documentGeneration, scrollState),
+      ...await captureScrollableTargets(client, { targetId: captureEpochStart.targetId, frameId: rootFrameId, generation: captureEpochStart.documentGeneration })
     ].filter(Boolean) : [];
     let screenshot = null;
     if (captureScreenshot) {
@@ -483,10 +530,61 @@ export class BrowserObserver {
         metrics,
         computedStyles: STYLE_NAMES,
         runtimeExpression,
+        documentGeneration: captureEpochStart.documentGeneration,
         deriveInteraction,
         remainingFrameBytes
       })
       : { frameResults: [], frameSnapshots: [] };
+
+    const finalRuntime = await client.send("Runtime.evaluate", { expression: runtimeExpression, returnByValue: true });
+    const finalRuntimeState = JSON.parse(finalRuntime.result?.value ?? "{}" );
+    activity = this.session.activity.snapshot();
+    const captureEpochEnd = captureEpochState(this.session, finalRuntimeState);
+    const coherenceChanges = [];
+    if (captureEpochStart.targetId !== captureEpochEnd.targetId) coherenceChanges.push("target_changed");
+    if (captureEpochStart.documentGeneration !== captureEpochEnd.documentGeneration) coherenceChanges.push("document_generation_changed");
+    if (captureEpochStart.rootDomMutationCount !== captureEpochEnd.rootDomMutationCount) coherenceChanges.push("root_dom_mutated_during_capture");
+    if (captureEpochStart.totalDomMutationCount !== captureEpochEnd.totalDomMutationCount) coherenceChanges.push("dom_mutated_during_capture");
+    if (captureEpochStart.lifecycleEventCount !== captureEpochEnd.lifecycleEventCount) coherenceChanges.push("lifecycle_changed_during_capture");
+    if (JSON.stringify(captureEpochStart.frames) !== JSON.stringify(captureEpochEnd.frames)) coherenceChanges.push("oopif_attachment_or_generation_changed");
+    if (captureEpochStart.routeDigest !== captureEpochEnd.routeDigest) coherenceChanges.push("route_changed_during_capture");
+    if (captureEpochStart.titleDigest !== captureEpochEnd.titleDigest) coherenceChanges.push("title_changed_during_capture");
+    if (captureEpochStart.readyState !== captureEpochEnd.readyState) coherenceChanges.push("lifecycle_state_changed_during_capture");
+    if (captureEpochStart.viewport && captureEpochEnd.viewport
+      && JSON.stringify(captureEpochStart.viewport) !== JSON.stringify(captureEpochEnd.viewport)) {
+      coherenceChanges.push("viewport_or_scroll_changed_during_capture");
+    } else if (captureStructure && (!captureEpochStart.viewport || !captureEpochEnd.viewport)) {
+      coherenceChanges.push("viewport_state_unavailable");
+    }
+    const coherenceGaps = [];
+    if (captureStructure && this.session.domObservationAvailable === false) coherenceGaps.push("root_dom_mutation_tracking_unavailable");
+    if (captureStructure && frameResults.some(frame => frame.status === "available" && frame.domMutationObservationAvailable !== true)) {
+      coherenceGaps.push("oopif_dom_mutation_tracking_unavailable");
+    }
+    if (captureStructure && captureEpochEnd.frames.some(frame => frame.status !== "ready")) coherenceGaps.push("oopif_capture_unavailable");
+    if (captureStructure && frameResults.some(frame => frame.status === "unavailable" || frame.status === "omitted")) {
+      coherenceGaps.push("oopif_evidence_incomplete");
+    }
+    if (captureStructure && (this.session.frameAttachmentOmitted ?? 0) > 0) coherenceGaps.push("oopif_attachment_limit_reached");
+    if (captureStructure && this.session.frameAttachmentAvailable === false) {
+      coherenceGaps.push("oopif_attachment_tracking_unavailable");
+    }
+    const captureCoherence = {
+      status: coherenceChanges.length ? "unstable" : coherenceGaps.length ? "incomplete" : "stable",
+      changes: coherenceChanges,
+      gaps: coherenceGaps,
+      start: captureEpochStart,
+      end: captureEpochEnd,
+      retryCount: Number.isInteger(retryCount) && retryCount >= 0 ? Math.min(1, retryCount) : 0
+    };
+    const pageChangeFingerprint = createHash("sha256").update(JSON.stringify([
+      pageState.url,
+      pageState.title,
+      pageState.readyState,
+      captureEpochEnd.documentGeneration,
+      activity.totalDomMutations,
+      activity.totalLifecycleEvents
+    ])).digest("hex");
     const documentIndexStartedAt = performance.now();
     const rootDocumentIndex = deriveSemantic
       ? buildDocumentIndex(snapshot, { frameTargetId: null, parentFrameId: null })
@@ -499,7 +597,7 @@ export class BrowserObserver {
     metrics.documentIndexBuildMs = performance.now() - documentIndexStartedAt;
     const candidateDerivationStartedAt = performance.now();
     const mainDerived = deriveInteraction
-      ? buildCandidates(snapshot, ax.nodes, rootFrameId, this.session.documentGeneration, this.session.target.id, {
+      ? buildCandidates(snapshot, ax.nodes, rootFrameId, captureEpochStart.documentGeneration, captureEpochStart.targetId, {
         selectionGoal,
         candidateLimit,
         priorityCandidateIdentities,
@@ -510,8 +608,8 @@ export class BrowserObserver {
       frame.domSnapshot,
       frame.accessibilityTree,
       frame.frameId,
-      this.session.documentGeneration,
-      this.session.target.id,
+      captureEpochStart.documentGeneration,
+      captureEpochStart.targetId,
       {
         frameTargetId: frame.targetId,
         parentFrameId: frame.parentFrameId,
@@ -541,14 +639,16 @@ export class BrowserObserver {
       headings: [...mainDerived.headings, ...childDerived.flatMap(frame => frame.headings)].slice(0, 100),
       frames: [...mainDerived.frames, ...childDerived.flatMap(frame => frame.frames)]
     };
+    if (deriveInteraction && captureCoherence.status !== "stable") derived.candidates = [];
     const allLookupCandidates = [
       ...mainDerived.lookupCandidates,
       ...childDerived.flatMap(frame => frame.lookupCandidates)
     ];
     const lookupIndex = {
-      available: deriveInteraction && Boolean(rootDocumentIndex),
+      available: deriveInteraction && captureCoherence.status === "stable" && Boolean(rootDocumentIndex),
       candidateCount: allLookupCandidates.length,
-      candidateCoverage: deriveInteraction && allLookupCandidates.length <= MAX_RETAINED_LOOKUP_CANDIDATES ? "complete" : "incomplete",
+      candidateCoverage: deriveInteraction && captureCoherence.status === "stable"
+        && allLookupCandidates.length <= MAX_RETAINED_LOOKUP_CANDIDATES ? "complete" : "incomplete",
       candidates: allLookupCandidates.slice(0, MAX_RETAINED_LOOKUP_CANDIDATES),
       frames: rootDocumentIndex ? [
         retainDocumentTraversalIndex(rootDocumentIndex),
@@ -592,9 +692,10 @@ export class BrowserObserver {
       frameTree: true,
       layout: captureStructure,
       scrollTargets: deriveInteraction,
-      interactionCandidates: deriveInteraction,
+      interactionCandidates: deriveInteraction && captureCoherence.status === "stable",
       interactionCandidatesTruncated: candidateCoverage.truncated,
       interactionCandidateCount: observedCandidateCount,
+      captureCoherence: captureCoherence.status,
       screenshot: screenshot !== null,
       network: this.session.networkObservationAvailable,
       lifecycleEvents: true,
@@ -610,13 +711,14 @@ export class BrowserObserver {
     const id = randomUUID();
     const evidence = {
       id,
-      targetId: this.session.target.id,
+      targetId: captureEpochStart.targetId,
       capturedAt: new Date().toISOString(),
-      documentGeneration: this.session.documentGeneration,
+      documentGeneration: captureEpochStart.documentGeneration,
       viewport: { width: scrollState.viewportWidth, height: scrollState.viewportHeight },
       viewportScroll,
       deviceScaleFactor,
       observationProfile: profile,
+      captureCoherence,
       coverage,
       page: pageState,
       domSnapshot: snapshot,
@@ -634,8 +736,8 @@ export class BrowserObserver {
     const semanticCompilationStartedAt = performance.now();
     const semanticPage = deriveSemantic ? compileSemanticPageModel({
       observationId: id,
-      targetId: this.session.target.id,
-      documentGeneration: this.session.documentGeneration,
+      targetId: captureEpochStart.targetId,
+      documentGeneration: captureEpochStart.documentGeneration,
       page: pageState,
       domSnapshot: snapshot,
       frameSnapshots: frameSnapshots.map(frame => ({
@@ -664,12 +766,13 @@ export class BrowserObserver {
     const memoryAfter = process.memoryUsage();
     const compact = {
       evidenceId: id,
-      targetId: this.session.target.id,
+      targetId: evidence.targetId,
       capturedAt: evidence.capturedAt,
       documentGeneration: evidence.documentGeneration,
       viewport: { ...evidence.viewport },
       deviceScaleFactor: evidence.deviceScaleFactor,
       observationProfile: profile,
+      captureCoherence,
       page: { ...pageState, url: sanitizeUrl(pageState.url ?? "") },
       frames: derived.frames,
       outOfProcessFrameGeometry: frameSnapshots.map(frame => {
@@ -691,9 +794,10 @@ export class BrowserObserver {
       domMutationCount: evidence.activity.totalDomMutations,
       coverage,
       captureMetrics: {
-        captureDurationMs: Date.now() - captureStartedAt,
+        captureDurationMs: performance.now() - captureStartedAt,
         cdpRoundTrips: metrics.cdpRoundTrips,
         totalCdpRoundTripMs: metrics.totalCdpRoundTripMs,
+        cdpRoundTripsByMethod: metrics.cdpRoundTripsByMethod,
         cdpRoundTripP95Ms: percentile(metrics.cdpRoundTripDurations, 0.95),
         domSnapshotCount: metrics.domSnapshotCount,
         documentIndexBuildCount: metrics.documentIndexBuildCount ?? 0,
@@ -760,6 +864,7 @@ export class BrowserObserver {
       targetId: stored.targetId,
       capturedAt: stored.capturedAt,
       documentGeneration: stored.documentGeneration,
+      captureCoherence: structuredClone(stored.captureCoherence ?? { status: "incomplete", gaps: ["capture_epoch_not_recorded"] }),
       viewport: structuredClone(stored.viewport ?? { width: 0, height: 0 }),
       observationProfile: stored.observationProfile ?? "interaction",
       coverage: structuredClone(stored.coverage ?? {})
@@ -788,6 +893,7 @@ export class BrowserObserver {
         result.outOfProcessFrames = stored.outOfProcessFrames.map(frame => frame.status === "available" ? {
           targetId: frame.targetId,
           frameId: frame.frameId,
+          frameGeneration: frame.frameGeneration ?? 0,
           parentFrameId: frame.parentFrameId,
           page: { ...structuredClone(frame.page), url: sanitizeUrl(frame.page?.url ?? "", { includeSensitiveUrlData }) },
           domSnapshot: sanitizeSnapshotForRetrieval(frame.domSnapshot, { includeSensitiveFormValues, includeSensitiveUrlData }),

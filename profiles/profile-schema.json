@@ -64,6 +64,11 @@
               "application_id": { "type": "string" },
               "authentication_realm": { "type": "string" },
               "candidate_entry": { "type": ["string", "null"] },
+              "entry_link_labels": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "description": "Exact visible link labels accepted when resolving this application's entry from the current page. A match is still re-observed and authorized before click dispatch."
+              },
               "status": { "type": "string", "enum": ["candidate", "verified"] },
               "final_origin": { "type": ["string", "null"], "description": "Observed final origin; set only from live navigation evidence." },
               "workflow_operations": {
@@ -220,6 +225,20 @@
         "allow_mutation": { "type": "boolean", "const": false },
         "mutation_requires_explicit_freeinference_authorization": { "type": "boolean", "const": true }
       }
+    },
+    "test_workspace_grants": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["provider", "repository_ids", "base_refs"],
+        "properties": {
+          "provider": { "type": "string", "const": "github" },
+          "repository_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 256 } },
+          "base_refs": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 256 } }
+        },
+        "additionalProperties": false
+      },
+      "description": "Trusted test workspace identities and base refs. Empty until independently reviewed and approved."
     },
     "test_packs": { "type": "array", "items": { "type": "object" } }
   }

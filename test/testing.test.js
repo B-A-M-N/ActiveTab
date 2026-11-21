@@ -127,6 +127,7 @@ test("deriveRunStatus handles mixed statuses", () => {
   assert.equal(deriveRunStatus([{ status: "PASS" }, { status: "BLOCKED" }]), "BLOCKED");
   assert.equal(deriveRunStatus([{ status: "PASS" }, { status: "CANCELED" }]), "CANCELED");
   assert.equal(deriveRunStatus([{ status: "PASS" }, { status: "UNCERTAIN" }]), "UNCERTAIN");
+  assert.equal(deriveRunStatus([{ status: "UNCERTAIN" }, { status: "CANCELED" }]), "UNCERTAIN");
 });
 
 test("uncertain dispatched step stays uncertain until independent evidence reconciles it", () => {
@@ -212,6 +213,72 @@ test("runner preserves a possibly dispatched browser error as UNCERTAIN", async 
     steps: [{ id: "click-settings", type: "interact", action: { type: "click", target: { identity: "tab-settings" } } }]
   }, { runId: "run-dispatch-uncertain" });
   assert.equal(receipt.steps[0].status, STEP_STATUS.UNCERTAIN);
+  assert.equal(receipt.status, RUN_STATUS.UNCERTAIN);
+});
+
+test("DAG runner stops dependent effects after a partial composite selection", async t => {
+  const runState = await createRunStateFixture("activetab-partial-composite-");
+  t.after(() => runState.cleanup());
+  const combobox = {
+    identity: "model-combobox", targetId: "partial-composite-target", documentGeneration: 1,
+    backendNodeId: 71, name: "Model", role: "combobox", tag: "button", visible: true, disabled: false
+  };
+  const nextLink = {
+    identity: "next-link", targetId: "partial-composite-target", documentGeneration: 1,
+    backendNodeId: 72, name: "Next", role: "link", tag: "a", href: "http://fixture.local/next", visible: true, disabled: false
+  };
+  let compositeOpenEffects = 0;
+  let dependentEffects = 0;
+  const session = {
+    target: { id: "partial-composite-target", url: "http://fixture.local/" },
+    attached: true,
+    async observe() {
+      return {
+        targetId: this.target.id, documentGeneration: 1,
+        page: { url: "http://fixture.local/", title: "Home" },
+        pageChangeFingerprint: "home", candidates: [combobox, nextLink], evidenceId: "partial-composite-evidence"
+      };
+    },
+    async validateObservedCandidate(candidate, { expectedUrl }) {
+      return { status: "valid", targetId: this.target.id, documentGeneration: 1, backendNodeId: candidate.backendNodeId, url: expectedUrl };
+    },
+    async selectOption() {
+      compositeOpenEffects++;
+      return {
+        dispatched: true, selected: false, selectionStatus: "refused_after_open",
+        reason: "The exact option changed after the combobox opened."
+      };
+    },
+    async click() {
+      dependentEffects++;
+      return { dispatched: true };
+    },
+    async waitForChange() {}
+  };
+  const receipt = await new TestRunner({
+    session,
+    environment: { environmentId: "fixture-local", authorizedOrigins: ["http://fixture.local"] },
+    runStateStore: runState.store,
+    operationAuthorizer: { async authorize() { return { allowed: true, category: "fixture-select" }; } }
+  }).run({
+    id: "partial-composite-workflow", name: "Stop after partial selection", execution: "dag",
+    steps: [
+      { id: "select-model", type: "interact", dependsOn: [], goal: "Select the requested model", action: {
+        type: "select", operationId: "select-model", target: { identity: combobox.identity }, value: "GLM5.3-flash",
+        postcondition: { type: "page_title_contains", value: "Home" }
+      } },
+      { id: "open-next", type: "interact", dependsOn: ["select-model"], goal: "Open the next page", action: {
+        type: "click", target: { identity: nextLink.identity },
+        postcondition: { type: "page_title_contains", value: "Next" }
+      } }
+    ]
+  }, { runId: "partial-composite-run" });
+
+  assert.equal(compositeOpenEffects, 1, "the first composite suboperation may already have changed browser state");
+  assert.equal(dependentEffects, 0, "a passing superficial page predicate cannot continue after the partial composite effect");
+  assert.deepEqual(receipt.steps.map(step => [step.stepId, step.status]), [
+    ["select-model", STEP_STATUS.UNCERTAIN], ["open-next", STEP_STATUS.BLOCKED]
+  ]);
   assert.equal(receipt.status, RUN_STATUS.UNCERTAIN);
 });
 
@@ -414,6 +481,130 @@ test("a durable cancellation from another store stops the DAG before its next di
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("receipt checkpoint failure after a verified effect makes the step uncertain and blocks its dependent action", async t => {
+  const runState = await createRunStateFixture("activetab-receipt-fault-");
+  t.after(() => runState.cleanup());
+  const store = runState.store;
+  const updateCheckpoint = store.updateCheckpoint.bind(store);
+  let failVerifiedCheckpoint = true;
+  store.updateCheckpoint = async (runId, checkpoint) => {
+    if (failVerifiedCheckpoint && checkpoint.status === STEP_STATUS.PASS && checkpoint.stepId === "open-reports") {
+      failVerifiedCheckpoint = false;
+      throw new Error("injected receipt checkpoint failure");
+    }
+    return await updateCheckpoint(runId, checkpoint);
+  };
+  const first = { identity: "reports-link", targetId: "receipt-fault-target", documentGeneration: 1,
+    backendNodeId: 81, name: "Reports", role: "link", tag: "a", href: "http://fixture.local/reports", visible: true, disabled: false };
+  const second = { identity: "next-link", targetId: "receipt-fault-target", documentGeneration: 1,
+    backendNodeId: 82, name: "Next", role: "link", tag: "a", href: "http://fixture.local/next", visible: true, disabled: false };
+  let title = "Home";
+  let dispatches = 0;
+  const session = {
+    target: { id: "receipt-fault-target", url: "http://fixture.local/" },
+    attached: true,
+    async observe() {
+      return { targetId: this.target.id, documentGeneration: 1,
+        page: { url: "http://fixture.local/", title }, candidates: [first, second],
+        evidenceId: `receipt-fault-${title}`, pageChangeFingerprint: title };
+    },
+    async click(candidate) {
+      dispatches++;
+      if (candidate.identity === first.identity) title = "Reports";
+      return { dispatched: true };
+    },
+    async waitForChange() {}
+  };
+  const receipt = await new TestRunner({
+    session,
+    environment: { environmentId: "fixture-local", authorizedOrigins: ["http://fixture.local"] },
+    runStateStore: store
+  }).run({
+    id: "receipt-fault-workflow", name: "Receipt failure stops continuation", execution: "dag",
+    steps: [
+      { id: "open-reports", type: "interact", dependsOn: [], action: {
+        type: "click", target: { identity: first.identity },
+        postcondition: { type: "page_title_contains", value: "Reports" }
+      } },
+      { id: "open-next", type: "interact", dependsOn: ["open-reports"], action: {
+        type: "click", target: { identity: second.identity },
+        postcondition: { type: "page_title_contains", value: "Next" }
+      } }
+    ]
+  }, { runId: "receipt-fault-run" });
+
+  assert.equal(dispatches, 1, "the dependent action is not sent after its predecessor receipt fails to persist");
+  assert.deepEqual(receipt.steps.map(step => [step.stepId, step.status]), [
+    ["open-reports", STEP_STATUS.UNCERTAIN], ["open-next", STEP_STATUS.BLOCKED]
+  ]);
+  assert.equal(receipt.status, RUN_STATUS.UNCERTAIN);
+  assert.equal((await store.getFresh(receipt.runId)).status, "reconciling");
+});
+
+test("final run receipt persistence failure resumes from the verified checkpoint without replay", async t => {
+  const runState = await createRunStateFixture("activetab-final-receipt-fault-");
+  t.after(() => runState.cleanup());
+  const store = runState.store;
+  const update = store.update.bind(store);
+  let failFinalReceipt = true;
+  store.update = async (runId, patch, options) => {
+    if (failFinalReceipt && patch.status === "passed") {
+      failFinalReceipt = false;
+      throw new Error("injected final run receipt persistence failure");
+    }
+    return await update(runId, patch, options);
+  };
+  const candidate = {
+    identity: "reports-link", targetId: "final-receipt-target", documentGeneration: 1,
+    backendNodeId: 91, name: "Reports", role: "link", tag: "a", href: "http://fixture.local/reports", visible: true, disabled: false
+  };
+  let title = "Home";
+  let dispatches = 0;
+  const session = {
+    target: { id: "final-receipt-target", url: "http://fixture.local/" },
+    attached: true,
+    async observe() {
+      return {
+        targetId: this.target.id, documentGeneration: 1,
+        page: { url: "http://fixture.local/", title }, candidates: [candidate],
+        evidenceId: `final-receipt-${title}`, pageChangeFingerprint: title
+      };
+    },
+    async validateObservedCandidate(_candidate, { expectedUrl }) {
+      return { status: "valid", targetId: this.target.id, documentGeneration: 1, backendNodeId: candidate.backendNodeId, url: expectedUrl };
+    },
+    async click() { dispatches++; title = "Reports"; return { dispatched: true }; },
+    async waitForChange() {}
+  };
+  const workflow = {
+    id: "final-receipt-workflow", name: "Persist final run receipt",
+    steps: [{ id: "open-reports", type: "interact", goal: "Open the Reports page", action: {
+      type: "click", target: { identity: candidate.identity },
+      postcondition: { type: "page_title_contains", value: "Reports" }
+    } }]
+  };
+  const environment = { environmentId: "fixture-local", authorizedOrigins: ["http://fixture.local"] };
+
+  let firstError = null;
+  let firstReceipt = null;
+  try {
+    firstReceipt = await new TestRunner({ session, environment, runStateStore: store })
+      .run(workflow, { runId: "final-receipt-run" });
+  } catch (error) { firstError = error; }
+  assert.ok(firstError, JSON.stringify({ receipt: firstReceipt, dispatches, durable: await store.getFresh("final-receipt-run") }));
+  assert.match(firstError.message, /injected final run receipt persistence failure/);
+  const pendingFinal = await store.getFresh("final-receipt-run");
+  assert.equal(pendingFinal.status, "resume_validation", "a failed terminal write leaves the run resumable rather than inventing terminal success or failure");
+  assert.deepEqual(pendingFinal.completedSteps.map(step => [step.stepId, step.status]), [["open-reports", STEP_STATUS.PASS]]);
+  assert.equal(dispatches, 1, "the completed effect was sent once before final receipt persistence failed");
+
+  const resumed = await new TestRunner({ session, environment, runStateStore: store })
+    .run(workflow, { runId: "final-receipt-run" });
+  assert.equal(resumed.status, RUN_STATUS.PASSED);
+  assert.equal(dispatches, 1, "resume trusts the durable verified checkpoint and does not repeat the effect");
+  assert.equal((await store.getFresh("final-receipt-run")).status, "passed");
 });
 
 test("scoped variables feed exact operation inputs without appearing in receipts", async t => {

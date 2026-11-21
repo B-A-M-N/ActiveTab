@@ -8,9 +8,9 @@
 #   --xvfb: starts Xvfb WITHIN this invocation when no graphical session
 #     is available. Chrome renders graphically, but it is NOT visible on
 #     the operator's desktop — do not claim the user visually observed it.
-#   ACTIVETAB_HEADLESS=1: explicit operator opt-in for constrained
-#     environments (this is the only headless path, and it is never a
-#     silent fallback).
+#   ACTIVETAB_HEADLESS=1: explicit operator opt-in for local regression,
+#     fixture, or benchmark runs when no usable display is available. It is
+#     never a silent fallback and does not qualify live/staging operation.
 set -euo pipefail
 
 USE_XVFB=0

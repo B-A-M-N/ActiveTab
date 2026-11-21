@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { once } from "node:events";
 import { launchOwnedChrome } from "../src/browser/ownedChrome.js";
 import { queryRetainedControls } from "../src/observe/targetedControlLookup.js";
+import { observeStable } from "../test-support/stableObservation.js";
 
 function retainedFixture({ nodeCount = 3, children = new Map(), candidates = [] } = {}) {
   const snapshot = {};
@@ -142,20 +143,10 @@ test("retained control lookup finds omitted controls without CDP traversal and p
     const frameTargetId = [...session.frameSessions.values()].find(frame => frame.status === "ready")?.targetId;
     assert.ok(frameTargetId, "the fixture's cross-origin frame is an attached OOPIF target");
 
-    let stableMutationCount = session.activity.totalDomMutations;
-    let mutationQuietSince = Date.now();
-    const quietDeadline = Date.now() + 10_000;
-    while (Date.now() < quietDeadline && Date.now() - mutationQuietSince < 150) {
-      await new Promise(resolve => setTimeout(resolve, 25));
-      const currentMutationCount = session.activity.totalDomMutations;
-      if (currentMutationCount !== stableMutationCount) {
-        stableMutationCount = currentMutationCount;
-        mutationQuietSince = Date.now();
-      }
-    }
-    assert.ok(Date.now() - mutationQuietSince >= 150, "the fixture frame mutation stream settles before its evidence snapshot");
-
-    const observation = await session.observe({ profile: "interaction", candidateLimit: 200 });
+    const observation = await observeStable(session, { profile: "interaction", candidateLimit: 200 }, {
+      timeoutMs: 10_000,
+      label: "retained control lookup fixture"
+    });
     assert.equal(observation.candidateCoverage.pageCoverage, "partial", "the fixture exceeds the normal candidate projection limit");
 
     const omitted = await session.queryAccessibility(observation.evidenceId, {

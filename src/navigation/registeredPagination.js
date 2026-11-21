@@ -2,9 +2,11 @@ import { discoverVisibleNextPage } from "../extraction/recordResolver.js";
 import { resolveObservedApplication } from "../environments/model.js";
 import { executeAuthorizedAction } from "../runtime/authorizedExecutor.js";
 
-export function createRegisteredPaginationButtonAuthorizer({ registry, environment, principalId, session, details }) {
+export function createRegisteredPaginationButtonAuthorizer({ registry, environment, principalId, session, getSession = null, details }) {
+  const currentSession = () => typeof getSession === "function" ? getSession() ?? session : session;
   return Object.freeze({
     authorize({ action, candidate, observation } = {}) {
+      const activeSession = currentSession();
       let page;
       try { page = new URL(details.fromPageUrl); } catch { return { allowed: false, reason: "The registered pagination source URL is invalid." }; }
       const application = resolveObservedApplication(environment, page.href);
@@ -18,12 +20,12 @@ export function createRegisteredPaginationButtonAuthorizer({ registry, environme
       const locator = details.nextPage?.target;
       const allowed = action === "click" && Boolean(manifest)
         && manifest.extractionContract?.pagination?.kind === "explicit_next_same_path"
-        && candidate?.targetId === session?.target?.id
+        && candidate?.targetId === activeSession?.target?.id
         && candidate?.backendNodeId === locator?.backendNodeId
         && candidate?.frameId === locator?.frameId
         && candidate?.tag === locator?.tag
         && candidate?.visible === true && candidate?.disabled !== true
-        && observation?.targetId === session?.target?.id
+        && observation?.targetId === activeSession?.target?.id
         && observation?.page?.url === details.fromPageUrl;
       return allowed
         ? { allowed: true, category: "registered_pagination_button" }

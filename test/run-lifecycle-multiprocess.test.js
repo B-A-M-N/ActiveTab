@@ -1,11 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { RunStateStore } from "../src/testing/runState.js";
+import { RunDocumentStore } from "../src/testing/lifecycle/runDocumentStore.js";
 import { spawnLifecycleWorker } from "../test-lab/fault-injection/runLifecycleHarness.js";
 
 async function withRunState(callback) {
@@ -67,6 +68,25 @@ test("target lease serializes separate processes and advances fencing after owne
   });
 });
 
+test("a live owner whose target lease heartbeat is fenced cannot dispatch again", async () => {
+  await withRunState(async store => {
+    const lease = await store.acquireTargetLease("heartbeat-target", "heartbeat-owner", { ttlMs: 1_000 });
+    const targetKey = createHash("sha256").update("heartbeat-target").digest("hex");
+    store.targetLeaseDb.prepare("DELETE FROM target_leases WHERE target_key = ?").run(targetKey);
+    await delay(400);
+    await assert.rejects(() => lease.assertCurrent(), error => error.code === "RUN_TARGET_LEASE_LOST");
+
+    const replacement = await store.acquireTargetLease("heartbeat-target", "replacement-owner", { ttlMs: 1_000 });
+    try {
+      assert.ok(replacement.fencingToken > lease.fencingToken);
+      await assert.rejects(() => lease.assertCurrent(), error => error.code === "RUN_TARGET_LEASE_LOST");
+    } finally {
+      await replacement.release();
+      await lease.release();
+    }
+  });
+});
+
 test("process restart keeps a dispatched effect uncertain and refuses replay", async () => {
   await withRunState(async (store, baseDir) => {
     const run = await store.create({
@@ -108,6 +128,45 @@ test("process restart keeps a dispatched effect uncertain and refuses replay", a
       await assert.rejects(() => restarted.reserveOperation(run.runId, operation("submitted-effect")), /already reached UNCERTAIN/);
       await assert.rejects(() => restarted.reserveOperation(run.runId, operation("replanned-effect")), /Equivalent effect is already UNCERTAIN/);
       assert.equal((await restarted.getFresh(run.runId)).pendingOperations[0].status, "UNCERTAIN");
+    } finally { restarted.close(); }
+  });
+});
+
+test("process death during postcondition verification keeps the external effect uncertain and blocks replay", async () => {
+  await withRunState(async (store, baseDir) => {
+    const run = await store.create({
+      runId: "kill-during-verification",
+      workflowId: "fixture-workflow",
+      workflowName: "Verification process death",
+      environmentId: "fixture-env",
+      targetId: "tab-exact"
+    });
+    const effectOraclePath = join(baseDir, "external-effect-count.txt");
+    const worker = spawnLifecycleWorker("verification-pending", baseDir, {
+      runId: run.runId,
+      operation: operation("verify-after-submit"),
+      receiptId: "verification-pending-receipt",
+      effectOraclePath
+    });
+    try {
+      assert.equal((await worker.nextMessage()).event, "postcondition-verification-started");
+      assert.equal((await store.getFresh(run.runId)).pendingOperations[0].status, "DISPATCHED");
+      assert.equal(await readFile(effectOraclePath, "utf8"), "1\n", "the independent fixture effect was applied once before verification began");
+      assert.equal((await worker.kill("SIGKILL")).signal, "SIGKILL");
+    } finally { await worker.kill(); }
+
+    const restarted = new RunStateStore(baseDir);
+    await restarted.init();
+    try {
+      const recovered = await restarted.reconcileRestart(run.runId, {
+        attachmentCheck: async targetId => targetId === "tab-exact",
+        environmentCheck: async environmentId => ({ ok: environmentId === "fixture-env" })
+      });
+      assert.equal(recovered.status, "reconciling");
+      assert.deepEqual(recovered.pendingOperations.map(item => [item.operationId, item.status]), [["verify-after-submit", "UNCERTAIN"]]);
+      assert.equal(await readFile(effectOraclePath, "utf8"), "1\n", "restart does not repeat the independently counted external effect");
+      await assert.rejects(() => restarted.reserveOperation(run.runId, operation("verify-after-submit")), /already reached UNCERTAIN/);
+      await assert.rejects(() => restarted.reserveOperation(run.runId, operation("retry-after-verification-crash")), /Equivalent effect is already UNCERTAIN/);
     } finally { restarted.close(); }
   });
 });
@@ -213,6 +272,26 @@ test("cross-process run updates use revision compare-and-swap and owner-private 
       assert.equal((await worker.waitForExit()).code, 0, worker.stderr);
       assert.equal((await store.getFresh(run.runId)).revision, initialRevision + 1);
     } finally { await worker.kill(); }
+  });
+});
+
+test("process death before atomic rename preserves the previous run document", async () => {
+  await withRunState(async (store, baseDir) => {
+    const original = await store.create({ runId: "interrupted-replacement", workflowId: "fixture-workflow", workflowName: "Atomic replacement" });
+    const worker = spawnLifecycleWorker("atomic-replace", baseDir, {
+      nextRun: { ...original, status: "passed", revision: original.revision + 1 }
+    });
+    try {
+      assert.equal((await worker.nextMessage()).event, "replacement-ready");
+      assert.equal((await worker.kill("SIGKILL")).signal, "SIGKILL");
+    } finally { await worker.kill(); }
+
+    const documents = new RunDocumentStore(baseDir);
+    const recovered = await documents.init();
+    assert.equal(recovered.length, 1, "temporary files are not published as run documents");
+    assert.equal(recovered[0].status, "created");
+    assert.equal(recovered[0].revision, original.revision);
+    assert.equal(await documents.read(original.runId).then(run => run.status), "created");
   });
 });
 

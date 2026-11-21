@@ -55,11 +55,19 @@ function fakeSession() {
     childFrames: [{ frame: { id: "frame-child", url: "https://frame.test/child?token=frame-secret#x" } }]
   };
   const client = {
-    async send(method) {
+    async send(method, params = {}) {
       if (method === "Page.getFrameTree") return { frameTree };
       if (method === "DOMSnapshot.captureSnapshot") return fixtureSnapshot();
       if (method === "Accessibility.getFullAXTree") return { nodes: [{ backendDOMNodeId: 2, ignored: false, role: { value: "link" }, name: { value: "Account" } }] };
-      if (method === "Runtime.evaluate") return { result: { value: JSON.stringify({ url: pageUrl, title: "Fixture", readyState: "complete" }) } };
+      if (method === "Runtime.evaluate") return { result: { value: JSON.stringify({
+        url: pageUrl,
+        title: "Fixture",
+        readyState: "complete",
+        ...(params.expression?.includes("viewportWidth") ? {
+          viewportWidth: 1280, viewportHeight: 720, scrollX: 0, scrollY: 0, scrollTop: 0, scrollLeft: 0,
+          maxScrollTop: 0, deviceScaleFactor: 1
+        } : {})
+      }) } };
       if (method === "Page.captureScreenshot") return { data: "c2NyZWVu" };
       if (method === "Network.getResponseBody") return { body: JSON.stringify({ loaded: true, access_token: "fixture-response-secret" }), base64Encoded: false };
       throw new Error(`Unexpected CDP method: ${method}`);
@@ -221,6 +229,11 @@ test("observation profiles make visual capture explicit and expose capture cost 
   assert.ok(interaction.candidateCount > 0);
   assert.equal(methods.includes("Page.captureScreenshot"), false, "ordinary interaction evidence avoids screenshot capture");
   assert.ok(interaction.captureMetrics.cdpRoundTrips > 0);
+  assert.equal(Object.values(interaction.captureMetrics.cdpRoundTripsByMethod)
+    .reduce((total, metric) => total + metric.count, 0), interaction.captureMetrics.cdpRoundTrips,
+  "method-level round-trip diagnostics account for every captured CDP request");
+  assert.ok(Object.values(interaction.captureMetrics.cdpRoundTripsByMethod)
+    .every(metric => metric.totalMs >= metric.maxMs && metric.maxMs >= 0));
   assert.equal(interaction.captureMetrics.domSnapshotCount, 1);
   assert.ok(interaction.captureMetrics.cdpRoundTripP95Ms >= 0);
   assert.ok(interaction.captureMetrics.captureDurationMs >= 0);
@@ -261,6 +274,95 @@ test("observation profiles make visual capture explicit and expose capture cost 
   const visual = await observer.capture({ profile: "visual" });
   assert.equal(visual.coverage.screenshot, true);
   assert.equal(methods.includes("Page.captureScreenshot"), true);
+});
+
+test("capture coherence rejects a root DOM mutation interleaved with DOMSnapshot and accessibility capture", async () => {
+  const session = fakeSession();
+  const originalSend = session.client.send.bind(session.client);
+  let injected = false;
+  session.client.send = async (method, ...args) => {
+    const result = await originalSend(method, ...args);
+    if (method === "DOMSnapshot.captureSnapshot" && !injected) {
+      injected = true;
+      session.activity.recordDomMutation("DOM.attributeModified", { nodeId: 44, name: "aria-label", value: "Changed during capture" });
+    }
+    return result;
+  };
+
+  const observer = new BrowserObserver(session);
+  const observation = await observer.capture();
+  assert.equal(observation.captureCoherence.status, "unstable");
+  assert.ok(observation.captureCoherence.changes.includes("root_dom_mutated_during_capture"));
+  assert.ok(observation.captureCoherence.end.rootDomMutationCount > observation.captureCoherence.start.rootDomMutationCount);
+  assert.equal(observation.candidates.length, 0, "mixed-epoch candidates are not exposed for action planning");
+  assert.equal(observation.coverage.interactionCandidates, false);
+  assert.equal(observer.getEvidence(observation.evidenceId, { facets: ["page"] }).captureCoherence.status, "unstable");
+});
+
+test("capture coherence detects an OOPIF navigation during frame evidence collection", async () => {
+  const session = fakeSession();
+  const frame = {
+    targetId: "oopif-target",
+    frameId: "frame-child",
+    parentFrameId: "frame-main",
+    generation: 1,
+    status: "ready",
+    domObservationAvailable: true,
+    networkObservationAvailable: false
+  };
+  const childClient = {
+    async send(method, params = {}) {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-child", url: "https://frame.test/child", loaderId: "child-loader-1" } } };
+      if (method === "DOMSnapshot.captureSnapshot") {
+        frame.generation++;
+        session.documentGeneration++;
+        session.activity.recordLifecycleEvent("Page.frameNavigated", { frame: { id: "frame-child", loaderId: "child-loader-2", url: "https://frame.test/child" } }, { frameTargetId: frame.targetId });
+        return fixtureSnapshot();
+      }
+      if (method === "Accessibility.getFullAXTree") return { nodes: [] };
+      if (method === "Runtime.evaluate") return { result: { value: JSON.stringify({
+        url: "https://frame.test/child", title: "Child", readyState: "complete",
+        ...(params.expression?.includes("viewportWidth") ? { viewportWidth: 600, viewportHeight: 400, scrollX: 0, scrollY: 0, scrollTop: 0, scrollLeft: 0, maxScrollTop: 0, deviceScaleFactor: 1 } : {})
+      }) } };
+      throw new Error(`Unexpected child CDP method: ${method}`);
+    }
+  };
+  session.frameSessions = new Map([[frame.targetId, frame]]);
+  session.getOutOfProcessFrames = async () => [{ ...frame, client: childClient, parentSessionId: null }];
+
+  const observation = await new BrowserObserver(session).capture();
+  assert.equal(observation.captureCoherence.status, "unstable");
+  assert.ok(observation.captureCoherence.changes.includes("document_generation_changed"));
+  assert.ok(observation.captureCoherence.changes.includes("oopif_attachment_or_generation_changed"));
+  assert.equal(observation.candidates.length, 0);
+});
+
+test("capture coherence detects viewport scroll after the screenshot was taken", async () => {
+  const session = fakeSession();
+  const originalSend = session.client.send.bind(session.client);
+  let scrollY = 0;
+  session.client.send = async (method, params = {}) => {
+    if (method === "Page.captureScreenshot") {
+      const result = await originalSend(method, params);
+      scrollY = 120;
+      return result;
+    }
+    if (method === "Runtime.evaluate" && params.expression?.includes("viewportWidth")) {
+      return { result: { value: JSON.stringify({
+        url: pageUrl, title: "Fixture", readyState: "complete",
+        viewportWidth: 1280, viewportHeight: 720, scrollX: 0, scrollY, scrollTop: scrollY,
+        scrollLeft: 0, maxScrollTop: 500, deviceScaleFactor: 1
+      }) } };
+    }
+    return originalSend(method, params);
+  };
+
+  const observation = await new BrowserObserver(session).capture({ profile: "visual" });
+  assert.equal(observation.captureCoherence.status, "unstable");
+  assert.ok(observation.captureCoherence.changes.includes("viewport_or_scroll_changed_during_capture"));
+  assert.equal(observation.captureCoherence.start.viewport.scrollY, 0);
+  assert.equal(observation.captureCoherence.end.viewport.scrollY, 120);
+  assert.equal(observation.candidates.length, 0);
 });
 
 test("root and OOPIF candidate discovery share one document index per captured snapshot", async () => {

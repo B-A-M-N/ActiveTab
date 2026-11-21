@@ -2,16 +2,24 @@ import { jsonByteLength } from "./evidenceSizing.js";
 
 const MAX_SCROLL_TARGETS_PER_FRAME = 8;
 
+function recordCdpRoundTrip(metrics, method, durationMs) {
+  metrics.totalCdpRoundTripMs += durationMs;
+  if (metrics.cdpRoundTripDurations.length < 2048) metrics.cdpRoundTripDurations.push(durationMs);
+  const byMethod = metrics.cdpRoundTripsByMethod ??= Object.create(null);
+  const entry = byMethod[method] ??= { count: 0, totalMs: 0, maxMs: 0 };
+  entry.count++;
+  entry.totalMs += durationMs;
+  entry.maxMs = Math.max(entry.maxMs, durationMs);
+}
+
 export function instrumentCaptureClient(client, metrics) {
   return {
     send(method, ...args) {
       metrics.cdpRoundTrips++;
-      const startedAt = Date.now();
+      const startedAt = performance.now();
       if (method === "DOMSnapshot.captureSnapshot") metrics.domSnapshotCount++;
       return Promise.resolve().then(() => client.send(method, ...args)).finally(() => {
-        const duration = Date.now() - startedAt;
-        metrics.totalCdpRoundTripMs += duration;
-        if (metrics.cdpRoundTripDurations.length < 2048) metrics.cdpRoundTripDurations.push(duration);
+        recordCdpRoundTrip(metrics, method, performance.now() - startedAt);
       });
     }
   };
@@ -157,13 +165,14 @@ export async function captureOutOfProcessFrames(session, {
   metrics,
   computedStyles,
   runtimeExpression,
+  documentGeneration,
   deriveInteraction,
   remainingFrameBytes
 }) {
   const attachedFrames = await session.getOutOfProcessFrames?.({
-    onCdpRoundTrip: durationMs => {
+    onCdpRoundTrip: (method, durationMs) => {
       metrics.cdpRoundTrips++;
-      metrics.totalCdpRoundTripMs += durationMs;
+      recordCdpRoundTrip(metrics, method, durationMs);
     }
   }) ?? [];
 
@@ -195,18 +204,19 @@ export async function captureOutOfProcessFrames(session, {
       delete page.viewportHeight;
       delete page.viewportWidth;
       const frameScrollTargets = deriveInteraction ? [
-        viewportScrollTarget(session.target.id, childFrameId, session.documentGeneration, frameScrollState, frame.targetId),
+        viewportScrollTarget(session.target.id, childFrameId, documentGeneration, frameScrollState, frame.targetId),
         ...await captureScrollableTargets(frameClient, {
           targetId: session.target.id,
           frameTargetId: frame.targetId,
           frameId: childFrameId,
-          generation: session.documentGeneration,
+          generation: documentGeneration,
           limit: 4
         })
       ].filter(Boolean) : [];
       return {
         targetId: frame.targetId,
         frameId: childFrameId,
+        frameGeneration: frame.generation ?? 0,
         parentFrameId: frame.parentFrameId,
         page,
         frameGeometry,

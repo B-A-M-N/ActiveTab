@@ -29,6 +29,7 @@ export class BrowserActivityRecorder {
     this.totalRequests = 0;
     this.totalLifecycleEvents = 0;
     this.totalDomMutations = 0;
+    this.rootDomMutationCount = 0;
     this.droppedRequests = 0;
     this.droppedLifecycleEvents = 0;
     this.droppedDomMutations = 0;
@@ -182,6 +183,7 @@ export class BrowserActivityRecorder {
       observedAt: new Date().toISOString()
     });
     this.totalDomMutations++;
+    if (frameTargetId === null || frameTargetId === undefined) this.rootDomMutationCount++;
     while (this.domMutations.length > this.maxDomMutations) {
       this.domMutations.shift();
       this.droppedDomMutations++;
@@ -196,6 +198,7 @@ export class BrowserActivityRecorder {
       totalRequests: this.totalRequests,
       totalLifecycleEvents: this.totalLifecycleEvents,
       totalDomMutations: this.totalDomMutations,
+      rootDomMutationCount: this.rootDomMutationCount,
       droppedRequests: this.droppedRequests,
       droppedLifecycleEvents: this.droppedLifecycleEvents,
       droppedDomMutations: this.droppedDomMutations

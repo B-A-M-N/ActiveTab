@@ -6,8 +6,9 @@
  * local template/bot run path and the LAN peer-execution path.
  *
  * Stale-worker fencing: a worker may only write results while it still
- * holds the controller entry for its task; cancel replaces nothing, but
- * forceCancel marks the task terminal so later writes are rejected.
+ * holds the controller entry for its task. Cancellation intent remains
+ * nonterminal until the worker establishes a safe outcome or reconciliation
+ * is required.
  */
 import { runReporter } from "../runtime/reports.js";
 import { logger, bound } from "../runtime/logger.js";
@@ -35,10 +36,35 @@ export class RunLifecycle {
    * failed. Never collapses these.
    */
   applyResult(taskId, controller, result, reporter) {
-    if (!this.isCurrent(taskId, controller) || controller.signal.aborted) return;
+    if (!this.isCurrent(taskId, controller)) return;
     if (result.status === "canceled") {
-      reporter?.markTerminal("canceled", result.output?.reason);
-      this.store.forceCancel(taskId);
+      const definitelyNotDispatched = result.uncertain === false
+        || result.dispatchDisposition === "refused_pre_dispatch";
+      const status = definitelyNotDispatched ? "canceled" : "reconciling";
+      const reason = String(result.reason ?? result.output?.reason
+        ?? (definitelyNotDispatched
+          ? "Canceled before dispatch; no browser or peer operation was sent."
+          : "Canceled after dispatch may have started; the operation outcome is unknown and must be reconciled."))
+        .slice(0, 500);
+      reporter?.markTerminal(status, reason);
+      this.store.update(taskId, {
+        status,
+        cancellation_requested: true,
+        error: reason,
+        output: result.output ?? { status, reason, ...(definitelyNotDispatched ? {} : { uncertain: true }) },
+        ...(definitelyNotDispatched ? { finished_at: new Date().toISOString() } : {})
+      });
+      return;
+    }
+    if (result.status === "reconciling" || result.status === "unresolved") {
+      const reason = String(result.reason ?? result.output?.reason
+        ?? "The execution outcome is unresolved and must be reconciled before retry.").slice(0, 500);
+      reporter?.markTerminal("reconciling", reason);
+      this.store.update(taskId, {
+        status: "reconciling",
+        error: reason,
+        output: result.output ?? { status: "unresolved", reason, uncertain: true }
+      });
       return;
     }
     const WAITING_STATES = new Set([
@@ -66,14 +92,22 @@ export class RunLifecycle {
   }
 
   applyFailure(taskId, controller, error, reporter, { prefix = "" } = {}) {
-    if (!this.isCurrent(taskId, controller) || controller.signal.aborted) return;
+    if (!this.isCurrent(taskId, controller)) return;
     const message = `${prefix}${String(error?.message ?? error).slice(0, 500)}`;
-    reporter?.markTerminal("failed", message);
-    logger.error("run.failed", { task: taskId, executor: this.executorName, reason: bound(message, 160) });
+    const definitelyNotDispatched = error?.dispatchDisposition === "refused_pre_dispatch";
+    const status = controller.signal.aborted
+      ? (definitelyNotDispatched ? "canceled" : "reconciling")
+      : "failed";
+    const reason = controller.signal.aborted && !definitelyNotDispatched
+      ? `Cancellation interrupted execution before an outcome was confirmed: ${message}`
+      : message;
+    reporter?.markTerminal(status, reason);
+    logger[status === "failed" ? "error" : "warn"]("run.failed", { task: taskId, executor: this.executorName, reason: bound(reason, 160) });
     this.store.update(taskId, {
-      status: "failed",
-      error: message,
-      finished_at: new Date().toISOString()
+      status,
+      error: reason,
+      cancellation_requested: controller.signal.aborted || undefined,
+      ...(status === "failed" || status === "canceled" ? { finished_at: new Date().toISOString() } : {})
     });
   }
 
@@ -91,15 +125,33 @@ export class RunLifecycle {
     const entry = { controller, worker: null, reporter };
     this.running.set(taskId, entry);
     entry.worker = (async () => {
-      if (!this.isCurrent(taskId, controller) || controller.signal.aborted) {
-        reporter.markTerminal("canceled", "aborted before dispatch");
+      if (!this.isCurrent(taskId, controller)) return;
+      if (controller.signal.aborted) {
+        this.applyResult(taskId, controller, {
+          status: "canceled",
+          uncertain: false,
+          reason: "Canceled before dispatch; no browser or peer operation was sent."
+        }, reporter);
         await this.#emitReport(taskId, reporter);
+        if (this.isCurrent(taskId, controller)) {
+          try { await this.store.persist(taskId); }
+          finally { if (this.isCurrent(taskId, controller)) this.running.delete(taskId); }
+        }
         return;
       }
       this.store.update(taskId, { status: "running" });
       await this.store.persist(taskId);
       const executePhase = reporter.phase("execute");
       try {
+        if (controller.signal.aborted) {
+          executePhase.end({ status: "canceled" });
+          this.applyResult(taskId, controller, {
+            status: "canceled",
+            uncertain: false,
+            reason: "Canceled before dispatch; no browser or peer operation was sent."
+          }, reporter);
+          return;
+        }
         const result = await execute(controller);
         executePhase.end({ status: result?.status ?? "unknown" });
         this.applyResult(taskId, controller, result, reporter);
@@ -138,16 +190,56 @@ export class RunLifecycle {
     }
   }
 
-  cancel(taskId) {
+  async cancel(taskId) {
     const entry = this.running.get(taskId);
-    if (entry) entry.controller.abort();
-    this.store.forceCancel(taskId);
-    entry?.reporter?.markTerminal("canceled", "canceled by API request");
-    logger.info("run.canceled", { task: taskId });
+    const task = this.store.get?.(taskId) ?? null;
+    if (!task) return null;
+    if (["finished", "failed", "canceled"].includes(task.status)) return task;
+
+    if (entry) {
+      this.store.update(taskId, {
+        status: "cancel_requested",
+        cancellation_requested: true,
+        cancellation_requested_at: task.cancellation_requested_at ?? new Date().toISOString(),
+        error: "Cancellation requested; waiting for the worker to stop and report whether an operation may have been dispatched."
+      });
+      // Persist intent before signaling the worker. If persistence fails, the
+      // caller receives an error and can retry while the worker still runs.
+      await this.store.persist(taskId);
+      entry.controller.abort();
+      logger.info("run.canceled", { task: taskId, status: "cancel_requested" });
+      return this.store.get(taskId);
+    }
+
+    const definitelyNotDispatched = ["created", "queued"].includes(task.status);
+    this.store.forceCancel(taskId, { notDispatched: definitelyNotDispatched });
+    await this.store.persist(taskId);
+    const status = this.store.get(taskId)?.status;
+    logger.info("run.canceled", { task: taskId, status });
+    return this.store.get(taskId);
   }
 
   async stopAll() {
-    for (const entry of this.running.values()) entry.controller.abort();
-    await Promise.allSettled([...this.running.values()].map(entry => entry.worker));
+    const entries = [...this.running.entries()];
+    for (const [taskId, entry] of entries) {
+      const task = this.store.get?.(taskId);
+      if (task && !["finished", "failed", "canceled"].includes(task.status)) {
+        this.store.update(taskId, {
+          status: "cancel_requested",
+          cancellation_requested: true,
+          cancellation_requested_at: task.cancellation_requested_at ?? new Date().toISOString(),
+          error: "API shutdown requested cancellation; the worker outcome must settle before resources close."
+        });
+        try { await this.store.persist(taskId); }
+        catch (error) {
+          logger.warn("run.shutdown.cancellation.persist.failed", {
+            task: taskId,
+            reason: bound(error?.message ?? error, 120)
+          });
+        }
+      }
+      entry.controller.abort();
+    }
+    await Promise.allSettled(entries.map(([, entry]) => entry.worker));
   }
 }

@@ -30,32 +30,47 @@ test("executor forwards only whitelisted keys to the peer", async () => {
   assert.equal(result.status, "succeeded");
   assert.equal(String(seen.url), "http://192.168.1.50:9377/v3/bots/remote/runs");
   assert.equal(seen.headers.authorization, "Bearer shared-secret");
+  assert.equal(seen.headers["idempotency-key"], "task-1");
   assert.deepEqual(Object.keys(seen.body).sort(), ["goal", "input", "taskId", "templateId"]);
   assert.equal(seen.body.authorization, undefined);
   assert.equal(seen.body.evidence, undefined);
 });
 
-test("unreachable peer is failed/interrupted, never success", async () => {
+test("executor refuses peer dispatch without a stable caller-owned key", async () => {
+  let fetchCalls = 0;
+  const executor = createRemoteExecutor({
+    peerUrl: "http://192.168.1.50:9377",
+    peerToken: "shared-secret",
+    fetchImpl: async () => { fetchCalls++; throw new Error("must not dispatch"); }
+  });
+  const result = await executor.run("Open the settings page", {});
+  assert.equal(result.status, "failed");
+  assert.match(result.output.reason, /stable caller-owned idempotency key/);
+  assert.equal(fetchCalls, 0);
+});
+
+test("unreachable peer is unresolved because the request may have been admitted", async () => {
   const executor = createRemoteExecutor({
     peerUrl: "http://10.0.0.99:9377",
     peerToken: "x",
     fetchImpl: async () => { throw new Error("ECONNREFUSED"); }
   });
-  const result = await executor.run("Do something", {});
-  assert.equal(result.status, "failed");
+  const result = await executor.run("Do something", { taskId: "unreachable-run" });
+  assert.equal(result.status, "reconciling");
+  assert.equal(result.uncertain, true);
   assert.match(result.output.reason, /interrupted/);
   assert.match(result.output.reason, /unreachable/);
 });
 
-test("non-OK peer responses map to failed/interrupted", async () => {
+test("peer rejection and uncertain server errors retain distinct outcomes", async () => {
   for (const status of [401, 403, 500, 503]) {
     const executor = createRemoteExecutor({
       peerUrl: "http://192.168.1.50:9377",
       peerToken: "x",
       fetchImpl: async () => ({ ok: false, status, json: async () => ({}) })
     });
-    const result = await executor.run("g", {});
-    assert.equal(result.status, "failed", `HTTP ${status} must not become success`);
+    const result = await executor.run("g", { taskId: `http-${status}` });
+    assert.equal(result.status, [401, 403].includes(status) ? "failed" : "reconciling", `HTTP ${status} must not become success`);
     assert.match(result.output.reason, /interrupted/);
   }
 });
@@ -66,28 +81,54 @@ test("unrecognized peer terminal state is treated as unknown outcome", async () 
     peerToken: "x",
     fetchImpl: async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ status: "weird-state" }), json: async () => ({ status: "weird-state" }) })
   });
-  const result = await executor.run("g", {});
-  assert.equal(result.status, "failed");
+  const result = await executor.run("g", { taskId: "unknown-peer-state" });
+  assert.equal(result.status, "reconciling");
+  assert.equal(result.uncertain, true);
   assert.match(result.output.reason, /unrecognized/);
 });
 
-test("local cancellation returns canceled with an interruption note", async () => {
+test("cancellation after peer dispatch remains unresolved until peer outcome is known", async () => {
+  let announceFetch;
+  const fetchStarted = new Promise(resolve => { announceFetch = resolve; });
   const executor = createRemoteExecutor({
     peerUrl: "http://192.168.1.50:9377",
     peerToken: "x",
-    fetchImpl: async (_url, options) => new Promise((_resolve, reject) => {
-      options.signal.addEventListener("abort", () => {
-        const error = new Error("canceled");
-        error.name = "AbortError";
-        reject(error);
+    fetchImpl: async (_url, options) => {
+      announceFetch();
+      return await new Promise((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => {
+          const error = new Error("canceled");
+          error.name = "AbortError";
+          reject(error);
+        });
       });
-    })
+    }
   });
   const controller = new AbortController();
-  const pending = executor.run("g", { signal: controller.signal });
+  const pending = executor.run("g", { signal: controller.signal, taskId: "canceled-peer-run" });
+  await fetchStarted;
   controller.abort();
   const result = await pending;
+  assert.equal(result.status, "reconciling");
+  assert.equal(result.uncertain, true);
+  assert.match(result.output.reason, /outcome must be reconciled/i);
+});
+
+test("cancellation before peer dispatch is a definite no-op", async () => {
+  let fetchCalls = 0;
+  const controller = new AbortController();
+  controller.abort();
+  const executor = createRemoteExecutor({
+    peerUrl: "http://192.168.1.50:9377",
+    peerToken: "shared-secret",
+    fetchImpl: async () => { fetchCalls++; throw new Error("must not dispatch"); }
+  });
+
+  const result = await executor.run("g", { signal: controller.signal, taskId: "not-dispatched" });
+
   assert.equal(result.status, "canceled");
+  assert.equal(result.uncertain, false);
+  assert.equal(fetchCalls, 0);
 });
 
 test("peerUrl must be a private LAN address", () => {
@@ -155,7 +196,7 @@ test("two-node split: control node forwards, executor node runs, truthful termin
       const peerTask = [...executorApi.store.tasks.values()].at(-1);
       const direct = await fetch(`${executorInfo.url}/v3/bots/remote/runs`, {
         method: "POST",
-        headers: { "content-type": "application/json", authorization: "Bearer e2e-shared-token" },
+        headers: { "content-type": "application/json", authorization: "Bearer e2e-shared-token", "idempotency-key": "direct-probe-key" },
         body: JSON.stringify({ goal: "direct-probe" })
       });
       const directBody = await direct.text();
@@ -167,7 +208,7 @@ test("two-node split: control node forwards, executor node runs, truthful termin
 
     // Wrong token is rejected by the executor node.
     const badRunner = createRemoteExecutor({ peerUrl: executorInfo.url, peerToken: "wrong", fetchImpl: fetch });
-    const badResult = await badRunner.run("g", {});
+    const badResult = await badRunner.run("g", { taskId: "bad-token-run" });
     assert.equal(badResult.status, "failed");
     assert.match(badResult.output.reason, /token/);
   } finally {

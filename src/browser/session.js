@@ -206,21 +206,71 @@ export class BrowserSession {
   }
 
   async observe(options) {
+    const observationStartedAt = performance.now();
     this.#assertTargetAttached();
     const observationSequence = ++this.observationGeneration;
     const targetId = this.target.id;
-    const documentGeneration = this.documentGeneration;
+    let documentGeneration = this.documentGeneration;
     this.#invalidateVisualProbe("superseded_by_new_observation");
-    const observation = await this.observer.capture(options);
+    const subscriptionRefreshStartedAt = performance.now();
+    const refreshes = [];
+    if (this.domEnabled && !this.domObservationAvailable) {
+      refreshes.push(this.#subscribeDomTree().then(available => {
+        this.domObservationAvailable = available;
+        return available ? 1 : 0;
+      }));
+    }
+    if ([...this.#frameSessionManager.values()].some(frame =>
+      frame.status === "ready" && frame.domEnabled && !frame.domObservationAvailable
+    )) refreshes.push(this.#frameSessionManager.refreshDomSubscriptions());
+    const refreshedTargets = refreshes.length ? await Promise.all(refreshes) : [];
+    documentGeneration = this.documentGeneration;
+    const subscriptionRefreshMs = performance.now() - subscriptionRefreshStartedAt;
+    const domSubscriptionTargetsRefreshed = refreshedTargets.reduce((total, count) => total + count, 0);
+    let observation = await this.observer.capture(options);
+    let coherenceRetryCount = 0;
+    const captureChangedBeforePublication = typeof observation?.captureCoherence?.status === "string"
+      && observation?.targetId === targetId
+      && (observation?.documentGeneration !== this.documentGeneration
+        || (Number.isInteger(observation?.captureCoherence?.end?.totalDomMutationCount)
+          && observation.captureCoherence.end.totalDomMutationCount !== this.activity.totalDomMutations));
+    if ((observation?.captureCoherence?.status === "unstable" || captureChangedBeforePublication)
+      && observation?.captureCoherence?.status !== "incomplete"
+      && this.attached && this.targetLifecycle === "attached"
+      && observationSequence === this.observationGeneration) {
+      coherenceRetryCount = 1;
+      documentGeneration = this.documentGeneration;
+      observation = await this.observer.capture(options, { retryCount: coherenceRetryCount });
+    }
     const isCurrent = observationSequence === this.observationGeneration
       && this.attached
       && this.targetLifecycle === "attached"
       && this.target.id === targetId
       && this.documentGeneration === documentGeneration
       && observation?.targetId === targetId
-      && observation?.documentGeneration === documentGeneration;
+      && observation?.documentGeneration === documentGeneration
+      && observation?.captureCoherence?.status !== "unstable"
+      && observation?.captureCoherence?.status !== "incomplete"
+      && (!Number.isInteger(observation?.captureCoherence?.end?.totalDomMutationCount)
+        || observation.captureCoherence.end.totalDomMutationCount === this.activity.totalDomMutations);
     const publishedObservation = observation && typeof observation === "object"
-      ? { ...observation, observationSequence, historical: !isCurrent }
+      ? {
+        ...observation,
+        captureMetrics: observation.captureMetrics
+          ? {
+            ...observation.captureMetrics,
+            observationDurationMs: performance.now() - observationStartedAt,
+            domSubscriptionRefreshMs: subscriptionRefreshMs,
+            domSubscriptionTargetsRefreshed,
+            coherenceRetryCount
+          }
+          : observation.captureMetrics,
+        captureCoherence: observation.captureCoherence
+          ? { ...observation.captureCoherence, retryCount: coherenceRetryCount }
+          : observation.captureCoherence,
+        observationSequence,
+        historical: !isCurrent
+      }
       : observation;
     // Observations are retained evidence. Record the session-owned evidence id
     // so diagnostic collectors can request the exact observation. An older,
@@ -285,14 +335,19 @@ export class BrowserSession {
   get hasPendingDialog() { return this.dialogState.hasPending; }
 
   async #subscribeDomTree(client = this.client) {
-    try {
-      const { root } = await client.send("DOM.getDocument", { depth: 0, pierce: true });
-      if (!Number.isInteger(root?.nodeId) || root.nodeId < 0) throw new Error("CDP did not return a document root node id.");
-      await client.send("DOM.requestChildNodes", { nodeId: root.nodeId, depth: -1, pierce: true });
-      return true;
-    } catch {
-      return false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const { root } = await client.send("DOM.getDocument", { depth: 0, pierce: true });
+        if (!Number.isInteger(root?.nodeId) || root.nodeId < 0) throw new Error("CDP did not return a document root node id.");
+        await client.send("DOM.requestChildNodes", { nodeId: root.nodeId, depth: -1, pierce: true });
+        return true;
+      } catch {
+        // A document replacement can invalidate the root between the two
+        // commands. Retry once against the current document, then report the
+        // subscription as unavailable to the capture-coherence gate.
+      }
     }
+    return false;
   }
 
   #scheduleDomSubscription(client = this.client, owner = this) {

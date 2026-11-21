@@ -16,6 +16,8 @@ import {
 } from "../src/testing/cloudAgentEntry.js";
 import { InterventionStore } from "../src/runtime/interventions.js";
 import { RunStateStore, blockingQualificationRuns } from "../src/testing/runState.js";
+import { BrowserStepHandler } from "../src/testing/steps/browserStepHandler.js";
+import { validateWorkflow } from "../src/testing/schema.js";
 
 test("replacement qualification remains blocked by unresolved runs unless one is explicitly abandoned", () => {
   const runs = [
@@ -31,23 +33,40 @@ const environment = {
   applicationEntryUrl: "https://staging.freeinference.org",
   authorizedOrigins: ["https://staging.freeinference.org", "https://agents-staging.freeinference.org"],
   environmentId: "freeinference-staging",
-  applications: [{
-    applicationId: "fi-agents",
-    authenticationRealm: "agents-session",
-    candidateEntry: "https://agents-staging.freeinference.org"
-  }]
+  authenticationRealms: [
+    { realmId: "fi-session", scope: ["dashboard"], separateCredentials: false },
+    { realmId: "agents-session", scope: ["agents_app"], separateCredentials: true }
+  ],
+  applications: [
+    {
+      applicationId: "fi-dashboard",
+      authenticationRealm: "fi-session",
+      candidateEntry: "/dashboard",
+      entryLinkLabels: ["Dashboard"]
+    },
+    {
+      applicationId: "fi-agents",
+      authenticationRealm: "agents-session",
+      candidateEntry: "https://agents-staging.freeinference.org/",
+      entryLinkLabels: ["Agents", "Cloud Agents"]
+    }
+  ]
 };
 
 test("Cloud Agent profile entry is only an identity hint and must be authorized", () => {
   assert.deepEqual(resolveCloudAgentEntry(environment), {
     url: "https://agents-staging.freeinference.org/",
     origin: "https://agents-staging.freeinference.org",
+    pathname: "/",
     applicationId: "fi-agents",
-    authenticationRealm: "agents-session"
+    authenticationRealm: "agents-session",
+    linkLabels: ["Agents", "Cloud Agents"]
   });
   assert.throws(() => resolveCloudAgentEntry({
     ...environment,
-    applications: [{ ...environment.applications[0], candidateEntry: "https://untrusted.example/" }]
+    applications: environment.applications.map(app => app.applicationId === "fi-agents"
+      ? { ...app, candidateEntry: "https://untrusted.example/" }
+      : app)
   }), /not authorized/);
 });
 
@@ -131,13 +150,65 @@ test("Agent readiness requires the observed authorized origin and task composer"
   assert.equal(verifyCloudAgentReady({ ...observation, page: { ...observation.page, url: "https://production.example/" } }, environment, "https://agents-staging.freeinference.org").ok, false);
 });
 
-test("entry workflow follows the visible UI from staging and skips navigation when already at the composer", () => {
-  const stagingPage = { page: { url: "https://staging.freeinference.org/dashboard", title: "FreeInference" }, candidates: [] };
-  const fromStaging = createCloudAgentEntryWorkflow(environment, stagingPage);
-  assert.equal(fromStaging.alreadyAtComposer, false);
-  assert.equal(fromStaging.workflow.steps[0].type, "goal");
-  assert.doesNotMatch(JSON.stringify(fromStaging.workflow), /https:\/\/agents-staging/);
-  assert.equal(fromStaging.workflow.steps.at(-1).type, "assert");
+test("entry workflow follows fresh, exact Dashboard then Agents links with URL postconditions", () => {
+  const rootPage = {
+    page: { url: "https://staging.freeinference.org/", title: "FreeInference" },
+    evidenceId: "ev-root",
+    candidates: [
+      { name: "Dashboard", role: "link", tag: "a", href: "https://staging.freeinference.org/dashboard", visible: true }
+    ]
+  };
+  const fromRoot = createCloudAgentEntryWorkflow(environment, rootPage);
+  assert.equal(validateWorkflow(fromRoot.workflow).valid, true);
+  assert.equal(fromRoot.alreadyAtComposer, false);
+  assert.deepEqual(fromRoot.workflow.steps.map(step => step.id), [
+    "follow-visible-dashboard-link", "follow-visible-agents-link", "verify-task-composer"
+  ]);
+  assert.deepEqual(fromRoot.workflow.steps.slice(0, 2).map(step => step.type), ["interact", "interact"]);
+  assert.deepEqual(fromRoot.workflow.steps[0].action.target, {
+    nameIn: ["Dashboard"], role: "link", hrefOrigin: "https://staging.freeinference.org", hrefPath: "/dashboard", visible: true
+  });
+  assert.deepEqual(fromRoot.workflow.steps[1].action.target, {
+    nameIn: ["Agents", "Cloud Agents"], role: "link", hrefOrigin: "https://agents-staging.freeinference.org", hrefPath: "/", visible: true
+  });
+  assert.match(fromRoot.workflow.steps[1].action.postcondition.pattern, /^\^https:\/\/agents-staging\\\.freeinference\\\.org/);
+  assert.equal(JSON.stringify(fromRoot.workflow).includes("https://agents-staging.freeinference.org/"), false);
+
+  const dashboardPage = {
+    page: { url: "https://staging.freeinference.org/dashboard", title: "FreeInference" },
+    evidenceId: "ev-dashboard",
+    candidates: [
+      { name: "Agents", role: "link", tag: "a", href: "https://agents-staging.freeinference.org/", visible: true }
+    ]
+  };
+  const fromDashboard = createCloudAgentEntryWorkflow(environment, dashboardPage);
+  assert.equal(validateWorkflow(fromDashboard.workflow).valid, true);
+  assert.deepEqual(fromDashboard.workflow.steps.map(step => step.id), ["follow-visible-agents-link", "verify-task-composer"]);
+});
+
+test("visible-entry selectors refuse hidden, disabled, wrong-origin, and ambiguous links", () => {
+  const handler = new BrowserStepHandler();
+  const target = {
+    nameIn: ["Agents", "Cloud Agents"],
+    role: "link",
+    hrefOrigin: "https://agents-staging.freeinference.org",
+    hrefPath: "/",
+    visible: true
+  };
+  const visible = { name: "Agents", role: "link", href: "https://agents-staging.freeinference.org/", visible: true };
+  assert.equal(handler.resolveCandidate({ page: { url: "https://staging.freeinference.org/dashboard" }, evidenceId: "ev", candidates: [visible] }, { target }), visible);
+  for (const rejected of [
+    { ...visible, visible: false },
+    { ...visible, disabled: true },
+    { ...visible, href: "https://production.example/" },
+    { ...visible, href: "https://agents-staging.freeinference.org/other" }
+  ]) {
+    assert.equal(handler.resolveCandidate({ page: { url: "https://staging.freeinference.org/dashboard" }, evidenceId: "ev", candidates: [rejected] }, { target }), null);
+  }
+  assert.equal(handler.resolveCandidate({ page: { url: "https://staging.freeinference.org/dashboard" }, evidenceId: "ev", candidates: [visible, { ...visible, backendNodeId: 2 }] }, { target }), null);
+});
+
+test("entry workflow skips link clicks when already at the protected task composer", () => {
 
   const agentPage = {
     page: { url: "https://agents-staging.freeinference.org/", title: "FreeInference Cloud Agent" },
@@ -160,7 +231,7 @@ test("owned qualification resumes the same durable run after process restart and
     const makeSession = page => ({
       attached: true,
       persistent: true,
-      target: { id: "owned-target-fixture" },
+      target: { id: "owned-target-fixture", url: page.url },
       async observe() {
         return {
           page: { url: page.url, title: page.title },

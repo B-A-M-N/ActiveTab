@@ -230,15 +230,17 @@ test("needs_human and waiting_* are suspensions, not terminals; cancellation wor
     // Cancellation during suspension.
     const task2 = store.create("tpl", {});
     store.update(task2.task_id, { status: "waiting_for_mfa" });
-    store.forceCancel(task2.task_id);
+    store.forceCancel(task2.task_id, { notDispatched: true });
     assert.equal(store.get(task2.task_id).status, "canceled");
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test("task records persist only structure-preserving input projections", async () => {
   const dir = await mkdtemp(join(tmpdir(), "activetab-task-input-"));
+  let store;
+  let reloaded;
   try {
-    const store = new TaskStore(dir);
+    store = new TaskStore(dir);
     await store.init();
     const task = store.create("template", {
       url: "https://private.example/path?access_token=secret",
@@ -258,9 +260,15 @@ test("task records persist only structure-preserving input projections", async (
       input: { url: "https://legacy.example/private", value: "legacy-secret", count: 2 },
       status: "finished"
     }), { mode: 0o600 });
-    const reloaded = new TaskStore(dir);
+    store.close();
+    store = null;
+    reloaded = new TaskStore(dir);
     await reloaded.init();
     assert.deepEqual(reloaded.get(legacyTaskId).input, { url: "[redacted]", value: "[redacted]", count: 2 });
     assert.equal((await readFile(join(dir, `${legacyTaskId}.json`), "utf8")).includes("legacy.example"), false);
-  } finally { await rm(dir, { recursive: true, force: true }); }
+  } finally {
+    store?.close();
+    reloaded?.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });

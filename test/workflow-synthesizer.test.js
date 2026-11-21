@@ -189,6 +189,34 @@ test("registered next-button authorization binds the trusted capability and exac
   assert.equal(authorizer.authorize({ action: "navigate", candidate, observation }).allowed, false);
 });
 
+test("registered pagination authorization follows the run's replacement session", () => {
+  let current = { target: { id: "retired-target" } };
+  const authorizer = createRegisteredPaginationButtonAuthorizer({
+    registry: { resolve: () => ({ extractionContract: { pagination: { kind: "explicit_next_same_path" } } }) },
+    environment: {
+      environmentId: "staging", authorizedOrigins: ["https://shop.example"],
+      applications: [{ applicationId: "shop", candidateEntry: "/products" }]
+    },
+    principalId: "operator-1",
+    session: current,
+    getSession: () => current,
+    details: {
+      fromPageUrl: "https://shop.example/products?page=1",
+      capabilityId: "shop.products", capabilityVersion: 1,
+      nextPage: { target: { backendNodeId: 11, frameId: "frame-1", tag: "button" } }
+    }
+  });
+  const candidate = { targetId: "replacement-target", backendNodeId: 11, frameId: "frame-1", tag: "button", visible: true, disabled: false };
+  const observation = { targetId: "replacement-target", page: { url: "https://shop.example/products?page=1" } };
+  current = { target: { id: "replacement-target" } };
+
+  assert.deepEqual(authorizer.authorize({ action: "click", candidate, observation }), {
+    allowed: true, category: "registered_pagination_button"
+  });
+  current = { target: { id: "different-target" } };
+  assert.equal(authorizer.authorize({ action: "click", candidate, observation }).allowed, false);
+});
+
 test("workflow synthesis binds a plan to trusted capabilities and current observed candidates once", async () => {
   const store = new DecisionEventStore({ databasePath: ":memory:" });
   try {

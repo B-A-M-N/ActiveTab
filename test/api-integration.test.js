@@ -30,11 +30,11 @@ function createMockNavigationRunner(outputDir, delayMs = 100) {
           reject(new DOMException("Aborted", "AbortError"));
         });
       }).catch(e => {
-        if (e.name === "AbortError") return { status: "canceled" };
+        if (e.name === "AbortError") return { status: "canceled", uncertain: false };
         throw e;
       });
 
-      if (signal?.aborted) return { status: "canceled" };
+      if (signal?.aborted) return { status: "canceled", uncertain: false };
 
       const taskId = providedTaskId ?? randomUUID();
       const recordCount = input?.review_count ?? 2;
@@ -108,11 +108,12 @@ async function apiCall(method, path, body) {
   return { status: res.status, body: await res.json() };
 }
 
-async function waitForTerminalStatus(taskId, maxMs = 5000) {
+async function waitForTerminalStatus(taskId, maxMs = 5000, serverUrl = baseUrl) {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
-    const res = await apiCall("GET", `/v3/bots/runs/${taskId}/status`);
-    if (["finished", "failed", "canceled"].includes(res.body.status)) return res.body.status;
+    const res = await fetch(`${serverUrl}/v3/bots/runs/${taskId}/status`, { headers: { "Authorization": `Bearer ${apiToken}` } });
+    const body = await res.json();
+    if (["finished", "failed", "canceled"].includes(body.status)) return body.status;
     await new Promise(r => setTimeout(r, 50));
   }
   throw new Error(`Task ${taskId} did not reach terminal status within ${maxMs}ms`);
@@ -184,11 +185,11 @@ test("E2E: cancel a running task", async () => {
   // Cancel immediately
   const cancelRes = await fetch(`${slowUrl}/v3/bots/runs/${taskId}/cancel`, { method: "POST", headers: { "Authorization": `Bearer ${apiToken}` } });
   assert.equal(cancelRes.status, 200);
+  const cancelBody = await cancelRes.json();
+  assert.ok(["cancel_requested", "canceled"].includes(cancelBody.status));
 
-  // Status should be canceled
-  const statusRes = await fetch(`${slowUrl}/v3/bots/runs/${taskId}/status`, { headers: { "Authorization": `Bearer ${apiToken}` } });
-  const statusBody = await statusRes.json();
-  assert.equal(statusBody.status, "canceled");
+  // The mock runner establishes that no browser mutation was dispatched.
+  assert.equal(await waitForTerminalStatus(taskId, 5000, slowUrl), "canceled");
 
   await slowApi.stop();
 });

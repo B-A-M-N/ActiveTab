@@ -228,11 +228,11 @@ export const STEP_STATUS_EXTENDED = Object.freeze({ ...STEP_STATUS, SUSPENDED: S
 
 export function deriveRunStatus(steps) {
   const statuses = steps.map(step => step.status);
+  if (statuses.includes(STEP_STATUS.UNCERTAIN)) return RUN_STATUS.UNCERTAIN;
   if (statuses.includes(STEP_STATUS.CANCELED)) return RUN_STATUS.CANCELED;
   if (statuses.includes(STEP_STATUS_EXTENDED.SUSPENDED)) return RUN_STATUS.WAITING_FOR_HUMAN_DECISION;
   if (statuses.includes(STEP_STATUS.FAIL)) return RUN_STATUS.FAILED;
   if (statuses.includes(STEP_STATUS.BLOCKED)) return RUN_STATUS.BLOCKED;
-  if (statuses.includes(STEP_STATUS.UNCERTAIN)) return RUN_STATUS.UNCERTAIN;
   if (statuses.some(status => status === STEP_STATUS.PASS)
     && statuses.every(status => status === STEP_STATUS.PASS || status === STEP_STATUS.SKIPPED)) return RUN_STATUS.PASSED;
   return RUN_STATUS.FAILED;

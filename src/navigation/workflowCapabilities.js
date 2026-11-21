@@ -170,7 +170,7 @@ function verifiedFormValue({ session, environment, applicationId, capabilityId, 
  * Each edit stays behind a profile-scoped operation authorizer; caller values
  * arrive only through WorkflowGraphPlanner inputRef bindings.
  */
-export function createNativeFormWorkflowCapabilities({ session, environment, applicationId, operationIds } = {}) {
+export function createNativeFormWorkflowCapabilities({ session, getSession = null, environment, applicationId, operationIds } = {}) {
   if (operationIds == null) return [];
   if (!session || !environment || !applicationId || !operationIds || typeof operationIds !== "object" || Array.isArray(operationIds)) {
     throw new Error("Native form workflow capabilities require a session, environment, application ID, and operation IDs.");
@@ -178,6 +178,7 @@ export function createNativeFormWorkflowCapabilities({ session, environment, app
   if (Object.keys(operationIds).some(key => !["fill", "select", "toggle", "apply_filter"].includes(key))) {
     throw new Error("Native form operation IDs contain an unsupported operation.");
   }
+  const currentSession = () => typeof getSession === "function" ? getSession() ?? session : session;
 
   const definitions = [
     {
@@ -275,11 +276,12 @@ export function createNativeFormWorkflowCapabilities({ session, environment, app
             return { status: "uncertain", reasonCode: "fresh_checkbox_state_evidence_missing", evidenceRefs: evidenceRefs ?? [] };
           }
           const fresh = (args.afterObservation.candidates ?? []).filter(candidate => candidate.identity === args.target?.identity);
+          const activeSession = currentSession();
           if (fresh.length !== 1 || !definition.predicate(fresh[0])
-            || typeof session.verifyCheckboxState !== "function") {
+            || typeof activeSession?.verifyCheckboxState !== "function") {
             return { status: "uncertain", reasonCode: "checkbox_state_verification_unavailable", evidenceRefs };
           }
-          return Promise.resolve(session.verifyCheckboxState(fresh[0], args.inputValue === "checked")).then(result => ({
+          return Promise.resolve(activeSession.verifyCheckboxState(fresh[0], args.inputValue === "checked")).then(result => ({
             status: result?.verified === true && result.matches === true ? "verified" : result?.verified === true ? "failed" : "uncertain",
             contractId: definition.id,
             verifiedCode: definition.verificationCode,
@@ -310,7 +312,7 @@ export function createNativeFormWorkflowCapabilities({ session, environment, app
             targetId: args.target.targetId, applicationId, evidenceRefs };
         }
         return verifiedFormValue({
-          session,
+          session: currentSession(),
           environment,
           applicationId,
           capabilityId: definition.id,
@@ -329,13 +331,13 @@ export function createNativeFormWorkflowCapabilities({ session, environment, app
 }
 
 /** Build native form capabilities only from the exact verified application's profile declarations. */
-export function createProfileFormWorkflowCapabilities({ session, environment, applicationId } = {}) {
+export function createProfileFormWorkflowCapabilities({ session, getSession = null, environment, applicationId } = {}) {
   if (!environment || typeof applicationId !== "string" || !applicationId) return [];
   const applications = (environment.applications ?? []).filter(application => application?.applicationId === applicationId);
   if (applications.length !== 1) return [];
   const operationIds = applications[0].workflowOperations;
   if (!operationIds) return [];
-  return createNativeFormWorkflowCapabilities({ session, environment, applicationId, operationIds });
+  return createNativeFormWorkflowCapabilities({ session, getSession, environment, applicationId, operationIds });
 }
 
 export function createGenericWorkflowCapabilities({ environment = null } = {}) {
@@ -432,13 +434,14 @@ export function createGenericWorkflowCapabilities({ environment = null } = {}) {
  * capability or input-reference projection. Raw goal egress remains governed
  * by the separate workflow goal-text consent.
  */
-export function createObservedSearchWorkflowCapabilities({ observation, session, inputRef, query } = {}) {
+export function createObservedSearchWorkflowCapabilities({ observation, session, getSession = null, inputRef, query } = {}) {
   if (!observation?.evidenceId || !observation?.targetId
     || !Number.isSafeInteger(observation?.documentGeneration)
     || session?.attached !== true || session.target?.id !== observation.targetId
     || session.documentGeneration !== observation.documentGeneration
     || !isLowercaseCode(inputRef, { maxLength: 64 })
     || typeof query !== "string" || !query.trim() || query.length > ACTION_VALUE_LIMITS.fill) return [];
+  const currentSession = () => typeof getSession === "function" ? getSession() ?? session : session;
 
   let origin;
   try {
@@ -490,9 +493,10 @@ export function createObservedSearchWorkflowCapabilities({ observation, session,
   const sameTargetObservation = (before, after) => Boolean(
     before?.evidenceId && after?.evidenceId && before.evidenceId !== after.evidenceId
       && before.targetId === observation.targetId && after.targetId === observation.targetId
-      && after.targetId === session.target.id
+      && after.targetId === currentSession()?.target?.id
       && Number.isSafeInteger(before.documentGeneration)
       && Number.isSafeInteger(after.documentGeneration)
+      && after.documentGeneration === currentSession()?.documentGeneration
       && after.documentGeneration >= before.documentGeneration
       && after.page?.url
   );
@@ -524,7 +528,7 @@ export function createObservedSearchWorkflowCapabilities({ observation, session,
         || !(beforeObservation.candidates ?? []).some(candidate => exactField(candidate) && candidate.identity === target.identity)
         || !(afterObservation.candidates ?? []).some(candidate => exactField(candidate) && candidate.identity === target.identity)
         || inputValue !== query) return { status: "uncertain", reasonCode: "search_field_evidence_mismatch", evidenceRefs: evidenceRefs.filter(Boolean) };
-      const result = await session.verifyControlValue(target, query).catch(() => null);
+      const result = await currentSession()?.verifyControlValue(target, query).catch(() => null);
       if (result?.verified !== true || result.matches !== true) return { status: result?.matches === false ? "failed" : "uncertain", reasonCode: "exact_search_query_not_observed", evidenceRefs };
       return { status: "verified", contractId: "observed_public_search_fill", verifiedCode: verificationCode,
         verificationKind: "exact_search_query_observed", reasonCode: "exact_search_query_observed", evidenceRefs,
@@ -568,7 +572,7 @@ export function createObservedSearchWorkflowCapabilities({ observation, session,
       const beforeContext = JSON.stringify([beforeObservation.page.title, beforeObservation.headings, (beforeObservation.candidates ?? []).map(candidate => [candidate.identity, candidate.name, candidate.contextName])]);
       const afterContext = JSON.stringify([afterObservation.page.title, afterObservation.headings, (afterObservation.candidates ?? []).map(candidate => [candidate.identity, candidate.name, candidate.contextName])]);
       if (!routeChanged && beforeContext === afterContext) return { status: "failed", reasonCode: "search_result_state_unchanged", evidenceRefs };
-      const verified = await session.verifySearchOutcome(query).catch(() => false);
+      const verified = await currentSession()?.verifySearchOutcome(query).catch(() => false);
       if (!verified) return { status: "failed", reasonCode: "search_results_not_verified", evidenceRefs };
       verifiedSearchSubmission = true;
       return { status: "verified", contractId: "observed_public_search_submit", verifiedCode: verificationCode,
@@ -587,6 +591,7 @@ export function createObservedSearchWorkflowCapabilities({ observation, session,
 export function createExtractionWorkflowCapabilities({
   registry,
   session,
+  getSession = null,
   environment,
   principalId = null,
   authorizeField = null,
@@ -599,6 +604,7 @@ export function createExtractionWorkflowCapabilities({
   if (!registry || typeof registry.list !== "function" || !session || !environment) return [];
   const environmentId = environment.environmentId ?? environment.id ?? null;
   if (!environmentId || !Array.isArray(environment.authorizedOrigins) || !Array.isArray(environment.applications)) return [];
+  const currentSession = () => typeof getSession === "function" ? getSession() ?? session : session;
   const authorizedOrigins = new Set(environment.authorizedOrigins.map(origin => {
     try { return new URL(origin).origin; } catch { return null; }
   }).filter(Boolean));
@@ -643,7 +649,8 @@ export function createExtractionWorkflowCapabilities({
     }))),
     async execute({ signal } = {}) {
       if (signal?.aborted) return { status: "uncertain", reasonCode: "canceled_before_extraction" };
-      if (session.attached !== true || !session.target?.id) return { status: "blocked", reasonCode: "authorized_target_unavailable" };
+      const activeSession = currentSession();
+      if (activeSession?.attached !== true || !activeSession.target?.id) return { status: "blocked", reasonCode: "authorized_target_unavailable" };
       try { await assertExecutionLease?.(); }
       catch { return { status: "blocked", reasonCode: "target_lease_unavailable" }; }
       const checkpoint = resumeCheckpoint?.capabilityId === manifest.capabilityId ? resumeCheckpoint : null;
@@ -683,9 +690,10 @@ export function createExtractionWorkflowCapabilities({
             || checkpoint.output?.scope?.applicationId !== manifest.applicationId) {
             return { status: "failed", reasonCode: "collection_checkpoint_binding_changed" };
           }
-          const current = await session.observe().catch(() => null);
-          if (!current?.page?.url || current.targetId !== session.target.id
-            || current.documentGeneration !== session.documentGeneration) {
+          const currentSessionForCheckpoint = currentSession();
+          const current = await currentSessionForCheckpoint.observe().catch(() => null);
+          if (!current?.page?.url || current.targetId !== currentSessionForCheckpoint.target.id
+            || current.documentGeneration !== currentSessionForCheckpoint.documentGeneration) {
             return { status: "uncertain", reasonCode: "collection_checkpoint_observation_unavailable" };
           }
           const currentCursorFingerprint = extractionPageCursorFingerprint(current.page.url);
@@ -695,7 +703,7 @@ export function createExtractionWorkflowCapabilities({
           if (atLastPage) {
             const lastPage = await executeExtractionCapability({
               capabilityId: manifest.capabilityId, capabilityVersion: manifest.capabilityVersion,
-              registry, session, environment, principalId, authorizeField
+              registry, session: currentSession(), environment, principalId, authorizeField
             });
             if (lastPage.status !== "available"
               || extractionIdentityFingerprint(lastPage.pageIdentity) !== checkpoint.pageIdentityFingerprints.at(-1)) {
@@ -738,7 +746,7 @@ export function createExtractionWorkflowCapabilities({
             capabilityId: manifest.capabilityId,
             capabilityVersion: manifest.capabilityVersion,
             registry,
-            session,
+            session: currentSession(),
             environment,
             principalId,
             authorizeField

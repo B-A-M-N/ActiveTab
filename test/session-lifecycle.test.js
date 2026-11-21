@@ -160,6 +160,7 @@ test("out-of-order observations remain historical and cannot replace the current
   const newerPromise = session.observe();
   const newerSequence = session.observationGeneration;
   assert.ok(newerSequence > olderSequence);
+  await new Promise(resolve => setImmediate(resolve));
 
   pending[1]({ evidenceId: "newer-evidence", targetId: session.target.id, documentGeneration: session.documentGeneration });
   const newer = await newerPromise;
@@ -175,6 +176,7 @@ test("out-of-order observations remain historical and cannot replace the current
 
   const oldGeneration = session.documentGeneration;
   const oldGenerationPromise = session.observe();
+  await new Promise(resolve => setImmediate(resolve));
   session.documentGeneration++;
   pending[pending.length - 1]({ evidenceId: "old-generation-evidence", targetId: session.target.id, documentGeneration: oldGeneration });
   const oldGenerationObservation = await oldGenerationPromise;
@@ -182,6 +184,7 @@ test("out-of-order observations remain historical and cannot replace the current
   assert.equal(session.latestEvidenceId, "newer-evidence");
 
   const detachedPromise = session.observe();
+  await new Promise(resolve => setImmediate(resolve));
   const detachedEvidence = pending.length;
   session.attached = false;
   session.targetLifecycle = "detached";
@@ -189,6 +192,120 @@ test("out-of-order observations remain historical and cannot replace the current
   const detached = await detachedPromise;
   assert.equal(detached.historical, true);
   assert.equal(session.latestEvidenceId, "newer-evidence");
+  await session.close();
+});
+
+test("observation retries one unstable capture and withholds evidence after a second unstable capture", async () => {
+  const transport = new MockTransport();
+  const session = await new BrowserSession({
+    id: "coherent-observation-target",
+    endpoint: "local-cdp",
+    browserClient: transport
+  }).attach();
+  let attempts = 0;
+  session.observer.capture = async (_options, { retryCount = 0 } = {}) => {
+    attempts++;
+    const stable = retryCount === 1;
+    return {
+      evidenceId: stable ? "coherent-evidence" : `unstable-${attempts}`,
+      targetId: session.target.id,
+      documentGeneration: session.documentGeneration,
+      captureCoherence: {
+        status: stable ? "stable" : "unstable",
+        retryCount,
+        end: { totalDomMutationCount: session.activity.totalDomMutations }
+      }
+    };
+  };
+
+  const recovered = await session.observe();
+  assert.equal(attempts, 2);
+  assert.equal(recovered.captureCoherence.status, "stable");
+  assert.equal(recovered.captureCoherence.retryCount, 1);
+  assert.equal(recovered.historical, false);
+  assert.equal(session.latestEvidenceId, "coherent-evidence");
+
+  attempts = 0;
+  session.observer.capture = async (_options, { retryCount = 0 } = {}) => {
+    attempts++;
+    return {
+      evidenceId: `still-unstable-${attempts}`,
+      targetId: session.target.id,
+      documentGeneration: session.documentGeneration,
+      captureCoherence: {
+        status: "unstable",
+        retryCount,
+        end: { totalDomMutationCount: session.activity.totalDomMutations }
+      }
+    };
+  };
+  const unresolved = await session.observe();
+  assert.equal(attempts, 2, "a capture receives at most one coherence retry");
+  assert.equal(unresolved.captureCoherence.retryCount, 1);
+  assert.equal(unresolved.historical, true);
+  assert.equal(session.latestEvidenceId, "coherent-evidence", "unstable evidence never replaces the current pointer");
+  await session.close();
+});
+
+test("observation restores an invalidated root DOM subscription before taking a capture", async () => {
+  const transport = new MockTransport();
+  const session = await new BrowserSession({
+    id: "dom-resubscription-target",
+    endpoint: "local-cdp",
+    browserClient: transport
+  }).attach();
+  session.domObservationAvailable = false;
+  let availabilityDuringCapture = null;
+  session.observer.capture = async () => {
+    availabilityDuringCapture = session.domObservationAvailable;
+    return {
+      evidenceId: "resubscribed-evidence",
+      targetId: session.target.id,
+      documentGeneration: session.documentGeneration,
+      captureMetrics: {},
+      captureCoherence: { status: "stable", end: { totalDomMutationCount: session.activity.totalDomMutations } }
+    };
+  };
+
+  const observation = await session.observe();
+  assert.equal(availabilityDuringCapture, true);
+  assert.equal(observation.historical, false);
+  assert.equal(session.latestEvidenceId, "resubscribed-evidence");
+  assert.ok(observation.captureMetrics.domSubscriptionRefreshMs >= 0);
+  assert.ok(transport.commands.some(command => command.method === "DOM.requestChildNodes"));
+  await session.close();
+});
+
+test("failed DOM subscription repair is not counted as a successful refresh", async () => {
+  const transport = new MockTransport();
+  const session = await new BrowserSession({
+    id: "failed-dom-resubscription-target",
+    endpoint: "local-cdp",
+    browserClient: transport
+  }).attach();
+  session.domObservationAvailable = false;
+  const originalSend = session.client.send.bind(session.client);
+  session.client.send = async (method, ...args) => {
+    if (method === "DOM.getDocument") throw new Error("injected root DOM subscription failure");
+    return originalSend(method, ...args);
+  };
+  session.observer.capture = async () => ({
+    evidenceId: "incomplete-evidence",
+    targetId: session.target.id,
+    documentGeneration: session.documentGeneration,
+    captureMetrics: {},
+    captureCoherence: {
+      status: "incomplete",
+      gaps: ["root_dom_mutation_tracking_unavailable"],
+      end: { totalDomMutationCount: session.activity.totalDomMutations }
+    }
+  });
+
+  const observation = await session.observe();
+  assert.equal(session.domObservationAvailable, false);
+  assert.equal(observation.captureMetrics.domSubscriptionTargetsRefreshed, 0);
+  assert.equal(observation.captureCoherence.status, "incomplete");
+  assert.equal(observation.historical, true);
   await session.close();
 });
 

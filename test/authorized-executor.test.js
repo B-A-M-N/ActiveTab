@@ -3,6 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { executeAuthorizedAction } from "../src/runtime/authorizedExecutor.js";
 import { createSearchSubmitAuthorizer, SEARCH_SUBMIT_OPERATION_ID } from "../src/navigation/search.js";
+import { AuthorizationGrantStore } from "../src/runtime/approvals.js";
 
 const fixtureLease = async () => {};
 
@@ -10,7 +11,7 @@ function mockSession({ observation = null } = {}) {
   return {
     dispatched: [],
     async observe() { return observation; },
-    async click(candidate) { this.dispatched.push(["click", candidate.backendNodeId]); return { dispatched: true }; },
+    async click(candidate, { beforeDispatch } = {}) { await beforeDispatch?.(); this.dispatched.push(["click", candidate.backendNodeId]); return { dispatched: true }; },
     async typeSearchPhrase(candidate, value, observation) {
       this.dispatched.push(["type", candidate.backendNodeId, value, observation?.page?.url]);
       return { dispatched: true };
@@ -125,6 +126,70 @@ test("same-origin GET query fields require the exact caller search contract for 
   }
 });
 
+test("attached BrowserSession dispatch rejects incomplete observation admission bindings before input", async () => {
+  const candidate = {
+    identity: "current-button", targetId: "strict-tab", documentGeneration: 3,
+    backendNodeId: 31, tag: "a", role: "link", href: "https://app.example.test/reports",
+    name: "Open reports", visible: true, disabled: false
+  };
+  const complete = {
+    evidenceId: "strict-observation",
+    targetId: "strict-tab",
+    documentGeneration: 3,
+    observationSequence: 1,
+    captureCoherence: {
+      status: "stable",
+      start: { targetId: "strict-tab", documentGeneration: 3, totalDomMutationCount: 2 },
+      end: { targetId: "strict-tab", documentGeneration: 3, totalDomMutationCount: 2 }
+    },
+    page: { url: "https://app.example.test/", title: "Home" },
+    candidates: [candidate]
+  };
+  const omissions = [
+    ["evidence identity", observation => { delete observation.evidenceId; }],
+    ["target identity", observation => { delete observation.targetId; }],
+    ["document generation", observation => { delete observation.documentGeneration; }],
+    ["stable capture coherence", observation => { delete observation.captureCoherence.status; }],
+    ["capture epoch", observation => { delete observation.captureCoherence.end; }],
+    ["observation sequence", observation => { delete observation.observationSequence; }]
+  ];
+
+  for (const [label, omit] of omissions) {
+    const observation = structuredClone(complete);
+    omit(observation);
+    const session = mockSession({ observation });
+    Object.assign(session, {
+      target: { id: "strict-tab", url: "https://app.example.test/" },
+      attached: true,
+      documentGeneration: 3,
+      observationGeneration: 1,
+      activity: { totalDomMutations: 2 }
+    });
+    const result = await executeAuthorizedAction({
+      session, goal: "Open reports", action: "click", candidate,
+      assertExecutionLease: fixtureLease
+    });
+    assert.equal(result.dispatched, false, `${label} must refuse before browser input`);
+    assert.equal(result.reasonCode, "observation_superseded", `${label} refusal is attributable`);
+    assert.deepEqual(session.dispatched, [], `${label} must not reach CDP input`);
+  }
+
+  const session = mockSession({ observation: complete });
+  Object.assign(session, {
+    target: { id: "strict-tab", url: "https://app.example.test/" },
+    attached: true,
+    documentGeneration: 3,
+    observationGeneration: 1,
+    activity: { totalDomMutations: 2 }
+  });
+  const admitted = await executeAuthorizedAction({
+    session, goal: "Open reports", action: "click", candidate,
+    assertExecutionLease: fixtureLease
+  });
+  assert.equal(admitted.dispatched, true, JSON.stringify(admitted));
+  assert.deepEqual(session.dispatched.map(([action]) => action), ["click"]);
+});
+
 test("sensitive actions are refused before dispatch through the authorized executor", async () => {
   const candidate = { name: "Delete account", role: "button", tag: "button", visible: true, backendNodeId: 1, targetId: "tab-1", documentGeneration: 1 };
   const observation = { page: { url: "https://app.example.test/", title: "Settings" }, candidates: [candidate], evidenceId: "e-1" };
@@ -181,6 +246,47 @@ test("a historical observation cannot authorize an effect after a newer capture 
     goal: "Open account",
     action: "click",
     candidate,
+    assertExecutionLease: fixtureLease
+  });
+
+  assert.equal(result.dispatchDisposition, "refused_pre_dispatch");
+  assert.equal(result.category, "observation_superseded");
+  assert.equal(result.browserEffectPossible, false);
+  assert.deepEqual(session.dispatched, []);
+});
+
+test("a DOM mutation after coherent capture refuses at the effect boundary", async () => {
+  const candidate = { name: "Open account", identity: "button-21", role: "button", tag: "button", visible: true, backendNodeId: 21, targetId: "tab-1", documentGeneration: 1 };
+  const observation = {
+    page: { url: "https://app.example.test/", title: "Home" },
+    candidates: [candidate],
+    evidenceId: "coherent-evidence",
+    targetId: "tab-1",
+    documentGeneration: 1,
+    observationSequence: 1,
+    historical: false,
+    captureCoherence: { status: "stable", end: { totalDomMutationCount: 0 } }
+  };
+  const session = mockSession({ observation });
+  session.target = { id: "tab-1", url: observation.page.url };
+  session.attached = true;
+  session.documentGeneration = 1;
+  session.observationGeneration = 1;
+  session.activity = { totalDomMutations: 0 };
+  session.click = async (target, { beforeDispatch } = {}) => {
+    session.activity.totalDomMutations++;
+    await beforeDispatch?.();
+    session.dispatched.push(["click", target.backendNodeId]);
+    return { dispatched: true };
+  };
+
+  const result = await executeAuthorizedAction({
+    session,
+    goal: "Open account",
+    action: "click",
+    candidate,
+    operationId: "test.coherent_click",
+    operationAuthorizer: { async authorize() { return { allowed: true, category: "test_coherent_click" }; } },
     assertExecutionLease: fixtureLease
   });
 
@@ -331,6 +437,45 @@ test("a trusted typed contract is checked even when generic policy allows the co
   assert.equal(result.dispatched, false);
   assert.equal(result.category, "operation_contract_refused");
   assert.equal(authorizations, 1);
+  assert.deepEqual(session.dispatched, []);
+});
+
+test("operator grant revocation during admission blocks the dispatch-time authorization check", async () => {
+  const candidate = { identity: "revocable-settings", targetId: "tab-1", documentGeneration: 1,
+    backendNodeId: 151, name: "Settings", role: "tab", tag: "button", visible: true, disabled: false };
+  const observation = { targetId: "tab-1", documentGeneration: 1,
+    page: { url: "https://app.example.test/", title: "Home" }, candidates: [candidate], evidenceId: "e-revocation" };
+  const session = mockSession({ observation });
+  session.target = { id: "tab-1", url: observation.page.url };
+  session.attached = true;
+  const grants = new AuthorizationGrantStore();
+  const scope = {
+    principal: "operator-1", environmentId: "fixture-env", resource: "settings",
+    operation: "open_settings", input: { target: candidate.identity }, effect: "click:settings"
+  };
+  const grant = grants.issue({ ...scope, allowedEffects: [scope.effect] });
+  let authorizations = 0;
+  const result = await executeAuthorizedAction({
+    session,
+    action: "click",
+    candidate,
+    assertExecutionLease: fixtureLease,
+    operationId: "registered-settings-step",
+    operationAuthorizer: {
+      async authorize() {
+        authorizations++;
+        const verified = grants.verify(grant.grantId, scope);
+        return { allowed: verified.ok, reason: verified.reason };
+      }
+    },
+    onAdmission: async () => {
+      grants.revoke(grant.grantId);
+      return { allowed: true };
+    }
+  });
+  assert.equal(authorizations, 2, "the scoped grant is checked again immediately before dispatch");
+  assert.equal(result.dispatched, false);
+  assert.equal(result.category, "operation_contract_refused");
   assert.deepEqual(session.dispatched, []);
 });
 

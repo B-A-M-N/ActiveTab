@@ -18,6 +18,7 @@ import { ControlFlowStepHandler } from "./steps/controlFlowStepHandler.js";
 import { VerificationStepHandler } from "./steps/verificationStepHandler.js";
 import { QualificationStepHandler } from "./steps/qualificationStepHandler.js";
 import { BrowserStepHandler } from "./steps/browserStepHandler.js";
+import { projectGoalOutcome } from "./steps/goalOutcome.js";
 import { ApiStepHandler } from "./steps/apiStepHandler.js";
 import { ExtractionStepHandler } from "./steps/extractionStepHandler.js";
 import { InterventionCoordinator } from "./lifecycle/interventionCoordinator.js";
@@ -66,7 +67,7 @@ function canRestoreStepWithoutExecution(step, status) {
 }
 
 export class TestRunner {
-  constructor({ session, collector, correlator, journal, maxSteps = 32, signal, interventions = null, environment = null, localFixture = false, decisionRuntime = null, qualificationService = null, operationAuthorizer = null, fileUploadGrantStore = null, workflowRegistry = null, capabilityRegistry = null, capabilityService = null, authorizeExtractionField = null, authorizeExtractionRelease = null, runStateStore = null, existingRunStateId = null, principalId = null, profileId = null, policyVersion = "active_policy_v1", targetLease = null } = {}) {
+  constructor({ session, collector, correlator, journal, maxSteps = 32, signal, interventions = null, environment = null, authenticationRealm = null, localFixture = false, decisionRuntime = null, qualificationService = null, operationAuthorizer = null, fileUploadGrantStore = null, workflowRegistry = null, capabilityRegistry = null, capabilityService = null, authorizeExtractionField = null, authorizeExtractionRelease = null, runStateStore = null, existingRunStateId = null, principalId = null, profileId = null, policyVersion = "active_policy_v1", targetLease = null } = {}) {
     this.session = session;
     this.collector = collector;
     this.correlator = correlator;
@@ -90,10 +91,13 @@ export class TestRunner {
     this.outputResults = {};
     this.capabilityDiscoveries = [];
     this.runStateStore = runStateStore;
+    // Trusted host composition may bind a cross-app run to its intended
+    // profile realm; per-action authority still resolves the observed app.
     this.runStateCoordinator = new RunStateCoordinator({
       runStateStore,
       session,
       environment,
+      authenticationRealm,
       principalId,
       profileId,
       policyVersion,
@@ -608,17 +612,13 @@ export class TestRunner {
         engineResult: { attempts: result.attempts, recoveries: result.recoveries, evidenceId: result.evidenceId ?? null }
       });
     }
-    const succeeded = result.status === "succeeded";
-    const status = succeeded ? STEP_STATUS.PASS : result.status === "canceled" ? STEP_STATUS.CANCELED : STEP_STATUS.UNCERTAIN;
-    const reason = succeeded
-      ? `Goal resolved: ${step.goal}`
-      : `Goal step ended '${result.status}'; the expected application-level effect was not verified, so this is UNCERTAIN rather than PASS.`;
+    const outcome = projectGoalOutcome(step.goal, result);
     receipt.recordStep({
-      stepId: step.id, type: step.type, status, reason, startedAt,
-      evidenceIds: [result.evidenceId ?? ""].filter(Boolean),
-      details: { goal: step.goal, engineStatus: result.status, attempts: result.attempts, recoveries: result.recoveries }
+      stepId: step.id, type: step.type, status: outcome.status, reason: outcome.reason, startedAt,
+      evidenceIds: outcome.evidenceIds,
+      details: outcome.details
     });
-    return { status, reason, result };
+    return { ...outcome, result };
   }
 
   /**

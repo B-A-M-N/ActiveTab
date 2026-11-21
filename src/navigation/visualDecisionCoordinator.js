@@ -7,6 +7,7 @@ import { groundVisualTarget, revalidateVisualGrounding } from "./visualGrounder.
 export function createVisualDecisionCoordinator({
   decisionRuntime,
   session,
+  getSession = null,
   deterministicPlanner,
   goal,
   episodeId,
@@ -19,13 +20,22 @@ export function createVisualDecisionCoordinator({
   searchPhrase = null,
   getLatestObservation = () => null
 } = {}) {
+  const currentSession = () => typeof getSession === "function" ? getSession() ?? session : session;
+  const sessionMatchesObservation = (activeSession, observation) => activeSession?.attached === true
+    && activeSession?.target?.id === observation?.targetId
+    && activeSession?.documentGeneration === observation?.documentGeneration;
   const captureVisualObservation = async observation => {
+    const activeSession = currentSession();
+    if (!sessionMatchesObservation(activeSession, observation)) return { observation: null, imageEvidence: null, session: activeSession };
     let visualObservation = observation;
     let imageEvidence = visualObservation?.visualEvidence ?? null;
     if (!imageEvidence) {
       try {
-        visualObservation = await session.observe({ profile: "visual", prepareForJev: true, selectionGoal: goal });
-        const retained = session.observer?.getEvidence?.(visualObservation.evidenceId, {
+        visualObservation = await activeSession.observe({ profile: "visual", prepareForJev: true, selectionGoal: goal });
+        if (currentSession() !== activeSession || !sessionMatchesObservation(activeSession, visualObservation)) {
+          return { observation: visualObservation, imageEvidence: null, session: activeSession };
+        }
+        const retained = activeSession.observer?.getEvidence?.(visualObservation.evidenceId, {
           facets: ["page"], includeScreenshot: true
         });
         imageEvidence = bindVisualEvidence(visualObservation, retained);
@@ -33,7 +43,7 @@ export function createVisualDecisionCoordinator({
         imageEvidence = null;
       }
     }
-    return { observation: visualObservation, imageEvidence };
+    return { observation: visualObservation, imageEvidence, session: activeSession };
   };
 
   const classifyAmbiguousPage = async observation => {
@@ -66,6 +76,9 @@ export function createVisualDecisionCoordinator({
         targetRole: "browser_page", expectedOutcomeClass: "page_classification", reasonCode: "visual_evidence_unavailable"
       });
       return { assessment: { status: "skipped", failureCode: "visual_evidence_unavailable", authorizesOperation: false }, ...captured };
+    }
+    if (currentSession() !== captured.session || !sessionMatchesObservation(captured.session, captured.observation)) {
+      return { assessment: { status: "skipped", failureCode: "session_replaced_during_capture", authorizesOperation: false }, ...captured };
     }
     const assessment = await service.classifyPage({ ...captured.observation, visualEvidence: captured.imageEvidence }, {
       episodeId,
@@ -111,19 +124,22 @@ export function createVisualDecisionCoordinator({
       imageEvidence: captured.imageEvidence,
       signal
     });
+    if (currentSession() !== captured.session || !sessionMatchesObservation(captured.session, captured.observation)) {
+      return { assessment: { status: "skipped", failureCode: "session_replaced_during_grounding", authorizesOperation: false }, grounding: null, ...captured };
+    }
     let finalAssessment = assessment;
     let candidateDiscoveryIdentity = null;
     let finalVisualImageEvidence = captured.imageEvidence;
     if (assessment?.status === "reviewed"
       && assessment.grounding?.status === "unavailable"
       && assessment.grounding?.reasonCode === "candidate_projection_incomplete"
-      && typeof session.probeVisualCandidateAtPoint === "function") {
+      && typeof captured.session?.probeVisualCandidateAtPoint === "function") {
       const box = assessment.grounding.sourceBox;
       const x = Number.isFinite(box?.left) && Number.isFinite(box?.right) ? Math.round((box.left + box.right) / 2) : null;
       const y = Number.isFinite(box?.top) && Number.isFinite(box?.bottom) ? Math.round((box.top + box.bottom) / 2) : null;
       if (x !== null && y !== null) {
         const hitStartedAt = performance.now();
-        const hit = await session.probeVisualCandidateAtPoint(captured.observation.evidenceId, { x, y }).catch(() => ({
+        const hit = await captured.session.probeVisualCandidateAtPoint(captured.observation.evidenceId, { x, y }).catch(() => ({
           status: "unavailable", reasonCode: "hit_probe_failed",
           elapsedMs: Math.max(0, Math.round(performance.now() - hitStartedAt)), actionAuthorized: false
         }));
@@ -152,19 +168,19 @@ export function createVisualDecisionCoordinator({
         if (hit?.status === "candidate" && hint?.targetId === captured.observation.targetId
           && hint?.documentGeneration === captured.observation.documentGeneration
           && typeof hint.identity === "string") {
-          const promotedObservation = await session.observe({
+          const promotedObservation = await captured.session.observe({
             profile: "visual",
             prepareForJev: true,
             selectionGoal: goal,
             candidateLimit: 384,
             priorityCandidateIdentities: [hint.identity]
           }).catch(() => null);
-          const promotedCandidate = (promotedObservation?.candidates ?? []).find(candidate => candidate.identity === hint.identity
+          const promotedCandidate = currentSession() === captured.session && (promotedObservation?.candidates ?? []).find(candidate => candidate.identity === hint.identity
             && candidate.targetId === hint.targetId
             && candidate.documentGeneration === hint.documentGeneration
             && candidate.frameTargetId === hint.frameTargetId);
           if (promotedCandidate) {
-            const promotedRetained = session.observer?.getEvidence?.(promotedObservation.evidenceId, {
+            const promotedRetained = captured.session.observer?.getEvidence?.(promotedObservation.evidenceId, {
               facets: ["page"], includeScreenshot: true
             });
             const promotedImageEvidence = bindVisualEvidence(promotedObservation, promotedRetained);
@@ -196,7 +212,8 @@ export function createVisualDecisionCoordinator({
     }
     // Reobserve after inference before offering any grounded identity to the
     // engine's ordinary policy and authorized-execution path.
-    const freshObservation = await session.observe({
+    if (currentSession() !== captured.session) return { assessment: finalAssessment, grounding: null, ...captured };
+    const freshObservation = await captured.session.observe({
       selectionGoal: goal,
       ...(candidateDiscoveryIdentity ? {
         profile: "visual",
@@ -206,7 +223,7 @@ export function createVisualDecisionCoordinator({
       } : {})
     });
     if (candidateDiscoveryIdentity) {
-      const retained = session.observer?.getEvidence?.(freshObservation.evidenceId, { facets: ["page"], includeScreenshot: true });
+      const retained = captured.session.observer?.getEvidence?.(freshObservation.evidenceId, { facets: ["page"], includeScreenshot: true });
       finalVisualImageEvidence = bindVisualEvidence(freshObservation, retained);
     }
     const candidate = finalAssessment?.status === "reviewed" && finalAssessment.grounding?.status === "grounded"

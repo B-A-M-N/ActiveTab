@@ -22,6 +22,7 @@ import { createApiServer } from "../src/api/local-server.js";
 import { generateOutputFiles } from "../src/api/output-files.js";
 import { acquireBrowserTargetLease } from "../src/testing/runState.js";
 import { chromeWindowPositionArgs } from "../src/browser/chromeWindowPlacement.js";
+import { observeStable } from "../test-support/stableObservation.js";
 
 const chromePath = process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
 const fixture = await readFile(new URL("./fixtures/navigation.html", import.meta.url));
@@ -157,11 +158,37 @@ function createRealRunner({ journalDir, outputDir }) {
             if (observation.page.title === "Demo shop") break;
             await new Promise(r => setTimeout(r, 100));
           }
+          if (observation?.page?.title !== "Demo shop") throw new Error("The local workflow fixture did not finish loading before observation.");
+          observation = await observeStable(session, undefined, {
+            timeoutMs: 10_000,
+            pollMs: 50,
+            includePendingRequests: true,
+            label: "local navigation fixture"
+          });
           const surface = await session.client.send("Runtime.evaluate", {
             expression: browserSurfaceExpression,
             returnByValue: true
           });
           console.log(`[CDP Test] Browser surface: ${JSON.stringify(surface?.result?.value)}`);
+          console.log(`[CDP Test] Observation metrics: ${JSON.stringify({
+            observationDurationMs: observation.captureMetrics?.observationDurationMs,
+            captureDurationMs: observation.captureMetrics?.captureDurationMs,
+            cdpRoundTrips: observation.captureMetrics?.cdpRoundTrips,
+            totalCdpRoundTripMs: observation.captureMetrics?.totalCdpRoundTripMs,
+            cdpRoundTripP95Ms: observation.captureMetrics?.cdpRoundTripP95Ms,
+            cdpRoundTripsByMethod: observation.captureMetrics?.cdpRoundTripsByMethod,
+            documentIndexBuildMs: observation.captureMetrics?.documentIndexBuildMs,
+            candidateDerivationMs: observation.captureMetrics?.candidateDerivationMs,
+            semanticCompilationMs: observation.captureMetrics?.semanticCompilationMs,
+            domNodeCount: observation.captureMetrics?.domNodeCount,
+            accessibilityNodeCount: observation.captureMetrics?.accessibilityNodeCount,
+            serializedEvidenceBytes: observation.captureMetrics?.serializedEvidenceBytes,
+            domSubscriptionTargetsRefreshed: observation.captureMetrics?.domSubscriptionTargetsRefreshed,
+            coherenceRetryCount: observation.captureMetrics?.coherenceRetryCount,
+            coherence: observation.captureCoherence?.status,
+            candidateCount: observation.candidateCount
+          })}`);
+          assert.equal(observation.captureCoherence?.status, "stable", "the shared headed/headless workflow fixture provides a stable actionable observation");
           assert.deepEqual(surface?.result?.value, {
             url: input.url,
             title: "Demo shop",
@@ -216,6 +243,16 @@ function createRealRunner({ journalDir, outputDir }) {
             await targetLease.release();
           }
           console.log(`[CDP Test] Result: ${navResult.status} attempts=${navResult.attempts}`);
+          const finalEvidence = navResult.evidenceId
+            ? session.observer.getEvidence(navResult.evidenceId, { facets: ["page", "lifecycleEvents"] })
+            : null;
+          console.log(`[CDP Test] Result details: ${JSON.stringify({
+            reason: navResult.reason ?? null,
+            coherence: finalEvidence?.captureCoherence?.status ?? null,
+            coverageCoherence: finalEvidence?.coverage?.captureCoherence ?? null,
+            candidateCount: finalEvidence?.coverage?.interactionCandidateCount ?? null,
+            title: finalEvidence?.page?.title ?? null
+          })}`);
 
           if (signal?.aborted) return { status: "canceled" };
 
@@ -348,11 +385,14 @@ test("API server with real CDP: navigate fixture page via HTTP API", { timeout: 
 
     // The key assertion: the pipeline works end-to-end
     // (Chrome launched, page loaded, engine ran, output generated)
-    assert.ok(["finished", "failed"].includes(finalStatus), `Task should reach terminal state, got: ${finalStatus}`);
+    assert.equal(finalStatus, "finished", `Task should finish successfully, got: ${finalStatus}`);
     assert.equal(detail.task_id, taskId);
     assert.ok(detail.output);
+    assert.equal(detail.output.status, "succeeded");
+    assert.equal(detail.output.final_page?.title, "Archive");
+    assert.equal(detail.output.final_page?.url, siteUrl);
     assert.ok(detail.usage && typeof detail.usage === "object");
-    assert.ok(typeof detail.usage.actions === "number");
+    assert.equal(detail.usage.actions, 1);
 
     // Output files should exist
     assert.ok(detail.output_files);

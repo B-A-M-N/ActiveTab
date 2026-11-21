@@ -68,6 +68,21 @@ export class FrameSessionManager {
   has(targetId) { return this.frameSessions.has(targetId); }
   values() { return this.frameSessions.values(); }
 
+  async refreshDomSubscriptions() {
+    const pending = [...this.frameSessions.values()].filter(frame =>
+      frame.status === "ready" && frame.domEnabled && !frame.domObservationAvailable
+    );
+    let refreshed = 0;
+    await Promise.all(pending.map(async frame => {
+      const available = await this.subscribeDomTree?.(frame.client);
+      if (this.frameSessions.get(frame.targetId) === frame && frame.status === "ready") {
+        frame.domObservationAvailable = available === true;
+        if (available === true) refreshed++;
+      }
+    }));
+    return refreshed;
+  }
+
   #isManagedParentSession(parentSessionId) {
     const parent = parentSessionId ?? null;
     if (parent === (this.session.sessionId ?? null)) return true;
@@ -95,6 +110,7 @@ export class FrameSessionManager {
       sessionId: childSessionId,
       client: null,
       status: "attaching",
+      generation: 1,
       error: null,
       ready: null,
       domEnabled: false,
@@ -145,10 +161,12 @@ export class FrameSessionManager {
     frame.disposers.push(client.on("Page.lifecycleEvent", event => recordLifecycle("Page.lifecycleEvent", event)));
     frame.disposers.push(client.on("Page.frameNavigated", event => {
       frame.frameId = event.frame?.id ?? frame.frameId;
+      frame.generation++;
       recordLifecycle("Page.frameNavigated", event);
       this.onGenerationChange?.();
     }));
     frame.disposers.push(client.on("Page.navigatedWithinDocument", event => {
+      frame.generation++;
       recordLifecycle("Page.navigatedWithinDocument", event);
       this.onGenerationChange?.();
     }));
@@ -156,6 +174,7 @@ export class FrameSessionManager {
       frame.disposers.push(client.on(method, event => recordLifecycle(method, event)));
     }
     frame.disposers.push(client.on("DOM.documentUpdated", event => {
+      frame.generation++;
       this.onGenerationChange?.();
       frame.domObservationAvailable = false;
       recordLifecycle("DOM.documentUpdated", event);
@@ -208,10 +227,10 @@ export class FrameSessionManager {
     let expected = new Set(this.frameSessions.keys());
     if (!session.ownsTransport && this.attachmentAvailable) {
       try {
-        const startedAt = Date.now();
+        const startedAt = performance.now();
         let targetInfos = [];
         try { ({ targetInfos = [] } = await session.transport.send("Target.getTargets")); }
-        finally { onCdpRoundTrip?.(Date.now() - startedAt); }
+        finally { onCdpRoundTrip?.("Target.getTargets", performance.now() - startedAt); }
         const iframeTargets = targetInfos.filter(item => item?.type === "iframe" && typeof item.targetId === "string");
         const parents = new Set([session.target.id]);
         let expanded = true;

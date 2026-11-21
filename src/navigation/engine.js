@@ -221,6 +221,7 @@ export class NavigationEngine {
     searchSubmitAuthorizer,
     state
   }) {
+    const getCurrentSession = () => this.session;
     const throwIfAborted = () => {
       if (abortSignal?.aborted) {
         const error = new Error("The navigation run was canceled.");
@@ -331,11 +332,11 @@ export class NavigationEngine {
         ?? this.environment?.environmentClass
         ?? (environmentId.includes("production") ? "production" : environmentId.includes("staging") ? "staging" : environmentId ? "local" : "unknown");
       const applicationId = this.workflowScope?.applicationId ?? observedApplicationId;
-      const profileFormCapabilities = createProfileFormWorkflowCapabilities({ session: this.session, environment: this.environment, applicationId });
+      const profileFormCapabilities = createProfileFormWorkflowCapabilities({ session: this.session, getSession: getCurrentSession, environment: this.environment, applicationId });
       const callerCapabilities = Array.isArray(this.workflowCapabilities) ? this.workflowCapabilities : [];
       const searchInputRef = searchReadRequest ? availableSearchInputRef(workflowInputs) : null;
       const searchWorkflowCapabilities = searchReadRequest
-        ? createObservedSearchWorkflowCapabilities({ observation: latest, session: this.session, inputRef: searchInputRef, query: searchReadRequest.query })
+        ? createObservedSearchWorkflowCapabilities({ observation: latest, session: this.session, getSession: getCurrentSession, inputRef: searchInputRef, query: searchReadRequest.query })
         : [];
       const effectiveWorkflowInputs = workflowInputs && typeof workflowInputs === "object" && !Array.isArray(workflowInputs)
         ? { ...workflowInputs }
@@ -350,6 +351,7 @@ export class NavigationEngine {
       const extractionCapabilities = createExtractionWorkflowCapabilities({
         registry: this.capabilityRegistry,
         session: this.session,
+        getSession: getCurrentSession,
         environment: this.environment,
         principalId: this.principalId,
         authorizeField: this.authorizeExtractionField,
@@ -376,6 +378,7 @@ export class NavigationEngine {
               environment: this.environment,
               principalId: this.principalId,
               session: this.session,
+              getSession: getCurrentSession,
               details
             })
           } : {})
@@ -387,19 +390,20 @@ export class NavigationEngine {
         ? requiresCompositeReadWorkflow(goal)
           ? (await this.capabilityService.createDeferredObservedReadWorkflowCapabilities?.({
             session: this.session,
+            getSession: getCurrentSession,
             environment: this.environment,
             principalId: this.principalId,
             goal: searchReadRequest?.resultRequest ?? goal
           })) ?? []
           : await this.capabilityService.createObservedReadWorkflowCapabilities?.({
           session: this.session,
+          getSession: getCurrentSession,
           environment: this.environment,
           principalId: this.principalId,
           observation: latest,
           goal
         })
         : [];
-      const thisSession = this.session;
       const verifiedSearchCapability = searchWorkflowCapabilities.find(capability => capability.id === "observed_public_search_submit");
       const deferredReadCapabilities = observedReadCapabilities.map(capability => {
         if (!searchReadRequest || capability.outputCompleteness !== "observed_partial") return capability;
@@ -411,7 +415,7 @@ export class NavigationEngine {
               reasonCode: "search_submission_not_verified_before_extraction",
               evidenceRefs: [args.observation?.evidenceId].filter(Boolean)
             };
-            const searchVerified = await thisSession.verifySearchOutcome(searchReadRequest.query).catch(() => false);
+            const searchVerified = await getCurrentSession()?.verifySearchOutcome(searchReadRequest.query).catch(() => false);
             if (!searchVerified) return {
               status: "failed",
               reasonCode: "search_results_not_verified_before_extraction",
@@ -652,7 +656,12 @@ export class NavigationEngine {
       state.status = "canceled";
       state.terminationReason = "The run was canceled; the last dispatched action has an unknown outcome and is preserved as uncertain.";
       await updateJournal();
-      return resultWithWorkflow({ status: "canceled", goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, uncertain: true, evidenceId: latest.evidenceId });
+      return resultWithWorkflow({
+        status: "canceled", goal, reason: state.terminationReason,
+        attempts: state.attempts.length, recoveries, uncertain: true,
+        dispatchDisposition: attempt.dispatchDisposition ?? DISPATCH_DISPOSITION.UNCERTAIN,
+        evidenceId: latest.evidenceId
+      });
     };
     const canceledBeforeDispatch = async attempt => {
       if (attempt && state.pendingAction === attempt) {
@@ -663,7 +672,12 @@ export class NavigationEngine {
       state.status = "canceled";
       state.terminationReason = "The run was canceled before the pending action was dispatched; no browser input was sent.";
       await updateJournal();
-      return resultWithWorkflow({ status: "canceled", goal, reason: state.terminationReason, attempts: state.attempts.length, recoveries, evidenceId: latest.evidenceId });
+      return resultWithWorkflow({
+        status: "canceled", goal, reason: state.terminationReason,
+        attempts: state.attempts.length, recoveries, uncertain: false,
+        dispatchDisposition: DISPATCH_DISPOSITION.REFUSED_PRE_DISPATCH,
+        evidenceId: latest.evidenceId
+      });
     };
     const actionAttemptCoordinator = new ActionAttemptCoordinator({
       taskState: state,
@@ -864,6 +878,7 @@ export class NavigationEngine {
     const { captureVisualObservation, classifyAmbiguousPage, groundAmbiguousTarget } = createVisualDecisionCoordinator({
       decisionRuntime: this.decisionRuntime,
       session: this.session,
+      getSession: getCurrentSession,
       deterministicPlanner: this.deterministicPlanner,
       goal,
       episodeId: decisionEpisodeId,

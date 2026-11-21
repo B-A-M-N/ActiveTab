@@ -55,11 +55,11 @@ function candidate(identity, overrides = {}) {
   };
 }
 
-function observation({ evidenceId = "before", url = "https://fixture.example/shop/profile", candidates = [], title = "Shop profile", semanticPage = undefined } = {}) {
+function observation({ evidenceId = "before", url = "https://fixture.example/shop/profile", candidates = [], title = "Shop profile", semanticPage = undefined, documentGeneration = 7 } = {}) {
   return {
     evidenceId,
     targetId: "form-tab",
-    documentGeneration: 7,
+    documentGeneration,
     page: { url, title },
     candidates,
     ...(semanticPage ? { semanticPage } : {})
@@ -238,6 +238,48 @@ test("fill capability preserves caller inputRef and verifies the exact value aga
   assert.equal(outcome.reasonCode, "exact_form_value_observed");
   assert.deepEqual(outcome.evidenceRefs, ["before", "after"]);
   assert.equal(JSON.stringify(outcome).includes("Foo.Bar+QA@example.com"), false);
+});
+
+test("native form verification rebinds to the current same-target session after recovery", async () => {
+  let retiredVerifications = 0;
+  let currentVerifications = 0;
+  const retired = {
+    ...session,
+    documentGeneration: 7,
+    async verifyControlValue() { retiredVerifications++; throw new Error("retired session used"); }
+  };
+  const replacement = {
+    ...session,
+    target: { ...session.target },
+    documentGeneration: 8,
+    async verifyControlValue(_target, value) {
+      currentVerifications++;
+      return { verified: true, matches: value === "Foo.Bar+QA@example.com  " };
+    }
+  };
+  let current = retired;
+  const [fill] = createNativeFormWorkflowCapabilities({
+    session: retired,
+    getSession: () => current,
+    environment,
+    applicationId: "shop",
+    operationIds
+  });
+  const field = candidate("email", { documentGeneration: 8 });
+  const before = observation({ evidenceId: "reattached-before", candidates: [field], documentGeneration: 8 });
+  const after = observation({ evidenceId: "reattached-after", candidates: [field], documentGeneration: 8 });
+  current = replacement;
+
+  const result = await fill.verify({
+    verificationCode: fill.verificationCodes[0],
+    beforeObservation: before,
+    afterObservation: after,
+    target: field,
+    inputValue: "Foo.Bar+QA@example.com  "
+  });
+  assert.equal(result.status, "verified");
+  assert.equal(retiredVerifications, 0);
+  assert.equal(currentVerifications, 1);
 });
 
 test("select capability resolves and verifies one caller-bound option value", async () => {

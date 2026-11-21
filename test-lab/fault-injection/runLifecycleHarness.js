@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { writeFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
@@ -97,6 +98,81 @@ function nextCommand() {
 
 async function runWorker(mode, baseDir, input) {
   installControlReader();
+  if (mode === "atomic-replace") {
+    const { RunDocumentStore } = await import("../../src/testing/lifecycle/runDocumentStore.js");
+    const documents = new RunDocumentStore(baseDir);
+    await documents.init();
+    await documents.writeAtomic(input.nextRun, {
+      beforeRename: async () => {
+        send({ event: "replacement-ready" });
+        await nextCommand();
+      }
+    });
+    return;
+  }
+  if (mode === "cdp-verification-pending") {
+    const { BrowserSession } = await import("../../src/browser/session.js");
+    const { resolveAuthorizedTarget } = await import("../../src/browser/targets.js");
+    const { TestRunner } = await import("../../src/testing/runner.js");
+    const { RunStateStore } = await import("../../src/testing/runState.js");
+    const target = await resolveAuthorizedTarget(input.endpoint, input.targetId, input.targetId);
+    const session = await new BrowserSession(target).attach();
+    const store = new RunStateStore(baseDir);
+    await store.init();
+    try {
+      let actionDispatched = false;
+      let verificationPaused = false;
+      const click = session.click.bind(session);
+      session.click = async (...args) => {
+        const result = await click(...args);
+        actionDispatched = true;
+        return result;
+      };
+      const observe = session.observe.bind(session);
+      session.observe = async (...args) => {
+        const result = await observe(...args);
+        if (actionDispatched && !verificationPaused) {
+          verificationPaused = true;
+          send({ event: "postcondition-verification-paused", evidenceId: result.evidenceId });
+          await nextCommand();
+        }
+        return result;
+      };
+      const operationAuthorizer = {
+        authorize({ action, candidate, observation }) {
+          const allowed = action === "click"
+            && candidate?.name === input.buttonName
+            && observation?.page?.url === input.pageUrl;
+          return { allowed, category: "test_cdp_postcondition_crash", reason: "The fixture contract permits one exact loopback control." };
+        }
+      };
+      await new TestRunner({
+        session,
+        environment: input.environment,
+        runStateStore: store,
+        operationAuthorizer
+      }).run({
+        id: "cdp-postcondition-crash-workflow",
+        name: "Pause after dispatch during postcondition verification",
+        steps: [{
+          id: "count-effect",
+          type: "interact",
+          goal: "Count the durable verification fixture effect",
+          action: {
+            type: "click",
+            operationId: "test.cdp_postcondition_crash",
+            target: { name: input.buttonName },
+            postcondition: { type: "page_title_contains", value: input.pageTitle }
+          }
+        }]
+      }, { runId: input.runId });
+      send({ event: "workflow-completed" });
+    } finally {
+      await session.close().catch(() => {});
+      store.close();
+    }
+    return;
+  }
   const { RunStateStore } = await import("../../src/testing/runState.js");
   const store = new RunStateStore(baseDir);
   await store.init();
@@ -141,6 +217,21 @@ async function runWorker(mode, baseDir, input) {
       } catch (error) {
         send({ event: "operation-result", outcome: "rejected", code: error.code ?? null, message: error.message });
       }
+      return;
+    }
+
+    if (mode === "verification-pending") {
+      await store.reserveOperation(input.runId, input.operation);
+      await store.recordOperationDispatch(input.runId, {
+        operationId: input.operation.operationId,
+        status: "DISPATCHED",
+        receiptId: input.receiptId ?? null
+      });
+      // Model one independently visible fixture effect, then hold inside the
+      // postcondition verifier until the parent terminates this process.
+      await writeFile(input.effectOraclePath, "1\n", { mode: 0o600 });
+      send({ event: "postcondition-verification-started" });
+      await nextCommand();
       return;
     }
 

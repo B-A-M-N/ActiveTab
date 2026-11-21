@@ -40,6 +40,21 @@ visible Agents link opens the separate Cloud Agent application at
 `https://agents-staging.freeinference.org/`; that application has a separate
 login/session realm.
 
+Cloud Agent staging qualification follows the visible `Dashboard` link from
+the FreeInference root when needed, then follows the visible `Agents` or
+`Cloud Agents` link. Each link must be a unique fresh observation matching
+profile-declared labels and origin/path constraints; click dispatch goes
+through TestRunner policy and the leased native-CDP executor. A URL
+postcondition checks each arrival. The profile's candidate URL constrains
+identity and link matching but is never used as a direct navigation target.
+The 2026-10-20 headed run reached the observed Agents origin and independently
+verified the task composer on the same target. It stopped before task
+submission; this proves real staging entry only, not Agent execution or
+application-level outcome verification. The live click used the exact visible
+label and destination origin; a preceding read-only inventory recorded `/` as
+the destination path. The final exact-path selector is covered by regression
+tests and was not re-run live after the tab reached the composer.
+
 The main Dashboard's **Admin Console** link points to
 `/dashboard/admin/users`. This is a privileged account-level surface and is
 separate from the Cloud Agent application's own Admin area under

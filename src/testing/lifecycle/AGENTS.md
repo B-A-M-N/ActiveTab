@@ -11,6 +11,7 @@ The testing layer. `RunStateCoordinator` owns run bindings and execution-lease l
 ## Local Contracts
 
 - Bind durable state to the exact workflow version/hash, environment, target, principal, profile, and policy before execution.
+- A trusted host may declare the workflow's profile-bound authentication realm when one run visibly crosses application realms. Keep that realm immutable across restart; every dispatched step still derives its application identity from the live observed URL and passes normal policy admission.
 - Acquire the run lease and exact browser-target lease before execution; preserve target fencing tokens on reservations and refuse dispatch after lease loss.
 - A navigation recovery may validate the durable target-lease token while its original CDP session is detached, then rebind only an attached replacement with the exact endpoint and target identity. Rebinding retains the same fencing token; dispatch still requires a current attached session.
 - Persist step outcomes before advancing. If checkpoint persistence fails after an effect, mark that step uncertain and require reconciliation.
@@ -19,6 +20,7 @@ The testing layer. `RunStateCoordinator` owns run bindings and execution-lease l
 - Continue through the existing runner callback and shared execution budget; an intervention coordinator cannot authorize or dispatch browser/application effects.
 - `RunStateCoordinator` coordinates state only. `InterventionCoordinator` evaluates only the declared human-handoff completion predicate; neither service authorizes or dispatches browser/application effects.
 - `RunDocumentStore` owns JSON run-document path validation, owner-private root setup, the fixed 64 KiB write bound, and atomic replacement. It does not decide operation transitions, grant leases, or authorize browser effects.
+- `RunDocumentStore.writeAtomic()` exposes an optional `beforeRename` cut point only for tests that terminate a child process between durable temporary-file sync and replacement. Production callers omit it; restart ignores the orphaned temporary file and reads the last renamed document.
 
 ## Verification
 

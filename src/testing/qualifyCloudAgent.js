@@ -189,7 +189,7 @@ export async function qualifyCloudAgent({
         workflowId: "cloud-agent-staging-qualification",
         workflowName: "Cloud Agent staging qualification",
         environmentId: environment.environmentId,
-        authenticationRealm: "agents-session",
+        authenticationRealm: (environment.applications ?? []).find(application => application.applicationId === "fi-agents")?.authenticationRealm ?? null,
         targetId: session.target?.id ?? null,
         goalFingerprint: createHash("sha256").update(String(environment.applicationEntryUrl)).digest("hex").slice(0, 32),
         mode,
@@ -279,7 +279,10 @@ export async function qualifyCloudAgent({
     }
 
     // ── 4. Profile route is an identity hint only; never navigate to it ──
-    const entryFlow = createCloudAgentEntryWorkflow(environment, observation, { forceEntryStep: Boolean(resumeRunState) });
+    const entryFlow = createCloudAgentEntryWorkflow(environment, observation, {
+      forceEntryStep: Boolean(resumeRunState),
+      authRequired
+    });
     if (!entryFlow) {
       finalState = QUALIFICATION_STATES.BLOCKED;
       reason = "The environment profile has no authorized Cloud Agent identity hint.";
@@ -292,7 +295,7 @@ export async function qualifyCloudAgent({
 
     // ── 5. Follow the visible route, hand off for login, then verify and resume ──
     const runner = new TestRunner({
-      session, interventions, environment, signal, decisionRuntime,
+      session, interventions, environment, authenticationRealm: agentEntry.authenticationRealm, signal, decisionRuntime,
       qualificationService: createQualificationRuntime({ decisionRuntime }),
       ...(runStore && runState ? {
         runStateStore: runStore,

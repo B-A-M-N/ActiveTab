@@ -59,7 +59,7 @@ export class RunDocumentStore {
     }
   }
 
-  async writeAtomic(run) {
+  async writeAtomic(run, { beforeRename = null } = {}) {
     const path = this.runPath(run.runId);
     const temp = `${path}.${randomUUID()}.tmp`;
     const file = await open(temp, "wx", 0o600);
@@ -74,6 +74,9 @@ export class RunDocumentStore {
       throw error;
     }
     await file.close();
+    // Fault-injection tests can stop here to model process death after the
+    // temporary file is durable but before the previous document is replaced.
+    await beforeRename?.({ path, temp });
     await rename(temp, path);
     await chmod(path, 0o600);
   }

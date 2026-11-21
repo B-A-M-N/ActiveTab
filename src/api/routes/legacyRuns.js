@@ -33,9 +33,12 @@ export function createLegacyRunRoutes({ store, lifecycle, findTemplate, projectI
       const taskId = path.split("/")[4];
       const task = store.get(taskId) ?? await store.load(taskId);
       if (!task) { sendError(res, 404, 99404, `No static resource v3/bots/runs/${taskId}/cancel.`); return true; }
-      lifecycle.cancel(taskId);
-      await store.persist(taskId);
-      sendJson(res, 200, { status: task.status, task_id: taskId, updated_at: task.updated_at });
+      const canceled = await lifecycle.cancel(taskId);
+      // Lightweight route fixtures and older lifecycle adapters may not own
+      // persistence; the production RunLifecycle persists intent before abort.
+      if (canceled === undefined) await store.persist(taskId);
+      const current = canceled ?? task;
+      sendJson(res, 200, { status: current.status, task_id: taskId, updated_at: current.updated_at });
       return true;
     }
 

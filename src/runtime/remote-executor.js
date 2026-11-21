@@ -100,18 +100,30 @@ export function createRemoteExecutor({ peerUrl, peerToken, peerTokenFile, timeou
    * Execute one run on the peer. Mirrors createNavigationRunner().run:
    * returns { status, output, usage, output_files, task_id, evidence_id }.
    * Terminal-state translation is explicit and can never fabricate success.
+   * @param {string} [options.idempotencyKey] - Stable caller-owned key; defaults to the durable local taskId.
    */
-  async function run(goal, { signal, input, templateId, taskId, inputSchema } = {}) {
-    const canceledResult = () => ({
-      status: "canceled",
-      output: { status: "canceled", reason: "Canceled locally; the remote peer may not have acknowledged the cancellation." }
+  async function run(goal, { signal, input, templateId, taskId, idempotencyKey, inputSchema } = {}) {
+    const canceledResult = (uncertain = false) => ({
+      status: uncertain ? "reconciling" : "canceled",
+      uncertain,
+      output: {
+        status: uncertain ? "unresolved" : "canceled",
+        reason: uncertain
+          ? "Cancellation interrupted the peer request after dispatch may have started; the remote outcome must be reconciled."
+          : "Canceled before the peer request was dispatched.",
+        ...(uncertain ? { uncertain: true } : {})
+      }
     });
-    if (signal?.aborted) return canceledResult();
+    if (signal?.aborted) return canceledResult(false);
+    const stableIdempotencyKey = idempotencyKey ?? taskId;
+    if (typeof stableIdempotencyKey !== "string" || !/^[\x21-\x7e]{1,128}$/.test(stableIdempotencyKey)) {
+      return interrupted("A stable caller-owned idempotency key or durable taskId is required before peer dispatch.", { uncertain: false });
+    }
     // Load the token before wiring cancellation so an abort that fires
     // while the token is being read still settles the run instead of
     // leaving it pending forever.
     const secret = await token();
-    if (signal?.aborted) return canceledResult();
+    if (signal?.aborted) return canceledResult(false);
     const controller = new AbortController();
     const onAbort = () => controller.abort();
     if (signal) signal.addEventListener("abort", onAbort, { once: true });
@@ -123,21 +135,23 @@ export function createRemoteExecutor({ peerUrl, peerToken, peerTokenFile, timeou
           method: "POST",
           headers: {
             "content-type": "application/json",
+          "idempotency-key": stableIdempotencyKey,
             ...(secret ? { authorization: `Bearer ${secret}` } : {})
           },
           body: JSON.stringify(sanitizeForwardBody({ goal, input, templateId, taskId })),
           signal: controller.signal
         });
       } catch (error) {
-        if (signal?.aborted) return canceledResult();
+        if (signal?.aborted) return canceledResult(true);
         return interrupted(`The remote executor is unreachable or the connection failed: ${String(error?.message ?? error).slice(0, 200)}`);
       }
 
       if (response.status === 401 || response.status === 403) {
-        return interrupted("The remote executor rejected the shared token (401/403).");
+        return interrupted("The remote executor rejected the shared token (401/403).", { uncertain: false });
       }
       if (!response.ok) {
-        return interrupted(`The remote executor returned HTTP ${response.status}.`);
+        const definitelyRejected = [400, 401, 403, 409, 413, 422, 507].includes(response.status);
+        return interrupted(`The remote executor returned HTTP ${response.status}.`, { uncertain: !definitelyRejected });
       }
 
       let payload;
@@ -167,14 +181,29 @@ export function createRemoteExecutor({ peerUrl, peerToken, peerTokenFile, timeou
       if (status === "needs_human") {
         return { status: "needs_human", output: payload.output ?? { reason: "Remote run requested human handoff." }, task_id: payload.task_id ?? taskId ?? null };
       }
-      if (status === "canceled") return { status: "canceled", output: payload.output ?? { status: "canceled" } };
-      if (status === "failed" || status === "interrupted" || status === "unresolved") {
+      if (status === "canceled") {
+        return payload.uncertain === false
+          ? { status: "canceled", uncertain: false, output: payload.output ?? { status: "canceled" } }
+          : { status: "reconciling", uncertain: true, output: payload.output ?? { status: "unresolved", uncertain: true, reason: "The peer has not established a safe terminal outcome." } };
+      }
+      if (status === "unresolved" || status === "reconciling") {
+        return {
+          status: "reconciling",
+          uncertain: true,
+          output: { status: "unresolved", uncertain: true, reason: String(payload.output?.reason ?? payload.error ?? "The peer outcome is unresolved.").slice(0, 500) },
+          task_id: payload.task_id ?? taskId ?? null
+        };
+      }
+      if (status === "failed") {
         return {
           status: "failed",
           output: { status: "failed", reason: String(payload.output?.reason ?? payload.error ?? "Remote run failed.").slice(0, 500) },
           usage: payload.usage ?? null,
           task_id: payload.task_id ?? taskId ?? null
         };
+      }
+      if (status === "interrupted") {
+        return interrupted(String(payload.output?.reason ?? payload.error ?? "The peer reported an interrupted request."));
       }
       return interrupted(`The remote executor returned an unrecognized terminal state "${String(status).slice(0, 64)}"; the run outcome is unknown.`);
     } finally {
@@ -183,10 +212,11 @@ export function createRemoteExecutor({ peerUrl, peerToken, peerTokenFile, timeou
     }
   }
 
-  function interrupted(reason) {
+  function interrupted(reason, { uncertain = true } = {}) {
     return {
-      status: "failed",
-      output: { status: "failed", reason: `interrupted: ${reason}` },
+      status: uncertain ? "reconciling" : "failed",
+      uncertain,
+      output: { status: uncertain ? "unresolved" : "failed", reason: `interrupted: ${reason}`, ...(uncertain ? { uncertain: true } : {}) },
       usage: null
     };
   }

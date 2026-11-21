@@ -5,10 +5,11 @@ import { resolveObservedApplication } from "../../environments/model.js";
 
 /** Owns durable workflow-run bindings, leases, checkpoints, and terminal state. */
 export class RunStateCoordinator {
-  constructor({ runStateStore = null, session = null, environment = null, principalId = null, profileId = null, policyVersion = "active_policy_v1", targetLease = null } = {}) {
+  constructor({ runStateStore = null, session = null, environment = null, authenticationRealm = null, principalId = null, profileId = null, policyVersion = "active_policy_v1", targetLease = null } = {}) {
     this.runStateStore = runStateStore;
     this.session = session;
     this.environment = environment;
+    this.authenticationRealm = authenticationRealm;
     this.principalId = principalId;
     this.profileId = profileId;
     this.policyVersion = policyVersion;
@@ -55,7 +56,12 @@ export class RunStateCoordinator {
     const application = this.session?.target?.url && this.environment
       ? resolveObservedApplication(this.environment, this.session.target.url)
       : { status: "unmatched" };
-    const authenticationRealm = application.status === "matched" ? application.authenticationRealm : run?.authenticationRealm ?? null;
+    const observedAuthenticationRealm = application.status === "matched" ? application.authenticationRealm : run?.authenticationRealm ?? null;
+    if (this.authenticationRealm !== null && this.authenticationRealm !== undefined
+      && !this.environment?.authenticationRealms?.some(realm => realm.realmId === this.authenticationRealm)) {
+      throw new Error("The declared run authentication realm is not present in the verified environment profile.");
+    }
+    const authenticationRealm = this.authenticationRealm ?? observedAuthenticationRealm;
     if (run) {
       if (run.runId !== receipt.runId || environmentId !== run.environmentId
         || targetId !== (run.target?.targetId ?? null)

@@ -205,10 +205,11 @@ test("deterministic ambiguity requests one fresh visual classification but never
   const session = {
     target: { id: "visual-ambiguity-target", endpoint: "local-cdp" },
     attached: true,
+    documentGeneration: 1,
     observer: {
       getEvidence(evidenceId) {
         return {
-          status: "available", evidenceId, targetId: "visual-ambiguity-target", documentGeneration: 2,
+          status: "available", evidenceId, targetId: "visual-ambiguity-target", documentGeneration: 1,
           viewport: { width: 780, height: 437 }, deviceScaleFactor: 1,
           coverage: { screenshot: true }, screenshotBase64
         };
@@ -217,7 +218,7 @@ test("deterministic ambiguity requests one fresh visual classification but never
     async observe(options = {}) {
       if (options.profile === "visual") {
         return {
-          evidenceId: "visual_ambiguity_evidence", targetId: this.target.id, documentGeneration: 2,
+          evidenceId: "visual_ambiguity_evidence", targetId: this.target.id, documentGeneration: 1,
           viewport: { width: 780, height: 437 }, page: { url: "https://shop.example.test/", title: "Shop", readyState: "complete" },
           candidates: [], candidateCount: 0, headings: []
         };
@@ -379,6 +380,7 @@ test("auto mode uses Jev Box grounding for a candidate tie, then re-resolves bef
   const session = {
     target: { id: targetId, endpoint: "local-cdp", url: "https://shop.example.test/" },
     attached: true,
+    documentGeneration: 1,
     observer: {
       getEvidence(evidenceId) {
         return {

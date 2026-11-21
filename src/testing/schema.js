@@ -189,6 +189,22 @@ export function validateWorkflow(workflow, { maxSteps = 128, requireFinalizedOut
       else if (typeof step.action.type !== "string" || !INTERACTION_TYPES.includes(step.action.type)) {
         errors.push(`${prefix}.action.type must be one of: ${INTERACTION_TYPES.join(", ")}.`);
       }
+      const target = step.action?.target;
+      if (target?.nameIn !== undefined && (!Array.isArray(target.nameIn) || target.nameIn.length === 0
+        || target.nameIn.length > 16 || target.nameIn.some(name => typeof name !== "string" || !name.trim() || name.length > 256))) {
+        errors.push(`${prefix}.action.target.nameIn must be a non-empty array of at most 16 exact link labels.`);
+      }
+      if (target?.hrefOrigin !== undefined) {
+        let origin = null;
+        try { origin = new URL(target.hrefOrigin).origin; } catch { /* validation below reports malformed origin */ }
+        if (typeof target.hrefOrigin !== "string" || target.hrefOrigin.length > 512 || origin !== target.hrefOrigin) {
+          errors.push(`${prefix}.action.target.hrefOrigin must be an exact URL origin.`);
+        }
+      }
+      if (target?.hrefPath !== undefined && (typeof target.hrefPath !== "string"
+        || target.hrefPath.length > 2048 || !target.hrefPath.startsWith("/") || target.hrefPath.includes("?") || target.hrefPath.includes("#"))) {
+        errors.push(`${prefix}.action.target.hrefPath must be an exact absolute path without query or fragment.`);
+      }
       if (step.action && Object.hasOwn(step.action, "value") && !isWorkflowValue(step.action.value)) {
         errors.push(`${prefix}.action.value must be a scalar or an explicit scoped variable/step-status reference.`);
       }

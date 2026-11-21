@@ -108,6 +108,35 @@ function sameObservationBinding(before, after, session) {
 
 function isCurrentObservation(session, observation) {
   if (observation?.historical === true) return false;
+  // BrowserSession owns an observation sequence. Once that authoritative
+  // sequence exists, every dispatch must carry the complete publication
+  // binding; omitted metadata is not interpreted as a legacy-compatible pass.
+  if (Number.isSafeInteger(session?.observationGeneration)) {
+    const targetId = session?.target?.id;
+    const generation = session?.documentGeneration;
+    const coherence = observation?.captureCoherence;
+    const start = coherence?.start;
+    const end = coherence?.end;
+    if (typeof targetId !== "string" || !targetId
+      || typeof observation?.evidenceId !== "string" || !observation.evidenceId
+      || observation.targetId !== targetId
+      || !Number.isSafeInteger(generation) || !Number.isSafeInteger(observation.documentGeneration)
+      || observation.documentGeneration !== generation
+      || coherence?.status !== "stable"
+      || !Number.isSafeInteger(observation.observationSequence)
+      || observation.observationSequence !== session.observationGeneration
+      || !start || !end
+      || start.targetId !== targetId || end.targetId !== targetId
+      || start.documentGeneration !== generation || end.documentGeneration !== generation) return false;
+  }
+  if (observation?.captureCoherence?.status
+    && observation.captureCoherence.status !== "stable") return false;
+  if (session?.target?.id && observation?.targetId && observation.targetId !== session.target.id) return false;
+  if (Number.isInteger(observation?.documentGeneration) && Number.isInteger(session?.documentGeneration)
+    && observation.documentGeneration !== session.documentGeneration) return false;
+  const observedMutationCount = observation?.captureCoherence?.end?.totalDomMutationCount;
+  if (Number.isInteger(observedMutationCount) && Number.isInteger(session?.activity?.totalDomMutations)
+    && observedMutationCount !== session.activity.totalDomMutations) return false;
   return !Number.isInteger(observation?.observationSequence)
     || observation.observationSequence === session?.observationGeneration;
 }

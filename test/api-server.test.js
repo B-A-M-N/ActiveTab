@@ -13,7 +13,7 @@ const MOCK_NAVIGATION_RUNNER = {
   async run(goal, { signal, input, templateId } = {}) {
     // Simulate a short navigation task
     await new Promise(resolve => setTimeout(resolve, 50));
-    if (signal?.aborted) return { status: "canceled" };
+    if (signal?.aborted) return { status: "canceled", uncertain: false };
     return {
       status: "succeeded",
       output: { records: [{ id: 1, title: "Mock result for: " + goal }] },
@@ -282,11 +282,10 @@ test("Cancel a run", async () => {
   // Cancel immediately (before mock runner completes)
   const cancelRes = await apiCall("POST", `/v3/bots/runs/${taskId}/cancel`);
   assert.equal(cancelRes.status, 200);
-  assert.equal(cancelRes.body.status, "canceled");
+  assert.ok(["cancel_requested", "canceled"].includes(cancelRes.body.status));
 
-  // Verify status is canceled
-  const statusRes = await apiCall("GET", `/v3/bots/runs/${taskId}/status`);
-  assert.equal(statusRes.body.status, "canceled");
+  // Cancellation is acknowledged only after the worker settles its outcome.
+  assert.equal(await waitForTerminal(baseUrl, taskId), "canceled");
 });
 
 test("Cancel nonexistent task returns 99404", async () => {
@@ -418,7 +417,11 @@ test("canceling a slow run produces canceled, and the worker cannot overwrite it
         release = resolve;
         signal?.addEventListener("abort", () => resolve(), { once: true });
       });
-      return { status: signal?.aborted ? "canceled" : "succeeded", output: { status: signal?.aborted ? "canceled" : "succeeded" } };
+      return {
+        status: signal?.aborted ? "canceled" : "succeeded",
+        uncertain: false,
+        output: { status: signal?.aborted ? "canceled" : "succeeded" }
+      };
     }
   };
   const slowApi = createApiServer({ port: 0, taskStoreDir: join(tempDir, "tasks-slow"), navigationRunner: slowRunner, apiToken: "test-token" });
@@ -508,22 +511,19 @@ test("output endpoint rejects path traversal and non-allowlisted names", async (
   assert.ok([403, 404].includes(res.status));
 });
 
-test("interrupted running tasks remain reconciling after restart", async () => {
+test("persisted running tasks are reconciled on API restart", async () => {
   const dir = join(tempDir, "tasks-reconcile");
   const first = createApiServer({ port: 0, taskStoreDir: dir, navigationRunner: MOCK_NAVIGATION_RUNNER, apiToken: "test-token" });
-  const { url } = await first.start();
-  const create = await fetch(`${url}/v3/bots/templates/local-web-reviews-scraper/runs`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": "Bearer test-token" },
-    body: JSON.stringify({ input: { url: "https://example.com", review_count: 1 } })
-  }).then(r => r.json());
-  // Simulate a crash: stop the server while the run is mid-flight.
-  await new Promise(r => setTimeout(r, 20));
+  await first.start();
+  const task = first.store.create("local-web-reviews-scraper", { url: "https://example.com", review_count: 1 });
+  first.store.update(task.task_id, { status: "running" });
+  await first.store.persist(task.task_id);
+  // Model a task that outlived its worker; shutdown itself is orderly.
   await first.stop();
 
   const second = createApiServer({ port: 0, taskStoreDir: dir, navigationRunner: MOCK_NAVIGATION_RUNNER, apiToken: "test-token" });
   const secondInfo = await second.start();
-  const detail = await fetch(`${secondInfo.url}/v3/bots/runs/${create.task_id}`, { headers: { "Authorization": "Bearer test-token" } }).then(r => r.json());
+  const detail = await fetch(`${secondInfo.url}/v3/bots/runs/${task.task_id}`, { headers: { "Authorization": "Bearer test-token" } }).then(r => r.json());
   assert.equal(detail.status, "reconciling", "a lost worker is not treated as proof of remote failure");
   assert.match(detail.error, /interrupted/);
   await second.stop();

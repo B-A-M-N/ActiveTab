@@ -24,6 +24,10 @@ function stableSelector(target) {
   for (const key of ["role", "name", "tag", "type", "contextName", "text", "label"]) {
     if (typeof target[key] === "string") selector[key] = boundedText(target[key], 512);
   }
+  if (Array.isArray(target.nameIn)) selector.nameIn = target.nameIn.slice(0, 16).filter(value => typeof value === "string").map(value => boundedText(value, 120));
+  if (typeof target.hrefOrigin === "string") {
+    try { selector.hrefOrigin = new URL(target.hrefOrigin).origin; } catch { /* omit malformed selector metadata */ }
+  }
   if (typeof target.href === "string") selector.href = stableUrl(target.href);
   return Object.keys(selector).length ? selector : null;
 }

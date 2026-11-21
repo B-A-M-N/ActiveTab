@@ -11,6 +11,7 @@ import { BrowserSession } from "../src/browser/session.js";
 import { FixtureNavigationEngine as NavigationEngine } from "../test-support/fixtureNavigationEngine.js";
 import { chromeWindowPositionArgs } from "../src/browser/chromeWindowPlacement.js";
 import { mapCandidateBoundsToRoot } from "../src/navigation/visualGrounder.js";
+import { observeStable } from "../test-support/stableObservation.js";
 
 const chromePath = process.env.CHROME_BIN ?? "/usr/bin/google-chrome";
 
@@ -113,7 +114,7 @@ test("native CDP recursively attaches, observes, and controls nested out-of-proc
           : { allowed: false, reason: "Only named, freshly observed OOPIF fixture buttons are allowed." };
       }
     };
-    const observation = await session.observe();
+    const observation = await observeStable(session);
     const frameRuntime = await session.observer.inspectRuntimeState(observation.evidenceId, { path: ["__activetabFrameState__", "frameLabel"], frameTargetId: childFrameSession.targetId });
     assert.equal(frameRuntime.status, "available", JSON.stringify(frameRuntime));
     assert.equal(frameRuntime.result.selected.valueRedacted, true, "runtime inspection can target an attached OOPIF while redacting values by default");
@@ -128,11 +129,16 @@ test("native CDP recursively attaches, observes, and controls nested out-of-proc
       `each attached OOPIF includes observed owner geometry for root-coordinate visual mapping: ${JSON.stringify(observation.outOfProcessFrameGeometry)}`);
     const rootScroll = await session.client.send("Runtime.evaluate", { expression: "window.scrollTo(0,650);scrollY", returnByValue: true });
     assert.equal(rootScroll.result?.value, 650, "the parent fixture is scrolled so hit testing must translate root viewport coordinates");
-    const visualObservation = await session.observe({ profile: "visual" });
+    const visualObservation = await observeStable(session, { profile: "visual" });
     for (const [name, depth] of [["Open OOPIF preferences", 1], ["Open nested preferences", 2]]) {
       const visualCandidate = visualObservation.candidates.find(item => item.name === name);
       const rootBounds = mapCandidateBoundsToRoot(visualCandidate, visualObservation);
-      assert.ok(rootBounds, `${name} has geometry within every ancestor viewport: ${JSON.stringify({ candidate: visualCandidate?.bounds, frames: visualObservation.outOfProcessFrameGeometry })}`);
+      assert.ok(rootBounds, `${name} has geometry within every ancestor viewport: ${JSON.stringify({
+        captureCoherence: visualObservation.captureCoherence,
+        viewport: visualObservation.viewport,
+        candidate: visualCandidate?.bounds,
+        frames: visualObservation.outOfProcessFrameGeometry
+      })}`);
       const hit = await session.probeVisualCandidateAtPoint(visualObservation.evidenceId, {
         x: Math.round(rootBounds.x + rootBounds.width / 2),
         y: Math.round(rootBounds.y + rootBounds.height / 2)

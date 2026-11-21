@@ -112,6 +112,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
 
   function closeOwnedResources() {
     resourceClosePromise ??= Promise.resolve().then(() => {
+      store.close();
       decisionRuntime?.close();
       if (ownsEvidenceReleaseStore) evidenceReleaseStore?.close();
       if (ownsRunStateStore) runStateStore.close();
@@ -277,7 +278,7 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
         ...(requestOrigin ? { "Access-Control-Allow-Origin": requestOrigin } : {}),
         "Vary": "Origin",
         "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-ActiveTab-Operator-Token"
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, Idempotency-Key, X-ActiveTab-Operator-Token"
       });
       res.end();
       return;
@@ -378,19 +379,24 @@ export function createApiServer({ port = DEFAULT_PORT, taskStoreDir, discoveryKn
     server,
     store,
     async start() {
-      await store.init();
-      await ensureRunStateStore();
-      await ensureInterventionStoreReady();
-      return new Promise((resolvePromise, reject) => {
-        server.listen(port, host, () => {
-          const address = server.address();
-          const boundHost = address.address === "::" ? "[::1]" : String(address.address);
-          const url = `http://${boundHost}:${address.port}`;
-          console.log(`ActiveTab local API server listening on ${url}`);
-          resolvePromise({ port: address.port, url });
+      try {
+        await store.init();
+        await ensureRunStateStore();
+        await ensureInterventionStoreReady();
+        return await new Promise((resolvePromise, reject) => {
+          server.listen(port, host, () => {
+            const address = server.address();
+            const boundHost = address.address === "::" ? "[::1]" : String(address.address);
+            const url = `http://${boundHost}:${address.port}`;
+            console.log(`ActiveTab local API server listening on ${url}`);
+            resolvePromise({ port: address.port, url });
+          });
+          server.once("error", reject);
         });
-        server.on("error", reject);
-      });
+      } catch (error) {
+        await closeOwnedResources();
+        throw error;
+      }
     },
     async stop() { return await shutdownCoordinator.stop(); }
   };

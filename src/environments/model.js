@@ -82,6 +82,9 @@ export function buildEnvironmentBinding(profile = {}) {
       applicationId: String(app.application_id ?? ""),
       authenticationRealm: app.authentication_realm ?? null,
       candidateEntry: app.candidate_entry ?? null,
+      ...(Array.isArray(app.entry_link_labels)
+        ? { entryLinkLabels: Object.freeze([...new Set(app.entry_link_labels.filter(label => typeof label === "string" && label.trim()).map(label => label.trim()))]) }
+        : {}),
       status: app.status ?? "candidate",
       ...(app.final_origin ? { finalOrigin: app.final_origin } : {}),
       ...(workflowOperations ? { workflowOperations } : {})

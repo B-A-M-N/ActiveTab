@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { projectExtractionOutput, projectExtractionOutputs } from "../../extraction/outputRelease.js";
 
 /** Compose compatibility run creation and peer execution from server-owned services. */
@@ -20,6 +21,8 @@ export function createRunExecutionHandlers({
   sendError,
   logger
 } = {}) {
+  const peerRunsInFlight = new Map();
+
   function createTask(templateId, input, botId, inputSchema, res) {
     try { return store.create(templateId, input, botId, inputSchema); }
     catch (error) {
@@ -156,61 +159,149 @@ export function createRunExecutionHandlers({
       sendError(res, 400, 99001, "A non-empty goal of at most 2000 characters is required.");
       return;
     }
-    if (store.tasks.size >= maxTaskRecords) {
-      sendError(res, 507, 99507, `Task storage is full (${maxTaskRecords} records).`);
+    const idempotencyKey = req.headers?.["idempotency-key"];
+    if (typeof idempotencyKey !== "string" || !/^[\x21-\x7e]{1,128}$/.test(idempotencyKey)) {
+      sendError(res, 400, 99001, "A stable Idempotency-Key header of 1 to 128 visible ASCII characters is required.");
       return;
     }
-    const task = createTask("remote-peer-run", {}, null, undefined, res);
-    if (!task) return;
-    store.update(task.task_id, { status: "running" });
-    await store.persist(task.task_id);
-    if (isShuttingDown()) {
-      await recordSchedulingFailure(task.task_id, "canceled during shutdown", res, {
-        status: 503, code: 99503,
-        message: "The API server is shutting down; this run was recorded as failed before scheduling."
+    const input = (body.input && typeof body.input === "object" && !Array.isArray(body.input)) ? body.input : {};
+    let reservation;
+    try {
+      reservation = store.reservePeerTask({
+        // The current peer-token ring represents one shared peer principal.
+        // Token rotation does not change this principal or its key namespace.
+        principalId: "shared-peer-token",
+        idempotencyKey,
+        fingerprint: fingerprintPeerRequest({
+          goal: body.goal,
+          input,
+          plannerMode: body.plannerMode,
+          workflowIntent: body.workflowIntent
+        }),
+        input
       });
+    } catch (error) {
+      if (error?.code === "TASK_STORE_FULL") {
+        sendError(res, 507, 99507, `Task storage is full (${maxTaskRecords} records).`);
+        return;
+      }
+      if (error?.code === "TASK_STORE_IDEMPOTENCY_CONFLICT") {
+        sendError(res, 409, 99409, "Idempotency-Key was already used for a different peer request.");
+        return;
+      }
+      logger.error("run.peer.reservation.failed", { reason: String(error?.message ?? error).slice(0, 160) });
+      sendError(res, 503, 99503, "Peer run reservation could not be confirmed; no run was scheduled.");
       return;
     }
-    diagnostics.bump("runs.peer");
-    logger.info("run.peer.created", { task: task.task_id });
 
-    let started;
+    let inFlight = null;
+    if (reservation.created) {
+      let signalStarted;
+      inFlight = { worker: null, started: new Promise(resolve => { signalStarted = resolve; }), signalStarted: null };
+      inFlight.signalStarted = signalStarted;
+      peerRunsInFlight.set(reservation.taskId, inFlight);
+    }
+
     try {
-      started = lifecycle.start(task.task_id, ctrl => lifecycle.navigationRunner.run(body.goal, {
-        signal: ctrl.signal,
-        input: (body.input && typeof body.input === "object" && !Array.isArray(body.input)) ? body.input : {},
-        templateId: "remote-peer-run",
-        taskId: task.task_id,
-        plannerMode: body.plannerMode,
-        workflowIntent: body.workflowIntent,
-        runStateStore
-      }));
-    } catch {
-      await recordSchedulingFailure(task.task_id, "scheduling", res);
+      await reservation.persisted;
+    } catch (error) {
+      logger.error("run.peer.reservation.persist.failed", { task: reservation.taskId, reason: String(error?.message ?? error).slice(0, 160) });
+      if (inFlight && peerRunsInFlight.get(reservation.taskId) === inFlight) {
+        inFlight.signalStarted();
+        peerRunsInFlight.delete(reservation.taskId);
+      }
+      sendError(res, 503, 99503, "Peer run reservation could not be confirmed; no run was scheduled.");
       return;
     }
-    const { worker } = started;
 
-    // Await-style peer response: heartbeats keep the socket responsive on
-    // slow runs; the remote executor tolerates the leading blank lines.
-    const heartbeat = setInterval(() => { try { res.write?.("\n"); } catch { /* socket gone */ } }, 15_000);
-    try {
-      await worker;
-    } finally {
-      clearInterval(heartbeat);
+    if (reservation.created) {
+      try {
+        if (isShuttingDown()) {
+          await recordSchedulingFailure(reservation.taskId, "canceled during shutdown", res, {
+            status: 503, code: 99503,
+            message: "The API server is shutting down; this run was recorded as failed before scheduling."
+          });
+          return;
+        }
+        diagnostics.bump("runs.peer");
+        logger.info("run.peer.created", { task: reservation.taskId });
+        const started = lifecycle.start(reservation.taskId, ctrl => lifecycle.navigationRunner.run(body.goal, {
+          signal: ctrl.signal,
+          input,
+          templateId: "remote-peer-run",
+          taskId: reservation.taskId,
+          plannerMode: body.plannerMode,
+          workflowIntent: body.workflowIntent,
+          runStateStore
+        }));
+        inFlight.worker = started.worker;
+      } catch {
+        await recordSchedulingFailure(reservation.taskId, "scheduling", res);
+      } finally {
+        inFlight.signalStarted();
+      }
     }
-    const finished = store.get(task.task_id);
-    sendJson(res, 200, {
-      status: finished.status === "finished" ? "succeeded" : finished.status,
-      output: finished.output ?? null,
-      usage: finished.usage ?? null,
-      output_files: finished.output_files ?? {},
-      task_id: task.task_id,
-      ...(finished.error ? { error: finished.error } : {})
-    });
+
+    const activeRun = reservation.created ? inFlight : peerRunsInFlight.get(reservation.taskId);
+    if (activeRun) {
+      const heartbeat = setInterval(() => { try { res.write?.("\n"); } catch { /* socket gone */ } }, 15_000);
+      try {
+        await activeRun.started;
+        if (activeRun.worker) await activeRun.worker;
+      } finally {
+        clearInterval(heartbeat);
+        if (reservation.created && peerRunsInFlight.get(reservation.taskId) === activeRun) {
+          peerRunsInFlight.delete(reservation.taskId);
+        }
+      }
+    } else {
+      const existing = store.get(reservation.taskId);
+      if (existing && ["created", "queued", "running"].includes(existing.status)) {
+        store.update(reservation.taskId, {
+          status: "reconciling",
+          error: "A matching peer request has no live worker; its original outcome must be reconciled before any retry."
+        });
+        await store.persist(reservation.taskId);
+      }
+    }
+    const finished = store.get(reservation.taskId);
+    sendPeerTaskResult(res, finished, reservation.taskId, sendJson);
   }
 
   return Object.freeze({ handleCreateRun, handlePeerRun });
+}
+
+function fingerprintPeerRequest(request) {
+  const canonicalize = value => {
+    if (Array.isArray(value)) return value.map(canonicalize);
+    if (!value || typeof value !== "object") return value;
+    return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalize(value[key])]));
+  };
+  return createHash("sha256").update(JSON.stringify(canonicalize(request))).digest("hex");
+}
+
+function sendPeerTaskResult(res, task, taskId, sendJson) {
+  if (!task) {
+    sendJson(res, 200, {
+      status: "unresolved",
+      output: null,
+      usage: null,
+      output_files: {},
+      task_id: taskId,
+      error: "The reserved peer task is unavailable; its outcome must be reconciled before retry.",
+      uncertain: true
+    });
+    return;
+  }
+  sendJson(res, 200, {
+    status: task.status === "finished" ? "succeeded" : task.status === "reconciling" ? "unresolved" : task.status,
+    output: task.output ?? null,
+    usage: task.usage ?? null,
+    output_files: task.output_files ?? {},
+    task_id: task.task_id,
+    uncertain: task.status === "reconciling" || task.output?.uncertain === true,
+    ...(task.error ? { error: task.error } : {})
+  });
 }
 
 function isJsonObject(value) {

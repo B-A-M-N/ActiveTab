@@ -143,14 +143,65 @@ export function discoverVisibleDiagnosticSurfaces(observation, environment) {
 
 /** Return a profile identity hint. This URL is never used as a navigation target. */
 export function resolveCloudAgentEntry(environment) {
-  const app = (environment?.applications ?? []).find(item => item.applicationId === "fi-agents");
+  return resolveApplicationEntry(environment, "fi-agents");
+}
+
+function resolveApplicationEntry(environment, applicationId) {
+  const app = (environment?.applications ?? []).find(item => item.applicationId === applicationId);
   if (!app?.candidateEntry) return null;
   let url;
   try { url = new URL(app.candidateEntry, environment.applicationEntryUrl); }
-  catch { throw new Error("The profile's Cloud Agent entry is not a valid URL."); }
+  catch { throw new Error(`The profile's '${applicationId}' entry is not a valid URL.`); }
   const identity = verifyObservedUrl(environment, url.href);
-  if (!identity.ok) throw new Error(`The profile's Cloud Agent entry is not authorized: ${identity.reason}`);
-  return { url: url.href, origin: url.origin, applicationId: app.applicationId, authenticationRealm: app.authenticationRealm ?? "agents-session" };
+  if (!identity.ok) throw new Error(`The profile's '${applicationId}' entry is not authorized: ${identity.reason}`);
+  return {
+    url: url.href,
+    origin: url.origin,
+    pathname: url.pathname,
+    applicationId: app.applicationId,
+    authenticationRealm: app.authenticationRealm ?? null,
+    linkLabels: [...(app.entryLinkLabels ?? [])]
+  };
+}
+
+function visibleEntryLink(observation, entry) {
+  if (!entry?.linkLabels?.length || !observation?.page?.url) return null;
+  const labels = new Set(entry.linkLabels.map(label => compactLabel(label).toLocaleLowerCase()));
+  const matches = (observation.candidates ?? []).filter(candidate => {
+    if (candidate.visible !== true || candidate.disabled === true || String(candidate.role).toLowerCase() !== "link" || !candidate.href) return false;
+    if (!labels.has(compactLabel(candidate.name).toLocaleLowerCase())) return false;
+    try {
+      const href = new URL(candidate.href, candidate.documentUrl ?? observation.page.url);
+      return href.protocol === "https:" && href.origin === entry.origin && href.pathname === entry.pathname;
+    } catch { return false; }
+  });
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function visibleEntryLinkStep(id, goal, entry, { matchOriginOnly = false } = {}) {
+  const expectedPattern = matchOriginOnly
+    ? `^${escapeRegExp(entry.origin)}(?:[/?#]|$)`
+    : `^${escapeRegExp(entry.origin)}${escapeRegExp(entry.pathname)}(?:[?#].*)?$`;
+  return {
+    type: "interact",
+    id,
+    goal,
+    action: {
+      type: "click",
+      target: {
+        nameIn: entry.linkLabels,
+        role: "link",
+        hrefOrigin: entry.origin,
+        hrefPath: entry.pathname,
+        visible: true
+      },
+      postcondition: { type: "url_matches", pattern: expectedPattern }
+    }
+  };
 }
 
 /** The actual Agent destination must be reached through the staging UI. */
@@ -187,23 +238,45 @@ export function hasCloudAgentTaskComposer(observation) {
 }
 
 /** Build a workflow that follows visible UI navigation and never auto-navigates to candidate_entry. */
-export function createCloudAgentEntryWorkflow(environment, observation, { forceEntryStep = false } = {}) {
+export function createCloudAgentEntryWorkflow(environment, observation, { forceEntryStep = false, authRequired = false } = {}) {
   const agentEntry = resolveCloudAgentEntry(environment);
   if (!agentEntry) return null;
   const alreadyAtComposer = verifyCloudAgentReady(observation, environment, agentEntry.origin).ok;
   const steps = [];
   if (!alreadyAtComposer || forceEntryStep) {
-    steps.push({
-      type: "goal",
-      id: "follow-visible-agents-route",
-      goal: "Follow the visible Cloud Agents link from the current FreeInference staging page, complete the visible Agent login link if required, and reach the Cloud Agent task composer",
-      intervention: {
-        type: "authentication",
-        realm: agentEntry.authenticationRealm,
-        requiredAction: "In the open browser, finish the current login if needed, return to the staging page, click its visible Cloud Agents link, then click the Agent page's visible login link. Stop when the Cloud Agent task composer is visible.",
-        condition: { type: "authenticated_session_check", realm: agentEntry.authenticationRealm }
+    const currentUrl = (() => { try { return new URL(observation?.page?.url); } catch { return null; } })();
+    const dashboardEntry = resolveApplicationEntry(environment, "fi-dashboard");
+    if (authRequired || currentUrl?.origin === agentEntry.origin) {
+      steps.push({
+        type: "goal",
+        id: "follow-visible-agents-route",
+        goal: "Complete the visible Agent login link if required, then stop when the Cloud Agent task composer is visible",
+        intervention: {
+          type: "authentication",
+          realm: agentEntry.authenticationRealm,
+          requiredAction: "In the open browser, complete the visible Agent login flow if one is shown. Stop when the Cloud Agent task composer is visible.",
+          condition: { type: "authenticated_session_check", realm: agentEntry.authenticationRealm }
+        }
+      });
+    } else {
+      const hasVisibleAgentsLink = visibleEntryLink(observation, agentEntry) !== null;
+      const atDashboard = dashboardEntry && currentUrl?.origin === dashboardEntry.origin
+        && currentUrl.pathname === dashboardEntry.pathname;
+      const mayFollowDashboardEntry = dashboardEntry && currentUrl?.origin === dashboardEntry.origin;
+      if (!hasVisibleAgentsLink && mayFollowDashboardEntry && !atDashboard) {
+        steps.push(visibleEntryLinkStep(
+          "follow-visible-dashboard-link",
+          "Follow the currently visible Dashboard link on FreeInference staging",
+          dashboardEntry
+        ));
       }
-    });
+      steps.push(visibleEntryLinkStep(
+        "follow-visible-agents-link",
+        "Follow the currently visible Agents link from FreeInference staging",
+        agentEntry,
+        { matchOriginOnly: true }
+      ));
+    }
   }
   steps.push({
     id: "verify-task-composer",

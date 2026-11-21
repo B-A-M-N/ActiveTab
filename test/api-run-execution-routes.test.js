@@ -29,6 +29,12 @@ function createHarness({ executorReady = true, body = { input: { url: "https://e
         taskRecords.set(task.task_id, task);
         return task;
       },
+      reservePeerTask: () => {
+        calls.push(["reservePeerTask"]);
+        if (taskRecords.size >= maxTaskRecords) throw Object.assign(new Error("full"), { code: "TASK_STORE_FULL" });
+        taskRecords.set(task.task_id, task);
+        return { created: true, task, taskId: task.task_id, persisted: Promise.resolve() };
+      },
       update: (taskId, updates) => { calls.push(["update", taskId, updates]); Object.assign(task, updates); },
       persist: async (...args) => { calls.push(["persist", ...args]); },
       get: (...args) => { calls.push(["get", ...args]); return { status: "finished", output: {} }; }
@@ -103,6 +109,15 @@ test("peer execution rejects non-object JSON bodies and missing goal with 400 be
     assert.equal(harness.responses[0].status, 400, `body ${JSON.stringify(body)}`);
     assert.equal(harness.calls.some(call => call[0] === "create" || call[0] === "persist"), false, `body ${JSON.stringify(body)}`);
   }
+
+  for (const key of [undefined, "", "x".repeat(129), "clé"]) {
+    const harness = createHarness({ body: { goal: "open the page" } });
+    const headers = { authorization: "Bearer route-test-peer-token" };
+    if (key !== undefined) headers["idempotency-key"] = key;
+    await harness.handlePeerRun({ headers }, {});
+    assert.equal(harness.responses[0].status, 400, `key ${JSON.stringify(key)}`);
+    assert.equal(harness.calls.some(call => call[0] === "reservePeerTask" || call[0] === "start"), false);
+  }
 });
 
 test("peer execution enforces task capacity after authenticating and validating the request", async t => {
@@ -122,7 +137,7 @@ test("peer execution enforces task capacity after authenticating and validating 
   });
   const harness = createHarness({ body: { goal: "open the page" }, maxTaskRecords: 1, initialTaskCount: 1 });
 
-  await harness.handlePeerRun({ headers: { authorization: "Bearer route-test-peer-token" } }, {});
+  await harness.handlePeerRun({ headers: { authorization: "Bearer route-test-peer-token", "idempotency-key": "stable-peer-run-1" } }, {});
 
   assert.deepEqual(harness.responses, [{ status: 507, code: 99507, message: "Task storage is full (1 records)." }]);
   assert.equal(harness.calls.some(call => call[0] === "create" || call[0] === "start"), false);

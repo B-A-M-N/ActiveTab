@@ -146,6 +146,24 @@ test("application workflow operation IDs are explicit, bounded, and immutable pr
   }), /invalid 'fill' workflow operation ID/u);
 });
 
+test("profile entry-link labels are copied into immutable application bindings", () => {
+  const binding = buildEnvironmentBinding({
+    profile_id: "entry-links",
+    environment: {
+      environment_id: "entry-links",
+      application_entry_url: "https://staging.example.org",
+      applications: [{
+        application_id: "agents",
+        authentication_realm: "agents-session",
+        candidate_entry: "https://agents-staging.example.org/",
+        entry_link_labels: ["Agents", "Cloud Agents", "Agents"]
+      }]
+    }
+  });
+  assert.deepEqual(binding.applications[0].entryLinkLabels, ["Agents", "Cloud Agents"]);
+  assert.equal(Object.isFrozen(binding.applications[0].entryLinkLabels), true);
+});
+
 test("staging profiles bind to the real FreeInference website with distinct realms", async () => {
   for (const profileId of ["freeinference-staging", "cloud-agent-staging"]) {
     const binding = await loadEnvironmentBinding(profilesDir, profileId);

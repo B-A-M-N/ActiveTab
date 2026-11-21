@@ -15,15 +15,29 @@
     "authorized_origins": ["https://staging.freeinference.org", "https://agents-staging.freeinference.org"],
     "applications": [
       {
+        "application_id": "fi-dashboard",
+        "authentication_realm": "fi-session",
+        "candidate_entry": "/dashboard",
+        "entry_link_labels": ["Dashboard"],
+        "status": "candidate"
+      },
+      {
         "application_id": "fi-agents",
         "authentication_realm": "agents-session",
         "candidate_entry": "https://agents-staging.freeinference.org/",
+        "entry_link_labels": ["Agents", "Cloud Agents"],
         "status": "candidate"
       }
     ]
   },
   "origin_patterns": ["https://staging.freeinference.org", "https://agents-staging.freeinference.org"],
   "authentication_realms": [
+    {
+      "realm_id": "fi-session",
+      "description": "FreeInference dashboard session used only to follow the visible staging UI entry link.",
+      "scope": ["dashboard"],
+      "separate_credentials": false
+    },
     {
       "realm_id": "agents-session",
       "description": "Agents/Cloud Agent application session. Distinct from the FreeInference dashboard session: verify it independently and never copy dashboard credentials or tokens into this realm.",
@@ -113,5 +127,6 @@
       "allowOnlyVisibleAdminLinks": true
     }
   },
+  "test_workspace_grants": [],
   "test_packs": []
 }

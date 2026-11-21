@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
 import { validateWorkflow } from "../../testing/schema.js";
+import { canonicalInputHash } from "../../runtime/approvals.js";
 
 export const CLOUD_AGENT_TASK_ROLES = Object.freeze({
+  REPOSITORY_SELECTOR: "cloud_agent_repository_selector",
+  REF_SELECTOR: "cloud_agent_ref_selector",
+  RUNTIME_SELECTOR: "cloud_agent_runtime_selector",
   MODEL_SELECTOR: "cloud_agent_model_selector",
   TASK_PROMPT: "cloud_agent_task_prompt",
   SUBMIT_TASK: "cloud_agent_submit_task"
@@ -113,26 +117,93 @@ function validateProfile(profile) {
   return { environmentId: environment.environment_id, agentOrigin };
 }
 
-function validateTaskRequest(request, environmentId) {
+const REQUEST_KEYS = new Set([
+  "version", "requestId", "environmentId", "repository", "runtimeId", "modelId", "prompt",
+  "options", "effectGrantId", "expectedOutcome", "diagnosticSources", "cleanupPolicyId"
+]);
+
+function exactKeys(value, keys, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).some(key => !keys.has(key))
+    || [...keys].some(key => !Object.hasOwn(value, key))) {
+    throw new Error(`${label} must contain exactly the supported fields; unknown or omitted fields are not accepted.`);
+  }
+}
+
+function boundedIdentifier(value, label, maxLength = 256) {
+  return requiredText(value, label, maxLength);
+}
+
+function validateOptionIds(value, label) {
+  if (!Array.isArray(value) || value.length > 50) throw new Error(`${label} must be an explicit array with at most 50 supported identifiers.`);
+  const normalized = value.map((item, index) => boundedIdentifier(item, `${label}[${index}]`, 128));
+  if (new Set(normalized).size !== normalized.length) throw new Error(`${label} must not contain duplicate identifiers.`);
+  return normalized;
+}
+
+/** Validate and fingerprint every field that can define a staging Agent job. */
+export function validateCloudAgentTaskRequest(request, profile) {
   if (!request || typeof request !== "object" || Array.isArray(request)) throw new Error("A typed Cloud Agent task request is required.");
+  exactKeys(request, REQUEST_KEYS, "Cloud Agent request v2");
+  if (request.version !== 2) throw new Error("Cloud Agent request version 2 is required.");
+  const environmentId = profile?.environment?.environment_id;
+  if (request.environmentId !== environmentId || environmentId !== "freeinference-staging") throw new Error("Task request environment does not match the Cloud Agent staging profile.");
   const requestId = requiredText(request.requestId, "requestId", 128);
-  if (request.environmentId !== environmentId) throw new Error("Task request environment does not match the Cloud Agent staging profile.");
+  const repositoryInput = request.repository;
+  exactKeys(repositoryInput, new Set(["provider", "repositoryId", "baseRef", "expectedCommit"]), "repository");
+  if (repositoryInput.provider !== "github") throw new Error("Only the reviewed GitHub repository provider is supported.");
+  const repository = {
+    provider: "github",
+    repositoryId: boundedIdentifier(repositoryInput.repositoryId, "repository.repositoryId"),
+    baseRef: boundedIdentifier(repositoryInput.baseRef, "repository.baseRef", 256),
+    expectedCommit: repositoryInput.expectedCommit === null
+      ? null : boundedIdentifier(repositoryInput.expectedCommit, "repository.expectedCommit", 128)
+  };
+  const workspaceGrants = profile?.test_workspace_grants;
+  const repositoryAuthorized = Array.isArray(workspaceGrants) && workspaceGrants.some(grant =>
+    grant?.provider === repository.provider
+      && Array.isArray(grant.repository_ids) && grant.repository_ids.includes(repository.repositoryId)
+      && Array.isArray(grant.base_refs) && grant.base_refs.includes(repository.baseRef));
+  if (!repositoryAuthorized) throw new Error("Requested repository and base ref are outside the profile's trusted test-workspace grants.");
+  const runtimeId = boundedIdentifier(request.runtimeId, "runtimeId", 256);
   const modelId = requiredText(request.modelId, "modelId", 500);
   const prompt = requiredText(request.prompt, "prompt", 2000);
+  const optionsInput = request.options;
+  exactKeys(optionsInput, new Set(["reasoning", "skills", "plugins", "mcpServers", "attachments"]), "options");
+  const reasoning = optionsInput.reasoning === null ? null : boundedIdentifier(optionsInput.reasoning, "options.reasoning", 128);
+  const options = {
+    reasoning,
+    skills: validateOptionIds(optionsInput.skills, "options.skills"),
+    plugins: validateOptionIds(optionsInput.plugins, "options.plugins"),
+    mcpServers: validateOptionIds(optionsInput.mcpServers, "options.mcpServers"),
+    attachments: validateOptionIds(optionsInput.attachments, "options.attachments")
+  };
+  // These selections have no independently reviewed composer binding yet. Refuse
+  // them explicitly until the deployed control and identifier contract is verified.
+  if (options.skills.length || options.plugins.length || options.mcpServers.length || options.attachments.length) {
+    throw new Error("Requested skills, plugins, MCP servers, or attachments are not supported by the reviewed staging composer contract.");
+  }
+  if (reasoning !== null) throw new Error("Reasoning selection is not supported by the reviewed staging composer contract.");
+  const effectGrantId = boundedIdentifier(request.effectGrantId, "effectGrantId", 128);
+  const cleanupPolicyId = boundedIdentifier(request.cleanupPolicyId, "cleanupPolicyId", 128);
   const expectedOutcome = validateExpectedOutcome(request.expectedOutcome);
   assertBoundedJson(expectedOutcome, "expectedOutcome");
-  const diagnosticSources = request.diagnosticSources ?? ["cloud-agent-runs", "cloud-agent-steps", "cloud-agent-usage"];
+  const diagnosticSources = request.diagnosticSources;
   if (!Array.isArray(diagnosticSources) || diagnosticSources.length > 6 || diagnosticSources.some(source => !ALLOWED_DIAGNOSTIC_SOURCES.has(source))) {
     throw new Error("Diagnostic source requests must use the bounded Cloud Agent run evidence allowlist.");
   }
-  return {
-    requestId,
-    environmentId,
-    modelId,
-    prompt,
-    expectedOutcome,
-    diagnosticSources: [...new Set(diagnosticSources)]
+  const normalized = {
+    version: 2, requestId, environmentId, repository, runtimeId, modelId, prompt, options,
+    effectGrantId, expectedOutcome, diagnosticSources: [...new Set(diagnosticSources)], cleanupPolicyId
   };
+  return Object.freeze({ ...normalized, requestHash: canonicalInputHash(normalized) });
+}
+
+function validateTaskRequest(request, profile) {
+  const environmentId = profile.environment.environment_id;
+  if (!request || typeof request !== "object" || Array.isArray(request)) throw new Error("A typed Cloud Agent task request is required.");
+  const normalized = validateCloudAgentTaskRequest(request, profile);
+  return { ...normalized, environmentId };
 }
 
 /**
@@ -147,11 +218,17 @@ function validateTaskRequest(request, environmentId) {
  */
 export function createCloudAgentTaskPlan({ profile, request, observation, mapping } = {}) {
   const { environmentId, agentOrigin } = validateProfile(profile);
-  const task = validateTaskRequest(request, environmentId);
+  const task = validateTaskRequest(request, profile);
   if (!observation?.evidenceId || !observation?.targetId || !observation?.page?.url) throw new Error("A fresh, target-bound browser observation is required to compile the Cloud Agent task.");
   const observedOrigin = originOf(observation.page.url);
   if (observedOrigin !== agentOrigin) throw new Error("The observed browser page is not on the profile-declared Cloud Agent application origin.");
 
+  const repositoryCandidate = resolveMappedCandidate(observation, mapping, CLOUD_AGENT_TASK_ROLES.REPOSITORY_SELECTOR,
+    candidate => candidate.tag === "select" || String(candidate.role ?? "").toLowerCase() === "combobox");
+  const refCandidate = resolveMappedCandidate(observation, mapping, CLOUD_AGENT_TASK_ROLES.REF_SELECTOR,
+    candidate => candidate.tag === "select" || String(candidate.role ?? "").toLowerCase() === "combobox");
+  const runtimeCandidate = resolveMappedCandidate(observation, mapping, CLOUD_AGENT_TASK_ROLES.RUNTIME_SELECTOR,
+    candidate => candidate.tag === "select" || String(candidate.role ?? "").toLowerCase() === "combobox");
   const modelCandidate = resolveMappedCandidate(observation, mapping, CLOUD_AGENT_TASK_ROLES.MODEL_SELECTOR,
     candidate => candidate.tag === "select" || String(candidate.role ?? "").toLowerCase() === "combobox");
   const promptCandidate = resolveMappedCandidate(observation, mapping, CLOUD_AGENT_TASK_ROLES.TASK_PROMPT,
@@ -173,7 +250,7 @@ export function createCloudAgentTaskPlan({ profile, request, observation, mappin
   if (!sameForm && !semanticSubmitMapping) {
     throw new Error("The task prompt and submit control require a shared observed form or a high-confidence fresh semantic mapping.");
   }
-  for (const candidate of [modelCandidate, promptCandidate, submitCandidate]) {
+  for (const candidate of [repositoryCandidate, refCandidate, runtimeCandidate, modelCandidate, promptCandidate, submitCandidate]) {
     if (candidate.targetId !== observation.targetId) throw new Error("All Cloud Agent controls must belong to the exact observed browser target.");
   }
 
@@ -182,6 +259,21 @@ export function createCloudAgentTaskPlan({ profile, request, observation, mappin
     id: workflowId,
     name: "Caller-directed FreeInference Cloud Agent task",
     steps: [
+      {
+        id: "select-requested-repository",
+        type: "interact",
+        action: { type: "select", operationId: "freeinference.cloud_agent.select_repository", target: { identity: repositoryCandidate.identity }, value: task.repository.repositoryId, verifyValue: true }
+      },
+      {
+        id: "select-requested-base-ref",
+        type: "interact",
+        action: { type: "select", operationId: "freeinference.cloud_agent.select_ref", target: { identity: refCandidate.identity }, value: task.repository.baseRef, verifyValue: true }
+      },
+      {
+        id: "select-requested-runtime",
+        type: "interact",
+        action: { type: "select", operationId: "freeinference.cloud_agent.select_runtime", target: { identity: runtimeCandidate.identity }, value: task.runtimeId, verifyValue: true }
+      },
       {
         id: "select-requested-model",
         type: "interact",
@@ -219,6 +311,9 @@ export function createCloudAgentTaskPlan({ profile, request, observation, mappin
   if (!validation.valid) throw new Error(`Compiled Cloud Agent workflow is invalid: ${validation.errors.join(" ")}`);
 
   const expectedOperations = [
+    { id: "freeinference.cloud_agent.select_repository", action: "select", identity: repositoryCandidate.identity, value: task.repository.repositoryId, targetRole: CLOUD_AGENT_TASK_ROLES.REPOSITORY_SELECTOR },
+    { id: "freeinference.cloud_agent.select_ref", action: "select", identity: refCandidate.identity, value: task.repository.baseRef, targetRole: CLOUD_AGENT_TASK_ROLES.REF_SELECTOR },
+    { id: "freeinference.cloud_agent.select_runtime", action: "select", identity: runtimeCandidate.identity, value: task.runtimeId, targetRole: CLOUD_AGENT_TASK_ROLES.RUNTIME_SELECTOR },
     { id: OPERATION_IDS.selectModel, action: "select", identity: modelCandidate.identity, value: task.modelId, targetRole: CLOUD_AGENT_TASK_ROLES.MODEL_SELECTOR },
     { id: OPERATION_IDS.enterPrompt, action: "fill", identity: promptCandidate.identity, value: task.prompt, targetRole: CLOUD_AGENT_TASK_ROLES.TASK_PROMPT },
     { id: OPERATION_IDS.submitTask, action: "click", identity: submitCandidate.identity, targetRole: CLOUD_AGENT_TASK_ROLES.SUBMIT_TASK }
@@ -255,7 +350,7 @@ export function createCloudAgentTaskPlan({ profile, request, observation, mappin
       }
       if (Object.hasOwn(expected, "value") && value !== expected.value) return { allowed: false, reason: "Operation input differs from the caller's exact typed task request." };
       if (action === "select" && candidate?.tag !== "select" && String(candidate?.role ?? "").toLowerCase() !== "combobox") {
-        return { allowed: false, reason: "Model selection requires a freshly observed native selector or ARIA combobox." };
+        return { allowed: false, reason: "Cloud Agent job selection requires a freshly observed native selector or ARIA combobox." };
       }
       const editableText = candidate?.contentEditable === true
         && ["textbox", "searchbox"].includes(String(candidate?.role ?? "").toLowerCase());
@@ -279,6 +374,12 @@ export function createCloudAgentTaskPlan({ profile, request, observation, mappin
     workflow,
     operationAuthorizer,
     requestId: task.requestId,
+    requestHash: task.requestHash,
+    repository: task.repository,
+    runtimeId: task.runtimeId,
+    modelId: task.modelId,
+    effectGrantId: task.effectGrantId,
+    cleanupPolicyId: task.cleanupPolicyId,
     observationId: observation.evidenceId,
     expectedOutcome: task.expectedOutcome,
     diagnosticSources: task.diagnosticSources,

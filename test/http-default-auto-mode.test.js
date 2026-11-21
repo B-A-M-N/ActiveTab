@@ -74,7 +74,11 @@ test("HTTP peer run defaults to guarded auto-mode extraction and preserves input
     const { url } = await api.start();
     const response = await fetch(`${url}/v3/bots/remote/runs`, {
       method: "POST",
-      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        "idempotency-key": "http-auto-mode-fixture-1"
+      },
       body: JSON.stringify({ goal: "List the visible product names", input })
     });
     const result = await response.json();

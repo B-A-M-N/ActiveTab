@@ -6,7 +6,8 @@ export const CLOUD_AGENT_MAPPING_CONFIDENCE_THRESHOLD = 0.8;
 
 function supportedCandidate(candidate, role) {
   if (!candidate || candidate.visible !== true || candidate.disabled === true || candidate.frameTargetId) return false;
-  if (role === CLOUD_AGENT_TASK_ROLES.MODEL_SELECTOR) {
+  if ([CLOUD_AGENT_TASK_ROLES.REPOSITORY_SELECTOR, CLOUD_AGENT_TASK_ROLES.REF_SELECTOR,
+    CLOUD_AGENT_TASK_ROLES.RUNTIME_SELECTOR, CLOUD_AGENT_TASK_ROLES.MODEL_SELECTOR].includes(role)) {
     return candidate.tag === "select" || String(candidate.role ?? "").toLowerCase() === "combobox";
   }
   if (role === CLOUD_AGENT_TASK_ROLES.TASK_PROMPT) {
@@ -36,42 +37,44 @@ function resolveControlRoles(observation, semantic, { allowSemanticAssociation =
     const candidate = candidates.find(item => item.identity === annotation.candidateRef);
     if (supportedCandidate(candidate, role)) fixed.set(role, candidate);
   }
-
-  // Enumerate complete typed control triples. The structural fallback is
-  // accepted only when the fresh observation leaves exactly one valid form
-  // mapping after applying any usable semantic predictions.
-  const modelChoices = fixed.has(CLOUD_AGENT_TASK_ROLES.MODEL_SELECTOR)
-    ? [fixed.get(CLOUD_AGENT_TASK_ROLES.MODEL_SELECTOR)]
-    : candidates.filter(candidate => supportedCandidate(candidate, CLOUD_AGENT_TASK_ROLES.MODEL_SELECTOR));
-  const promptChoices = fixed.has(CLOUD_AGENT_TASK_ROLES.TASK_PROMPT)
-    ? [fixed.get(CLOUD_AGENT_TASK_ROLES.TASK_PROMPT)]
-    : candidates.filter(candidate => supportedCandidate(candidate, CLOUD_AGENT_TASK_ROLES.TASK_PROMPT));
-  const submitChoices = fixed.has(CLOUD_AGENT_TASK_ROLES.SUBMIT_TASK)
-    ? [fixed.get(CLOUD_AGENT_TASK_ROLES.SUBMIT_TASK)]
-    : candidates.filter(candidate => supportedCandidate(candidate, CLOUD_AGENT_TASK_ROLES.SUBMIT_TASK) && candidate.submitsForm === true);
-  const triples = [];
-  for (const model of modelChoices) {
-    for (const prompt of promptChoices) {
-      for (const submit of submitChoices) {
-        if (prompt.identity === submit.identity) continue;
-        const sameForm = prompt.formIdentity && prompt.formIdentity === submit.formIdentity;
-        if (!sameForm && !allowSemanticAssociation) continue;
-        if (new Set([model.identity, prompt.identity, submit.identity]).size !== 3) continue;
-        triples.push({ model, prompt, submit });
-        if (triples.length > 1) break;
-      }
-      if (triples.length > 1) break;
-    }
-    if (triples.length > 1) break;
+  const hints = new Map([
+    [CLOUD_AGENT_TASK_ROLES.REPOSITORY_SELECTOR, /repo(sitory)?/i],
+    [CLOUD_AGENT_TASK_ROLES.REF_SELECTOR, /branch|base\s*ref|\bref\b/i],
+    [CLOUD_AGENT_TASK_ROLES.RUNTIME_SELECTOR, /runtime|environment/i],
+    [CLOUD_AGENT_TASK_ROLES.MODEL_SELECTOR, /model/i]
+  ]);
+  const accessibleName = candidate => [candidate.name, candidate.label, candidate.ariaLabel, candidate.placeholder]
+    .filter(value => typeof value === "string").join(" ").trim();
+  for (const [role, hint] of hints) {
+    if (fixed.has(role)) continue;
+    const matches = candidates.filter(candidate => supportedCandidate(candidate, role) && hint.test(accessibleName(candidate)));
+    if (matches.length === 1) fixed.set(role, matches[0]);
   }
-  if (triples.length !== 1) {
-    throw Object.assign(new Error("Cloud Agent controls remain ambiguous in the fresh observation after semantic and structural resolution."), { code: "semantic_mapping_unresolved" });
+  if (!fixed.has(CLOUD_AGENT_TASK_ROLES.TASK_PROMPT)) {
+    const prompts = candidates.filter(candidate => supportedCandidate(candidate, CLOUD_AGENT_TASK_ROLES.TASK_PROMPT));
+    if (prompts.length === 1) fixed.set(CLOUD_AGENT_TASK_ROLES.TASK_PROMPT, prompts[0]);
   }
-  return {
-    [CLOUD_AGENT_TASK_ROLES.MODEL_SELECTOR]: triples[0].model.identity,
-    [CLOUD_AGENT_TASK_ROLES.TASK_PROMPT]: triples[0].prompt.identity,
-    [CLOUD_AGENT_TASK_ROLES.SUBMIT_TASK]: triples[0].submit.identity
-  };
+  if (!fixed.has(CLOUD_AGENT_TASK_ROLES.SUBMIT_TASK)) {
+    const prompt = fixed.get(CLOUD_AGENT_TASK_ROLES.TASK_PROMPT);
+    const submits = candidates.filter(candidate => supportedCandidate(candidate, CLOUD_AGENT_TASK_ROLES.SUBMIT_TASK)
+      && candidate.submitsForm === true && prompt?.formIdentity && candidate.formIdentity === prompt.formIdentity);
+    if (submits.length === 1) fixed.set(CLOUD_AGENT_TASK_ROLES.SUBMIT_TASK, submits[0]);
+  }
+  const missing = roles.filter(role => !fixed.has(role));
+  if (missing.length) {
+    throw Object.assign(new Error(`Cloud Agent controls remain ambiguous or missing in the fresh observation: ${missing.join(", ")}.`), { code: "semantic_mapping_unresolved" });
+  }
+  const identities = roles.map(role => fixed.get(role).identity);
+  if (new Set(identities).size !== identities.length) {
+    throw Object.assign(new Error("Cloud Agent role mappings must resolve to distinct fresh controls."), { code: "semantic_mapping_unresolved" });
+  }
+  const prompt = fixed.get(CLOUD_AGENT_TASK_ROLES.TASK_PROMPT);
+  const submit = fixed.get(CLOUD_AGENT_TASK_ROLES.SUBMIT_TASK);
+  const sameForm = prompt.formIdentity && prompt.formIdentity === submit.formIdentity;
+  if (!sameForm && !allowSemanticAssociation) {
+    throw Object.assign(new Error("Cloud Agent prompt and submit controls require a shared observed form or semantic association."), { code: "semantic_mapping_unresolved" });
+  }
+  return Object.fromEntries(roles.map(role => [role, fixed.get(role).identity]));
 }
 
 /**

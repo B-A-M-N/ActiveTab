@@ -16,7 +16,7 @@ function createHarness({ task = null, listed = [] } = {}) {
   };
   const route = createLegacyRunRoutes({
     store,
-    lifecycle: { cancel: id => calls.push(["cancel", id]) },
+    lifecycle: { cancel: id => { calls.push(["cancel", id]); } },
     findTemplate: id => { calls.push(["findTemplate", id]); return id ? { input_schema: { type: "object" } } : null; },
     projectInput: (input, schema) => ({ projected: input, schema }),
     sendJson: (_response, status, body) => responses.push({ status, body }),

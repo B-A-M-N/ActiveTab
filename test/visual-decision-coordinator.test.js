@@ -59,3 +59,55 @@ test("visual target grounding requires multiple deterministic candidates", async
   assert.equal(groundings, 0);
   assert.deepEqual(harness.calls, []);
 });
+
+test("visual assessment resolves the current session after a same-target reattachment", async () => {
+  const calls = [];
+  const retired = {
+    attached: false,
+    target: { id: "visual-retired" },
+    documentGeneration: 1,
+    async observe() { calls.push("retired"); throw new Error("retired session used"); }
+  };
+  const replacement = {
+    attached: true,
+    target: { id: "visual-replacement" },
+    documentGeneration: 2
+  };
+  let current = replacement;
+  const observation = {
+    evidenceId: "visual-after-reattach",
+    targetId: "visual-replacement",
+    documentGeneration: 2,
+    visualEvidence: { evidenceId: "visual-after-reattach", targetId: "visual-replacement", documentGeneration: 2,
+      viewport: { width: 1280, height: 720 }, screenshotBase64: "fixture" }
+  };
+  let classifications = 0;
+  const coordinator = createVisualDecisionCoordinator({
+    decisionRuntime: {
+      jevClient: { allowImages: true },
+      recordInferenceRoute() {},
+      recordReviewSkipped() {},
+      visualDecisionService: { async classifyPage(input) {
+        classifications++;
+        assert.equal(input.targetId, "visual-replacement");
+        return { status: "reviewed" };
+      } }
+    },
+    session: retired,
+    getSession: () => current,
+    goal: "inspect this page",
+    episodeId: "visual-reattach-episode",
+    runId: "visual-reattach-run",
+    decisionStepId: () => "step-1"
+  });
+
+  const result = await coordinator.classifyAmbiguousPage(observation);
+  assert.equal(result.assessment.status, "reviewed");
+  assert.equal(classifications, 1);
+  assert.deepEqual(calls, []);
+
+  current = { ...replacement, target: { id: "other-target" } };
+  const stale = await coordinator.classifyAmbiguousPage(observation);
+  assert.equal(stale.assessment.failureCode, "visual_evidence_unavailable");
+  assert.equal(classifications, 1);
+});

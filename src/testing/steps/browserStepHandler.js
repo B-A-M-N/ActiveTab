@@ -229,7 +229,11 @@ export class BrowserStepHandler {
         : STEP_STATUS.UNCERTAIN);
     }
     if (actionPostcondition) verificationStatuses.push(actionPostcondition.status);
-    let status = authResult.telemetryError || authResult.operationError
+    // A partial composite dispatch may have changed browser state without
+    // completing the requested control operation. A postcondition that
+    // happens to pass (for example, the page title staying the same) cannot
+    // turn that typed uncertain dispatch into a successful workflow step.
+    let status = authResult.telemetryError || authResult.operationError || authResult.dispatchStatus === "uncertain"
       ? STEP_STATUS.UNCERTAIN
       : verificationStatuses.includes(STEP_STATUS.FAIL) ? STEP_STATUS.FAIL
         : verificationStatuses.includes(STEP_STATUS.UNCERTAIN) || verificationStatuses.length === 0 ? STEP_STATUS.UNCERTAIN
@@ -288,9 +292,18 @@ export class BrowserStepHandler {
       if (target.identity && candidate.identity !== target.identity) return false;
       if (target.backendNodeId !== undefined && candidate.backendNodeId !== target.backendNodeId) return false;
       if (target.name && candidate.name !== target.name) return false;
+      if (target.nameIn !== undefined && (!Array.isArray(target.nameIn) || !target.nameIn.includes(candidate.name))) return false;
       if (target.role && candidate.role !== target.role) return false;
       if (target.tag && candidate.tag !== target.tag) return false;
       if (target.visible !== undefined && candidate.visible !== target.visible) return false;
+      if (target.hrefOrigin !== undefined || target.hrefPath !== undefined) {
+        if (candidate.disabled === true) return false;
+        let href;
+        try { href = new URL(candidate.href, candidate.documentUrl ?? observation.page?.url); }
+        catch { return false; }
+        if (target.hrefOrigin !== undefined && href.origin !== target.hrefOrigin) return false;
+        if (target.hrefPath !== undefined && href.pathname !== target.hrefPath) return false;
+      }
       return true;
     });
     return matches.length === 1 ? matches[0] : null;
